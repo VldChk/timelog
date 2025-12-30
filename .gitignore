@@ -1,0 +1,7 @@
+build/
+docs/
+build_x64/
+build_x64_debug/
+.vscode/
+.claude/
+**.md
