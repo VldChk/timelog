@@ -18,6 +18,7 @@ extern "C" {
  */
 #define TL_TS_MIN INT64_MIN
 #define TL_TS_MAX INT64_MAX
+#define TL_TS_UNBOUNDED TL_TS_MAX  /* Range end sentinel: treated as unbounded */
 
 /*
  * Cache line size for alignment
@@ -42,6 +43,18 @@ extern "C" {
 #define TL_NOINLINE
 #define TL_UNUSED
 #endif
+
+TL_INLINE bool tl_ts_is_unbounded(tl_ts_t ts) {
+    return ts == TL_TS_UNBOUNDED;
+}
+
+TL_INLINE bool tl_ts_before_end(tl_ts_t ts, tl_ts_t end) {
+    return tl_ts_is_unbounded(end) || ts < end;
+}
+
+TL_INLINE bool tl_ts_range_empty(tl_ts_t t1, tl_ts_t t2) {
+    return !tl_ts_is_unbounded(t2) && t1 >= t2;
+}
 
 #ifdef __cplusplus
 }

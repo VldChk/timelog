@@ -529,7 +529,7 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
 
 tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     if (tl == NULL || !tl->is_open) return TL_EINVAL;
-    if (t2 < t1) return TL_EINVAL;
+    if (!tl_ts_is_unbounded(t2) && t2 < t1) return TL_EINVAL;
     if (t1 == t2) return TL_OK;  /* Empty range */
 
     bool sealed = false;
@@ -711,7 +711,7 @@ tl_status_t tl_iter_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
 tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
                           tl_iter_t** out) {
     /* since(t1) = range(t1, TL_TS_MAX) */
-    return iter_create_range(snap, t1, TL_TS_MAX, out);
+    return iter_create_range(snap, t1, TL_TS_UNBOUNDED, out);
 }
 
 tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
@@ -725,7 +725,7 @@ tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
     /* equal(ts) = range(ts, ts+1) */
     if (ts == TL_TS_MAX) {
         /* Edge case: ts+1 would overflow */
-        return iter_create_range(snap, ts, ts, out);
+        return iter_create_range(snap, ts, TL_TS_UNBOUNDED, out);
     }
     return iter_create_range(snap, ts, ts + 1, out);
 }
@@ -844,7 +844,7 @@ tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     }
 
     tl_iter_t* it = NULL;
-    tl_status_t st = iter_create_range(snap, ts + 1, TL_TS_MAX, &it);
+    tl_status_t st = iter_create_range(snap, ts + 1, TL_TS_UNBOUNDED, &it);
     if (st != TL_OK) {
         return st;
     }

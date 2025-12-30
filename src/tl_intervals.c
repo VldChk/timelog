@@ -166,7 +166,7 @@ bool tl_intervals_contains(const tl_intervals_t* iset, tl_ts_t ts) {
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (iset->data[mid].end <= ts) {
+        if (!tl_ts_before_end(ts, iset->data[mid].end)) {
             lo = mid + 1;
         } else if (iset->data[mid].start > ts) {
             hi = mid;
@@ -188,7 +188,7 @@ size_t tl_intervals_find(const tl_intervals_t* iset, tl_ts_t ts) {
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (iset->data[mid].end <= ts) {
+        if (!tl_ts_before_end(ts, iset->data[mid].end)) {
             lo = mid + 1;
         } else {
             hi = mid;

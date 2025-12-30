@@ -198,7 +198,7 @@ bool tl_page_row_deleted(const tl_page_t* page, uint32_t row);
  */
 TL_INLINE bool tl_page_overlaps(const tl_page_t* page, tl_ts_t t1, tl_ts_t t2) {
     if (page == NULL || page->count == 0) return false;
-    return page->max_ts >= t1 && page->min_ts < t2;
+    return page->max_ts >= t1 && tl_ts_before_end(page->min_ts, t2);
 }
 
 /**

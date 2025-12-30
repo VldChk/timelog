@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../include/timelog/timelog.h"
+#include "../src/internal/tl_defs.h"
 
 /* Test macros */
 #define TEST_ASSERT(cond) do { \
@@ -400,6 +401,59 @@ int test_read_path(void) {
     st = tl_prev_ts(snap, 600, &ts);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(ts, 500);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /*=======================================================================
+     * TL_TS_MAX Edge Case Tests
+     *=======================================================================*/
+
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_append(tl, TL_TS_MAX - 1, 9001);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_append(tl, TL_TS_MAX, 9002);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* iter_since should include TL_TS_MAX */
+    st = tl_iter_since(snap, TL_TS_MAX - 1, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    tl_ts_t last_seen = TL_TS_MIN;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        last_seen = rec.ts;
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 2);
+    TEST_ASSERT_EQ(last_seen, TL_TS_MAX);
+    tl_iter_destroy(it);
+
+    /* iter_equal should return TL_TS_MAX */
+    st = tl_iter_equal(snap, TL_TS_MAX, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, TL_TS_MAX);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 1);
+    tl_iter_destroy(it);
+
+    /* next_ts should reach TL_TS_MAX */
+    st = tl_next_ts(snap, TL_TS_MAX - 1, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, TL_TS_MAX);
+
+    st = tl_next_ts(snap, TL_TS_MAX, &ts);
+    TEST_ASSERT_EQ(st, TL_EOF);
 
     tl_snapshot_release(snap);
     tl_close(tl);

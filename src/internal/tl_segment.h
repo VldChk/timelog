@@ -115,7 +115,7 @@ uint32_t tl_segment_release(tl_segment_t* seg);
  * Check if segment overlaps query range [t1, t2).
  *
  * Uses the standard overlap predicate:
- *   seg.max_ts >= t1 AND seg.min_ts < t2
+ *   seg.max_ts >= t1 AND (t2 unbounded OR seg.min_ts < t2)
  *
  * @param seg Segment to check
  * @param t1  Range start (inclusive)
@@ -124,7 +124,7 @@ uint32_t tl_segment_release(tl_segment_t* seg);
  */
 TL_INLINE bool tl_segment_overlaps(const tl_segment_t* seg, tl_ts_t t1, tl_ts_t t2) {
     if (seg == NULL) return false;
-    return seg->max_ts >= t1 && seg->min_ts < t2;
+    return seg->max_ts >= t1 && tl_ts_before_end(seg->min_ts, t2);
 }
 
 /**

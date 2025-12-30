@@ -24,7 +24,7 @@ bool tl_tomb_cursor_is_deleted(tl_tomb_cursor_t* cur, tl_ts_t ts) {
      * Advance cursor while ts >= cur_end.
      * Because timestamps are non-decreasing, we only move forward.
      */
-    while (cur->idx < cur->tombs->n && ts >= cur->cur_end) {
+    while (cur->idx < cur->tombs->n && !tl_ts_before_end(ts, cur->cur_end)) {
         cur->idx++;
         if (cur->idx < cur->tombs->n) {
             cur->cur_start = cur->tombs->v[cur->idx].start;
@@ -36,7 +36,7 @@ bool tl_tomb_cursor_is_deleted(tl_tomb_cursor_t* cur, tl_ts_t ts) {
     }
 
     /* Check if ts falls within current interval [cur_start, cur_end) */
-    return (ts >= cur->cur_start && ts < cur->cur_end);
+    return (ts >= cur->cur_start && tl_ts_before_end(ts, cur->cur_end));
 }
 
 /*

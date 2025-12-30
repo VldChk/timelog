@@ -19,6 +19,7 @@ extern "C" {
  * - Intervals are sorted by t1 (start)
  * - Intervals are non-overlapping and non-adjacent (coalesced)
  * - Half-open semantics: [t1, t2) means t1 <= deleted_ts < t2
+ *   (t2 == TL_TS_UNBOUNDED is treated as open-ended)
  */
 typedef struct tl_tombstones {
     uint32_t         n;       /* Number of intervals */
@@ -77,7 +78,7 @@ tl_ts_t tl_tombstones_min_ts(const tl_tombstones_t* ts);
 /**
  * Get maximum timestamp covered by tombstones.
  *
- * Note: Returns max(t2) which is exclusive upper bound.
+ * Note: Returns max(t2); exclusive unless t2 is TL_TS_UNBOUNDED.
  *
  * @param ts Tombstone set
  * @return Maximum t2, or TL_TS_MIN if empty

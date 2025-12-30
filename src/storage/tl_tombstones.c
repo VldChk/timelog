@@ -87,7 +87,7 @@ bool tl_tombstones_contains(const tl_tombstones_t* ts, tl_ts_t t) {
 
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (ts->v[mid].end <= t) {
+        if (!tl_ts_before_end(t, ts->v[mid].end)) {
             lo = mid + 1;
         } else if (ts->v[mid].start > t) {
             hi = mid;

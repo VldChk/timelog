@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 /**
- * A half-open time interval [start, end).
+ * A half-open time interval [start, end) (end may be TL_TS_UNBOUNDED).
  *
  * Invariant: start < end (empty intervals are not stored)
  */

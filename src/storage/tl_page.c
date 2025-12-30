@@ -281,6 +281,7 @@ uint32_t tl_page_catalog_find_first(const tl_page_catalog_t* cat, tl_ts_t t1) {
 
 uint32_t tl_page_catalog_find_last(const tl_page_catalog_t* cat, tl_ts_t t2) {
     if (cat == NULL || cat->n_pages == 0) return 0;
+    if (tl_ts_is_unbounded(t2)) return cat->n_pages;
 
     /*
      * Binary search for first page with min_ts >= t2.

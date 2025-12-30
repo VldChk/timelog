@@ -178,7 +178,7 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
 static bool memrun_overlaps(const tl_memrun_t* mr, tl_ts_t t1, tl_ts_t t2) {
     if (mr == NULL) return false;
     if (mr->run_len == 0 && mr->ooo_len == 0) return false;
-    return mr->max_ts >= t1 && mr->min_ts < t2;
+    return mr->max_ts >= t1 && tl_ts_before_end(mr->min_ts, t2);
 }
 
 tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
@@ -189,7 +189,7 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
     if (out == NULL) return TL_EINVAL;
     *out = NULL;
 
-    if (t2 < t1) return TL_EINVAL;
+    if (!tl_ts_is_unbounded(t2) && t2 < t1) return TL_EINVAL;
 
     /* Allocate plan */
     tl_qplan_t* plan = tl__calloc(alloc, 1, sizeof(tl_qplan_t));
@@ -200,7 +200,7 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
     plan->t2 = t2;
 
     /* Empty range: return empty plan */
-    if (t1 == t2 || snap == NULL) {
+    if (snap == NULL || (!tl_ts_is_unbounded(t2) && t1 == t2)) {
         *out = plan;
         return TL_OK;
     }
@@ -287,7 +287,7 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
                     active_max = snap->memview->active_ooo[snap->memview->active_ooo_len - 1].ts;
             }
 
-            if (has_data && active_max >= t1 && active_min < t2) {
+            if (has_data && active_max >= t1 && tl_ts_before_end(active_min, t2)) {
                 tl_twoway_iter_t* it = NULL;
                 st = tl_twoway_iter_create(alloc,
                                             snap->memview->active_run,
