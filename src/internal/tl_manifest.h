@@ -19,7 +19,7 @@ extern "C" {
  *
  * Key properties:
  * - Immutable after creation
- * - Published via atomic pointer swap
+ * - Published via serialized pointer swap (writer_mu)
  * - Reference counted for snapshot pinning
  * - New manifests are built by copying and modifying
  */

@@ -20,7 +20,7 @@
 /*
  * Forward declarations for compaction (defined later in file).
  */
-static bool compaction_needed(const tl_timelog_t* tl);
+static bool compaction_needed(tl_timelog_t* tl);
 static tl_status_t compact_one_step(tl_timelog_t* tl);
 
 /*
@@ -52,17 +52,20 @@ struct tl_timelog {
     /* Publication protocol */
     tl_atomic_u64_t view_seq;         /* Seqlock for snapshot consistency */
 
-    /* Current manifest (atomic access) */
+    /* Current manifest (protected by writer_mu) */
     tl_manifest_t*  manifest_current;
 
     /* Delta layer */
     tl_memtable_t*  memtable;
 
     /* Generation counter for segments */
-    uint32_t        next_generation;
+    tl_atomic_u32_t next_generation;
 
     /* Writer coordination */
     tl_mutex_t      writer_mu;        /* Serializes write operations */
+
+    /* Flush serialization (protects flush_one_and_publish build+publish) */
+    tl_mutex_t      flush_mu;
 
     /* State flags */
     bool            is_open;
@@ -70,7 +73,8 @@ struct tl_timelog {
     /*
      * Maintenance subsystem
      *
-     * Lock ordering: maint_mu -> writer_mu (never reverse)
+     * Lock ordering: maint_mu -> flush_mu -> writer_mu (never reverse)
+     * memtable->mu is internal and may be taken while holding writer_mu.
      */
     tl_mutex_t      maint_mu;         /* Protects maintenance state */
     tl_cond_t       maint_cond;       /* Signal to wake worker */
@@ -100,8 +104,7 @@ struct tl_timelog {
  * Makes view_seq odd to signal readers to wait/retry.
  */
 static void publication_begin(tl_timelog_t* tl) {
-    uint64_t seq = tl_atomic_u64_load(&tl->view_seq);
-    tl_atomic_u64_store(&tl->view_seq, seq + 1);  /* Now odd */
+    tl_atomic_u64_fetch_add(&tl->view_seq, 1);  /* Now odd */
     tl_atomic_thread_fence_release();
 }
 
@@ -111,8 +114,7 @@ static void publication_begin(tl_timelog_t* tl) {
  */
 static void publication_end(tl_timelog_t* tl) {
     tl_atomic_thread_fence_release();
-    uint64_t seq = tl_atomic_u64_load(&tl->view_seq);
-    tl_atomic_u64_store(&tl->view_seq, seq + 1);  /* Now even */
+    tl_atomic_u64_fetch_add(&tl->view_seq, 1);  /* Now even */
 }
 
 /*===========================================================================
@@ -129,6 +131,7 @@ uint64_t tl_timelog_view_seq_load(const tl_timelog_t* tl) {
 
 /**
  * Acquire manifest reference (increments refcount).
+ * Caller must hold writer_mu.
  */
 tl_manifest_t* tl_timelog_manifest_acquire(tl_timelog_t* tl) {
     tl_manifest_t* m = tl->manifest_current;
@@ -140,6 +143,7 @@ tl_manifest_t* tl_timelog_manifest_acquire(tl_timelog_t* tl) {
 
 /**
  * Capture memview snapshot.
+ * Caller must hold writer_mu.
  */
 tl_status_t tl_timelog_memview_capture(tl_timelog_t* tl, tl_memview_t** out) {
     return tl_memtable_snapshot(tl->memtable, out);
@@ -150,6 +154,17 @@ tl_status_t tl_timelog_memview_capture(tl_timelog_t* tl, tl_memview_t** out) {
  */
 const tl_allocator_t* tl_timelog_allocator(const tl_timelog_t* tl) {
     return &tl->cfg.allocator;
+}
+
+/**
+ * Lock/unlock writer mutex (used by snapshot acquisition).
+ */
+void tl_timelog_writer_lock(tl_timelog_t* tl) {
+    tl_mutex_lock(&tl->writer_mu);
+}
+
+void tl_timelog_writer_unlock(tl_timelog_t* tl) {
+    tl_mutex_unlock(&tl->writer_mu);
 }
 
 /*===========================================================================
@@ -170,19 +185,27 @@ const tl_allocator_t* tl_timelog_allocator(const tl_timelog_t* tl) {
  * @return TL_OK on success, TL_EOF if no memruns to flush
  */
 static tl_status_t flush_one_and_publish(tl_timelog_t* tl) {
+    tl_status_t st;
+
+    /* Serialize flush operations to avoid double-flush of the same memrun */
+    tl_mutex_lock(&tl->flush_mu);
+
     /* Get oldest sealed memrun */
     tl_memrun_t* mr = tl_memtable_peek_oldest_sealed(tl->memtable);
     if (mr == NULL) {
+        tl_mutex_unlock(&tl->flush_mu);
         return TL_EOF;
     }
 
-    /* Build segment from memrun (expensive, outside critical section) */
+    /* Build segment from memrun (expensive, outside publication lock) */
     tl_segment_t* seg = NULL;
-    tl_status_t st = tl_flush_memrun(&tl->cfg.allocator, mr,
-                                      tl->cfg.target_page_bytes,
-                                      tl->next_generation++,
-                                      &seg);
+    uint32_t gen = tl_atomic_u32_fetch_add(&tl->next_generation, 1);
+    st = tl_flush_memrun(&tl->cfg.allocator, mr,
+                         tl->cfg.target_page_bytes,
+                         gen,
+                         &seg);
     if (st != TL_OK && st != TL_EOF) {
+        tl_mutex_unlock(&tl->flush_mu);
         return st;
     }
 
@@ -193,12 +216,15 @@ static tl_status_t flush_one_and_publish(tl_timelog_t* tl) {
         if (removed != NULL) {
             tl_memrun_release(removed);
         }
+        tl_mutex_unlock(&tl->flush_mu);
         return TL_OK;
     }
 
     /*
      * Publication transaction (short critical section).
+     * writer_mu ensures no concurrent snapshot capture or other publication.
      */
+    tl_mutex_lock(&tl->writer_mu);
 
     /* Begin: view_seq becomes odd */
     publication_begin(tl);
@@ -216,11 +242,13 @@ static tl_status_t flush_one_and_publish(tl_timelog_t* tl) {
 
     if (st != TL_OK) {
         publication_end(tl);
+        tl_mutex_unlock(&tl->writer_mu);
         tl_segment_release(seg);
+        tl_mutex_unlock(&tl->flush_mu);
         return st;
     }
 
-    /* Atomic manifest swap */
+    /* Manifest swap (serialized by writer_mu) */
     tl->manifest_current = new_manifest;
 
     /* Remove memrun from sealed queue (marks as published) */
@@ -228,6 +256,8 @@ static tl_status_t flush_one_and_publish(tl_timelog_t* tl) {
 
     /* End: view_seq becomes even */
     publication_end(tl);
+
+    tl_mutex_unlock(&tl->writer_mu);
 
     /* Release old manifest (may still be pinned by snapshots) */
     if (old_manifest != NULL) {
@@ -242,6 +272,7 @@ static tl_status_t flush_one_and_publish(tl_timelog_t* tl) {
         tl_memrun_release(removed);
     }
 
+    tl_mutex_unlock(&tl->flush_mu);
     return TL_OK;
 }
 
@@ -291,12 +322,20 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
         return TL_EINTERNAL;
     }
 
+    /* Initialize flush mutex */
+    if (tl_mutex_init(&tl->flush_mu) != 0) {
+        tl_mutex_destroy(&tl->writer_mu);
+        tl__free(&cfg->allocator, tl);
+        return TL_EINTERNAL;
+    }
+
     /* Create empty manifest
      * NOTE: Use &tl->cfg.allocator (the copy) since cfg may point to
      * a stack-local config that will be deallocated after tl_open returns.
      */
     st = tl_manifest_create_empty(&tl->cfg.allocator, 0, &tl->manifest_current);
     if (st != TL_OK) {
+        tl_mutex_destroy(&tl->flush_mu);
         tl_mutex_destroy(&tl->writer_mu);
         tl__free(&tl->cfg.allocator, tl);
         return st;
@@ -311,6 +350,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
                             &tl->memtable);
     if (st != TL_OK) {
         tl_manifest_release(tl->manifest_current);
+        tl_mutex_destroy(&tl->flush_mu);
         tl_mutex_destroy(&tl->writer_mu);
         tl__free(&tl->cfg.allocator, tl);
         return st;
@@ -320,6 +360,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     if (tl_mutex_init(&tl->maint_mu) != 0) {
         tl_memtable_destroy(tl->memtable);
         tl_manifest_release(tl->manifest_current);
+        tl_mutex_destroy(&tl->flush_mu);
         tl_mutex_destroy(&tl->writer_mu);
         tl__free(&tl->cfg.allocator, tl);
         return TL_EINTERNAL;
@@ -329,6 +370,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
         tl_mutex_destroy(&tl->maint_mu);
         tl_memtable_destroy(tl->memtable);
         tl_manifest_release(tl->manifest_current);
+        tl_mutex_destroy(&tl->flush_mu);
         tl_mutex_destroy(&tl->writer_mu);
         tl__free(&tl->cfg.allocator, tl);
         return TL_EINTERNAL;
@@ -339,7 +381,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl->flush_pending = false;
     tl->compact_pending = false;
 
-    tl->next_generation = 1;
+    tl_atomic_u32_store(&tl->next_generation, 1);
     tl->is_open = true;
 
     TL_LOG_INFO(&tl->logger, "timelog opened (time_unit=%d, page_bytes=%zu)",
@@ -381,6 +423,7 @@ void tl_close(tl_timelog_t* tl) {
     }
 
     /* Destroy mutex */
+    tl_mutex_destroy(&tl->flush_mu);
     tl_mutex_destroy(&tl->writer_mu);
 
     /* Free instance using its own allocator */
@@ -396,7 +439,7 @@ void tl_close(tl_timelog_t* tl) {
  * Signal the maintenance thread that there's work to do.
  *
  * IMPORTANT: This must be called AFTER releasing writer_mu to respect
- * the lock ordering (maint_mu -> writer_mu, never reverse).
+ * the lock ordering (maint_mu -> flush_mu -> writer_mu, never reverse).
  */
 static void signal_maintenance_flush(tl_timelog_t* tl) {
     tl_mutex_lock(&tl->maint_mu);
@@ -597,7 +640,7 @@ tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out) {
     if (tl == NULL || out == NULL) return TL_EINVAL;
     if (!tl->is_open) return TL_ESTATE;
 
-    /* Cast away const for internal access (seqlock is safe for concurrent reads) */
+    /* Cast away const for internal access (writer_mu protects capture) */
     return tl_snapshot_acquire_internal((struct tl_timelog*)tl, out);
 }
 
@@ -878,6 +921,7 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
  *
  * Thread safety:
  * - Uses maint_mu to protect state access
+ * - Uses flush_mu to serialize flush build+publish
  * - Uses writer_mu only during publication (short critical section)
  * - Never holds maint_mu while doing actual work
  */
@@ -1003,11 +1047,17 @@ tl_status_t tl_maint_stop(tl_timelog_t* tl) {
  *
  * V1 simple policy: compact when delta segment count exceeds threshold.
  */
-static bool compaction_needed(const tl_timelog_t* tl) {
-    const tl_manifest_t* m = tl->manifest_current;
-    if (m == NULL) return false;
+static bool compaction_needed(tl_timelog_t* tl) {
+    bool needed = false;
 
-    return m->n_delta >= tl->cfg.max_delta_segments;
+    tl_mutex_lock(&tl->writer_mu);
+    const tl_manifest_t* m = tl->manifest_current;
+    if (m != NULL) {
+        needed = (m->n_delta >= tl->cfg.max_delta_segments);
+    }
+    tl_mutex_unlock(&tl->writer_mu);
+
+    return needed;
 }
 
 /**
@@ -1136,12 +1186,20 @@ static tl_status_t compact_one_step(tl_timelog_t* tl) {
      * Acquire current manifest reference.
      * This ensures the manifest (and its segments) remain valid during build.
      */
-    tl_manifest_t* old_manifest = tl->manifest_current;
+    tl_manifest_t* old_manifest = NULL;
+    tl_mutex_lock(&tl->writer_mu);
+    old_manifest = tl->manifest_current;
+    if (old_manifest != NULL) {
+        tl_manifest_acquire(old_manifest);
+    }
+    tl_mutex_unlock(&tl->writer_mu);
+
     if (old_manifest == NULL || old_manifest->n_delta == 0) {
+        if (old_manifest != NULL) {
+            tl_manifest_release(old_manifest);
+        }
         return TL_EOF;  /* Nothing to compact */
     }
-
-    tl_manifest_acquire(old_manifest);
 
     uint32_t n_delta = old_manifest->n_delta;
 
@@ -1239,8 +1297,9 @@ static tl_status_t compact_one_step(tl_timelog_t* tl) {
     if (page_capacity < 128) page_capacity = 128;
 
     tl_segment_builder_t builder;
+    uint32_t gen = tl_atomic_u32_fetch_add(&tl->next_generation, 1);
     st = tl_segment_builder_init(&builder, alloc, page_capacity,
-                                  TL_SEG_MAIN, tl->next_generation);
+                                  TL_SEG_MAIN, gen);
     if (st != TL_OK) {
         tl__free(alloc, heap);
         for (uint32_t i = 0; i < n_delta; i++) {
@@ -1345,8 +1404,6 @@ static tl_status_t compact_one_step(tl_timelog_t* tl) {
         return TL_EBUSY;  /* Manifest changed, retry */
     }
 
-    /* Increment generation (was used in builder init, now commit) */
-    tl->next_generation++;
 
     publication_begin(tl);
 

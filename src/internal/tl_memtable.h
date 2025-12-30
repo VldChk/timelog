@@ -279,7 +279,7 @@ struct tl_memview {
 /**
  * Capture a consistent memview snapshot.
  *
- * Called during snapshot acquisition under view_seq protection.
+ * Called during snapshot acquisition while holding writer_mu.
  *
  * @param mt  Memtable
  * @param out Output pointer

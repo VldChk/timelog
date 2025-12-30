@@ -22,11 +22,8 @@ extern "C" {
  * - Manifest and memview remain valid for snapshot lifetime
  * - Multiple iterators can be created from same snapshot
  *
- * The snapshot is acquired under the view_seq seqlock protocol:
- * - Reader spins until view_seq is even (stable)
- * - Acquires manifest and memview references
- * - Validates view_seq unchanged
- * - If changed, retries
+ * The snapshot is acquired with writer_mu held briefly to prevent
+ * concurrent writes during capture, then validated with view_seq.
  *
  * This guarantees "exactly-once visibility": each record is seen
  * either in memview OR in manifest segments, never both/neither.
@@ -53,12 +50,14 @@ struct tl_snapshot {
 /**
  * Acquire a snapshot from a timelog instance.
  *
- * Uses seqlock protocol for lock-free snapshot acquisition:
- * 1. Load view_seq, verify even (stable)
- * 2. Pin manifest
- * 3. Capture memview
- * 4. Verify view_seq unchanged
- * 5. If changed, release and retry
+ * Uses writer_mu + seqlock for snapshot acquisition:
+ * 1. Lock writer_mu
+ * 2. Load view_seq, verify even (stable)
+ * 3. Pin manifest
+ * 4. Capture memview
+ * 5. Verify view_seq unchanged
+ * 6. Unlock writer_mu
+ * 7. If changed, release and retry
  *
  * @param tl  Timelog instance
  * @param out Output pointer for snapshot

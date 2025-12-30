@@ -487,7 +487,7 @@ tl_status_t tl_memtable_snapshot(tl_memtable_t* mt, tl_memview_t** out) {
     /*
      * Copy active buffers snapshot.
      * Note: Writer must not be actively modifying during snapshot.
-     * This is ensured by the view_seq protocol at the tl_timelog level.
+     * This is ensured by holding writer_mu at the tl_timelog level.
      */
     size_t run_len = tl_recvec_len(&mt->active_run);
     size_t ooo_len = tl_recvec_len(&mt->active_ooo);

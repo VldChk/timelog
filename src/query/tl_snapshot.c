@@ -9,6 +9,8 @@ extern tl_manifest_t* tl_timelog_manifest_acquire(struct tl_timelog* tl);
 extern tl_status_t tl_timelog_memview_capture(struct tl_timelog* tl,
                                                tl_memview_t** out);
 extern const tl_allocator_t* tl_timelog_allocator(const struct tl_timelog* tl);
+extern void tl_timelog_writer_lock(struct tl_timelog* tl);
+extern void tl_timelog_writer_unlock(struct tl_timelog* tl);
 
 /*
  * Maximum retry attempts before giving up (prevents infinite loop on bug)
@@ -30,27 +32,36 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
     snap->tl = tl;
 
     /*
-     * Seqlock acquisition protocol:
+     * Seqlock acquisition protocol (with writer_mu held for capture):
      *
      * The view_seq counter uses even/odd signaling:
      * - Even: stable state, safe to read
      * - Odd: publication in progress, must wait
      *
      * Algorithm:
-     * 1. Load v1 = view_seq; if odd, retry
-     * 2. Acquire manifest reference
-     * 3. Capture memview snapshot
-     * 4. Load v2 = view_seq
-     * 5. If v1 == v2 and even: success
-     * 6. Else: release, retry
+     * 1. Lock writer_mu
+     * 2. Load v1 = view_seq; if odd, retry
+     * 3. Acquire manifest reference
+     * 4. Capture memview snapshot
+     * 5. Load v2 = view_seq
+     * 6. Unlock writer_mu
+     * 7. If v1 == v2 and even: success
+     * 8. Else: release, retry
      */
     int retries = 0;
     while (retries < TL_SNAPSHOT_MAX_RETRIES) {
+        /*
+         * Hold writer_mu while capturing manifest + memview to prevent
+         * races with append/seal/publish.
+         */
+        tl_timelog_writer_lock(tl);
+
         /* Step 1: Load view_seq and check stability */
         uint64_t v1 = tl_timelog_view_seq_load(tl);
 
         if ((v1 & 1) != 0) {
-            /* Odd: publication in progress, spin briefly */
+            /* Odd: publication in progress, retry after unlock */
+            tl_timelog_writer_unlock(tl);
             retries++;
             continue;
         }
@@ -61,6 +72,12 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
         /* Step 3: Capture memview */
         tl_memview_t* memview = NULL;
         tl_status_t st = tl_timelog_memview_capture(tl, &memview);
+
+        /* Step 4: Load view_seq again */
+        uint64_t v2 = tl_timelog_view_seq_load(tl);
+
+        tl_timelog_writer_unlock(tl);
+
         if (st != TL_OK) {
             if (manifest != NULL) {
                 tl_manifest_release(manifest);
@@ -68,9 +85,6 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
             tl__free(alloc, snap);
             return st;
         }
-
-        /* Step 4: Load view_seq again */
-        uint64_t v2 = tl_timelog_view_seq_load(tl);
 
         /* Step 5: Verify consistency */
         if (v1 == v2) {

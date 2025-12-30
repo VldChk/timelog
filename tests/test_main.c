@@ -33,6 +33,8 @@ extern int test_read_path(void);
 extern int test_diagnostics(void);
 /* Phase 6: Maintenance tests */
 extern int test_maintenance(void);
+/* Concurrency tests */
+extern int test_concurrency(void);
 
 int main(void) {
     int failed = 0;
@@ -103,6 +105,11 @@ int main(void) {
     printf("Starting test_maintenance...\n"); fflush(stdout);
     if (test_maintenance()) { failed++; printf("test_maintenance FAILED\n"); }
     else printf("test_maintenance PASSED\n");
+
+    /* Concurrency tests */
+    printf("Starting test_concurrency...\n"); fflush(stdout);
+    if (test_concurrency()) { failed++; printf("test_concurrency FAILED\n"); }
+    else printf("test_concurrency PASSED\n");
 
     printf("\n%d test(s) failed.\n", failed);
     return failed ? EXIT_FAILURE : EXIT_SUCCESS;
