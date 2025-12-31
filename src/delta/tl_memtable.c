@@ -234,7 +234,7 @@ tl_status_t tl_memtable_add_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t t2)
     if (t1 == t2) return TL_OK;
 
     /* Insert with coalescing */
-    tl_status_t st = tl_intervals_insert(&mt->active_tombs, t1, t2);
+    tl_status_t st = tl_intervals_insert(&mt->active_tombs, t1, t2, false);
     if (st != TL_OK) return st;
 
     /* Update accounting (rough estimate; coalescing may reduce actual count) */

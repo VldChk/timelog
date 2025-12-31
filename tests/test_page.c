@@ -86,14 +86,14 @@ int test_page(void) {
     TEST_ASSERT_EQ(tl_page_upper_bound(page, 100), 5);  /* Way after */
 
     /* Test: Page overlap predicate */
-    TEST_ASSERT(tl_page_overlaps(page, 0, 100));    /* Fully covers */
-    TEST_ASSERT(tl_page_overlaps(page, 10, 20));    /* Partial start */
-    TEST_ASSERT(tl_page_overlaps(page, 40, 60));    /* Partial end */
-    TEST_ASSERT(tl_page_overlaps(page, 25, 35));    /* Inside */
-    TEST_ASSERT(!tl_page_overlaps(page, 0, 10));    /* Before (exclusive end) */
-    TEST_ASSERT(!tl_page_overlaps(page, 51, 100));  /* After */
-    TEST_ASSERT(tl_page_overlaps(page, 50, 100));   /* Touches end */
-    TEST_ASSERT(tl_page_overlaps(page, 0, 11));     /* Touches start */
+    TEST_ASSERT(tl_page_overlaps(page, 0, 100, false));    /* Fully covers */
+    TEST_ASSERT(tl_page_overlaps(page, 10, 20, false));    /* Partial start */
+    TEST_ASSERT(tl_page_overlaps(page, 40, 60, false));    /* Partial end */
+    TEST_ASSERT(tl_page_overlaps(page, 25, 35, false));    /* Inside */
+    TEST_ASSERT(!tl_page_overlaps(page, 0, 10, false));    /* Before (exclusive end) */
+    TEST_ASSERT(!tl_page_overlaps(page, 51, 100, false));  /* After */
+    TEST_ASSERT(tl_page_overlaps(page, 50, 100, false));   /* Touches end */
+    TEST_ASSERT(tl_page_overlaps(page, 0, 11, false));     /* Touches start */
 
     /* Test: Row deleted check (for FULLY_LIVE page) */
     TEST_ASSERT(!tl_page_row_deleted(page, 0));
@@ -148,13 +148,13 @@ int test_page(void) {
     TEST_ASSERT_EQ(tl_page_catalog_find_first(&cat, 71), 3);  /* After all */
 
     /* Test: find_last - first page with min_ts >= t2, returns end of usable range */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 0), 0);    /* Before all */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 10), 0);   /* At first start */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 11), 1);   /* Inside first */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 30), 1);   /* At second start */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 50), 2);   /* At third start */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 51), 3);   /* Inside third */
-    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 100), 3);  /* After all */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 0, false), 0);    /* Before all */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 10, false), 0);   /* At first start */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 11, false), 1);   /* Inside first */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 30, false), 1);   /* At second start */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 50, false), 2);   /* At third start */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 51, false), 3);   /* Inside third */
+    TEST_ASSERT_EQ(tl_page_catalog_find_last(&cat, 100, false), 3);  /* After all */
 
     /* Cleanup pages */
     tl_page_destroy(&alloc, p1);
@@ -217,7 +217,7 @@ int test_page(void) {
     /* Test: Null safety */
     TEST_ASSERT_EQ(tl_page_lower_bound(NULL, 100), 0);
     TEST_ASSERT_EQ(tl_page_upper_bound(NULL, 100), 0);
-    TEST_ASSERT(!tl_page_overlaps(NULL, 0, 100));
+    TEST_ASSERT(!tl_page_overlaps(NULL, 0, 100, false));
     TEST_ASSERT(!tl_page_row_deleted(NULL, 0));
     TEST_ASSERT_EQ(tl_page_validate(NULL), TL_OK);
 

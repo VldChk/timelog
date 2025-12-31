@@ -27,7 +27,7 @@ int test_iter(void) {
 
     /* Test: Empty array iterator */
     tl_array_iter_t* ait = NULL;
-    st = tl_array_iter_create(&alloc, NULL, 0, 0, 100, &ait);
+    st = tl_array_iter_create(&alloc, NULL, 0, 0, 100, false, &ait);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_NE(ait, NULL);
     TEST_ASSERT_EQ(tl_array_iter_state(ait), TL_ITER_EOF);
@@ -39,7 +39,7 @@ int test_iter(void) {
         {100, 1001}, {200, 1002}, {300, 1003}, {400, 1004}, {500, 1005}
     };
 
-    st = tl_array_iter_create(&alloc, records, 5, 0, 1000, &ait);
+    st = tl_array_iter_create(&alloc, records, 5, 0, 1000, false, &ait);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_array_iter_state(ait), TL_ITER_READY);
 
@@ -76,7 +76,7 @@ int test_iter(void) {
     tl_array_iter_destroy(ait);
 
     /* Test: Array iterator with range filter */
-    st = tl_array_iter_create(&alloc, records, 5, 200, 400, &ait);
+    st = tl_array_iter_create(&alloc, records, 5, 200, 400, false, &ait);
     TEST_ASSERT_EQ(st, TL_OK);
 
     rec = tl_array_iter_peek(ait);
@@ -93,7 +93,7 @@ int test_iter(void) {
     tl_array_iter_destroy(ait);
 
     /* Test: Array iterator seek */
-    st = tl_array_iter_create(&alloc, records, 5, 0, 1000, &ait);
+    st = tl_array_iter_create(&alloc, records, 5, 0, 1000, false, &ait);
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_array_iter_seek(ait, 250);
@@ -117,14 +117,14 @@ int test_iter(void) {
 
     /* Test: Empty two-way iterator */
     tl_twoway_iter_t* twit = NULL;
-    st = tl_twoway_iter_create(&alloc, NULL, 0, NULL, 0, 0, 100, &twit);
+    st = tl_twoway_iter_create(&alloc, NULL, 0, NULL, 0, 0, 100, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_twoway_iter_state(twit), TL_ITER_EOF);
     tl_twoway_iter_destroy(twit);
 
     /* Test: Two-way merge with run only */
     tl_record_t run[] = {{100, 1}, {200, 2}, {300, 3}};
-    st = tl_twoway_iter_create(&alloc, run, 3, NULL, 0, 0, 1000, &twit);
+    st = tl_twoway_iter_create(&alloc, run, 3, NULL, 0, 0, 1000, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_twoway_iter_state(twit), TL_ITER_READY);
 
@@ -139,7 +139,7 @@ int test_iter(void) {
 
     /* Test: Two-way merge with ooo only */
     tl_record_t ooo[] = {{150, 4}, {250, 5}};
-    st = tl_twoway_iter_create(&alloc, NULL, 0, ooo, 2, 0, 1000, &twit);
+    st = tl_twoway_iter_create(&alloc, NULL, 0, ooo, 2, 0, 1000, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     rec = tl_twoway_iter_peek(twit);
@@ -152,7 +152,7 @@ int test_iter(void) {
     tl_twoway_iter_destroy(twit);
 
     /* Test: Two-way merge interleaved */
-    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 0, 1000, &twit);
+    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 0, 1000, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Expected order: 100, 150, 200, 250, 300 */
@@ -174,7 +174,7 @@ int test_iter(void) {
     tl_twoway_iter_destroy(twit);
 
     /* Test: Two-way merge with range filter */
-    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 150, 260, &twit);
+    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 150, 260, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Expected order in range [150, 260): 150, 200, 250 */
@@ -194,7 +194,7 @@ int test_iter(void) {
     tl_twoway_iter_destroy(twit);
 
     /* Test: Two-way merge seek */
-    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 0, 1000, &twit);
+    st = tl_twoway_iter_create(&alloc, run, 3, ooo, 2, 0, 1000, false, &twit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_twoway_iter_seek(twit, 175);
@@ -210,7 +210,7 @@ int test_iter(void) {
 
     /* Test: Empty segment iterator */
     tl_segment_iter_t* sit = NULL;
-    st = tl_segment_iter_create(&alloc, NULL, 0, 1000, &sit);
+    st = tl_segment_iter_create(&alloc, NULL, 0, 1000, false, &sit);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_segment_iter_state(sit), TL_ITER_EOF);
     tl_segment_iter_destroy(sit);
@@ -237,7 +237,7 @@ int test_iter(void) {
     tl_segment_builder_destroy(&builder);
 
     /* Iterate entire segment */
-    st = tl_segment_iter_create(&alloc, seg, 0, 1000, &sit);
+    st = tl_segment_iter_create(&alloc, seg, 0, 1000, false, &sit);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_segment_iter_state(sit), TL_ITER_READY);
 
@@ -255,7 +255,7 @@ int test_iter(void) {
     tl_segment_iter_destroy(sit);
 
     /* Test: Segment iterator with range */
-    st = tl_segment_iter_create(&alloc, seg, 250, 450, &sit);
+    st = tl_segment_iter_create(&alloc, seg, 250, 450, false, &sit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Should get 300, 400 */
@@ -271,7 +271,7 @@ int test_iter(void) {
     tl_segment_iter_destroy(sit);
 
     /* Test: Segment iterator seek */
-    st = tl_segment_iter_create(&alloc, seg, 0, 1000, &sit);
+    st = tl_segment_iter_create(&alloc, seg, 0, 1000, false, &sit);
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_segment_iter_seek(sit, 350);
@@ -282,7 +282,7 @@ int test_iter(void) {
     tl_segment_iter_destroy(sit);
 
     /* Test: Segment iterator with non-overlapping range */
-    st = tl_segment_iter_create(&alloc, seg, 700, 800, &sit);
+    st = tl_segment_iter_create(&alloc, seg, 700, 800, false, &sit);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_EQ(tl_segment_iter_state(sit), TL_ITER_EOF);
     tl_segment_iter_destroy(sit);

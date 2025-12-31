@@ -93,6 +93,36 @@ static const tl_iter_vtable_t twoway_iter_vtable = {
     .destroy = twoway_iter_destroy_adapter
 };
 
+static bool clip_interval_for_range(const tl_interval_t* iv,
+                                    tl_ts_t t1,
+                                    tl_ts_t t2,
+                                    bool t2_unbounded,
+                                    tl_ts_t* out_start,
+                                    tl_ts_t* out_end,
+                                    bool* out_end_unbounded) {
+    tl_ts_t start = (iv->start > t1) ? iv->start : t1;
+    tl_ts_t end = iv->end;
+    bool end_unbounded = iv->end_unbounded;
+
+    if (!t2_unbounded) {
+        if (end_unbounded) {
+            end = t2;
+            end_unbounded = false;
+        } else if (end > t2) {
+            end = t2;
+        }
+    }
+
+    if (!end_unbounded && start >= end) {
+        return false;
+    }
+
+    *out_start = start;
+    *out_end = end;
+    *out_end_unbounded = end_unbounded;
+    return true;
+}
+
 /*
  * Collect tombstones from all sources into intervals set.
  * Clips intervals to [t1, t2).
@@ -101,9 +131,13 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
                                        const tl_snapshot_t* snap,
                                        tl_ts_t t1,
                                        tl_ts_t t2,
+                                       bool t2_unbounded,
                                        tl_intervals_t* out) {
     tl_intervals_init(out, alloc);
     tl_status_t st;
+    tl_ts_t start = 0;
+    tl_ts_t end = 0;
+    bool end_unbounded = false;
 
     /* Collect from manifest segments */
     if (snap->manifest != NULL) {
@@ -113,11 +147,9 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
             if (seg->tombstones != NULL && !tl_tombstones_empty(seg->tombstones)) {
                 for (uint32_t j = 0; j < seg->tombstones->n; j++) {
                     const tl_interval_t* iv = &seg->tombstones->v[j];
-                    /* Clip to [t1, t2) */
-                    tl_ts_t start = (iv->start > t1) ? iv->start : t1;
-                    tl_ts_t end = (iv->end < t2) ? iv->end : t2;
-                    if (start < end) {
-                        st = tl_intervals_insert(out, start, end);
+                    if (clip_interval_for_range(iv, t1, t2, t2_unbounded,
+                                                &start, &end, &end_unbounded)) {
+                        st = tl_intervals_insert(out, start, end, end_unbounded);
                         if (st != TL_OK) return st;
                     }
                 }
@@ -130,10 +162,9 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
             if (seg->tombstones != NULL && !tl_tombstones_empty(seg->tombstones)) {
                 for (uint32_t j = 0; j < seg->tombstones->n; j++) {
                     const tl_interval_t* iv = &seg->tombstones->v[j];
-                    tl_ts_t start = (iv->start > t1) ? iv->start : t1;
-                    tl_ts_t end = (iv->end < t2) ? iv->end : t2;
-                    if (start < end) {
-                        st = tl_intervals_insert(out, start, end);
+                    if (clip_interval_for_range(iv, t1, t2, t2_unbounded,
+                                                &start, &end, &end_unbounded)) {
+                        st = tl_intervals_insert(out, start, end, end_unbounded);
                         if (st != TL_OK) return st;
                     }
                 }
@@ -146,10 +177,9 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
         /* Active tombstones */
         for (size_t i = 0; i < snap->memview->active_tombs_len; i++) {
             const tl_interval_t* iv = &snap->memview->active_tombs[i];
-            tl_ts_t start = (iv->start > t1) ? iv->start : t1;
-            tl_ts_t end = (iv->end < t2) ? iv->end : t2;
-            if (start < end) {
-                st = tl_intervals_insert(out, start, end);
+            if (clip_interval_for_range(iv, t1, t2, t2_unbounded,
+                                        &start, &end, &end_unbounded)) {
+                st = tl_intervals_insert(out, start, end, end_unbounded);
                 if (st != TL_OK) return st;
             }
         }
@@ -159,10 +189,9 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
             const tl_memrun_t* mr = snap->memview->sealed[i];
             for (size_t j = 0; j < mr->tombs_len; j++) {
                 const tl_interval_t* iv = &mr->tombs[j];
-                tl_ts_t start = (iv->start > t1) ? iv->start : t1;
-                tl_ts_t end = (iv->end < t2) ? iv->end : t2;
-                if (start < end) {
-                    st = tl_intervals_insert(out, start, end);
+                if (clip_interval_for_range(iv, t1, t2, t2_unbounded,
+                                            &start, &end, &end_unbounded)) {
+                    st = tl_intervals_insert(out, start, end, end_unbounded);
                     if (st != TL_OK) return st;
                 }
             }
@@ -175,21 +204,23 @@ static tl_status_t collect_tombstones(const tl_allocator_t* alloc,
 /*
  * Check if memrun overlaps with query range.
  */
-static bool memrun_overlaps(const tl_memrun_t* mr, tl_ts_t t1, tl_ts_t t2) {
+static bool memrun_overlaps(const tl_memrun_t* mr, tl_ts_t t1, tl_ts_t t2,
+                            bool t2_unbounded) {
     if (mr == NULL) return false;
     if (mr->run_len == 0 && mr->ooo_len == 0) return false;
-    return mr->max_ts >= t1 && tl_ts_before_end(mr->min_ts, t2);
+    return mr->max_ts >= t1 && tl_ts_before_end(mr->min_ts, t2, t2_unbounded);
 }
 
 tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
                             const tl_snapshot_t* snap,
                             tl_ts_t t1,
                             tl_ts_t t2,
+                            bool t2_unbounded,
                             tl_qplan_t** out) {
     if (out == NULL) return TL_EINVAL;
     *out = NULL;
 
-    if (!tl_ts_is_unbounded(t2) && t2 < t1) return TL_EINVAL;
+    if (!t2_unbounded && t2 < t1) return TL_EINVAL;
 
     /* Allocate plan */
     tl_qplan_t* plan = tl__calloc(alloc, 1, sizeof(tl_qplan_t));
@@ -198,9 +229,10 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
     plan->alloc = alloc;
     plan->t1 = t1;
     plan->t2 = t2;
+    plan->t2_unbounded = t2_unbounded;
 
     /* Empty range: return empty plan */
-    if (snap == NULL || (!tl_ts_is_unbounded(t2) && t1 == t2)) {
+    if (snap == NULL || tl_ts_range_empty(t1, t2, t2_unbounded)) {
         *out = plan;
         return TL_OK;
     }
@@ -214,10 +246,10 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
         for (uint32_t i = 0; i < snap->manifest->n_delta; i++) {
             const tl_segment_t* seg = snap->manifest->delta[i];
             if (seg->record_count == 0) continue;  /* Tombstone-only segment */
-            if (!tl_segment_overlaps(seg, t1, t2)) continue;
+            if (!tl_segment_overlaps(seg, t1, t2, t2_unbounded)) continue;
 
             tl_segment_iter_t* it = NULL;
-            st = tl_segment_iter_create(alloc, seg, t1, t2, &it);
+            st = tl_segment_iter_create(alloc, seg, t1, t2, t2_unbounded, &it);
             if (st != TL_OK) {
                 tl_qplan_destroy(plan);
                 return st;
@@ -240,10 +272,10 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
         for (uint32_t i = 0; i < snap->manifest->n_main; i++) {
             const tl_segment_t* seg = snap->manifest->main[i];
             if (seg->record_count == 0) continue;
-            if (!tl_segment_overlaps(seg, t1, t2)) continue;
+            if (!tl_segment_overlaps(seg, t1, t2, t2_unbounded)) continue;
 
             tl_segment_iter_t* it = NULL;
-            st = tl_segment_iter_create(alloc, seg, t1, t2, &it);
+            st = tl_segment_iter_create(alloc, seg, t1, t2, t2_unbounded, &it);
             if (st != TL_OK) {
                 tl_qplan_destroy(plan);
                 return st;
@@ -287,14 +319,15 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
                     active_max = snap->memview->active_ooo[snap->memview->active_ooo_len - 1].ts;
             }
 
-            if (has_data && active_max >= t1 && tl_ts_before_end(active_min, t2)) {
+            if (has_data && active_max >= t1 &&
+                tl_ts_before_end(active_min, t2, t2_unbounded)) {
                 tl_twoway_iter_t* it = NULL;
                 st = tl_twoway_iter_create(alloc,
                                             snap->memview->active_run,
                                             snap->memview->active_run_len,
                                             snap->memview->active_ooo,
                                             snap->memview->active_ooo_len,
-                                            t1, t2, &it);
+                                            t1, t2, t2_unbounded, &it);
                 if (st != TL_OK) {
                     tl_qplan_destroy(plan);
                     return st;
@@ -316,13 +349,13 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
         /* Sealed memruns (each is a 2-way merge) */
         for (size_t i = 0; i < snap->memview->sealed_len; i++) {
             const tl_memrun_t* mr = snap->memview->sealed[i];
-            if (!memrun_overlaps(mr, t1, t2)) continue;
+            if (!memrun_overlaps(mr, t1, t2, t2_unbounded)) continue;
 
             tl_twoway_iter_t* it = NULL;
             st = tl_twoway_iter_create(alloc,
                                         mr->run, mr->run_len,
                                         mr->ooo, mr->ooo_len,
-                                        t1, t2, &it);
+                                        t1, t2, t2_unbounded, &it);
             if (st != TL_OK) {
                 tl_qplan_destroy(plan);
                 return st;
@@ -343,7 +376,7 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
 
     /* Build effective tombstones */
     tl_intervals_t tombs_intervals;
-    st = collect_tombstones(alloc, snap, t1, t2, &tombs_intervals);
+    st = collect_tombstones(alloc, snap, t1, t2, t2_unbounded, &tombs_intervals);
     if (st != TL_OK) {
         tl_qplan_destroy(plan);
         return st;

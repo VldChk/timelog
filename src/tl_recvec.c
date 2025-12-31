@@ -178,8 +178,8 @@ void tl_recvec_move(tl_recvec_t* dst, tl_recvec_t* src) {
 }
 
 /*
- * Comparison function for qsort
- * Sorts by timestamp only (tie order unspecified per V1 semantics)
+ * Comparison function for qsort.
+ * qsort is not stable, so tie order is unspecified per V1 semantics.
  */
 static int cmp_record_ts(const void* a, const void* b) {
     const tl_record_t* ra = (const tl_record_t*)a;

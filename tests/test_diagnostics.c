@@ -293,9 +293,43 @@ int test_diagnostics(void) {
     snap = NULL;
 
     /*=======================================================================
-     * Test 11: Null safety for diagnostics APIs
+     * Test 11: Adjacent tombstones should fail validation if invariants broken
      *=======================================================================*/
-    printf("    Test 11: Null safety...\n");
+    printf("    Test 11: Adjacent tombstone validation...\n");
+
+    tl_timelog_t* tl_bad = NULL;
+    st = tl_open(NULL, &tl_bad);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Create two disjoint tombstones */
+    st = tl_delete_range(tl_bad, 100, 200);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_delete_range(tl_bad, 300, 400);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl_bad, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_NE(snap->memview, NULL);
+    TEST_ASSERT_EQ(snap->memview->active_tombs_len, 2);
+
+    /* Corrupt tombstones to be adjacent */
+    tl_interval_t* bad = snap->memview->active_tombs;
+    bad[1].start = bad[0].end;
+    bad[1].end = bad[0].end + 50;
+    bad[1].end_unbounded = false;
+
+    st = tl_validate(snap);
+    TEST_ASSERT_EQ(st, TL_EINTERNAL);
+
+    tl_snapshot_release(snap);
+    snap = NULL;
+    tl_close(tl_bad);
+    tl_bad = NULL;
+
+    /*=======================================================================
+     * Test 12: Null safety for diagnostics APIs
+     *=======================================================================*/
+    printf("    Test 12: Null safety...\n");
 
     TEST_ASSERT_EQ(tl_validate(NULL), TL_EINVAL);
     TEST_ASSERT_EQ(tl_stats(NULL, &stats), TL_EINVAL);
@@ -307,9 +341,9 @@ int test_diagnostics(void) {
     snap = NULL;
 
     /*=======================================================================
-     * Test 12: Stats bounds match query results
+     * Test 13: Stats bounds match query results
      *=======================================================================*/
-    printf("    Test 12: Stats bounds accuracy...\n");
+    printf("    Test 13: Stats bounds accuracy...\n");
 
     st = tl_snapshot_acquire(tl, &snap);
     TEST_ASSERT_EQ(st, TL_OK);

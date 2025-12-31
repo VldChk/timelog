@@ -24,7 +24,7 @@ int test_intervals(void) {
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
 
     /* Test insert single interval */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 10, 20), TL_OK);
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 10, 20, false), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 1);
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
 
@@ -34,8 +34,8 @@ int test_intervals(void) {
     TEST_ASSERT_EQ(iv->end, 20);
 
     /* Test invalid interval (start >= end) */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 50, 50), TL_EINVAL);
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 60, 50), TL_EINVAL);
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 50, 50, false), TL_EINVAL);
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 60, 50, false), TL_EINVAL);
 
     /* Test contains */
     TEST_ASSERT(tl_intervals_contains(&iset, 10));
@@ -46,12 +46,12 @@ int test_intervals(void) {
     TEST_ASSERT(!tl_intervals_contains(&iset, 25));
 
     /* Test insert disjoint interval (after) */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 30, 40), TL_OK);
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 30, 40, false), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 2);
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
 
     /* Test insert disjoint interval (before) */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 0, 5), TL_OK);
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 0, 5, false), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 3);
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
 
@@ -62,13 +62,13 @@ int test_intervals(void) {
     TEST_ASSERT_EQ(data[2].start, 30);
 
     /* Test coalescing overlapping intervals */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 15, 25), TL_OK);  /* overlaps [10,20) */
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 15, 25, false), TL_OK);  /* overlaps [10,20) */
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 3);  /* merged with [10,20) -> [10,25) */
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
     TEST_ASSERT(tl_intervals_contains(&iset, 22));
 
     /* Test coalescing adjacent intervals */
-    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 25, 30), TL_OK);  /* touches [10,25) and [30,40) */
+    TEST_ASSERT_EQ(tl_intervals_insert(&iset, 25, 30, false), TL_OK);  /* touches [10,25) and [30,40) */
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 2);  /* merged into [10,40) */
     TEST_ASSERT_EQ(tl_intervals_validate(&iset), TL_OK);
 
@@ -95,8 +95,8 @@ int test_intervals(void) {
     TEST_ASSERT(tl_intervals_empty(&iset));
 
     /* Test clip */
-    tl_intervals_insert(&iset, 0, 100);
-    TEST_ASSERT_EQ(tl_intervals_clip(&iset, 20, 80), TL_OK);
+    tl_intervals_insert(&iset, 0, 100, false);
+    TEST_ASSERT_EQ(tl_intervals_clip(&iset, 20, 80, false), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 1);
     iv = tl_intervals_at(&iset, 0);
     TEST_ASSERT_EQ(iv->start, 20);
@@ -105,11 +105,11 @@ int test_intervals(void) {
 
     /* Test clip with multiple intervals */
     tl_intervals_clear(&iset);
-    tl_intervals_insert(&iset, 0, 10);
-    tl_intervals_insert(&iset, 20, 30);
-    tl_intervals_insert(&iset, 40, 50);
-    tl_intervals_insert(&iset, 60, 70);
-    TEST_ASSERT_EQ(tl_intervals_clip(&iset, 25, 55), TL_OK);
+    tl_intervals_insert(&iset, 0, 10, false);
+    tl_intervals_insert(&iset, 20, 30, false);
+    tl_intervals_insert(&iset, 40, 50, false);
+    tl_intervals_insert(&iset, 60, 70, false);
+    TEST_ASSERT_EQ(tl_intervals_clip(&iset, 25, 55, false), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&iset), 2);
     data = tl_intervals_data(&iset);
     TEST_ASSERT_EQ(data[0].start, 25);
@@ -123,11 +123,11 @@ int test_intervals(void) {
     tl_intervals_init(&b, &alloc);
     tl_intervals_init(&c, &alloc);
 
-    tl_intervals_insert(&a, 0, 10);
-    tl_intervals_insert(&a, 20, 30);
+    tl_intervals_insert(&a, 0, 10, false);
+    tl_intervals_insert(&a, 20, 30, false);
 
-    tl_intervals_insert(&b, 5, 25);
-    tl_intervals_insert(&b, 40, 50);
+    tl_intervals_insert(&b, 5, 25, false);
+    tl_intervals_insert(&b, 40, 50, false);
 
     TEST_ASSERT_EQ(tl_intervals_union(&c, &a, &b), TL_OK);
     TEST_ASSERT_EQ(tl_intervals_len(&c), 2);  /* [0,30) and [40,50) */

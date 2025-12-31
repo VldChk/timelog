@@ -90,7 +90,7 @@ static tl_status_t snapshot_check_order(tl_timelog_t* tl, bool do_validate) {
         }
     }
 
-    st = tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it);
+    st = tl_iter_since(snap, TL_TS_MIN, &it);
     if (st != TL_OK) {
         tl_snapshot_release(snap);
         return st;
@@ -108,6 +108,56 @@ static tl_status_t snapshot_check_order(tl_timelog_t* tl, bool do_validate) {
         }
         last = rec.ts;
         first = false;
+    }
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    if (ist != TL_EOF) return ist;
+    return TL_OK;
+}
+
+static tl_status_t snapshot_check_exact_once(tl_timelog_t* tl, bool do_validate) {
+    tl_snapshot_t* snap = NULL;
+    tl_iter_t* it = NULL;
+    tl_status_t st = tl_snapshot_acquire(tl, &snap);
+    if (st != TL_OK) return st;
+
+    if (do_validate) {
+        st = tl_validate(snap);
+        if (st != TL_OK) {
+            tl_snapshot_release(snap);
+            return st;
+        }
+    }
+
+    st = tl_iter_since(snap, TL_TS_MIN, &it);
+    if (st != TL_OK) {
+        tl_snapshot_release(snap);
+        return st;
+    }
+
+    tl_record_t rec;
+    bool first = true;
+    tl_ts_t expected = 0;
+    tl_status_t ist;
+    while ((ist = tl_iter_next(it, &rec)) == TL_OK) {
+        if (first) {
+            if (rec.ts != 1) {
+                tl_iter_destroy(it);
+                tl_snapshot_release(snap);
+                return TL_EINTERNAL;
+            }
+            expected = rec.ts;
+            first = false;
+        } else {
+            if (rec.ts != expected + 1) {
+                tl_iter_destroy(it);
+                tl_snapshot_release(snap);
+                return TL_EINTERNAL;
+            }
+            expected = rec.ts;
+        }
     }
 
     tl_iter_destroy(it);
@@ -145,8 +195,8 @@ int test_concurrency(void) {
     int rc = tl_thread_create(&writer_thread, writer_thread_fn, &ctx);
     TEST_ASSERT_EQ(rc, 0);
 
-    for (int i = 0; i < 200; i++) {
-        st = snapshot_check_order(tl, false);
+    for (int i = 0; i < 100; i++) {
+        st = snapshot_check_exact_once(tl, (i % 10) == 0);
         TEST_ASSERT_EQ(st, TL_OK);
         if ((i % 20) == 0) {
             test_sleep_ms(1);
@@ -168,6 +218,7 @@ int test_concurrency(void) {
     cfg.memtable_max_bytes = 16 * 1024;
     cfg.target_page_bytes = 4096;
     cfg.max_delta_segments = 2;
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
 
     st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);

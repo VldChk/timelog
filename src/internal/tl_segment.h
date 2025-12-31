@@ -120,11 +120,13 @@ uint32_t tl_segment_release(tl_segment_t* seg);
  * @param seg Segment to check
  * @param t1  Range start (inclusive)
  * @param t2  Range end (exclusive)
+ * @param t2_unbounded True if range has no upper bound
  * @return true if segment overlaps range
  */
-TL_INLINE bool tl_segment_overlaps(const tl_segment_t* seg, tl_ts_t t1, tl_ts_t t2) {
+TL_INLINE bool tl_segment_overlaps(const tl_segment_t* seg, tl_ts_t t1, tl_ts_t t2,
+                                   bool t2_unbounded) {
     if (seg == NULL) return false;
-    return seg->max_ts >= t1 && tl_ts_before_end(seg->min_ts, t2);
+    return seg->max_ts >= t1 && tl_ts_before_end(seg->min_ts, t2, t2_unbounded);
 }
 
 /**

@@ -27,7 +27,8 @@ static void array_iter_position_to_first(tl_array_iter_t* it) {
     it->idx = array_lower_bound(it->data, it->len, it->t1);
 
     /* Find first valid record in range [t1, t2) */
-    if (it->idx < it->len && tl_ts_before_end(it->data[it->idx].ts, it->t2)) {
+    if (it->idx < it->len &&
+        tl_ts_before_end(it->data[it->idx].ts, it->t2, it->t2_unbounded)) {
         it->current = it->data[it->idx];
         it->state = TL_ITER_READY;
         return;
@@ -41,6 +42,7 @@ tl_status_t tl_array_iter_create(const tl_allocator_t* alloc,
                                   size_t len,
                                   tl_ts_t t1,
                                   tl_ts_t t2,
+                                  bool t2_unbounded,
                                   tl_array_iter_t** out) {
     if (out == NULL) return TL_EINVAL;
     *out = NULL;
@@ -53,9 +55,10 @@ tl_status_t tl_array_iter_create(const tl_allocator_t* alloc,
     it->len = len;
     it->t1 = t1;
     it->t2 = t2;
+    it->t2_unbounded = t2_unbounded;
 
     /* Position to first valid record */
-    if (data != NULL && len > 0 && !tl_ts_range_empty(t1, t2)) {
+    if (data != NULL && len > 0 && !tl_ts_range_empty(t1, t2, t2_unbounded)) {
         array_iter_position_to_first(it);
     } else {
         it->state = TL_ITER_EOF;
@@ -82,7 +85,8 @@ tl_status_t tl_array_iter_advance(tl_array_iter_t* it) {
     it->idx++;
 
     /* Find next valid record in range */
-    if (it->idx < it->len && tl_ts_before_end(it->data[it->idx].ts, it->t2)) {
+    if (it->idx < it->len &&
+        tl_ts_before_end(it->data[it->idx].ts, it->t2, it->t2_unbounded)) {
         it->current = it->data[it->idx];
         return TL_OK;
     }
@@ -103,7 +107,8 @@ tl_status_t tl_array_iter_seek(tl_array_iter_t* it, tl_ts_t ts) {
     it->idx = array_lower_bound(it->data, it->len, ts);
 
     /* Check if in range */
-    if (it->idx < it->len && tl_ts_before_end(it->data[it->idx].ts, it->t2)) {
+    if (it->idx < it->len &&
+        tl_ts_before_end(it->data[it->idx].ts, it->t2, it->t2_unbounded)) {
         it->current = it->data[it->idx];
         it->state = TL_ITER_READY;
         return TL_OK;
@@ -141,7 +146,7 @@ static void segment_iter_load_page(tl_segment_iter_t* it) {
 
         /* Compute row range within page using binary search */
         it->row_idx = tl_page_lower_bound(it->current_page, it->t1);
-        it->row_end = tl_ts_is_unbounded(it->t2)
+        it->row_end = it->t2_unbounded
             ? it->current_page->count
             : tl_page_lower_bound(it->current_page, it->t2);
 
@@ -194,6 +199,7 @@ tl_status_t tl_segment_iter_create(const tl_allocator_t* alloc,
                                     const tl_segment_t* seg,
                                     tl_ts_t t1,
                                     tl_ts_t t2,
+                                    bool t2_unbounded,
                                     tl_segment_iter_t** out) {
     if (out == NULL) return TL_EINVAL;
     *out = NULL;
@@ -205,6 +211,7 @@ tl_status_t tl_segment_iter_create(const tl_allocator_t* alloc,
     it->seg = seg;
     it->t1 = t1;
     it->t2 = t2;
+    it->t2_unbounded = t2_unbounded;
     it->state = TL_ITER_EOF;
 
     /* Empty segment check */
@@ -214,20 +221,20 @@ tl_status_t tl_segment_iter_create(const tl_allocator_t* alloc,
     }
 
     /* Invalid range check */
-    if (tl_ts_range_empty(t1, t2)) {
+    if (tl_ts_range_empty(t1, t2, t2_unbounded)) {
         *out = it;
         return TL_OK;
     }
 
     /* Check segment overlap with query range */
-    if (!tl_segment_overlaps(seg, t1, t2)) {
+    if (!tl_segment_overlaps(seg, t1, t2, t2_unbounded)) {
         *out = it;
         return TL_OK;
     }
 
     /* Find candidate pages using catalog (fence pointer navigation) */
     it->page_idx = tl_page_catalog_find_first(&seg->catalog, t1);
-    it->page_end = tl_page_catalog_find_last(&seg->catalog, t2);
+    it->page_end = tl_page_catalog_find_last(&seg->catalog, t2, t2_unbounded);
 
     /* Load first page and position to first valid record */
     if (it->page_idx < it->page_end) {
@@ -314,11 +321,13 @@ static void twoway_iter_pick_next(tl_twoway_iter_t* it) {
     bool run_valid = (it->run != NULL &&
                       it->run_idx < it->run_len &&
                       it->run[it->run_idx].ts >= it->t1 &&
-                      tl_ts_before_end(it->run[it->run_idx].ts, it->t2));
+                      tl_ts_before_end(it->run[it->run_idx].ts, it->t2,
+                                       it->t2_unbounded));
     bool ooo_valid = (it->ooo != NULL &&
                       it->ooo_idx < it->ooo_len &&
                       it->ooo[it->ooo_idx].ts >= it->t1 &&
-                      tl_ts_before_end(it->ooo[it->ooo_idx].ts, it->t2));
+                      tl_ts_before_end(it->ooo[it->ooo_idx].ts, it->t2,
+                                       it->t2_unbounded));
 
     if (!run_valid && !ooo_valid) {
         it->state = TL_ITER_EOF;
@@ -359,6 +368,7 @@ tl_status_t tl_twoway_iter_create(const tl_allocator_t* alloc,
                                    size_t ooo_len,
                                    tl_ts_t t1,
                                    tl_ts_t t2,
+                                   bool t2_unbounded,
                                    tl_twoway_iter_t** out) {
     if (out == NULL) return TL_EINVAL;
     *out = NULL;
@@ -373,8 +383,9 @@ tl_status_t tl_twoway_iter_create(const tl_allocator_t* alloc,
     it->ooo_len = ooo_len;
     it->t1 = t1;
     it->t2 = t2;
+    it->t2_unbounded = t2_unbounded;
 
-    if (!tl_ts_range_empty(t1, t2)) {
+    if (!tl_ts_range_empty(t1, t2, t2_unbounded)) {
         twoway_iter_position(it);
     } else {
         it->state = TL_ITER_EOF;
@@ -401,10 +412,12 @@ tl_status_t tl_twoway_iter_advance(tl_twoway_iter_t* it) {
     /* Advance the array that produced the current record */
     bool run_valid = (it->run != NULL &&
                       it->run_idx < it->run_len &&
-                      tl_ts_before_end(it->run[it->run_idx].ts, it->t2));
+                      tl_ts_before_end(it->run[it->run_idx].ts, it->t2,
+                                       it->t2_unbounded));
     bool ooo_valid = (it->ooo != NULL &&
                       it->ooo_idx < it->ooo_len &&
-                      tl_ts_before_end(it->ooo[it->ooo_idx].ts, it->t2));
+                      tl_ts_before_end(it->ooo[it->ooo_idx].ts, it->t2,
+                                       it->t2_unbounded));
 
     /* Determine which array produced current record and advance it */
     if (run_valid && it->current.ts == it->run[it->run_idx].ts &&

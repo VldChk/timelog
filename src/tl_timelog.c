@@ -529,7 +529,7 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
 
 tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     if (tl == NULL || !tl->is_open) return TL_EINVAL;
-    if (!tl_ts_is_unbounded(t2) && t2 < t1) return TL_EINVAL;
+    if (t2 < t1) return TL_EINVAL;
     if (t1 == t2) return TL_OK;  /* Empty range */
 
     bool sealed = false;
@@ -658,11 +658,12 @@ void tl_snapshot_release(tl_snapshot_t* s) {
 static tl_status_t iter_create_range(const tl_snapshot_t* snap,
                                       tl_ts_t t1,
                                       tl_ts_t t2,
+                                      bool t2_unbounded,
                                       tl_iter_t** out) {
     if (snap == NULL || out == NULL) return TL_EINVAL;
     *out = NULL;
 
-    if (t2 < t1) return TL_EINVAL;
+    if (!t2_unbounded && t2 < t1) return TL_EINVAL;
 
     const tl_allocator_t* alloc = snap->alloc;
 
@@ -676,7 +677,7 @@ static tl_status_t iter_create_range(const tl_snapshot_t* snap,
     tl_status_t st;
 
     /* Build query plan */
-    st = tl_qplan_build(alloc, snap, t1, t2, &it->plan);
+    st = tl_qplan_build(alloc, snap, t1, t2, t2_unbounded, &it->plan);
     if (st != TL_OK) {
         tl__free(alloc, it);
         return st;
@@ -705,19 +706,19 @@ static tl_status_t iter_create_range(const tl_snapshot_t* snap,
 
 tl_status_t tl_iter_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
                           tl_iter_t** out) {
-    return iter_create_range(snap, t1, t2, out);
+    return iter_create_range(snap, t1, t2, false, out);
 }
 
 tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
                           tl_iter_t** out) {
-    /* since(t1) = range(t1, TL_TS_MAX) */
-    return iter_create_range(snap, t1, TL_TS_UNBOUNDED, out);
+    /* since(t1) = range(t1, +inf) */
+    return iter_create_range(snap, t1, t1, true, out);
 }
 
 tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
                           tl_iter_t** out) {
     /* until(t2) = range(TL_TS_MIN, t2) */
-    return iter_create_range(snap, TL_TS_MIN, t2, out);
+    return iter_create_range(snap, TL_TS_MIN, t2, false, out);
 }
 
 tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
@@ -725,9 +726,9 @@ tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
     /* equal(ts) = range(ts, ts+1) */
     if (ts == TL_TS_MAX) {
         /* Edge case: ts+1 would overflow */
-        return iter_create_range(snap, ts, TL_TS_UNBOUNDED, out);
+        return iter_create_range(snap, ts, ts, true, out);
     }
-    return iter_create_range(snap, ts, ts + 1, out);
+    return iter_create_range(snap, ts, ts + 1, false, out);
 }
 
 /*===========================================================================
@@ -788,7 +789,7 @@ tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
 
     /* Create iterator for range */
     tl_iter_t* it = NULL;
-    tl_status_t st = iter_create_range(snap, t1, t2, &it);
+    tl_status_t st = iter_create_range(snap, t1, t2, false, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -810,6 +811,39 @@ tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
  * Timestamp Navigation
  *===========================================================================*/
 
+static bool snapshot_has_tombstones(const tl_snapshot_t* snap) {
+    if (snap == NULL) return false;
+
+    if (snap->manifest != NULL) {
+        for (uint32_t i = 0; i < snap->manifest->n_main; i++) {
+            const tl_segment_t* seg = snap->manifest->main[i];
+            if (seg->tombstones != NULL && seg->tombstones->n > 0) {
+                return true;
+            }
+        }
+        for (uint32_t i = 0; i < snap->manifest->n_delta; i++) {
+            const tl_segment_t* seg = snap->manifest->delta[i];
+            if (seg->tombstones != NULL && seg->tombstones->n > 0) {
+                return true;
+            }
+        }
+    }
+
+    if (snap->memview != NULL) {
+        if (snap->memview->active_tombs_len > 0) {
+            return true;
+        }
+        for (size_t i = 0; i < snap->memview->sealed_len; i++) {
+            const tl_memrun_t* mr = snap->memview->sealed[i];
+            if (mr->tombs_len > 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
     if (snap == NULL || out == NULL) return TL_EINVAL;
 
@@ -817,8 +851,33 @@ tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
         return TL_EOF;  /* Empty snapshot */
     }
 
-    *out = snap->min_ts;
-    return TL_OK;
+    if (!snapshot_has_tombstones(snap)) {
+        *out = snap->min_ts;
+        return TL_OK;
+    }
+
+    /*
+     * Tombstone-aware min: iterate from beginning and return first visible ts.
+     * This is O(n) but correct under deletes.
+     */
+    tl_iter_t* it = NULL;
+    tl_status_t st = tl_iter_since(snap, TL_TS_MIN, &it);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    tl_record_t rec;
+    st = tl_iter_next(it, &rec);
+    tl_iter_destroy(it);
+
+    if (st == TL_OK) {
+        *out = rec.ts;
+        return TL_OK;
+    }
+    if (st == TL_EOF) {
+        return TL_EOF;
+    }
+    return st;
 }
 
 tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
@@ -828,7 +887,39 @@ tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
         return TL_EOF;  /* Empty snapshot */
     }
 
-    *out = snap->max_ts;
+    if (!snapshot_has_tombstones(snap)) {
+        *out = snap->max_ts;
+        return TL_OK;
+    }
+
+    /*
+     * Tombstone-aware max: iterate entire range and keep last visible ts.
+     * This is O(n) but correct under deletes.
+     */
+    tl_iter_t* it = NULL;
+    tl_status_t st = tl_iter_since(snap, TL_TS_MIN, &it);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    bool found = false;
+    tl_ts_t last_ts = TL_TS_MIN;
+    tl_record_t rec;
+    while ((st = tl_iter_next(it, &rec)) == TL_OK) {
+        last_ts = rec.ts;
+        found = true;
+    }
+
+    tl_iter_destroy(it);
+
+    if (st != TL_EOF) {
+        return st;
+    }
+    if (!found) {
+        return TL_EOF;
+    }
+
+    *out = last_ts;
     return TL_OK;
 }
 
@@ -844,7 +935,7 @@ tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     }
 
     tl_iter_t* it = NULL;
-    tl_status_t st = iter_create_range(snap, ts + 1, TL_TS_UNBOUNDED, &it);
+    tl_status_t st = iter_create_range(snap, ts + 1, ts + 1, true, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -881,7 +972,7 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     }
 
     tl_iter_t* it = NULL;
-    tl_status_t st = iter_create_range(snap, snap->min_ts, ts, &it);
+    tl_status_t st = iter_create_range(snap, snap->min_ts, ts, false, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -983,6 +1074,7 @@ static void* maint_worker_fn(void* arg) {
 
 tl_status_t tl_maint_start(tl_timelog_t* tl) {
     if (tl == NULL || !tl->is_open) return TL_EINVAL;
+    if (tl->cfg.maintenance_mode != TL_MAINT_BACKGROUND) return TL_ESTATE;
 
     tl_mutex_lock(&tl->maint_mu);
 
@@ -1216,7 +1308,8 @@ static tl_status_t compact_one_step(tl_timelog_t* tl) {
             for (uint32_t j = 0; j < seg->tombstones->n; j++) {
                 st = tl_intervals_insert(&merged_tombs,
                                           seg->tombstones->v[j].start,
-                                          seg->tombstones->v[j].end);
+                                          seg->tombstones->v[j].end,
+                                          seg->tombstones->v[j].end_unbounded);
                 if (st != TL_OK) {
                     tl_intervals_destroy(&merged_tombs);
                     tl_manifest_release(old_manifest);
@@ -1243,7 +1336,7 @@ static tl_status_t compact_one_step(tl_timelog_t* tl) {
 
     for (uint32_t i = 0; i < n_delta; i++) {
         st = tl_segment_iter_create(alloc, old_manifest->delta[i],
-                                     TL_TS_MIN, TL_TS_MAX, &iters[i]);
+                                     TL_TS_MIN, TL_TS_MIN, true, &iters[i]);
         if (st != TL_OK) {
             /* Cleanup on error */
             for (uint32_t j = 0; j < n_delta; j++) {
@@ -1556,22 +1649,31 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
 
 /*
  * Helper: validate a tombstone array (tl_interval_t[]).
- * Checks: each interval has start < end, intervals are sorted, non-overlapping.
+ * Checks: each interval is valid, sorted, non-overlapping, non-adjacent.
  */
 static tl_status_t validate_tombstone_array(const tl_interval_t* tombs, size_t len) {
     if (tombs == NULL || len == 0) return TL_OK;
 
-    tl_ts_t prev_end = TL_TS_MIN;
-    for (size_t i = 0; i < len; i++) {
+    if (!tombs[0].end_unbounded && tombs[0].start >= tombs[0].end) {
+        return TL_EINTERNAL;  /* Invalid tombstone: start >= end */
+    }
+
+    tl_ts_t prev_end = tombs[0].end;
+    bool prev_end_unbounded = tombs[0].end_unbounded;
+    for (size_t i = 1; i < len; i++) {
         /* S7: Each interval must have start < end */
-        if (tombs[i].start >= tombs[i].end) {
+        if (!tombs[i].end_unbounded && tombs[i].start >= tombs[i].end) {
             return TL_EINTERNAL;  /* Invalid tombstone: start >= end */
         }
-        /* S8/W4: Intervals must be sorted and non-overlapping */
-        if (tombs[i].start < prev_end) {
-            return TL_EINTERNAL;  /* Overlapping or unsorted tombstones */
+        /* S8/W4: Intervals must be sorted, non-overlapping, non-adjacent */
+        if (prev_end_unbounded) {
+            return TL_EINTERNAL;  /* Open-ended must be last */
+        }
+        if (tombs[i].start <= prev_end) {
+            return TL_EINTERNAL;  /* Overlapping or non-coalesced tombstones */
         }
         prev_end = tombs[i].end;
+        prev_end_unbounded = tombs[i].end_unbounded;
     }
     return TL_OK;
 }

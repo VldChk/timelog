@@ -91,7 +91,7 @@ tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* vec);
 void tl_recvec_move(tl_recvec_t* dst, tl_recvec_t* src);
 
 /**
- * Sort vector by timestamp using stable sort.
+ * Sort vector by timestamp; tie order is unspecified (not stable).
  * Used at memrun seal time for out-of-order buffer.
  */
 void tl_recvec_sort_by_ts(tl_recvec_t* vec);

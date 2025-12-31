@@ -9,9 +9,11 @@ void tl_tomb_cursor_init(tl_tomb_cursor_t* cur, const tl_tombstones_t* tombs) {
     if (tombs != NULL && tombs->n > 0) {
         cur->cur_start = tombs->v[0].start;
         cur->cur_end = tombs->v[0].end;
+        cur->cur_end_unbounded = tombs->v[0].end_unbounded;
     } else {
         cur->cur_start = TL_TS_MAX;
         cur->cur_end = TL_TS_MAX;
+        cur->cur_end_unbounded = false;
     }
 }
 
@@ -24,19 +26,23 @@ bool tl_tomb_cursor_is_deleted(tl_tomb_cursor_t* cur, tl_ts_t ts) {
      * Advance cursor while ts >= cur_end.
      * Because timestamps are non-decreasing, we only move forward.
      */
-    while (cur->idx < cur->tombs->n && !tl_ts_before_end(ts, cur->cur_end)) {
+    while (cur->idx < cur->tombs->n &&
+           !tl_ts_before_end(ts, cur->cur_end, cur->cur_end_unbounded)) {
         cur->idx++;
         if (cur->idx < cur->tombs->n) {
             cur->cur_start = cur->tombs->v[cur->idx].start;
             cur->cur_end = cur->tombs->v[cur->idx].end;
+            cur->cur_end_unbounded = cur->tombs->v[cur->idx].end_unbounded;
         } else {
             cur->cur_start = TL_TS_MAX;
             cur->cur_end = TL_TS_MAX;
+            cur->cur_end_unbounded = false;
         }
     }
 
     /* Check if ts falls within current interval [cur_start, cur_end) */
-    return (ts >= cur->cur_start && tl_ts_before_end(ts, cur->cur_end));
+    return (ts >= cur->cur_start &&
+            tl_ts_before_end(ts, cur->cur_end, cur->cur_end_unbounded));
 }
 
 /*

@@ -169,7 +169,7 @@ int test_flush(void) {
         tl_memrun_t* mr = create_memrun_inorder(&alloc, records, 2);
         TEST_ASSERT_NE(mr, NULL);
 
-        tl_interval_t tombs[] = {{150, 180}, {250, 300}};
+        tl_interval_t tombs[] = {{150, 180, false}, {250, 300, false}};
         memrun_add_tombstones(&alloc, mr, tombs, 2);
         TEST_ASSERT_EQ(mr->tombs_len, 2);
 
@@ -197,7 +197,7 @@ int test_flush(void) {
         mr->min_ts = TL_TS_MAX;
         mr->max_ts = TL_TS_MIN;
 
-        tl_interval_t tombs[] = {{100, 200}, {300, 400}};
+        tl_interval_t tombs[] = {{100, 200, false}, {300, 400, false}};
         memrun_add_tombstones(&alloc, mr, tombs, 2);
 
         st = tl_flush_memrun(&alloc, mr, 64 * 1024, 4, &seg);

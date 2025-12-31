@@ -31,6 +31,7 @@ typedef struct tl_qplan {
     /* Query range */
     tl_ts_t              t1;
     tl_ts_t              t2;
+    bool                t2_unbounded;
 
     /* Component iterators */
     tl_component_iter_t* iters;
@@ -64,6 +65,7 @@ tl_status_t tl_qplan_build(const tl_allocator_t* alloc,
                             const tl_snapshot_t* snap,
                             tl_ts_t t1,
                             tl_ts_t t2,
+                            bool t2_unbounded,
                             tl_qplan_t** out);
 
 /**

@@ -67,6 +67,7 @@ typedef struct tl_array_iter {
     size_t              idx;
     tl_ts_t             t1;
     tl_ts_t             t2;
+    bool                t2_unbounded;
     tl_record_t         current;
     tl_iter_state_t     state;
     const tl_allocator_t* alloc;
@@ -77,6 +78,7 @@ tl_status_t tl_array_iter_create(const tl_allocator_t* alloc,
                                   size_t len,
                                   tl_ts_t t1,
                                   tl_ts_t t2,
+                                  bool t2_unbounded,
                                   tl_array_iter_t** out);
 
 void tl_array_iter_destroy(tl_array_iter_t* it);
@@ -106,6 +108,7 @@ typedef struct tl_segment_iter {
     const tl_segment_t* seg;
     tl_ts_t             t1;
     tl_ts_t             t2;
+    bool                t2_unbounded;
 
     /* Current position */
     uint32_t            page_idx;
@@ -138,6 +141,7 @@ tl_status_t tl_segment_iter_create(const tl_allocator_t* alloc,
                                     const tl_segment_t* seg,
                                     tl_ts_t t1,
                                     tl_ts_t t2,
+                                    bool t2_unbounded,
                                     tl_segment_iter_t** out);
 
 void tl_segment_iter_destroy(tl_segment_iter_t* it);
@@ -170,6 +174,7 @@ typedef struct tl_twoway_iter {
     /* Range bounds */
     tl_ts_t             t1;
     tl_ts_t             t2;
+    bool                t2_unbounded;
 
     /* Current record */
     tl_record_t         current;
@@ -198,6 +203,7 @@ tl_status_t tl_twoway_iter_create(const tl_allocator_t* alloc,
                                    size_t ooo_len,
                                    tl_ts_t t1,
                                    tl_ts_t t2,
+                                   bool t2_unbounded,
                                    tl_twoway_iter_t** out);
 
 void tl_twoway_iter_destroy(tl_twoway_iter_t* it);

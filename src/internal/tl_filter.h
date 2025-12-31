@@ -22,6 +22,7 @@ typedef struct tl_tomb_cursor {
     uint32_t               idx;       /* Current interval index */
     tl_ts_t                cur_start; /* Current interval start */
     tl_ts_t                cur_end;   /* Current interval end */
+    bool                   cur_end_unbounded; /* Current interval open-ended */
 } tl_tomb_cursor_t;
 
 /**

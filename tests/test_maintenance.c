@@ -44,7 +44,12 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 1: maint_step no work on empty timelog...\n");
 
-    st = tl_open(NULL, &tl);
+    tl_config_t cfg;
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
     TEST_ASSERT_NE(tl, NULL);
 
@@ -60,7 +65,11 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 2: maint_step flushes one memrun...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Add records and manually flush to create sealed memruns */
@@ -100,7 +109,11 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 3: maint_start/stop lifecycle...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Start maintenance */
@@ -119,7 +132,11 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 4: maint_start idempotent...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Start multiple times should be OK */
@@ -141,7 +158,11 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 5: maint_stop idempotent...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Stop without start should be OK */
@@ -166,7 +187,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 6: close stops background maintenance...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_maint_start(tl);
@@ -183,7 +207,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 7: background flush of sealed memruns...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Start background maintenance */
@@ -225,7 +252,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 8: snapshot stability during maintenance...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Add data */
@@ -275,7 +305,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 9: concurrent reads during maintenance...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Add data */
@@ -323,7 +356,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 10: restart maintenance after stop...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Start, stop, start again */
@@ -382,7 +418,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 12: maint_step with closed timelog...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Add some data */
@@ -402,8 +441,8 @@ int test_maintenance(void) {
     printf("    Test 13: compaction reduces delta count...\n");
 
     /* Create config with low max_delta_segments to trigger compaction */
-    tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
     cfg.max_delta_segments = 2;  /* Compact when >= 2 deltas */
 
     st = tl_open(&cfg, &tl);
@@ -668,7 +707,10 @@ int test_maintenance(void) {
      *=======================================================================*/
     printf("    Test 17: compact on empty timelog...\n");
 
-    st = tl_open(NULL, &tl);
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    st = tl_open(&cfg, &tl);
     TEST_ASSERT_EQ(st, TL_OK);
 
     /* Compact empty timelog should return TL_EOF */
@@ -759,9 +801,26 @@ int test_maintenance(void) {
     tl = NULL;
 
     /*=======================================================================
-     * Test 20: Null safety for tl_compact
+     * Test 20: maint_start returns TL_ESTATE when disabled
      *=======================================================================*/
-    printf("    Test 20: compact null safety...\n");
+    printf("    Test 20: maint_start disabled...\n");
+
+    st = tl_config_init_defaults(&cfg);
+    TEST_ASSERT_EQ(st, TL_OK);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_maint_start(tl);
+    TEST_ASSERT_EQ(st, TL_ESTATE);
+
+    tl_close(tl);
+    tl = NULL;
+
+    /*=======================================================================
+     * Test 21: Null safety for tl_compact
+     *=======================================================================*/
+    printf("    Test 21: compact null safety...\n");
 
     TEST_ASSERT_EQ(tl_compact(NULL), TL_EINVAL);
 

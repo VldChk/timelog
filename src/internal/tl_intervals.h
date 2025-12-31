@@ -11,13 +11,18 @@ extern "C" {
 #endif
 
 /**
- * A half-open time interval [start, end) (end may be TL_TS_UNBOUNDED).
+ * A half-open time interval [start, end).
  *
- * Invariant: start < end (empty intervals are not stored)
+ * If end_unbounded is true, the interval is open-ended and end is ignored.
+ *
+ * Invariant:
+ * - end_unbounded == false: start < end
+ * - end_unbounded == true:  interval extends to +infinity
  */
 typedef struct tl_interval {
-    tl_ts_t start;  /* Inclusive */
-    tl_ts_t end;    /* Exclusive */
+    tl_ts_t start;         /* Inclusive */
+    tl_ts_t end;           /* Exclusive (ignored if end_unbounded) */
+    bool    end_unbounded; /* Open-ended interval */
 } tl_interval_t;
 
 /**
@@ -66,14 +71,17 @@ void tl_intervals_clear(tl_intervals_t* iset);
  * Insert an interval with coalescing.
  *
  * @param start Inclusive start (must be < end)
- * @param end   Exclusive end
- * @return TL_OK on success, TL_EINVAL if start >= end, TL_ENOMEM on allocation failure
+ * @param end   Exclusive end (ignored if end_unbounded)
+ * @param end_unbounded True to insert an open-ended interval
+ * @return TL_OK on success, TL_EINVAL if start >= end (when bounded),
+ *         TL_ENOMEM on allocation failure
  *
  * Behavior:
  * - If [start, end) overlaps or touches existing intervals, they are merged
  * - Result is always a minimal disjoint set
  */
-tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end);
+tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end,
+                                 bool end_unbounded);
 
 /**
  * Check if a timestamp is covered by any interval.
@@ -100,7 +108,8 @@ size_t tl_intervals_find(const tl_intervals_t* iset, tl_ts_t ts);
  *
  * @return TL_OK on success
  */
-tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t clip_end);
+tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t clip_end,
+                               bool clip_end_unbounded);
 
 /**
  * Compute union of two interval sets into dst.

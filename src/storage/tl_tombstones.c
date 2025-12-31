@@ -87,7 +87,7 @@ bool tl_tombstones_contains(const tl_tombstones_t* ts, tl_ts_t t) {
 
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (!tl_ts_before_end(t, ts->v[mid].end)) {
+        if (!tl_ts_before_end(t, ts->v[mid].end, ts->v[mid].end_unbounded)) {
             lo = mid + 1;
         } else if (ts->v[mid].start > t) {
             hi = mid;
@@ -107,5 +107,6 @@ tl_ts_t tl_tombstones_min_ts(const tl_tombstones_t* ts) {
 
 tl_ts_t tl_tombstones_max_ts(const tl_tombstones_t* ts) {
     if (ts == NULL || ts->n == 0) return TL_TS_MIN;
+    if (ts->v[ts->n - 1].end_unbounded) return TL_TS_MAX;
     return ts->v[ts->n - 1].end;
 }

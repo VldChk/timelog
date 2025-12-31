@@ -286,6 +286,201 @@ int test_read_path(void) {
     tl_close(tl);
 
     /*=======================================================================
+     * Tombstone-Only Segment Suppression Tests
+     *=======================================================================*/
+
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Append records and flush to create data segment */
+    for (int i = 1; i <= 5; i++) {
+        st = tl_append(tl, i * 100, i * 1000);
+        TEST_ASSERT_EQ(st, TL_OK);
+    }
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Delete range and flush with no new records -> tombstone-only segment */
+    st = tl_delete_range(tl, 200, 400);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_iter_range(snap, 0, 1000, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_ts_t expected_tomb_only[] = {100, 400, 500};
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, expected_tomb_only[count]);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 3);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /*=======================================================================
+     * Delete-Before Tests
+     *=======================================================================*/
+
+    /* delete_before should suppress records across segments and memview */
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    for (int i = 1; i <= 3; i++) {
+        st = tl_append(tl, i * 100, i * 1000);  /* 100, 200, 300 */
+        TEST_ASSERT_EQ(st, TL_OK);
+    }
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    for (int i = 4; i <= 5; i++) {
+        st = tl_append(tl, i * 100, i * 1000);  /* 400, 500 (active) */
+        TEST_ASSERT_EQ(st, TL_OK);
+    }
+
+    st = tl_delete_before(tl, 300);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_iter_range(snap, 0, 1000, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_ts_t expected_cutoff[] = {300, 400, 500};
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, expected_cutoff[count]);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 3);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /* delete_before equivalence to delete_range(TL_TS_MIN, cutoff) */
+    tl_timelog_t* tl_a = NULL;
+    tl_timelog_t* tl_b = NULL;
+    tl_snapshot_t* snap_a = NULL;
+    tl_snapshot_t* snap_b = NULL;
+    tl_iter_t* it_a = NULL;
+    tl_iter_t* it_b = NULL;
+
+    st = tl_open(&cfg, &tl_a);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_open(&cfg, &tl_b);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    for (int i = 1; i <= 5; i++) {
+        st = tl_append(tl_a, i * 100, i * 1000);
+        TEST_ASSERT_EQ(st, TL_OK);
+        st = tl_append(tl_b, i * 100, i * 1000);
+        TEST_ASSERT_EQ(st, TL_OK);
+    }
+    st = tl_flush(tl_a);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl_b);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_delete_before(tl_a, 300);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_delete_range(tl_b, TL_TS_MIN, 300);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl_a);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl_b);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl_a, &snap_a);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_snapshot_acquire(tl_b, &snap_b);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_iter_since(snap_a, TL_TS_MIN, &it_a);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_iter_since(snap_b, TL_TS_MIN, &it_b);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    while (1) {
+        tl_record_t rec_a;
+        tl_record_t rec_b;
+        tl_status_t sta = tl_iter_next(it_a, &rec_a);
+        tl_status_t stb = tl_iter_next(it_b, &rec_b);
+        TEST_ASSERT_EQ(sta, stb);
+        if (sta == TL_EOF) break;
+        TEST_ASSERT_EQ(rec_a.ts, rec_b.ts);
+        TEST_ASSERT_EQ(rec_a.handle, rec_b.handle);
+    }
+
+    tl_iter_destroy(it_a);
+    tl_iter_destroy(it_b);
+    tl_snapshot_release(snap_a);
+    tl_snapshot_release(snap_b);
+    tl_close(tl_a);
+    tl_close(tl_b);
+
+    /*=======================================================================
+     * Min/Max With Tombstones (Head/Tail)
+     *=======================================================================*/
+
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Append records: 100, 200, 300, 400, 500 */
+    for (int i = 1; i <= 5; i++) {
+        st = tl_append(tl, i * 100, i * 1000);
+        TEST_ASSERT_EQ(st, TL_OK);
+    }
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Delete head and tail */
+    st = tl_delete_range(tl, 100, 200);  /* delete 100 */
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_delete_range(tl, 500, 600);  /* delete 500 */
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* Tombstones in memview */
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_min_ts(snap, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, 200);
+
+    st = tl_max_ts(snap, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, 400);
+
+    tl_snapshot_release(snap);
+    snap = NULL;
+
+    /* Flush tombstones to segments and re-check */
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_min_ts(snap, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, 200);
+
+    st = tl_max_ts(snap, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, 400);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /*=======================================================================
      * Out-of-Order Insertion Tests
      *=======================================================================*/
 
@@ -321,6 +516,97 @@ int test_read_path(void) {
         count++;
     }
     TEST_ASSERT_EQ(count, 5);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /*=======================================================================
+     * Batch Append Tests
+     *=======================================================================*/
+
+    /* Sorted batch with hint */
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_record_t batch_sorted[] = {
+        {100, 1001}, {200, 1002}, {300, 1003}, {400, 1004}, {500, 1005}
+    };
+    st = tl_append_batch(tl, batch_sorted, 5, TL_APPEND_HINT_MOSTLY_ORDER);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_iter_range(snap, 0, 1000, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_ts_t expected_batch1[] = {100, 200, 300, 400, 500};
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, expected_batch1[count]);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 5);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /* Mostly ordered batch with one late out-of-order record */
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_record_t batch_late[] = {
+        {100, 1}, {200, 2}, {400, 4}, {300, 3}, {500, 5}
+    };
+    st = tl_append_batch(tl, batch_late, 5, TL_APPEND_HINT_MOSTLY_ORDER);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_iter_range(snap, 0, 1000, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_ts_t expected_batch2[] = {100, 200, 300, 400, 500};
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, expected_batch2[count]);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 5);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /* Unsorted batch without hint */
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_record_t batch_unsorted[] = {
+        {300, 3}, {100, 1}, {200, 2}
+    };
+    st = tl_append_batch(tl, batch_unsorted, 3, 0);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_iter_range(snap, 0, 1000, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    tl_ts_t expected_batch3[] = {100, 200, 300};
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, expected_batch3[count]);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 3);
 
     tl_iter_destroy(it);
     tl_snapshot_release(snap);
@@ -406,6 +692,70 @@ int test_read_path(void) {
     tl_close(tl);
 
     /*=======================================================================
+     * TL_TS_MIN Edge Case Tests
+     *=======================================================================*/
+
+    st = tl_open(&cfg, &tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_append(tl, TL_TS_MIN, 8001);
+    TEST_ASSERT_EQ(st, TL_OK);
+    st = tl_append(tl, TL_TS_MIN + 1, 8002);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_flush(tl);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_EQ(st, TL_OK);
+
+    /* iter_since should include TL_TS_MIN */
+    st = tl_iter_since(snap, TL_TS_MIN, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    tl_ts_t first_seen = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        if (count == 0) first_seen = rec.ts;
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 2);
+    TEST_ASSERT_EQ(first_seen, TL_TS_MIN);
+    tl_iter_destroy(it);
+
+    /* iter_equal should return TL_TS_MIN */
+    st = tl_iter_equal(snap, TL_TS_MIN, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, TL_TS_MIN);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 1);
+    tl_iter_destroy(it);
+
+    /* iter_until should return only TL_TS_MIN */
+    st = tl_iter_until(snap, TL_TS_MIN + 1, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, TL_TS_MIN);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 1);
+    tl_iter_destroy(it);
+
+    /* next/prev ts around TL_TS_MIN */
+    st = tl_next_ts(snap, TL_TS_MIN, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, TL_TS_MIN + 1);
+
+    st = tl_prev_ts(snap, TL_TS_MIN, &ts);
+    TEST_ASSERT_EQ(st, TL_EOF);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+
+    /*=======================================================================
      * TL_TS_MAX Edge Case Tests
      *=======================================================================*/
 
@@ -447,6 +797,17 @@ int test_read_path(void) {
     TEST_ASSERT_EQ(count, 1);
     tl_iter_destroy(it);
 
+    /* iter_until should stop before TL_TS_MAX */
+    st = tl_iter_until(snap, TL_TS_MAX, &it);
+    TEST_ASSERT_EQ(st, TL_OK);
+    count = 0;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        TEST_ASSERT_EQ(rec.ts, TL_TS_MAX - 1);
+        count++;
+    }
+    TEST_ASSERT_EQ(count, 1);
+    tl_iter_destroy(it);
+
     /* next_ts should reach TL_TS_MAX */
     st = tl_next_ts(snap, TL_TS_MAX - 1, &ts);
     TEST_ASSERT_EQ(st, TL_OK);
@@ -454,6 +815,11 @@ int test_read_path(void) {
 
     st = tl_next_ts(snap, TL_TS_MAX, &ts);
     TEST_ASSERT_EQ(st, TL_EOF);
+
+    /* prev_ts should reach TL_TS_MAX - 1 */
+    st = tl_prev_ts(snap, TL_TS_MAX, &ts);
+    TEST_ASSERT_EQ(st, TL_OK);
+    TEST_ASSERT_EQ(ts, TL_TS_MAX - 1);
 
     tl_snapshot_release(snap);
     tl_close(tl);

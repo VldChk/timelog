@@ -66,6 +66,26 @@ static tl_status_t ensure_capacity(tl_intervals_t* iset, size_t needed) {
     return TL_OK;
 }
 
+static bool interval_end_before_start(const tl_interval_t* iv, tl_ts_t start_ts) {
+    return !iv->end_unbounded && iv->end < start_ts;
+}
+
+static bool interval_end_le_start(const tl_interval_t* iv, tl_ts_t start_ts) {
+    return !iv->end_unbounded && iv->end <= start_ts;
+}
+
+static void interval_extend_end(tl_ts_t* end, bool* end_unbounded,
+                                tl_ts_t other_end, bool other_unbounded) {
+    if (*end_unbounded) return;
+    if (other_unbounded) {
+        *end_unbounded = true;
+        return;
+    }
+    if (other_end > *end) {
+        *end = other_end;
+    }
+}
+
 /*
  * Find index of first interval where end >= start_ts.
  * This includes adjacent intervals (where end == start_ts) for proper coalescing.
@@ -79,7 +99,7 @@ static size_t find_overlap_start(const tl_intervals_t* iset, tl_ts_t start_ts) {
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (iset->data[mid].end < start_ts) {
+        if (interval_end_before_start(&iset->data[mid], start_ts)) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -89,9 +109,10 @@ static size_t find_overlap_start(const tl_intervals_t* iset, tl_ts_t start_ts) {
     return lo;
 }
 
-tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end) {
+tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end,
+                                bool end_unbounded) {
     if (iset == NULL) return TL_EINVAL;
-    if (start >= end) return TL_EINVAL;  /* Empty interval */
+    if (!end_unbounded && start >= end) return TL_EINVAL;  /* Empty interval */
 
     /*
      * Algorithm:
@@ -106,17 +127,28 @@ tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end
     /* Extend start/end to cover all overlapping intervals */
     tl_ts_t new_start = start;
     tl_ts_t new_end = end;
+    bool new_end_unbounded = end_unbounded;
     size_t merge_end = merge_start;
 
-    while (merge_end < iset->len && iset->data[merge_end].start <= new_end) {
+    while (merge_end < iset->len) {
+        const tl_interval_t* cur = &iset->data[merge_end];
+
+        if (!new_end_unbounded && cur->start > new_end) {
+            break;  /* No overlap */
+        }
+
         /* This interval overlaps or touches [new_start, new_end) */
         if (iset->data[merge_end].start < new_start) {
             new_start = iset->data[merge_end].start;
         }
-        if (iset->data[merge_end].end > new_end) {
-            new_end = iset->data[merge_end].end;
-        }
+        interval_extend_end(&new_end, &new_end_unbounded,
+                            cur->end, cur->end_unbounded);
+
         merge_end++;
+        if (new_end_unbounded) {
+            merge_end = iset->len;
+            break;
+        }
     }
 
     /* Number of intervals being replaced */
@@ -135,15 +167,18 @@ tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end
 
         iset->data[merge_start].start = new_start;
         iset->data[merge_start].end = new_end;
+        iset->data[merge_start].end_unbounded = new_end_unbounded;
         iset->len++;
     } else if (replace_count == 1) {
         /* Replace exactly one interval */
         iset->data[merge_start].start = new_start;
         iset->data[merge_start].end = new_end;
+        iset->data[merge_start].end_unbounded = new_end_unbounded;
     } else {
         /* Replace multiple intervals with one merged interval */
         iset->data[merge_start].start = new_start;
         iset->data[merge_start].end = new_end;
+        iset->data[merge_start].end_unbounded = new_end_unbounded;
 
         /* Remove excess intervals by shifting */
         size_t remove_count = replace_count - 1;
@@ -166,7 +201,8 @@ bool tl_intervals_contains(const tl_intervals_t* iset, tl_ts_t ts) {
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (!tl_ts_before_end(ts, iset->data[mid].end)) {
+        if (!tl_ts_before_end(ts, iset->data[mid].end,
+                              iset->data[mid].end_unbounded)) {
             lo = mid + 1;
         } else if (iset->data[mid].start > ts) {
             hi = mid;
@@ -188,7 +224,8 @@ size_t tl_intervals_find(const tl_intervals_t* iset, tl_ts_t ts) {
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (!tl_ts_before_end(ts, iset->data[mid].end)) {
+        if (!tl_ts_before_end(ts, iset->data[mid].end,
+                              iset->data[mid].end_unbounded)) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -198,22 +235,24 @@ size_t tl_intervals_find(const tl_intervals_t* iset, tl_ts_t ts) {
     return lo;
 }
 
-tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t clip_end) {
+tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t clip_end,
+                              bool clip_end_unbounded) {
     if (iset == NULL) return TL_EINVAL;
-    if (clip_start >= clip_end) {
+    if (!clip_end_unbounded && clip_start >= clip_end) {
         iset->len = 0;
         return TL_OK;
     }
 
     /* Find first interval that might intersect clip range */
     size_t first = 0;
-    while (first < iset->len && iset->data[first].end <= clip_start) {
+    while (first < iset->len && interval_end_le_start(&iset->data[first], clip_start)) {
         first++;
     }
 
     /* Find last interval that intersects clip range */
     size_t last = iset->len;
-    while (last > first && iset->data[last - 1].start >= clip_end) {
+    while (!clip_end_unbounded && last > first &&
+           iset->data[last - 1].start >= clip_end) {
         last--;
     }
 
@@ -235,8 +274,12 @@ tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t 
         if (iset->data[0].start < clip_start) {
             iset->data[0].start = clip_start;
         }
-        if (iset->data[iset->len - 1].end > clip_end) {
-            iset->data[iset->len - 1].end = clip_end;
+        if (!clip_end_unbounded) {
+            tl_interval_t* tail = &iset->data[iset->len - 1];
+            if (tail->end_unbounded || tail->end > clip_end) {
+                tail->end = clip_end;
+                tail->end_unbounded = false;
+            }
         }
     }
 
@@ -267,6 +310,7 @@ tl_status_t tl_intervals_union(tl_intervals_t* dst,
      */
     size_t i = 0, j = 0;
     tl_ts_t cur_start = 0, cur_end = 0;
+    bool cur_end_unbounded = false;
     bool have_current = false;
 
     while (i < src1->len || j < src2->len) {
@@ -285,11 +329,14 @@ tl_status_t tl_intervals_union(tl_intervals_t* dst,
         if (!have_current) {
             cur_start = next->start;
             cur_end = next->end;
+            cur_end_unbounded = next->end_unbounded;
             have_current = true;
-        } else if (next->start <= cur_end) {
+        } else if (cur_end_unbounded || next->start <= cur_end) {
             /* Overlaps or touches: extend */
-            if (next->end > cur_end) {
-                cur_end = next->end;
+            interval_extend_end(&cur_end, &cur_end_unbounded,
+                                next->end, next->end_unbounded);
+            if (cur_end_unbounded) {
+                break;
             }
         } else {
             /* Gap: output current interval and start new */
@@ -298,10 +345,12 @@ tl_status_t tl_intervals_union(tl_intervals_t* dst,
 
             dst->data[dst->len].start = cur_start;
             dst->data[dst->len].end = cur_end;
+            dst->data[dst->len].end_unbounded = cur_end_unbounded;
             dst->len++;
 
             cur_start = next->start;
             cur_end = next->end;
+            cur_end_unbounded = next->end_unbounded;
         }
     }
 
@@ -312,6 +361,7 @@ tl_status_t tl_intervals_union(tl_intervals_t* dst,
 
         dst->data[dst->len].start = cur_start;
         dst->data[dst->len].end = cur_end;
+        dst->data[dst->len].end_unbounded = cur_end_unbounded;
         dst->len++;
     }
 
@@ -354,21 +404,28 @@ void tl_intervals_move(tl_intervals_t* dst, tl_intervals_t* src) {
 tl_status_t tl_intervals_validate(const tl_intervals_t* iset) {
     if (iset == NULL) return TL_OK;
 
+    bool prev_end_unbounded = false;
+    tl_ts_t prev_end = 0;
+
     for (size_t i = 0; i < iset->len; i++) {
         /* Check interval validity */
-        if (iset->data[i].start >= iset->data[i].end) {
+        if (!iset->data[i].end_unbounded &&
+            iset->data[i].start >= iset->data[i].end) {
             return TL_EINTERNAL;
         }
 
         /* Check ordering and disjointness */
         if (i > 0) {
-            if (iset->data[i].start < iset->data[i-1].end) {
-                return TL_EINTERNAL;  /* Overlapping */
+            if (prev_end_unbounded) {
+                return TL_EINTERNAL;  /* Open-ended must be last */
             }
-            if (iset->data[i].start == iset->data[i-1].end) {
-                return TL_EINTERNAL;  /* Should have been coalesced */
+            if (iset->data[i].start <= prev_end) {
+                return TL_EINTERNAL;  /* Overlapping or adjacent */
             }
         }
+
+        prev_end = iset->data[i].end;
+        prev_end_unbounded = iset->data[i].end_unbounded;
     }
 
     return TL_OK;

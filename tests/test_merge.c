@@ -75,7 +75,8 @@ static tl_status_t create_test_plan(const tl_allocator_t* alloc,
 
         for (uint32_t i = 0; i < n_arrays; i++) {
             tl_array_iter_t* ait = NULL;
-            tl_status_t st = tl_array_iter_create(alloc, arrays[i], lengths[i], t1, t2, &ait);
+            tl_status_t st = tl_array_iter_create(alloc, arrays[i], lengths[i],
+                                                  t1, t2, false, &ait);
             if (st != TL_OK) {
                 /* Cleanup on failure */
                 for (uint32_t j = 0; j < i; j++) {
@@ -256,7 +257,7 @@ int test_merge(void) {
     tl_merge_iter_destroy(mit);
     tl_qplan_destroy(plan);
 
-    /* Test: Merge with duplicate timestamps (deterministic ordering by component_id) */
+    /* Test: Merge with duplicate timestamps (tie order unspecified) */
     tl_record_t arr5a[] = {{100, 1}, {200, 2}};
     tl_record_t arr5b[] = {{100, 3}, {200, 4}};
     const tl_record_t* arrays5[] = {arr5a, arr5b};
@@ -268,28 +269,42 @@ int test_merge(void) {
     st = tl_merge_iter_create(&alloc, plan, &mit);
     TEST_ASSERT_EQ(st, TL_OK);
 
-    /* Expected: (100, id=0), (100, id=1), (200, id=0), (200, id=1) */
-    rec = tl_merge_iter_peek(mit);
-    TEST_ASSERT_EQ(rec->ts, 100);
-    TEST_ASSERT_EQ(rec->handle, 1);  /* From component 0 */
+    /* Expected: two records at ts=100 and two at ts=200, tie order unspecified */
+    bool seen_100_h1 = false;
+    bool seen_100_h3 = false;
+    bool seen_200_h2 = false;
+    bool seen_200_h4 = false;
+    tl_ts_t last_ts = TL_TS_MIN;
+    int total = 0;
 
-    st = tl_merge_iter_advance(mit);
-    TEST_ASSERT_EQ(st, TL_OK);
-    rec = tl_merge_iter_peek(mit);
-    TEST_ASSERT_EQ(rec->ts, 100);
-    TEST_ASSERT_EQ(rec->handle, 3);  /* From component 1 */
+    while (tl_merge_iter_state(mit) == TL_ITER_READY) {
+        rec = tl_merge_iter_peek(mit);
+        TEST_ASSERT_NE(rec, NULL);
+        TEST_ASSERT(rec->ts >= last_ts);
+        last_ts = rec->ts;
 
-    st = tl_merge_iter_advance(mit);
-    TEST_ASSERT_EQ(st, TL_OK);
-    rec = tl_merge_iter_peek(mit);
-    TEST_ASSERT_EQ(rec->ts, 200);
-    TEST_ASSERT_EQ(rec->handle, 2);  /* From component 0 */
+        if (rec->ts == 100) {
+            if (rec->handle == 1) seen_100_h1 = true;
+            else if (rec->handle == 3) seen_100_h3 = true;
+            else TEST_ASSERT(0);
+        } else if (rec->ts == 200) {
+            if (rec->handle == 2) seen_200_h2 = true;
+            else if (rec->handle == 4) seen_200_h4 = true;
+            else TEST_ASSERT(0);
+        } else {
+            TEST_ASSERT(0);
+        }
 
-    st = tl_merge_iter_advance(mit);
-    TEST_ASSERT_EQ(st, TL_OK);
-    rec = tl_merge_iter_peek(mit);
-    TEST_ASSERT_EQ(rec->ts, 200);
-    TEST_ASSERT_EQ(rec->handle, 4);  /* From component 1 */
+        total++;
+        st = tl_merge_iter_advance(mit);
+        if (st != TL_OK && st != TL_EOF) {
+            TEST_ASSERT(0);
+        }
+    }
+
+    TEST_ASSERT_EQ(total, 4);
+    TEST_ASSERT(seen_100_h1 && seen_100_h3);
+    TEST_ASSERT(seen_200_h2 && seen_200_h4);
 
     tl_merge_iter_destroy(mit);
     tl_qplan_destroy(plan);
@@ -330,8 +345,8 @@ int test_merge(void) {
     /* Test: With tombstones */
     tl_intervals_t intervals;
     tl_intervals_init(&intervals, &alloc);
-    tl_intervals_insert(&intervals, 100, 200);  /* Delete [100, 200) */
-    tl_intervals_insert(&intervals, 300, 400);  /* Delete [300, 400) */
+    tl_intervals_insert(&intervals, 100, 200, false);  /* Delete [100, 200) */
+    tl_intervals_insert(&intervals, 300, 400, false);  /* Delete [300, 400) */
 
     tl_tombstones_t* tombs = NULL;
     st = tl_tombstones_create(&alloc, &intervals, &tombs);
@@ -401,7 +416,7 @@ int test_merge(void) {
 
     /* Create tombstones: delete [150, 250) */
     tl_intervals_init(&intervals, &alloc);
-    tl_intervals_insert(&intervals, 150, 250);
+    tl_intervals_insert(&intervals, 150, 250, false);
     st = tl_tombstones_create(&alloc, &intervals, &tombs);
     TEST_ASSERT_EQ(st, TL_OK);
     tl_intervals_destroy(&intervals);
@@ -440,7 +455,7 @@ int test_merge(void) {
 
     /* Create tombstones: delete [0, 1000) - all records */
     tl_intervals_init(&intervals, &alloc);
-    tl_intervals_insert(&intervals, 0, 1000);
+    tl_intervals_insert(&intervals, 0, 1000, false);
     st = tl_tombstones_create(&alloc, &intervals, &tombs);
     TEST_ASSERT_EQ(st, TL_OK);
     tl_intervals_destroy(&intervals);
