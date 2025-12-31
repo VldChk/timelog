@@ -50,12 +50,12 @@ int test_segment(void) {
     TEST_ASSERT_EQ(tl_segment_validate(seg), TL_OK);
 
     /* Test: Segment overlap */
-    TEST_ASSERT(tl_segment_overlaps(seg, 0, 1000));    /* Fully covers */
-    TEST_ASSERT(tl_segment_overlaps(seg, 100, 200));   /* Partial */
-    TEST_ASSERT(tl_segment_overlaps(seg, 450, 550));   /* Inside last page */
-    TEST_ASSERT(!tl_segment_overlaps(seg, 0, 100));    /* Before (exclusive end) */
-    TEST_ASSERT(!tl_segment_overlaps(seg, 501, 1000)); /* After */
-    TEST_ASSERT(tl_segment_overlaps(seg, 500, 600));   /* Touches end */
+    TEST_ASSERT(tl_segment_overlaps(seg, 0, 1000, false));    /* Fully covers */
+    TEST_ASSERT(tl_segment_overlaps(seg, 100, 200, false));   /* Partial */
+    TEST_ASSERT(tl_segment_overlaps(seg, 450, 550, false));   /* Inside last page */
+    TEST_ASSERT(!tl_segment_overlaps(seg, 0, 100, false));    /* Before (exclusive end) */
+    TEST_ASSERT(!tl_segment_overlaps(seg, 501, 1000, false)); /* After */
+    TEST_ASSERT(tl_segment_overlaps(seg, 500, 600, false));   /* Touches end */
 
     /* Test: Reference counting */
     TEST_ASSERT_EQ(tl_atomic_u32_load(&seg->refcnt), 1);
@@ -81,9 +81,9 @@ int test_segment(void) {
     /* Test: Segment with tombstones only */
     tl_intervals_t iset;
     tl_intervals_init(&iset, &alloc);
-    st = tl_intervals_insert(&iset, 100, 200);
+    st = tl_intervals_insert(&iset, 100, 200, false);
     TEST_ASSERT_EQ(st, TL_OK);
-    st = tl_intervals_insert(&iset, 300, 400);
+    st = tl_intervals_insert(&iset, 300, 400, false);
     TEST_ASSERT_EQ(st, TL_OK);
 
     tl_tombstones_t* tombs = NULL;
@@ -109,9 +109,9 @@ int test_segment(void) {
     TEST_ASSERT_EQ(st, TL_OK);
 
     tl_intervals_init(&iset, &alloc);
-    st = tl_intervals_insert(&iset, 50, 80);  /* Before page range */
+    st = tl_intervals_insert(&iset, 50, 80, false);  /* Before page range */
     TEST_ASSERT_EQ(st, TL_OK);
-    st = tl_intervals_insert(&iset, 350, 500); /* Extends past page range */
+    st = tl_intervals_insert(&iset, 350, 500, false); /* Extends past page range */
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_tombstones_create(&alloc, &iset, &tombs);
@@ -181,7 +181,7 @@ int test_segment(void) {
 
     /* Add tombstones */
     tl_intervals_init(&iset, &alloc);
-    st = tl_intervals_insert(&iset, 150, 180);
+    st = tl_intervals_insert(&iset, 150, 180, false);
     TEST_ASSERT_EQ(st, TL_OK);
 
     st = tl_tombstones_create(&alloc, &iset, &tombs);
@@ -211,7 +211,7 @@ int test_segment(void) {
     tl_segment_builder_destroy(&builder);
 
     /* Test: Null safety */
-    TEST_ASSERT(!tl_segment_overlaps(NULL, 0, 100));
+    TEST_ASSERT(!tl_segment_overlaps(NULL, 0, 100, false));
     TEST_ASSERT_EQ(tl_segment_acquire(NULL), 0);
     TEST_ASSERT_EQ(tl_segment_release(NULL), 0);
     TEST_ASSERT_EQ(tl_segment_validate(NULL), TL_OK);
