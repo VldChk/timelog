@@ -1,116 +1,117 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include "test_harness.h"
+#include "timelog/timelog.h"
 
-/* Simple test macros */
-#define TEST_ASSERT(cond) do { \
-    if (!(cond)) { \
-        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-        return 1; \
-    } \
-} while(0)
+/*===========================================================================
+ * Global Test Context
+ *===========================================================================*/
 
-#define TEST_ASSERT_EQ(a, b) TEST_ASSERT((a) == (b))
-#define TEST_ASSERT_NE(a, b) TEST_ASSERT((a) != (b))
+test_context_t g_test_ctx;
 
-/* Test declarations */
-extern int test_status(void);
-extern int test_alloc(void);
-extern int test_recvec(void);
-extern int test_intervals(void);
-/* Phase 2: Storage tests */
-extern int test_page(void);
-extern int test_segment(void);
-extern int test_manifest(void);
-/* Phase 3: Write path tests */
-extern int test_memtable(void);
-extern int test_flush(void);
-/* Phase 4: Read path tests */
-extern int test_snapshot(void);
-extern int test_iter(void);
-extern int test_merge(void);
-extern int test_read_path(void);
-/* Phase 5: Diagnostics tests */
-extern int test_diagnostics(void);
-/* Phase 6: Maintenance tests */
-extern int test_maintenance(void);
-/* Concurrency tests */
-extern int test_concurrency(void);
+/*===========================================================================
+ * Test Framework Implementation
+ *===========================================================================*/
 
-int main(void) {
-    int failed = 0;
+void test_init(void) {
+    memset(&g_test_ctx, 0, sizeof(g_test_ctx));
+}
 
-    printf("Running timelog tests...\n\n"); fflush(stdout);
+void test_run(const char* name, test_fn fn) {
+    g_test_ctx.current_test = name;
+    printf("  Running: %s ... ", name);
+    fflush(stdout);
 
-    printf("Starting test_status...\n"); fflush(stdout);
-    if (test_status()) { failed++; printf("test_status FAILED\n"); }
-    else printf("test_status PASSED\n");
+    int prev_count = g_test_ctx.count;
 
-    printf("Starting test_alloc...\n"); fflush(stdout);
-    if (test_alloc()) { failed++; printf("test_alloc FAILED\n"); }
-    else printf("test_alloc PASSED\n");
+    /* Run the test */
+    fn();
 
-    printf("Starting test_recvec...\n"); fflush(stdout);
-    if (test_recvec()) { failed++; printf("test_recvec FAILED\n"); }
-    else printf("test_recvec PASSED\n");
+    /* If we get here without failing, the test passed */
+    if (g_test_ctx.count == prev_count) {
+        /* No failure was recorded, so test passed */
+        test_result_t* r = &g_test_ctx.results[g_test_ctx.count++];
+        r->name = name;
+        r->passed = 1;
+        g_test_ctx.passed++;
+        printf("PASSED\n");
+    }
+}
 
-    printf("Starting test_intervals...\n"); fflush(stdout);
-    if (test_intervals()) { failed++; printf("test_intervals FAILED\n"); }
-    else printf("test_intervals PASSED\n");
+void test_fail(const char* file, int line, const char* msg) {
+    test_result_t* r = &g_test_ctx.results[g_test_ctx.count++];
+    r->name = g_test_ctx.current_test;
+    r->file = file;
+    r->line = line;
+    r->passed = 0;
+    snprintf(r->message, sizeof(r->message), "%s", msg);
+    g_test_ctx.failed++;
+    printf("FAILED\n");
+    printf("    %s:%d: %s\n", file, line, msg);
+}
 
-    /* Phase 2: Storage tests */
-    printf("Starting test_page...\n"); fflush(stdout);
-    if (test_page()) { failed++; printf("test_page FAILED\n"); }
-    else printf("test_page PASSED\n");
+void test_fail_eq(const char* file, int line,
+                  const char* expected_expr, const char* actual_expr,
+                  long long expected, long long actual) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "Expected %s == %s, got %lld != %lld",
+             expected_expr, actual_expr, expected, actual);
+    test_fail(file, line, msg);
+}
 
-    printf("Starting test_segment...\n"); fflush(stdout);
-    if (test_segment()) { failed++; printf("test_segment FAILED\n"); }
-    else printf("test_segment PASSED\n");
+void test_fail_status(const char* file, int line,
+                      tl_status_t expected, tl_status_t actual) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "Expected status %s (%d), got %s (%d)",
+             tl_strerror(expected), expected,
+             tl_strerror(actual), actual);
+    test_fail(file, line, msg);
+}
 
-    printf("Starting test_manifest...\n"); fflush(stdout);
-    if (test_manifest()) { failed++; printf("test_manifest FAILED\n"); }
-    else printf("test_manifest PASSED\n");
+int test_report(void) {
+    printf("\n");
+    printf("========================================\n");
+    printf("Test Results: %d passed, %d failed\n",
+           g_test_ctx.passed, g_test_ctx.failed);
+    printf("========================================\n");
 
-    /* Phase 3: Write path tests */
-    printf("Starting test_memtable...\n"); fflush(stdout);
-    if (test_memtable()) { failed++; printf("test_memtable FAILED\n"); }
-    else printf("test_memtable PASSED\n");
+    if (g_test_ctx.failed > 0) {
+        printf("\nFailed tests:\n");
+        for (int i = 0; i < g_test_ctx.count; i++) {
+            if (!g_test_ctx.results[i].passed) {
+                printf("  - %s: %s\n",
+                       g_test_ctx.results[i].name,
+                       g_test_ctx.results[i].message);
+            }
+        }
+    }
 
-    printf("Starting test_flush...\n"); fflush(stdout);
-    if (test_flush()) { failed++; printf("test_flush FAILED\n"); }
-    else printf("test_flush PASSED\n");
+    return g_test_ctx.failed > 0 ? 1 : 0;
+}
 
-    /* Phase 4: Read path tests */
-    printf("Starting test_snapshot...\n"); fflush(stdout);
-    if (test_snapshot()) { failed++; printf("test_snapshot FAILED\n"); }
-    else printf("test_snapshot PASSED\n");
+/*===========================================================================
+ * External Test Declarations
+ *===========================================================================*/
 
-    printf("Starting test_iter...\n"); fflush(stdout);
-    if (test_iter()) { failed++; printf("test_iter FAILED\n"); }
-    else printf("test_iter PASSED\n");
+/* Phase 0 tests */
+extern void run_phase0_tests(void);
 
-    printf("Starting test_merge...\n"); fflush(stdout);
-    if (test_merge()) { failed++; printf("test_merge FAILED\n"); }
-    else printf("test_merge PASSED\n");
+/*===========================================================================
+ * Main Entry Point
+ *===========================================================================*/
 
-    printf("Starting test_read_path...\n"); fflush(stdout);
-    if (test_read_path()) { failed++; printf("test_read_path FAILED\n"); }
-    else printf("test_read_path PASSED\n");
+int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
 
-    /* Phase 5: Diagnostics tests */
-    printf("Starting test_diagnostics...\n"); fflush(stdout);
-    if (test_diagnostics()) { failed++; printf("test_diagnostics FAILED\n"); }
-    else printf("test_diagnostics PASSED\n");
+    printf("Timelog V1 Test Suite\n");
+    printf("========================================\n\n");
 
-    /* Phase 6: Maintenance tests */
-    printf("Starting test_maintenance...\n"); fflush(stdout);
-    if (test_maintenance()) { failed++; printf("test_maintenance FAILED\n"); }
-    else printf("test_maintenance PASSED\n");
+    test_init();
 
-    /* Concurrency tests */
-    printf("Starting test_concurrency...\n"); fflush(stdout);
-    if (test_concurrency()) { failed++; printf("test_concurrency FAILED\n"); }
-    else printf("test_concurrency PASSED\n");
+    printf("Phase 0: Contract and Lifecycle\n");
+    printf("----------------------------------------\n");
+    run_phase0_tests();
 
-    printf("\n%d test(s) failed.\n", failed);
-    return failed ? EXIT_FAILURE : EXIT_SUCCESS;
+    return test_report();
 }

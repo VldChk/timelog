@@ -1,78 +1,89 @@
 #ifndef TL_LOG_H
 #define TL_LOG_H
 
-/*
- * Internal logging header.
- * Provides extended logging infrastructure beyond the public tl_log_fn.
- */
-#include "../../include/timelog/timelog.h"
+#include "tl_defs.h"
+#include <stdarg.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/*===========================================================================
+ * Log Levels
+ *===========================================================================*/
 
-/**
- * Log levels matching common conventions.
- */
 typedef enum tl_log_level {
-    TL_LOG_TRACE = 0,
-    TL_LOG_DEBUG = 1,
-    TL_LOG_INFO  = 2,
-    TL_LOG_WARN  = 3,
-    TL_LOG_ERROR = 4,
-    TL_LOG_FATAL = 5,
-    TL_LOG_OFF   = 6    /* Disable all logging */
+    TL_LOG_LEVEL_ERROR = 0,
+    TL_LOG_LEVEL_WARN  = 1,
+    TL_LOG_LEVEL_INFO  = 2,
+    TL_LOG_LEVEL_DEBUG = 3,
+    TL_LOG_LEVEL_TRACE = 4
 } tl_log_level_t;
 
-/**
- * Internal log callback signature (extended with file/line info).
- * Different from public tl_log_fn which is simpler.
- */
-typedef void (*tl_log_fn_internal)(void* ctx, tl_log_level_t level,
-                                   const char* file, int line, const char* msg);
+/*===========================================================================
+ * Log Context
+ *===========================================================================*/
+
+typedef struct tl_log_ctx {
+    tl_log_fn       fn;
+    void*           ctx;
+    tl_log_level_t  max_level;
+} tl_log_ctx_t;
+
+/*===========================================================================
+ * Initialization
+ *===========================================================================*/
 
 /**
- * Logger context stored in timelog instance.
+ * Initialize log context from user configuration.
+ * If fn is NULL, logging is disabled.
  */
-typedef struct tl_logger {
-    tl_log_fn_internal fn;
-    void*              ctx;
-    tl_log_level_t     min_level;
-} tl_logger_t;
+void tl__log_init(tl_log_ctx_t* log, tl_log_fn fn, void* ctx);
+
+/*===========================================================================
+ * Logging Functions
+ *===========================================================================*/
 
 /**
- * Initialize logger to no-op (disabled).
+ * Log a message at the specified level.
+ * Thread-safe if the user's log function is thread-safe.
  */
-void tl_logger_init_noop(tl_logger_t* logger);
+void tl__log(tl_log_ctx_t* log, tl_log_level_t level,
+             const char* fmt, ...);
 
-/**
- * Initialize logger with callback.
- */
-void tl_logger_init(tl_logger_t* logger, tl_log_fn_internal fn, void* ctx,
-                    tl_log_level_t min_level);
+void tl__log_v(tl_log_ctx_t* log, tl_log_level_t level,
+               const char* fmt, va_list args);
 
-/**
- * Internal logging macros - these become no-ops in release builds
- * unless TL_ENABLE_LOGGING is defined.
- */
-#if defined(TL_ENABLE_LOGGING) || !defined(NDEBUG)
-void tl__log(const tl_logger_t* logger, tl_log_level_t level,
-             const char* file, int line, const char* fmt, ...);
+/*===========================================================================
+ * Convenience Macros
+ *
+ * Note: These macros use __VA_ARGS__ without the ## GCC extension for
+ * MSVC portability. The format string is included in __VA_ARGS__.
+ *===========================================================================*/
 
-#define TL_LOG(logger, level, ...) \
-    tl__log((logger), (level), __FILE__, __LINE__, __VA_ARGS__)
+/* These require a `tl_log_ctx_t* log` in scope */
+
+#define TL_LOG_ERROR(...) \
+    tl__log(log, TL_LOG_LEVEL_ERROR, __VA_ARGS__)
+
+#define TL_LOG_WARN(...) \
+    tl__log(log, TL_LOG_LEVEL_WARN, __VA_ARGS__)
+
+#define TL_LOG_INFO(...) \
+    tl__log(log, TL_LOG_LEVEL_INFO, __VA_ARGS__)
+
+#ifdef TL_DEBUG
+    #define TL_LOG_DEBUG(...) \
+        tl__log(log, TL_LOG_LEVEL_DEBUG, __VA_ARGS__)
+    #define TL_LOG_TRACE(...) \
+        tl__log(log, TL_LOG_LEVEL_TRACE, __VA_ARGS__)
 #else
-#define TL_LOG(logger, level, ...) ((void)0)
+    #define TL_LOG_DEBUG(...) ((void)0)
+    #define TL_LOG_TRACE(...) ((void)0)
 #endif
 
-#define TL_LOG_TRACE(logger, ...) TL_LOG(logger, TL_LOG_TRACE, __VA_ARGS__)
-#define TL_LOG_DEBUG(logger, ...) TL_LOG(logger, TL_LOG_DEBUG, __VA_ARGS__)
-#define TL_LOG_INFO(logger, ...)  TL_LOG(logger, TL_LOG_INFO, __VA_ARGS__)
-#define TL_LOG_WARN(logger, ...)  TL_LOG(logger, TL_LOG_WARN, __VA_ARGS__)
-#define TL_LOG_ERROR(logger, ...) TL_LOG(logger, TL_LOG_ERROR, __VA_ARGS__)
+/*===========================================================================
+ * Global Log Macros (for use before instance is created)
+ *===========================================================================*/
 
-#ifdef __cplusplus
-}
-#endif
+/* These use a static null log context - effectively disabled */
+#define TL_LOG_STATIC_ERROR(...) ((void)0)
+#define TL_LOG_STATIC_WARN(...)  ((void)0)
 
 #endif /* TL_LOG_H */

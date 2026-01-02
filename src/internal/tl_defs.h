@@ -1,58 +1,93 @@
 #ifndef TL_DEFS_H
 #define TL_DEFS_H
 
-/*
- * Internal definitions header.
- * Re-exports fundamental types from public header and adds internal macros.
- */
-#include "../../include/timelog/timelog.h"
+#include "timelog/timelog.h"
+#include "tl_platform.h"
+
+#include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
-#include <limits.h>
+#include <string.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/*===========================================================================
+ * Timestamp Bounds
+ *===========================================================================*/
 
-/*
- * Timestamp bounds
- */
-#define TL_TS_MIN INT64_MIN
-#define TL_TS_MAX INT64_MAX
+#define TL_TS_MIN  INT64_MIN
+#define TL_TS_MAX  INT64_MAX
 
-/*
- * Cache line size for alignment
- */
-#ifndef TL_CACHE_LINE
-#define TL_CACHE_LINE 64
-#endif
+/*===========================================================================
+ * Size Constants
+ *===========================================================================*/
 
-/*
- * Compiler hints
- */
-#if defined(__GNUC__) || defined(__clang__)
-#define TL_LIKELY(x)   __builtin_expect(!!(x), 1)
-#define TL_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#define TL_INLINE      static inline __attribute__((always_inline))
-#define TL_NOINLINE    __attribute__((noinline))
-#define TL_UNUSED      __attribute__((unused))
-#else
-#define TL_LIKELY(x)   (x)
-#define TL_UNLIKELY(x) (x)
-#define TL_INLINE      static inline
-#define TL_NOINLINE
-#define TL_UNUSED
-#endif
+/* Default configuration values */
+#define TL_DEFAULT_TARGET_PAGE_BYTES      (64 * 1024)   /* 64 KiB */
+#define TL_DEFAULT_MEMTABLE_MAX_BYTES     (1024 * 1024) /* 1 MiB */
+#define TL_DEFAULT_SEALED_MAX_RUNS        4
+#define TL_DEFAULT_SEALED_WAIT_MS         100
+#define TL_DEFAULT_MAX_DELTA_SEGMENTS     8
 
-TL_INLINE bool tl_ts_before_end(tl_ts_t ts, tl_ts_t end, bool end_unbounded) {
-    return end_unbounded || ts < end;
-}
+/* Minimum page rows to prevent degenerate pages */
+#define TL_MIN_PAGE_ROWS                  16
 
-TL_INLINE bool tl_ts_range_empty(tl_ts_t t1, tl_ts_t t2, bool end_unbounded) {
-    return !end_unbounded && t1 >= t2;
-}
+/* Record size for byte accounting (use actual struct size to handle padding) */
+#define TL_RECORD_SIZE                    (sizeof(tl_record_t))
 
-#ifdef __cplusplus
-}
-#endif
+/*===========================================================================
+ * Window Defaults (in time units)
+ *===========================================================================*/
+
+/* 1 hour in each time unit */
+#define TL_WINDOW_1H_S   (3600LL)
+#define TL_WINDOW_1H_MS  (3600LL * 1000)
+#define TL_WINDOW_1H_US  (3600LL * 1000 * 1000)
+#define TL_WINDOW_1H_NS  (3600LL * 1000 * 1000 * 1000)
+
+/*===========================================================================
+ * Forward Declarations (Internal Types)
+ *===========================================================================*/
+
+/* Storage layer */
+typedef struct tl_page          tl_page_t;
+typedef struct tl_page_catalog  tl_page_catalog_t;
+typedef struct tl_segment       tl_segment_t;
+typedef struct tl_manifest      tl_manifest_t;
+
+/* Delta layer */
+typedef struct tl_memtable      tl_memtable_t;
+typedef struct tl_memrun        tl_memrun_t;
+typedef struct tl_memview       tl_memview_t;
+
+/* Tombstones */
+typedef struct tl_interval      tl_interval_t;
+typedef struct tl_intervals     tl_intervals_t;
+
+/* Maintenance */
+typedef struct tl_maint_state   tl_maint_state_t;
+
+/*===========================================================================
+ * Internal Helper Macros
+ *===========================================================================*/
+
+/* Safe minimum/maximum */
+#define TL_MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define TL_MAX(a, b) (((a) > (b)) ? (a) : (b))
+
+/* Array element count */
+#define TL_ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+/* Pointer alignment check */
+#define TL_IS_ALIGNED(ptr, align) (((uintptr_t)(ptr) & ((align) - 1)) == 0)
+
+/* Round up to power of 2 alignment */
+#define TL_ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+
+/*===========================================================================
+ * Internal Allocator Access
+ *===========================================================================*/
+
+/* These are defined in tl_alloc.h but forward-declared here for convenience */
+struct tl_alloc_ctx;
+typedef struct tl_alloc_ctx tl_alloc_ctx_t;
 
 #endif /* TL_DEFS_H */
