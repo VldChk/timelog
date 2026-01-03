@@ -96,6 +96,12 @@ int test_report(void) {
 /* Phase 0 tests */
 extern void run_phase0_tests(void);
 
+/* Phase 1 tests */
+extern void run_phase1_tests(void);
+
+/* Phase 2 tests */
+extern void run_phase2_tests(void);
+
 /*===========================================================================
  * Main Entry Point
  *===========================================================================*/
@@ -112,6 +118,14 @@ int main(int argc, char* argv[]) {
     printf("Phase 0: Contract and Lifecycle\n");
     printf("----------------------------------------\n");
     run_phase0_tests();
+
+    printf("\nPhase 1: Concurrency Primitives\n");
+    printf("----------------------------------------\n");
+    run_phase1_tests();
+
+    printf("\nPhase 2: Shared Data Structures\n");
+    printf("----------------------------------------\n");
+    run_phase2_tests();
 
     return test_report();
 }

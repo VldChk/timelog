@@ -2,6 +2,9 @@
 #include "internal/tl_defs.h"
 #include "internal/tl_alloc.h"
 #include "internal/tl_log.h"
+#include "internal/tl_sync.h"
+#include "internal/tl_seqlock.h"
+#include "internal/tl_locks.h"
 
 #include <string.h>
 
@@ -131,26 +134,59 @@ struct tl_timelog {
     tl_log_ctx_t    log;
 
     /*-----------------------------------------------------------------------
-     * State Flags
+     * Synchronization (Phase 1)
+     *
+     * Lock ordering: maint_mu -> flush_mu -> writer_mu -> memtable_mu
      *-----------------------------------------------------------------------*/
-    bool            is_open;
-    bool            maint_started;
+
+    /* Writer mutex: serializes manifest publication and snapshot capture.
+     * Held briefly during the publish phase of flush/compaction. */
+    tl_mutex_t      writer_mu;
+
+    /* Flush mutex: serializes flush build + publish (single flusher). */
+    tl_mutex_t      flush_mu;
+
+    /* Maintenance mutex: protects maint state flags and thread lifecycle. */
+    tl_mutex_t      maint_mu;
+    tl_cond_t       maint_cond;
+
+    /* Memtable mutex: protects sealed memrun queue. */
+    tl_mutex_t      memtable_mu;
+
+    /* Seqlock for snapshot consistency. Even = idle, odd = publish in progress. */
+    tl_seqlock_t    view_seq;
 
     /*-----------------------------------------------------------------------
-     * Future: Storage, Delta, Maintenance subsystems
-     * These will be added in subsequent phases.
+     * State Flags
+     *
+     * IMPORTANT: All flags accessed by multiple threads must be atomic.
+     * - maint_started: read in tl__request_flush/compact without lock
+     * - maint_shutdown: read by worker, set by close
+     * - flush_pending/compact_pending: set by writers, read by maintenance
+     *
+     * is_open is only modified at open/close boundaries when no other
+     * threads should be accessing the instance.
+     *-----------------------------------------------------------------------*/
+    bool            is_open;
+    tl_atomic_u32   maint_started;        /* Worker thread running (0=no, 1=yes) */
+    tl_atomic_u32   maint_shutdown;       /* Signal worker to exit (0=running, 1=shutdown) */
+    tl_atomic_u32   flush_pending;        /* Work available for flush (0=no, 1=yes) */
+    tl_atomic_u32   compact_pending;      /* Work available for compaction (0=no, 1=yes) */
+
+    /*-----------------------------------------------------------------------
+     * Maintenance Thread (Phase 7)
+     *-----------------------------------------------------------------------*/
+    tl_thread_t     maint_thread;
+
+    /*-----------------------------------------------------------------------
+     * Future: Storage, Delta subsystems
      *-----------------------------------------------------------------------*/
 
-    /* Manifest pointer (Phase 3) */
-    /* tl_manifest_t* manifest; */
+    /* Manifest pointer (Phase 3) - atomic for lock-free reads */
+    /* tl_atomic_ptr  manifest; */
 
     /* Memtable (Phase 4) */
     /* tl_memtable_t* memtable; */
-
-    /* Locks (Phase 1) */
-    /* tl_mutex_t writer_mu; */
-    /* tl_mutex_t flush_mu; */
-    /* etc. */
 };
 
 /*===========================================================================
@@ -189,6 +225,12 @@ static tl_status_t validate_config(const tl_config_t* cfg) {
 
     /* Delete debt threshold must be in [0, 1] if set */
     if (cfg->delete_debt_threshold < 0.0 || cfg->delete_debt_threshold > 1.0) {
+        return TL_EINVAL;
+    }
+
+    /* Window size must be non-negative (0 means use default).
+     * A negative window size doesn't make sense for time-based windowing. */
+    if (cfg->window_size < 0) {
         return TL_EINVAL;
     }
 
@@ -242,6 +284,59 @@ static void normalize_config(tl_timelog_t* tl) {
     } else {
         tl->effective_ooo_budget = cfg->ooo_budget_bytes;
     }
+}
+
+/*===========================================================================
+ * Lock Initialization Helpers
+ *===========================================================================*/
+
+static tl_status_t init_locks(tl_timelog_t* tl) {
+    tl_status_t s;
+
+    s = tl_mutex_init(&tl->writer_mu);
+    if (s != TL_OK) return s;
+
+    s = tl_mutex_init(&tl->flush_mu);
+    if (s != TL_OK) {
+        tl_mutex_destroy(&tl->writer_mu);
+        return s;
+    }
+
+    s = tl_mutex_init(&tl->maint_mu);
+    if (s != TL_OK) {
+        tl_mutex_destroy(&tl->flush_mu);
+        tl_mutex_destroy(&tl->writer_mu);
+        return s;
+    }
+
+    s = tl_cond_init(&tl->maint_cond);
+    if (s != TL_OK) {
+        tl_mutex_destroy(&tl->maint_mu);
+        tl_mutex_destroy(&tl->flush_mu);
+        tl_mutex_destroy(&tl->writer_mu);
+        return s;
+    }
+
+    s = tl_mutex_init(&tl->memtable_mu);
+    if (s != TL_OK) {
+        tl_cond_destroy(&tl->maint_cond);
+        tl_mutex_destroy(&tl->maint_mu);
+        tl_mutex_destroy(&tl->flush_mu);
+        tl_mutex_destroy(&tl->writer_mu);
+        return s;
+    }
+
+    tl_seqlock_init(&tl->view_seq);
+
+    return TL_OK;
+}
+
+static void destroy_locks(tl_timelog_t* tl) {
+    tl_mutex_destroy(&tl->memtable_mu);
+    tl_cond_destroy(&tl->maint_cond);
+    tl_mutex_destroy(&tl->maint_mu);
+    tl_mutex_destroy(&tl->flush_mu);
+    tl_mutex_destroy(&tl->writer_mu);
 }
 
 /*===========================================================================
@@ -308,9 +403,20 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     /* Normalize configuration values */
     normalize_config(tl);
 
-    /* Mark as open */
+    /* Initialize synchronization primitives (Phase 1) */
+    status = init_locks(tl);
+    if (status != TL_OK) {
+        tl__alloc_destroy(&tl->alloc);
+        temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
+        return status;
+    }
+
+    /* Initialize state flags */
     tl->is_open = true;
-    tl->maint_started = false;
+    tl_atomic_init_u32(&tl->maint_started, 0);
+    tl_atomic_init_u32(&tl->maint_shutdown, 0);
+    tl_atomic_init_u32(&tl->flush_pending, 0);
+    tl_atomic_init_u32(&tl->compact_pending, 0);
 
     /* Log successful open */
     tl_log_ctx_t* log = &tl->log;
@@ -318,9 +424,6 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
                 (int)tl->config.time_unit,
                 tl->config.target_page_bytes,
                 tl->config.memtable_max_bytes);
-
-    /* Destroy temp allocator (it was only used for the initial allocation) */
-    /* Note: The instance now owns its own allocator context */
 
     *out = tl;
     return TL_OK;
@@ -341,25 +444,32 @@ void tl_close(tl_timelog_t* tl) {
     /* Mark as closed first (prevents further operations) */
     tl->is_open = false;
 
+    /* Stop maintenance thread if running (Phase 7) */
+    if (tl_atomic_load_acquire_u32(&tl->maint_started)) {
+        TL_LOCK_MAINT(tl);
+        tl_atomic_store_release_u32(&tl->maint_shutdown, 1);
+        tl_cond_signal(&tl->maint_cond);
+        TL_UNLOCK_MAINT(tl);
+
+        tl_thread_join(&tl->maint_thread, NULL);
+        tl_atomic_store_release_u32(&tl->maint_started, 0);
+    }
+
     /*
      * Future cleanup (to be added in subsequent phases):
      *
-     * 1. Stop maintenance thread (if running)
-     *    - tl_maint_stop(tl);
-     *
-     * 2. Wait for and release all snapshots
+     * 1. Wait for and release all snapshots
      *    - In debug builds, assert no outstanding snapshots
      *
-     * 3. Release manifest and all segments
+     * 2. Release manifest and all segments
      *    - tl_manifest_release(tl->manifest);
      *
-     * 4. Destroy memtable
+     * 3. Destroy memtable
      *    - tl_memtable_destroy(tl->memtable);
-     *
-     * 5. Destroy locks
-     *    - tl_mutex_destroy(&tl->writer_mu);
-     *    - etc.
      */
+
+    /* Destroy synchronization primitives */
+    destroy_locks(tl);
 
     /* Get allocator context before we destroy it */
     tl_alloc_ctx_t alloc = tl->alloc;
@@ -509,4 +619,51 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
 tl_status_t tl_validate(const tl_snapshot_t* snap) {
     (void)snap;
     return TL_ESTATE; /* Not yet implemented */
+}
+
+/*===========================================================================
+ * Publication Protocol Helpers (Phase 1)
+ *
+ * These functions implement the atomic publication pattern used by both
+ * flush and compaction. The actual publish work is done between
+ * tl__publish_begin() and tl__publish_end().
+ *
+ * From timelog_v1_c_software_design_spec.md Section 4.3:
+ *
+ * 1. Lock writer_mu
+ * 2. view_seq++ (odd = publish in progress)
+ * 3. Swap manifest pointer + update state
+ * 4. view_seq++ (even = publish complete)
+ * 5. Unlock writer_mu
+ *===========================================================================*/
+
+/**
+ * Begin publication phase.
+ * Acquires writer_mu and increments seqlock to odd.
+ *
+ * @param tl Timelog instance
+ */
+void tl__publish_begin(tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+    TL_ASSERT(tl->is_open);
+
+    TL_LOCK_WRITER(tl);
+    tl_seqlock_write_begin(&tl->view_seq);
+
+    /* Now seq is odd - no snapshot can proceed */
+}
+
+/**
+ * End publication phase.
+ * Increments seqlock to even and releases writer_mu.
+ *
+ * @param tl Timelog instance
+ */
+void tl__publish_end(tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+
+    tl_seqlock_write_end(&tl->view_seq);
+    TL_UNLOCK_WRITER(tl);
+
+    /* Now seq is even - snapshots can proceed */
 }

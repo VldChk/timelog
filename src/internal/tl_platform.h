@@ -33,7 +33,7 @@
  *===========================================================================*/
 
 #if defined(TL_COMPILER_MSVC)
-    #define TL_INLINE        __forceinline
+    #define TL_INLINE        static __forceinline
     #define TL_NOINLINE      __declspec(noinline)
     #define TL_RESTRICT      __restrict
     #define TL_LIKELY(x)     (x)
@@ -41,6 +41,7 @@
     #define TL_ALIGNED(n)    __declspec(align(n))
     #define TL_ASSUME(x)     __assume(x)
     #define TL_UNREACHABLE() __assume(0)
+    #define TL_THREAD_LOCAL  __declspec(thread)
 #else
     #define TL_INLINE        static inline __attribute__((always_inline))
     #define TL_NOINLINE      __attribute__((noinline))
@@ -50,6 +51,7 @@
     #define TL_ALIGNED(n)    __attribute__((aligned(n)))
     #define TL_ASSUME(x)     do { if (!(x)) __builtin_unreachable(); } while(0)
     #define TL_UNREACHABLE() __builtin_unreachable()
+    #define TL_THREAD_LOCAL  _Thread_local
 #endif
 
 /*===========================================================================

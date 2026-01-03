@@ -2,145 +2,181 @@
 #define TL_RECVEC_H
 
 #include "tl_defs.h"
-#include "tl_status.h"
 #include "tl_alloc.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/*===========================================================================
+ * Record Vector
+ *
+ * A dynamic array of tl_record_t that provides:
+ * - Amortized O(1) append for sorted and unsorted insertions
+ * - Binary search helpers (lower_bound, upper_bound) for range queries
+ * - Reserve/clear/destroy lifecycle
+ *
+ * Used by:
+ * - tl_memtable_t.active_run (append-only sorted records)
+ * - tl_memtable_t.active_ooo (sorted out-of-order records)
+ * - tl_memrun_t.run and tl_memrun_t.ooo (sealed arrays)
+ * - Page builder (sorted record stream)
+ *
+ * Thread Safety:
+ * - Not thread-safe. Caller must provide synchronization.
+ *===========================================================================*/
 
 /**
- * Dynamic vector of tl_record_t.
+ * Dynamic array of records.
  *
- * Design choices:
- * - Amortized O(1) append via geometric growth (1.5x)
- * - No shrinking (caller must explicitly compact)
- * - Supports move semantics for ownership transfer
- * - Pin-aware: can track external references to prevent invalidating reallocs
+ * Design notes:
+ * - The allocator pointer is borrowed; the caller owns the allocator lifetime.
+ * - Capacity growth uses 2x strategy (amortized O(1) append).
+ * - Zero-length vectors have data == NULL, len == 0, cap == 0.
  */
 typedef struct tl_recvec {
-    tl_record_t*          data;       /* Record array */
-    size_t                len;        /* Current count */
-    size_t                cap;        /* Allocated capacity */
-    const tl_allocator_t* alloc;      /* Allocator (not owned) */
-    uint32_t              pin_count;  /* External references (for snapshot safety) */
+    tl_record_t*    data;     /* Array of records */
+    size_t          len;      /* Current number of records */
+    size_t          cap;      /* Allocated capacity */
+    tl_alloc_ctx_t* alloc;    /* Allocator context (borrowed, not owned) */
 } tl_recvec_t;
 
+/*---------------------------------------------------------------------------
+ * Lifecycle
+ *---------------------------------------------------------------------------*/
+
 /**
- * Initialize an empty vector.
+ * Initialize an empty record vector.
+ * @param rv    Vector to initialize
+ * @param alloc Allocator context (must outlive the vector)
+ */
+void tl_recvec_init(tl_recvec_t* rv, tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy a record vector and free memory.
+ * Idempotent: safe to call on already-destroyed or zero-initialized vectors.
+ * After this call, rv is in a valid empty state (can be destroyed again or reused).
+ */
+void tl_recvec_destroy(tl_recvec_t* rv);
+
+/**
+ * Clear the vector (set len = 0) without freeing memory.
+ * Useful for reuse without reallocation.
+ */
+void tl_recvec_clear(tl_recvec_t* rv);
+
+/*---------------------------------------------------------------------------
+ * Capacity Management
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Ensure capacity for at least min_cap records.
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_recvec_reserve(tl_recvec_t* rv, size_t min_cap);
+
+/**
+ * Shrink capacity to exactly fit current length.
+ * If len == 0: frees backing storage and sets data=NULL, cap=0.
+ * If len == cap: no-op.
+ * Otherwise: realloc to len.
+ * @return TL_OK on success, TL_ENOMEM if realloc fails (capacity unchanged)
+ */
+tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* rv);
+
+/*---------------------------------------------------------------------------
+ * Insertion
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Append a single record to the end.
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_recvec_push(tl_recvec_t* rv, tl_ts_t ts, tl_handle_t handle);
+
+/**
+ * Append multiple records to the end.
+ * @param records Array of records to append
+ * @param n       Number of records
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_recvec_push_n(tl_recvec_t* rv, const tl_record_t* records, size_t n);
+
+/**
+ * Insert a record at a specific index, shifting subsequent records.
+ * @param idx Index to insert at (0 <= idx <= len)
+ * @return TL_OK on success, TL_ENOMEM on allocation failure, TL_EINVAL if idx > len
+ */
+tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_t handle);
+
+/*---------------------------------------------------------------------------
+ * Binary Search (for sorted vectors)
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Find the first index where rv->data[i].ts >= ts.
+ * Returns rv->len if all records have ts < target.
  *
- * @param vec   Vector to initialize
- * @param alloc Allocator to use (may be NULL for libc)
+ * Precondition: rv is sorted by ts (non-decreasing).
  */
-void tl_recvec_init(tl_recvec_t* vec, const tl_allocator_t* alloc);
+size_t tl_recvec_lower_bound(const tl_recvec_t* rv, tl_ts_t ts);
 
 /**
- * Initialize with pre-allocated capacity.
+ * Find the first index where rv->data[i].ts > ts.
+ * Returns rv->len if all records have ts <= target.
  *
- * @param vec      Vector to initialize
- * @param alloc    Allocator to use
- * @param init_cap Initial capacity
- * @return TL_OK or TL_ENOMEM
+ * Precondition: rv is sorted by ts (non-decreasing).
  */
-tl_status_t tl_recvec_init_cap(tl_recvec_t* vec, const tl_allocator_t* alloc,
-                                size_t init_cap);
+size_t tl_recvec_upper_bound(const tl_recvec_t* rv, tl_ts_t ts);
 
 /**
- * Destroy vector and free memory.
- */
-void tl_recvec_destroy(tl_recvec_t* vec);
-
-/**
- * Clear vector (set len=0) without freeing memory.
- */
-void tl_recvec_clear(tl_recvec_t* vec);
-
-/**
- * Append a single record.
+ * Find the range [lo, hi) of indices where rv->data[i].ts is in [t1, t2).
+ * @param lo Output: first index with ts >= t1
+ * @param hi Output: first index with ts >= t2
  *
- * @return TL_OK on success, TL_ENOMEM if growth fails
+ * Precondition: rv is sorted by ts (non-decreasing).
  */
-tl_status_t tl_recvec_push(tl_recvec_t* vec, tl_ts_t ts, tl_handle_t handle);
+void tl_recvec_range_bounds(const tl_recvec_t* rv, tl_ts_t t1, tl_ts_t t2,
+                            size_t* lo, size_t* hi);
+
+/*---------------------------------------------------------------------------
+ * Accessors
+ *---------------------------------------------------------------------------*/
 
 /**
- * Append multiple records.
- *
- * @return TL_OK on success, TL_ENOMEM if growth fails
+ * Get pointer to record at index (no bounds check in release).
  */
-tl_status_t tl_recvec_push_n(tl_recvec_t* vec, const tl_record_t* recs, size_t n);
-
-/**
- * Ensure capacity for at least `needed` total elements.
- * Does not change len.
- *
- * @return TL_OK on success, TL_ENOMEM if allocation fails
- */
-tl_status_t tl_recvec_reserve(tl_recvec_t* vec, size_t needed);
-
-/**
- * Shrink capacity to match length (release excess memory).
- *
- * @return TL_OK on success, TL_ENOMEM if realloc fails (unlikely)
- */
-tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* vec);
-
-/**
- * Move ownership from src to dst.
- * After move, src is empty and dst owns the data.
- */
-void tl_recvec_move(tl_recvec_t* dst, tl_recvec_t* src);
-
-/**
- * Sort vector by timestamp; tie order is unspecified (not stable).
- * Used at memrun seal time for out-of-order buffer.
- */
-void tl_recvec_sort_by_ts(tl_recvec_t* vec);
-
-/**
- * Binary search for lower_bound of timestamp.
- *
- * @param ts Target timestamp
- * @return Index of first element with rec.ts >= ts, or len if none
- */
-size_t tl_recvec_lower_bound(const tl_recvec_t* vec, tl_ts_t ts);
-
-/**
- * Pin-aware operations for snapshot safety.
- * When pin_count > 0, growth must allocate new buffer and retire old.
- */
-void tl_recvec_pin(tl_recvec_t* vec);
-void tl_recvec_unpin(tl_recvec_t* vec);
-bool tl_recvec_is_pinned(const tl_recvec_t* vec);
-
-/*
- * Inline accessors
- */
-TL_INLINE size_t tl_recvec_len(const tl_recvec_t* vec) {
-    return vec ? vec->len : 0;
+TL_INLINE const tl_record_t* tl_recvec_get(const tl_recvec_t* rv, size_t idx) {
+    TL_ASSERT(idx < rv->len);
+    return &rv->data[idx];
 }
 
-TL_INLINE size_t tl_recvec_cap(const tl_recvec_t* vec) {
-    return vec ? vec->cap : 0;
+/**
+ * Get mutable pointer to record at index.
+ */
+TL_INLINE tl_record_t* tl_recvec_get_mut(tl_recvec_t* rv, size_t idx) {
+    TL_ASSERT(idx < rv->len);
+    return &rv->data[idx];
 }
 
-TL_INLINE bool tl_recvec_empty(const tl_recvec_t* vec) {
-    return vec == NULL || vec->len == 0;
+TL_INLINE size_t tl_recvec_len(const tl_recvec_t* rv) {
+    return rv->len;
 }
 
-TL_INLINE tl_record_t* tl_recvec_data(tl_recvec_t* vec) {
-    return vec ? vec->data : NULL;
+TL_INLINE bool tl_recvec_is_empty(const tl_recvec_t* rv) {
+    return rv->len == 0;
 }
 
-TL_INLINE const tl_record_t* tl_recvec_data_const(const tl_recvec_t* vec) {
-    return vec ? vec->data : NULL;
+/**
+ * Get raw data pointer (for bulk operations).
+ * May be NULL if len == 0.
+ */
+TL_INLINE const tl_record_t* tl_recvec_data(const tl_recvec_t* rv) {
+    return rv->data;
 }
 
-TL_INLINE tl_record_t* tl_recvec_at(tl_recvec_t* vec, size_t i) {
-    return (vec && i < vec->len) ? &vec->data[i] : NULL;
-}
-
-#ifdef __cplusplus
-}
-#endif
+/**
+ * Take ownership of the internal array and reset vector to empty.
+ * Caller is responsible for freeing the returned array via tl__free().
+ * @param out_len Output: length of returned array
+ * @return Array pointer (may be NULL if empty)
+ */
+tl_record_t* tl_recvec_take(tl_recvec_t* rv, size_t* out_len);
 
 #endif /* TL_RECVEC_H */

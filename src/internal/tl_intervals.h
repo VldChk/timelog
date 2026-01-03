@@ -2,163 +2,284 @@
 #define TL_INTERVALS_H
 
 #include "tl_defs.h"
-#include "tl_status.h"
 #include "tl_alloc.h"
-#include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/*===========================================================================
+ * Interval Set
+ *
+ * Stores half-open time intervals [t1, t2) representing tombstones.
+ * Provides:
+ * - Mutable insert with automatic coalescing
+ * - Immutable snapshot for storage attachment
+ * - Binary search for point containment
+ * - Union of two interval sets
+ * - Clipping to a range
+ *
+ * Used by:
+ * - tl_memtable_t.active_tombs (mutable, receives new tombstones)
+ * - tl_memrun_t.tombs (immutable, from sealed memtable)
+ * - tl_segment_t.tombstones (immutable, attached to L0 segments)
+ * - Read path effective tombstone computation (union + clip)
+ *
+ * Thread Safety:
+ * - Not thread-safe. Caller must provide synchronization.
+ *===========================================================================*/
 
 /**
- * A half-open time interval [start, end).
+ * A single half-open interval [start, end).
+ * If end_unbounded is true, represents [start, +inf).
  *
- * If end_unbounded is true, the interval is open-ended and end is ignored.
- *
- * Invariant:
- * - end_unbounded == false: start < end
- * - end_unbounded == true:  interval extends to +infinity
+ * IMPORTANT: When end_unbounded is true, the 'end' field is UNDEFINED.
+ * Do not read 'end' without first checking end_unbounded.
  */
 typedef struct tl_interval {
-    tl_ts_t start;         /* Inclusive */
-    tl_ts_t end;           /* Exclusive (ignored if end_unbounded) */
-    bool    end_unbounded; /* Open-ended interval */
+    tl_ts_t start;        /* Inclusive start bound */
+    tl_ts_t end;          /* Exclusive end bound (ONLY valid if !end_unbounded) */
+    bool    end_unbounded;/* True => [start, +inf), 'end' is undefined */
 } tl_interval_t;
 
 /**
- * Disjoint sorted interval set.
- *
+ * Mutable interval set with automatic coalescing.
  * Invariants:
- * 1. intervals[i].start < intervals[i].end for all i
- * 2. intervals[i].end <= intervals[i+1].start for all i (strictly disjoint)
- * 3. intervals are sorted by start
- * 4. Adjacent intervals are coalesced (no i where intervals[i].end == intervals[i+1].start)
- *
- * Design choices:
- * - Dynamic array (not tree) since tombstone lists are typically small
- * - Insert coalesces immediately to keep list minimal
- * - Supports efficient "is timestamp deleted?" queries
+ * - Intervals are sorted by start.
+ * - No two intervals overlap.
+ * - No two intervals are adjacent (coalesced).
  */
 typedef struct tl_intervals {
-    tl_interval_t*        data;
-    size_t                len;
-    size_t                cap;
-    const tl_allocator_t* alloc;
+    tl_interval_t*  data;
+    size_t          len;
+    size_t          cap;
+    tl_alloc_ctx_t* alloc;
 } tl_intervals_t;
 
 /**
- * Initialize an empty interval set.
+ * Immutable interval array (for storage/snapshot).
+ * Same invariants as mutable set.
  */
-void tl_intervals_init(tl_intervals_t* iset, const tl_allocator_t* alloc);
+typedef struct tl_intervals_imm {
+    const tl_interval_t* data;
+    size_t               len;
+} tl_intervals_imm_t;
 
-/**
- * Initialize with pre-allocated capacity.
- */
-tl_status_t tl_intervals_init_cap(tl_intervals_t* iset, const tl_allocator_t* alloc,
-                                   size_t init_cap);
+/*---------------------------------------------------------------------------
+ * Lifecycle
+ *---------------------------------------------------------------------------*/
+
+void tl_intervals_init(tl_intervals_t* iv, tl_alloc_ctx_t* alloc);
 
 /**
  * Destroy interval set and free memory.
+ * Idempotent: safe to call on already-destroyed or zero-initialized sets.
+ * After this call, iv is in a valid empty state.
  */
-void tl_intervals_destroy(tl_intervals_t* iset);
+void tl_intervals_destroy(tl_intervals_t* iv);
+
+void tl_intervals_clear(tl_intervals_t* iv);
+
+/*---------------------------------------------------------------------------
+ * Insertion (with coalescing)
+ *---------------------------------------------------------------------------*/
 
 /**
- * Clear interval set without freeing memory.
- */
-void tl_intervals_clear(tl_intervals_t* iset);
-
-/**
- * Insert an interval with coalescing.
+ * Insert a bounded interval [t1, t2).
  *
- * @param start Inclusive start (must be < end)
- * @param end   Exclusive end (ignored if end_unbounded)
- * @param end_unbounded True to insert an open-ended interval
- * @return TL_OK on success, TL_EINVAL if start >= end (when bounded),
+ * Semantics (Write Path LLD Section 3.8):
+ * - t1 > t2:  Returns TL_EINVAL (invalid interval)
+ * - t1 == t2: Returns TL_OK (no-op, empty interval not stored)
+ * - t1 < t2:  Inserts and coalesces
+ *
+ * @return TL_OK on success (including no-op for t1==t2)
+ *         TL_EINVAL if t1 > t2
  *         TL_ENOMEM on allocation failure
  *
- * Behavior:
- * - If [start, end) overlaps or touches existing intervals, they are merged
- * - Result is always a minimal disjoint set
+ * Coalescing rules:
+ * - Overlapping intervals are merged.
+ * - Adjacent intervals (end1 == start2) are merged.
+ * - Unboundedness propagates: merging with [x, +inf) yields unbounded result.
  */
-tl_status_t tl_intervals_insert(tl_intervals_t* iset, tl_ts_t start, tl_ts_t end,
-                                 bool end_unbounded);
+tl_status_t tl_intervals_insert(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2);
 
 /**
- * Check if a timestamp is covered by any interval.
+ * Insert an unbounded interval [t1, +inf).
  *
- * @param ts Timestamp to check
- * @return true if ts is in some interval [a, b) (i.e., a <= ts < b)
- */
-bool tl_intervals_contains(const tl_intervals_t* iset, tl_ts_t ts);
-
-/**
- * Find the interval containing or immediately after a timestamp.
- *
- * @param ts  Timestamp to search for
- * @param out Output interval (if found)
- * @return Index of interval where start <= ts < end,
- *         or first interval with start > ts,
- *         or iset->len if no such interval exists
- */
-size_t tl_intervals_find(const tl_intervals_t* iset, tl_ts_t ts);
-
-/**
- * Clip intervals to a range [clip_start, clip_end).
- * Modifies in place: removes intervals outside range, trims boundary intervals.
- *
- * @return TL_OK on success
- */
-tl_status_t tl_intervals_clip(tl_intervals_t* iset, tl_ts_t clip_start, tl_ts_t clip_end,
-                               bool clip_end_unbounded);
-
-/**
- * Compute union of two interval sets into dst.
- * dst is cleared first; src1 and src2 are not modified.
+ * This interval contains ALL timestamps >= t1, including INT64_MAX.
+ * When merged with any overlapping/adjacent bounded interval, the result
+ * is unbounded.
  *
  * @return TL_OK on success, TL_ENOMEM on allocation failure
  */
-tl_status_t tl_intervals_union(tl_intervals_t* dst,
-                                const tl_intervals_t* src1,
-                                const tl_intervals_t* src2);
+tl_status_t tl_intervals_insert_unbounded(tl_intervals_t* iv, tl_ts_t t1);
+
+/*---------------------------------------------------------------------------
+ * Point Containment
+ *---------------------------------------------------------------------------*/
 
 /**
- * Copy interval set.
+ * Check if timestamp ts is contained in any interval.
+ * @return true if ts is in [start, end) for some interval, false otherwise
  */
-tl_status_t tl_intervals_copy(tl_intervals_t* dst, const tl_intervals_t* src);
+bool tl_intervals_contains(const tl_intervals_t* iv, tl_ts_t ts);
+bool tl_intervals_imm_contains(tl_intervals_imm_t iv, tl_ts_t ts);
+
+/*---------------------------------------------------------------------------
+ * Set Operations
+ *---------------------------------------------------------------------------*/
 
 /**
- * Move ownership from src to dst.
+ * Compute union of two interval sets into output.
+ * Output is cleared first.
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
  */
-void tl_intervals_move(tl_intervals_t* dst, tl_intervals_t* src);
-
-/*
- * Inline accessors
- */
-TL_INLINE size_t tl_intervals_len(const tl_intervals_t* iset) {
-    return iset ? iset->len : 0;
-}
-
-TL_INLINE bool tl_intervals_empty(const tl_intervals_t* iset) {
-    return iset == NULL || iset->len == 0;
-}
-
-TL_INLINE const tl_interval_t* tl_intervals_data(const tl_intervals_t* iset) {
-    return iset ? iset->data : NULL;
-}
-
-TL_INLINE const tl_interval_t* tl_intervals_at(const tl_intervals_t* iset, size_t i) {
-    return (iset && i < iset->len) ? &iset->data[i] : NULL;
-}
+tl_status_t tl_intervals_union(tl_intervals_t* out,
+                               const tl_intervals_t* a,
+                               const tl_intervals_t* b);
 
 /**
- * Validate invariants (for testing/debugging).
+ * Union variant with immutable inputs.
+ */
+tl_status_t tl_intervals_union_imm(tl_intervals_t* out,
+                                   tl_intervals_imm_t a,
+                                   tl_intervals_imm_t b);
+
+/**
+ * Clip intervals to [t1, t2) range.
+ * Intervals fully outside the range are removed.
+ * Intervals partially inside are truncated.
+ * Modifies in place.
  *
- * @return TL_OK if valid, TL_EINTERNAL if invariants violated
+ * Unbounded interval handling:
+ * - An unbounded interval [start, +inf) clipped to [t1, t2) becomes:
+ *   - Removed if start >= t2
+ *   - Bounded [max(start, t1), t2) otherwise
+ *
+ * After clipping, all intervals are guaranteed to be bounded.
+ *
+ * Precondition: t1 < t2 (the clip range must be non-empty and bounded)
  */
-tl_status_t tl_intervals_validate(const tl_intervals_t* iset);
+void tl_intervals_clip(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2);
 
-#ifdef __cplusplus
+/*---------------------------------------------------------------------------
+ * Accessors
+ *---------------------------------------------------------------------------*/
+
+TL_INLINE size_t tl_intervals_len(const tl_intervals_t* iv) {
+    return iv->len;
 }
+
+TL_INLINE bool tl_intervals_is_empty(const tl_intervals_t* iv) {
+    return iv->len == 0;
+}
+
+TL_INLINE const tl_interval_t* tl_intervals_get(const tl_intervals_t* iv, size_t idx) {
+    TL_ASSERT(idx < iv->len);
+    return &iv->data[idx];
+}
+
+/**
+ * Create an immutable view of the intervals.
+ */
+TL_INLINE tl_intervals_imm_t tl_intervals_as_imm(const tl_intervals_t* iv) {
+    tl_intervals_imm_t imm;
+    imm.data = iv->data;
+    imm.len = iv->len;
+    return imm;
+}
+
+/**
+ * Take ownership of intervals array.
+ * @return Array pointer (caller must free), NULL if empty
+ */
+tl_interval_t* tl_intervals_take(tl_intervals_t* iv, size_t* out_len);
+
+/**
+ * Compute total span covered by intervals (for delete debt metric).
+ * Used by compaction policy (Compaction Policy LLD Section 5).
+ *
+ * Unbounded interval handling:
+ * - SHOULD only be called after clipping to a bounded window.
+ * - If an unbounded interval is present, returns TL_TS_MAX (saturated).
+ *   This signals "infinite delete debt" which forces compaction.
+ *
+ * Overflow handling:
+ * - Uses saturating addition to prevent signed overflow.
+ * - Returns TL_TS_MAX if sum would overflow.
+ *
+ * @return Sum of (end - start) for all intervals, or TL_TS_MAX if unbounded/overflow
+ */
+tl_ts_t tl_intervals_covered_span(const tl_intervals_t* iv);
+
+/*---------------------------------------------------------------------------
+ * Cursor-Based Iteration (for tombstone filtering - Read Path LLD Section 7)
+ *
+ * The tombstone filter uses a cursor over sorted intervals to achieve
+ * amortized O(1) per-record filtering. The cursor advances forward only.
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Cursor for efficient tombstone filtering during iteration.
+ * Maintains position in a sorted interval set.
+ */
+typedef struct tl_intervals_cursor {
+    const tl_interval_t* data;  /* Interval array (borrowed) */
+    size_t               len;   /* Array length */
+    size_t               pos;   /* Current position */
+} tl_intervals_cursor_t;
+
+/**
+ * Initialize cursor from immutable interval set.
+ */
+TL_INLINE void tl_intervals_cursor_init(tl_intervals_cursor_t* cur,
+                                        tl_intervals_imm_t iv) {
+    cur->data = iv.data;
+    cur->len = iv.len;
+    cur->pos = 0;
+}
+
+/**
+ * Check if timestamp is deleted and advance cursor.
+ *
+ * Algorithm (Read Path LLD Section 7.1):
+ * - Advance cursor while ts >= cur.end (for bounded intervals)
+ * - Return true if cur.start <= ts (and ts < cur.end for bounded, always for unbounded)
+ *
+ * Unbounded interval handling:
+ * - An unbounded interval [start, +inf) covers all ts >= start.
+ * - Once cursor reaches an unbounded interval, it stays there (all future ts are deleted).
+ *
+ * @param ts Timestamp to check
+ * @return true if ts is covered by a tombstone, false otherwise
+ *
+ * Precondition: Timestamps must be passed in non-decreasing order.
+ */
+bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts);
+
+/**
+ * Get the next uncovered timestamp after the current position.
+ * Used for skip-ahead optimization (Read Path LLD Section 7.2).
+ *
+ * If ts is covered by interval [start, end), returns end.
+ * If ts is covered by unbounded interval [start, +inf), returns TL_TS_MAX.
+ * If ts is not covered, returns ts unchanged.
+ *
+ * IMPORTANT: When TL_TS_MAX is returned, it is a SENTINEL indicating
+ * "no more uncovered timestamps exist", NOT an actual timestamp to seek to.
+ * Callers must check for this value and treat it as end-of-iteration.
+ *
+ * @param ts Timestamp to check
+ * @return End of covering interval, TL_TS_MAX sentinel if unbounded, or ts if not covered
+ */
+tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts);
+
+/*---------------------------------------------------------------------------
+ * Validation (Debug)
+ *---------------------------------------------------------------------------*/
+
+#ifdef TL_DEBUG
+/**
+ * Validate interval set invariants.
+ * @return true if valid, false if invariants violated
+ */
+bool tl_intervals_validate(const tl_intervals_t* iv);
 #endif
 
 #endif /* TL_INTERVALS_H */
