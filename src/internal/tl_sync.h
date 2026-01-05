@@ -204,4 +204,15 @@ void tl_thread_yield(void);
  */
 void tl_sleep_ms(uint32_t ms);
 
+/*===========================================================================
+ * Monotonic Time
+ *===========================================================================*/
+
+/**
+ * Get current monotonic time in milliseconds.
+ * Used for computing elapsed time in bounded waits.
+ * The absolute value is meaningless; only differences are useful.
+ */
+uint64_t tl_monotonic_ms(void);
+
 #endif /* TL_SYNC_H */

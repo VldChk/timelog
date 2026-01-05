@@ -246,6 +246,94 @@ TEST_DECLARE(timestamp_type_range) {
 }
 
 /*===========================================================================
+ * Write Path API Tests (Phase 4 wiring)
+ *===========================================================================*/
+
+TEST_DECLARE(write_api_append_single) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    /* Single append should succeed */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 1000, 42));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 2000, 43));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 3000, 44));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(write_api_append_batch) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    tl_record_t batch[3] = {
+        {.ts = 100, .handle = 1},
+        {.ts = 200, .handle = 2},
+        {.ts = 300, .handle = 3},
+    };
+
+    /* Batch append should succeed */
+    TEST_ASSERT_STATUS(TL_OK, tl_append_batch(tl, batch, 3, 0));
+
+    /* Empty batch is no-op */
+    TEST_ASSERT_STATUS(TL_OK, tl_append_batch(tl, batch, 0, 0));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(write_api_delete_range) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Delete range should succeed */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 200));
+
+    /* Empty range is no-op (t1 == t2) */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 100));
+
+    /* Invalid range (t1 > t2) should fail */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_delete_range(tl, 200, 100));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(write_api_delete_before) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Delete before should succeed */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_before(tl, 1000));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(write_api_flush) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert some data */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 1000, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 2000, 2));
+
+    /* Flush should succeed (seals memtable) */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Flush empty is also OK */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(write_api_null_checks) {
+    /* NULL timelog should return EINVAL */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_append(NULL, 1000, 1));
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_append_batch(NULL, NULL, 0, 0));
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_delete_range(NULL, 0, 100));
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_delete_before(NULL, 100));
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_flush(NULL));
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -276,4 +364,12 @@ void run_phase0_tests(void) {
 
     /* Timestamp type */
     RUN_TEST(timestamp_type_range);
+
+    /* Write path API (Phase 4 wiring) */
+    RUN_TEST(write_api_append_single);
+    RUN_TEST(write_api_append_batch);
+    RUN_TEST(write_api_delete_range);
+    RUN_TEST(write_api_delete_before);
+    RUN_TEST(write_api_flush);
+    RUN_TEST(write_api_null_checks);
 }

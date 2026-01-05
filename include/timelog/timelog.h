@@ -59,6 +59,7 @@ typedef enum tl_status {
     TL_ESTATE    = 20,
     TL_EBUSY     = 21,
     TL_ENOMEM    = 30,
+    TL_EOVERFLOW = 31,  /* Arithmetic overflow (extreme timestamp values) */
     TL_EINTERNAL = 90
 } tl_status_t;
 

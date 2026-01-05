@@ -102,6 +102,18 @@ extern void run_phase1_tests(void);
 /* Phase 2 tests */
 extern void run_phase2_tests(void);
 
+/* Phase 3 tests */
+extern void run_phase3_tests(void);
+
+/* Phase 4 tests */
+extern void run_phase4_tests(void);
+
+/* Phase 5 tests */
+extern void run_phase5_tests(void);
+
+/* Phase 6 tests */
+extern void run_phase6_tests(void);
+
 /*===========================================================================
  * Main Entry Point
  *===========================================================================*/
@@ -126,6 +138,22 @@ int main(int argc, char* argv[]) {
     printf("\nPhase 2: Shared Data Structures\n");
     printf("----------------------------------------\n");
     run_phase2_tests();
+
+    printf("\nPhase 3: Immutable Storage Layer\n");
+    printf("----------------------------------------\n");
+    run_phase3_tests();
+
+    printf("\nPhase 4: Memtable and Write Path\n");
+    printf("----------------------------------------\n");
+    run_phase4_tests();
+
+    printf("\nPhase 5: Snapshot and Read Path\n");
+    printf("----------------------------------------\n");
+    run_phase5_tests();
+
+    printf("\nPhase 6: Statistics and Diagnostics\n");
+    printf("----------------------------------------\n");
+    run_phase6_tests();
 
     return test_report();
 }

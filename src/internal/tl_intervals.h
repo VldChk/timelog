@@ -29,13 +29,13 @@
  * A single half-open interval [start, end).
  * If end_unbounded is true, represents [start, +inf).
  *
- * IMPORTANT: When end_unbounded is true, the 'end' field is UNDEFINED.
- * Do not read 'end' without first checking end_unbounded.
+ * When end_unbounded is true, the 'end' field is ignored (set to 0 for clarity).
+ * Always check end_unbounded BEFORE reading 'end'.
  */
 typedef struct tl_interval {
     tl_ts_t start;        /* Inclusive start bound */
     tl_ts_t end;          /* Exclusive end bound (ONLY valid if !end_unbounded) */
-    bool    end_unbounded;/* True => [start, +inf), 'end' is undefined */
+    bool    end_unbounded;/* True => [start, +inf), 'end' is ignored */
 } tl_interval_t;
 
 /**
@@ -158,6 +158,22 @@ tl_status_t tl_intervals_union_imm(tl_intervals_t* out,
  */
 void tl_intervals_clip(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2);
 
+/**
+ * Clip intervals to [t1, +inf) - only lower bound.
+ *
+ * Removes intervals that end before t1 (bounded intervals where end <= t1).
+ * Truncates intervals that overlap t1 (sets start = max(start, t1)).
+ * Unbounded intervals [start, +inf) are kept if start >= t1 or truncated otherwise.
+ *
+ * This is used for unbounded queries where we cannot clip to a finite upper bound.
+ *
+ * Unlike tl_intervals_clip(), unbounded intervals remain unbounded after clipping.
+ *
+ * @param iv  Interval set to clip in place
+ * @param t1  Lower bound (inclusive)
+ */
+void tl_intervals_clip_lower(tl_intervals_t* iv, tl_ts_t t1);
+
 /*---------------------------------------------------------------------------
  * Accessors
  *---------------------------------------------------------------------------*/
@@ -257,18 +273,19 @@ bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts);
  * Get the next uncovered timestamp after the current position.
  * Used for skip-ahead optimization (Read Path LLD Section 7.2).
  *
- * If ts is covered by interval [start, end), returns end.
- * If ts is covered by unbounded interval [start, +inf), returns TL_TS_MAX.
- * If ts is not covered, returns ts unchanged.
+ * If ts is covered by interval [start, end), sets *out = end and returns true.
+ * If ts is covered by unbounded interval [start, +inf), returns false
+ *   (no uncovered timestamps exist after this point).
+ * If ts is not covered, sets *out = ts and returns true.
  *
- * IMPORTANT: When TL_TS_MAX is returned, it is a SENTINEL indicating
- * "no more uncovered timestamps exist", NOT an actual timestamp to seek to.
- * Callers must check for this value and treat it as end-of-iteration.
- *
- * @param ts Timestamp to check
- * @return End of covering interval, TL_TS_MAX sentinel if unbounded, or ts if not covered
+ * @param cur Cursor
+ * @param ts  Timestamp to check
+ * @param out Output: next uncovered timestamp (only valid if returns true)
+ * @return true if there is a next uncovered timestamp, false if all remaining
+ *         timestamps are covered by an unbounded interval
  */
-tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts);
+bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
+                                  tl_ts_t* out);
 
 /*---------------------------------------------------------------------------
  * Validation (Debug)
@@ -276,7 +293,26 @@ tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts);
 
 #ifdef TL_DEBUG
 /**
+ * Validate raw interval array invariants.
+ *
+ * This is the shared validator used by segment and memview validation.
+ * Checks:
+ * 1. Each bounded interval has start < end
+ * 2. Sorted by start timestamp
+ * 3. Non-overlapping (prev->end <= cur->start)
+ * 4. Non-adjacent / coalesced (prev->end != cur->start)
+ * 5. No intervals after an unbounded interval
+ *
+ * @param data  Array of intervals (may be NULL if len == 0)
+ * @param len   Number of intervals
+ * @return true if valid, false if any invariant violated
+ */
+bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len);
+
+/**
  * Validate interval set invariants.
+ * Calls tl_intervals_arr_validate() on the internal array.
+ *
  * @return true if valid, false if invariants violated
  */
 bool tl_intervals_validate(const tl_intervals_t* iv);

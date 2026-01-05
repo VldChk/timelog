@@ -745,11 +745,15 @@ TEST_DECLARE(intervals_cursor_skip_to) {
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
 
+    tl_ts_t out;
+
     /* Not covered - returns ts unchanged */
-    TEST_ASSERT_EQ(5, tl_intervals_cursor_skip_to(&cur, 5));
+    TEST_ASSERT(tl_intervals_cursor_skip_to(&cur, 5, &out));
+    TEST_ASSERT_EQ(5, out);
 
     /* Covered - returns end of interval */
-    TEST_ASSERT_EQ(30, tl_intervals_cursor_skip_to(&cur, 15));
+    TEST_ASSERT(tl_intervals_cursor_skip_to(&cur, 15, &out));
+    TEST_ASSERT_EQ(30, out);
 
     tl_intervals_destroy(&iv);
     tl__alloc_destroy(&alloc);
@@ -766,12 +770,14 @@ TEST_DECLARE(intervals_cursor_skip_to_unbounded) {
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
 
-    /* Not covered */
-    TEST_ASSERT_EQ(40, tl_intervals_cursor_skip_to(&cur, 40));
+    tl_ts_t out;
 
-    /* Covered by unbounded - returns TL_TS_MAX as SENTINEL */
-    tl_ts_t skip_result = tl_intervals_cursor_skip_to(&cur, 60);
-    TEST_ASSERT_EQ(TL_TS_MAX, skip_result);
+    /* Not covered */
+    TEST_ASSERT(tl_intervals_cursor_skip_to(&cur, 40, &out));
+    TEST_ASSERT_EQ(40, out);
+
+    /* Covered by unbounded - returns false (no more uncovered timestamps) */
+    TEST_ASSERT(!tl_intervals_cursor_skip_to(&cur, 60, &out));
 
     tl_intervals_destroy(&iv);
     tl__alloc_destroy(&alloc);
@@ -894,6 +900,15 @@ TEST_DECLARE(heap_ordering) {
 }
 
 TEST_DECLARE(heap_tie_break_by_component) {
+    /*
+     * NOTE: This test verifies a DOCUMENTED INVARIANT, not an implementation
+     * detail. The K-way merge relies on deterministic tie-breaking by
+     * component_id to ensure stable, reproducible iteration order when
+     * multiple components have records at the same timestamp.
+     *
+     * If tie-breaking order changes, update both the implementation AND
+     * this test intentionally - don't just remove the test.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -908,7 +923,7 @@ TEST_DECLARE(heap_tie_break_by_component) {
     tl_heap_push(&h, &e2);
     tl_heap_push(&h, &e3);
 
-    /* Should pop in component_id order */
+    /* Should pop in ascending component_id order (documented tie-breaker) */
     tl_heap_entry_t out;
     tl_heap_pop(&h, &out);
     TEST_ASSERT_EQ(2, out.component_id);

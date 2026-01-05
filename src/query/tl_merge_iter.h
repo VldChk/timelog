@@ -1,0 +1,123 @@
+#ifndef TL_KMERGE_ITER_H
+#define TL_KMERGE_ITER_H
+
+#include "../internal/tl_defs.h"
+#include "../internal/tl_alloc.h"
+#include "../internal/tl_heap.h"
+#include "tl_plan.h"
+
+/*===========================================================================
+ * K-way Merge Iterator
+ *
+ * K-way merge over all component iterators (segments, memruns, active).
+ * Uses a min-heap to efficiently produce records in sorted order.
+ *
+ * NOTE: This is distinct from tl_merge_iter_t in tl_flush.h, which is
+ * a simple two-way merge used during flush. This is a K-way merge for
+ * the read path query execution.
+ *
+ * The merge iterator takes a query plan as input. The plan contains
+ * initialized iterators for all sources that overlap the query range.
+ *
+ * Algorithm:
+ * 1. Initialize: prime each source iterator with next(), push onto heap
+ * 2. On next(): pop minimum, output record, advance source, push replacement
+ * 3. Continue until heap is empty
+ *
+ * Tie-Breaking (implementation detail, not a public guarantee):
+ * - On timestamp ties, sources are ordered by component_id (source index)
+ * - This provides deterministic results for testing, but clients must not
+ *   depend on tie-break ordering - it may change in future versions
+ *
+ * Thread Safety:
+ * - Not thread-safe (each thread needs its own iterator)
+ * - Plan must remain valid for the lifetime of the iterator
+ *
+ * Reference: Read Path LLD Section 6
+ *===========================================================================*/
+
+typedef struct tl_kmerge_iter {
+    /* Min-heap for K-way merge */
+    tl_heap_t       heap;
+
+    /* Source plan (borrowed, must remain valid) */
+    tl_plan_t*      plan;
+
+    /* State */
+    bool            done;
+
+    /* Allocator (borrowed) */
+    tl_alloc_ctx_t* alloc;
+} tl_kmerge_iter_t;
+
+/*===========================================================================
+ * Lifecycle
+ *===========================================================================*/
+
+/**
+ * Initialize K-way merge iterator from query plan.
+ *
+ * Primes all component iterators and builds the initial heap.
+ * If no sources have data, the iterator starts exhausted.
+ *
+ * @param it     Iterator to initialize
+ * @param plan   Query plan (must remain valid; owned by caller)
+ * @param alloc  Allocator for heap data
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
+                                 tl_plan_t* plan,
+                                 tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy K-way merge iterator.
+ *
+ * Frees heap data but does NOT destroy the plan.
+ * Safe to call on zero-initialized or partially initialized iterator.
+ */
+void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it);
+
+/*===========================================================================
+ * Iteration
+ *===========================================================================*/
+
+/**
+ * Get next record from merged stream.
+ *
+ * Returns records in non-decreasing timestamp order.
+ * Duplicates (same timestamp from different sources) are preserved.
+ *
+ * @param it   Iterator
+ * @param out  Output record
+ * @return TL_OK if record available, TL_EOF if exhausted
+ */
+tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
+
+/*===========================================================================
+ * State Queries
+ *===========================================================================*/
+
+/**
+ * Check if iterator is exhausted.
+ */
+TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
+    TL_ASSERT(it != NULL);
+    return it->done;
+}
+
+/**
+ * Peek at minimum timestamp without advancing.
+ *
+ * Useful for skip-ahead optimization.
+ *
+ * @param it  Iterator
+ * @return Pointer to minimum timestamp, or NULL if exhausted
+ */
+TL_INLINE const tl_ts_t* tl_kmerge_iter_peek_ts(const tl_kmerge_iter_t* it) {
+    TL_ASSERT(it != NULL);
+    if (it->done) return NULL;
+    const tl_heap_entry_t* entry = tl_heap_peek(&it->heap);
+    return entry != NULL ? &entry->ts : NULL;
+}
+
+#endif /* TL_KMERGE_ITER_H */

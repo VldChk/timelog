@@ -365,8 +365,13 @@ tl_status_t tl_intervals_union(tl_intervals_t* out,
     TL_ASSERT(out != NULL);
     TL_ASSERT(a != NULL);
     TL_ASSERT(b != NULL);
-    /* Aliasing not supported: out must be distinct from inputs */
-    TL_ASSERT(out != a && out != b);
+
+    /* Aliasing not supported: out must be distinct from inputs.
+     * This is a runtime check (not TL_ASSERT) because caller error
+     * should not become UB in release builds. */
+    if (out == a || out == b) {
+        return TL_EINVAL;
+    }
 
     tl_intervals_clear(out);
 
@@ -483,6 +488,44 @@ void tl_intervals_clip(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2) {
     iv->len = write;
 }
 
+void tl_intervals_clip_lower(tl_intervals_t* iv, tl_ts_t t1) {
+    TL_ASSERT(iv != NULL);
+
+    size_t write = 0;
+
+    for (size_t read = 0; read < iv->len; read++) {
+        tl_interval_t* cur = &iv->data[read];
+
+        if (cur->end_unbounded) {
+            /*
+             * Unbounded interval [start, +inf).
+             * Always kept (infinite intervals never "end before t1").
+             * Truncate start if needed.
+             */
+            iv->data[write].start = TL_MAX(cur->start, t1);
+            iv->data[write].end = 0; /* Undefined for unbounded */
+            iv->data[write].end_unbounded = true;
+            write++;
+        } else {
+            /*
+             * Bounded interval [start, end).
+             * Skip if interval ends at or before t1.
+             */
+            if (cur->end <= t1) {
+                continue;
+            }
+
+            /* Truncate start if needed, preserve end */
+            iv->data[write].start = TL_MAX(cur->start, t1);
+            iv->data[write].end = cur->end;
+            iv->data[write].end_unbounded = false;
+            write++;
+        }
+    }
+
+    iv->len = write;
+}
+
 /*===========================================================================
  * Accessors and Ownership
  *===========================================================================*/
@@ -569,7 +612,10 @@ bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts) {
     return ts >= iv->start && (iv->end_unbounded || ts < iv->end);
 }
 
-tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts) {
+bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
+                                  tl_ts_t* out) {
+    TL_ASSERT(out != NULL);
+
     /*
      * Advance past intervals that are exhausted (ts >= end).
      * This mirrors cursor_is_deleted's advancement logic.
@@ -580,25 +626,33 @@ tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts) {
         /* Unbounded interval never ends */
         if (iv->end_unbounded) {
             if (ts >= iv->start) {
-                return TL_TS_MAX; /* Covered by unbounded => skip to max */
+                /* Covered by unbounded interval - no more uncovered timestamps */
+                return false;
             }
-            return ts; /* ts < start => not covered yet */
+            /* ts < start => not covered yet */
+            *out = ts;
+            return true;
         }
 
         /* If ts < end, this interval might still be relevant */
         if (ts < iv->end) {
             if (ts >= iv->start) {
-                return iv->end; /* Covered => skip to end */
+                /* Covered => skip to end of interval */
+                *out = iv->end;
+                return true;
             }
-            return ts; /* ts < start => not covered yet */
+            /* ts < start => not covered yet */
+            *out = ts;
+            return true;
         }
 
         /* ts >= end: interval exhausted, advance */
         cur->pos++;
     }
 
-    /* No more intervals */
-    return ts;
+    /* No more intervals - ts is not covered */
+    *out = ts;
+    return true;
 }
 
 /*===========================================================================
@@ -606,13 +660,30 @@ tl_ts_t tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts) {
  *===========================================================================*/
 
 #ifdef TL_DEBUG
-bool tl_intervals_validate(const tl_intervals_t* iv) {
-    if (iv == NULL) {
+
+/**
+ * Shared raw array validator - core validation logic.
+ *
+ * Invariants checked:
+ * 1. Each bounded interval has start < end
+ * 2. Sorted by start timestamp (non-decreasing)
+ * 3. Non-overlapping (prev->end <= cur->start for bounded prev)
+ * 4. Non-adjacent / coalesced (prev->end != cur->start)
+ * 5. No intervals after an unbounded interval
+ */
+bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len) {
+    /* Empty array is trivially valid */
+    if (len == 0) {
+        return true;
+    }
+
+    /* Non-empty array requires non-NULL data */
+    if (data == NULL) {
         return false;
     }
 
-    for (size_t i = 0; i < iv->len; i++) {
-        const tl_interval_t* cur = &iv->data[i];
+    for (size_t i = 0; i < len; i++) {
+        const tl_interval_t* cur = &data[i];
 
         /* Bounded intervals must have start < end */
         if (!cur->end_unbounded && cur->start >= cur->end) {
@@ -620,15 +691,15 @@ bool tl_intervals_validate(const tl_intervals_t* iv) {
         }
 
         /* Unbounded interval must be the last one (covers everything after) */
-        if (cur->end_unbounded && i < iv->len - 1) {
+        if (cur->end_unbounded && i < len - 1) {
             return false;
         }
 
-        /* Check sorted order and no overlap */
+        /* Check sorted order and no overlap with predecessor */
         if (i > 0) {
-            const tl_interval_t* prev = &iv->data[i - 1];
+            const tl_interval_t* prev = &data[i - 1];
 
-            /* Must be sorted by start */
+            /* Must be sorted by start (non-decreasing) */
             if (cur->start < prev->start) {
                 return false;
             }
@@ -647,4 +718,16 @@ bool tl_intervals_validate(const tl_intervals_t* iv) {
 
     return true;
 }
-#endif
+
+/**
+ * Validate interval set by delegating to raw array validator.
+ */
+bool tl_intervals_validate(const tl_intervals_t* iv) {
+    if (iv == NULL) {
+        return false;
+    }
+
+    return tl_intervals_arr_validate(iv->data, iv->len);
+}
+
+#endif /* TL_DEBUG */

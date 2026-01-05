@@ -49,14 +49,18 @@
 
 /* Storage layer */
 typedef struct tl_page          tl_page_t;
+typedef struct tl_page_meta     tl_page_meta_t;
 typedef struct tl_page_catalog  tl_page_catalog_t;
 typedef struct tl_segment       tl_segment_t;
 typedef struct tl_manifest      tl_manifest_t;
+typedef struct tl_tombstones    tl_tombstones_t;
 
 /* Delta layer */
 typedef struct tl_memtable      tl_memtable_t;
 typedef struct tl_memrun        tl_memrun_t;
 typedef struct tl_memview       tl_memview_t;
+typedef struct tl_flush_ctx     tl_flush_ctx_t;
+typedef struct tl_merge_iter    tl_merge_iter_t;
 
 /* Tombstones */
 typedef struct tl_interval      tl_interval_t;

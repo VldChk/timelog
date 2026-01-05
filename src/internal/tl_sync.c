@@ -206,6 +206,13 @@ void tl_sleep_ms(uint32_t ms) {
     Sleep(ms);
 }
 
+uint64_t tl_monotonic_ms(void) {
+    /* GetTickCount64 returns milliseconds since system start.
+     * Available on Windows Vista and later (our minimum target).
+     * Never wraps (64-bit), monotonic, ~15ms resolution typical. */
+    return GetTickCount64();
+}
+
 /*===========================================================================
  * POSIX Implementation
  *===========================================================================*/
@@ -513,6 +520,17 @@ void tl_sleep_ms(uint32_t ms) {
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
         /* Retry with remaining time if interrupted */
     }
+}
+
+uint64_t tl_monotonic_ms(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    /* Fallback to realtime if monotonic unavailable (rare) */
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 #endif /* Platform selection */
