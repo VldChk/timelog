@@ -531,7 +531,7 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             }
         }
 
-        /* L1: records within window */
+        /* L1: records within window and bounds must EQUAL page bounds */
         if (seg->catalog.n_pages > 0) {
             /* min_ts must be >= window_start */
             if (seg->min_ts < seg->window_start) {
@@ -549,10 +549,8 @@ bool tl_segment_validate(const tl_segment_t* seg) {
                     return false;
                 }
             }
-        }
 
-        /* L1: bounds must EQUAL page bounds (no tombstones to widen) */
-        if (seg->catalog.n_pages > 0) {
+            /* L1: bounds must EQUAL page bounds (no tombstones to widen) */
             const tl_page_meta_t* first = &seg->catalog.pages[0];
             const tl_page_meta_t* last = &seg->catalog.pages[seg->catalog.n_pages - 1];
 

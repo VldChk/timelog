@@ -51,12 +51,10 @@ void tl__alloc_init(tl_alloc_ctx_t* ctx, const tl_allocator_t* user_alloc) {
         ctx->alloc = *user_alloc;
         ctx->is_default = false;
 
-        /* If calloc not provided, we'll emulate it */
-        if (ctx->alloc.calloc_fn == NULL) {
-            ctx->alloc.calloc_fn = NULL; /* Will use malloc + memset */
-        }
-
-        /* Note: realloc_fn is optional. If not provided, tl__realloc will
+        /* Note: If calloc_fn is not provided (NULL), tl__calloc will emulate
+         * it with malloc + memset. No action needed here.
+         *
+         * Note: realloc_fn is optional. If not provided, tl__realloc will
          * return NULL for resize operations (cannot emulate without old size).
          * Callers requiring realloc must provide realloc_fn. */
     }

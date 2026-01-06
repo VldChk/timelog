@@ -190,7 +190,7 @@ static tl_status_t intervals_insert_internal(tl_intervals_t* iv,
 
     /* Check predecessor for merge */
     if (pos > 0) {
-        tl_interval_t* prev = &iv->data[pos - 1];
+        const tl_interval_t* prev = &iv->data[pos - 1];
         if (intervals_can_merge(prev, &merged)) {
             pos--;
             intervals_merge_into(&merged, prev, &merged);
@@ -200,7 +200,7 @@ static tl_status_t intervals_insert_internal(tl_intervals_t* iv,
     /* Merge with successors */
     size_t merge_end = pos;
     while (merge_end < iv->len && !merged.end_unbounded) {
-        tl_interval_t* cur = &iv->data[merge_end];
+        const tl_interval_t* cur = &iv->data[merge_end];
         if (!intervals_can_merge(&merged, cur)) {
             break; /* No more overlap */
         }

@@ -20,9 +20,9 @@
  * Size Constants
  *===========================================================================*/
 
-/* Default configuration values */
-#define TL_DEFAULT_TARGET_PAGE_BYTES      (64 * 1024)   /* 64 KiB */
-#define TL_DEFAULT_MEMTABLE_MAX_BYTES     (1024 * 1024) /* 1 MiB */
+/* Default configuration values (use size_t to avoid implicit widening) */
+#define TL_DEFAULT_TARGET_PAGE_BYTES      ((size_t)64 * 1024)   /* 64 KiB */
+#define TL_DEFAULT_MEMTABLE_MAX_BYTES     ((size_t)1024 * 1024) /* 1 MiB */
 #define TL_DEFAULT_SEALED_MAX_RUNS        4
 #define TL_DEFAULT_SEALED_WAIT_MS         100
 #define TL_DEFAULT_MAX_DELTA_SEGMENTS     8

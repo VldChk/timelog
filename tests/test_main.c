@@ -114,6 +114,9 @@ extern void run_phase5_tests(void);
 /* Phase 6 tests */
 extern void run_phase6_tests(void);
 
+/* Phase 8 tests */
+extern void run_phase8_tests(void);
+
 /*===========================================================================
  * Main Entry Point
  *===========================================================================*/
@@ -154,6 +157,10 @@ int main(int argc, char* argv[]) {
     printf("\nPhase 6: Statistics and Diagnostics\n");
     printf("----------------------------------------\n");
     run_phase6_tests();
+
+    printf("\nPhase 8: Compaction\n");
+    printf("----------------------------------------\n");
+    run_phase8_tests();
 
     return test_report();
 }

@@ -58,9 +58,9 @@ void tl_heap_destroy(tl_heap_t* h);
 void tl_heap_clear(tl_heap_t* h);
 
 /**
- * Reserve capacity for at least n entries.
+ * Reserve capacity for at least min_cap entries.
  */
-tl_status_t tl_heap_reserve(tl_heap_t* h, size_t n);
+tl_status_t tl_heap_reserve(tl_heap_t* h, size_t min_cap);
 
 /*---------------------------------------------------------------------------
  * Heap Operations

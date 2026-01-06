@@ -93,7 +93,30 @@ typedef struct tl_allocator {
 /** Log callback */
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 
-/** Handle drop callback (for payload reclamation on physical delete) */
+/**
+ * Handle drop callback (invoked during compaction when records are removed).
+ *
+ * IMPORTANT SEMANTICS (read carefully):
+ * This callback indicates a record is being RETIRED from the newest manifest,
+ * NOT that it's safe to free immediately. Existing snapshots acquired before
+ * compaction may still reference this handle until those snapshots are released.
+ *
+ * SAFE usage patterns:
+ * - Epoch-based reclamation: track callback timestamp, defer free until all
+ *   snapshots older than that epoch are released
+ * - Reference counting: callback decrements refcount, actual free when zero
+ * - Grace period: callback adds to deferred-free queue with timestamp
+ *
+ * UNSAFE usage (can cause use-after-free):
+ * - Immediately freeing user payload in this callback
+ *
+ * The callback is invoked synchronously during compaction merge phase,
+ * without holding locks. It must not call back into timelog APIs.
+ *
+ * @param ctx    User-provided context (from tl_config_t.on_drop_ctx)
+ * @param ts     Timestamp of the dropped record
+ * @param handle Handle of the dropped record
+ */
 typedef void (*tl_on_drop_fn)(void* ctx, tl_ts_t ts, tl_handle_t handle);
 
 /** Configuration for tl_open() */
@@ -264,16 +287,58 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
  * Maintenance control
  *===========================================================================*/
 
-/*
- * Background mode:
- * - tl_maint_start must be called to start the worker (tl_open does not start
- *   threads).
+/**
+ * Start the background maintenance worker thread.
+ *
+ * Must be called after tl_open() to enable background flush and compaction.
+ * tl_open() does NOT start the worker automatically.
+ *
+ * @param tl Timelog instance
+ * @return TL_OK       Worker started successfully (or already running)
+ *         TL_EINVAL   tl is NULL
+ *         TL_ESTATE   Not open, or mode is not TL_MAINT_BACKGROUND
+ *         TL_EBUSY    Stop in progress (STOPPING state) - retry later
+ *         TL_EINTERNAL Thread creation failed
+ *
+ * Thread Safety: Safe to call from any thread.
+ * Idempotency: If already running, returns TL_OK without action.
  */
 tl_status_t tl_maint_start(tl_timelog_t* tl);
 
+/**
+ * Stop the background maintenance worker thread.
+ *
+ * Signals the worker to exit and blocks until it terminates.
+ * Safe to call regardless of mode (allows cleanup in tl_close).
+ *
+ * @param tl Timelog instance
+ * @return TL_OK       Worker stopped (or already stopped, or stop in progress)
+ *         TL_EINVAL   tl is NULL
+ *         TL_EINTERNAL Thread join failed (severe error)
+ *
+ * Thread Safety: Safe to call from any thread.
+ * Idempotency: Returns TL_OK if already stopped or if another thread is
+ *              stopping. In the latter case, TL_OK does NOT guarantee the
+ *              worker has fully exited - only that a stop is in progress.
+ *
+ * @warning Do not call from the worker thread itself (deadlock on join).
+ */
 tl_status_t tl_maint_stop(tl_timelog_t* tl);
 
-/* Manual mode: performs one unit of work, returns TL_EOF if idle. */
+/**
+ * Perform one unit of maintenance work (manual mode only).
+ *
+ * Priority: flush one sealed memrun, else compact one step.
+ *
+ * @param tl Timelog instance
+ * @return TL_OK       Work was performed
+ *         TL_EOF      No work to do
+ *         TL_EINVAL   tl is NULL
+ *         TL_ESTATE   Not open, or mode is not TL_MAINT_DISABLED
+ *         TL_ENOMEM   Build failed (inputs preserved, retry later)
+ *
+ * Thread Safety: NOT thread-safe. Caller must ensure single-threaded access.
+ */
 tl_status_t tl_maint_step(tl_timelog_t* tl);
 
 /*===========================================================================

@@ -296,7 +296,7 @@ static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
                                       tl_segment_t** remove_arr, size_t remove_len) {
     /* Check each removal exists in base exactly once */
     for (size_t i = 0; i < remove_len; i++) {
-        tl_segment_t* target = remove_arr[i];
+        const tl_segment_t* target = remove_arr[i];
 
         /* Check for duplicates in removal list */
         for (size_t j = 0; j < i; j++) {
@@ -430,29 +430,37 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     m->n_l1 = 0;
 
     /* Copy L0 from base (excluding removals), then add new */
-    if (mb->base != NULL) {
-        for (uint32_t i = 0; i < mb->base->n_l0; i++) {
-            tl_segment_t* seg = mb->base->l0[i];
-            if (!is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len)) {
-                m->l0[m->n_l0++] = tl_segment_acquire(seg);
+    if (new_l0_count > 0) {
+        if (mb->base != NULL) {
+            for (uint32_t i = 0; i < mb->base->n_l0; i++) {
+                tl_segment_t* seg = mb->base->l0[i];
+                if (!is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len)) {
+                    m->l0[m->n_l0++] = tl_segment_acquire(seg);
+                }
             }
         }
-    }
-    for (size_t i = 0; i < mb->add_l0_len; i++) {
-        m->l0[m->n_l0++] = tl_segment_acquire(mb->add_l0[i]);
+        for (size_t i = 0; i < mb->add_l0_len; i++) {
+            m->l0[m->n_l0++] = tl_segment_acquire(mb->add_l0[i]);
+        }
+    } else {
+        TL_ASSERT(mb->add_l0_len == 0);
     }
 
     /* Copy L1 from base (excluding removals), then add new */
-    if (mb->base != NULL) {
-        for (uint32_t i = 0; i < mb->base->n_l1; i++) {
-            tl_segment_t* seg = mb->base->l1[i];
-            if (!is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
-                m->l1[m->n_l1++] = tl_segment_acquire(seg);
+    if (new_l1_count > 0) {
+        if (mb->base != NULL) {
+            for (uint32_t i = 0; i < mb->base->n_l1; i++) {
+                tl_segment_t* seg = mb->base->l1[i];
+                if (!is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
+                    m->l1[m->n_l1++] = tl_segment_acquire(seg);
+                }
             }
         }
-    }
-    for (size_t i = 0; i < mb->add_l1_len; i++) {
-        m->l1[m->n_l1++] = tl_segment_acquire(mb->add_l1[i]);
+        for (size_t i = 0; i < mb->add_l1_len; i++) {
+            m->l1[m->n_l1++] = tl_segment_acquire(mb->add_l1[i]);
+        }
+    } else {
+        TL_ASSERT(mb->add_l1_len == 0);
     }
 
     /* Sort L1 by window_start */

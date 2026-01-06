@@ -1,0 +1,201 @@
+#ifndef TL_COMPACTION_H
+#define TL_COMPACTION_H
+
+#include "../internal/tl_defs.h"
+#include "../internal/tl_alloc.h"
+#include "../internal/tl_intervals.h"
+#include "../storage/tl_segment.h"
+#include "../storage/tl_manifest.h"
+
+/*===========================================================================
+ * Compaction Module
+ *
+ * Implements L0 -> L1 compaction for the LSM-style storage layer.
+ *
+ * Goals (Compaction Policy LLD Section 1):
+ * 1. Bound read amplification: L0 count <= max_delta_segments
+ * 2. Enforce L1 non-overlap: L1 segments aligned to time windows
+ * 3. Fold tombstones: L1 segments are tombstone-free
+ * 4. Preserve snapshot isolation: atomic manifest publication
+ * 5. Support handle drop callback: notify when records retired
+ *
+ * Phases:
+ * 1. Trigger check (tl_compact_needed)
+ * 2. Selection (tl_compact_select)
+ * 3. Merge (tl_compact_merge)
+ * 4. Publication (tl_compact_publish)
+ *
+ * Thread Safety:
+ * - Compaction is serialized externally by maint_mu (one compaction at a time)
+ * - writer_mu held only during short publication phase
+ * - Long-running merge happens without locks
+ *
+ * Handle Drop Callback Semantics:
+ * - The on_drop_handle callback is invoked during merge phase when a record
+ *   is filtered by tombstones (will not appear in the new L1 output)
+ * - IMPORTANT: This is a "retire" notification, NOT a "safe to free" signal
+ * - Existing snapshots may still reference the dropped record until released
+ * - User must implement their own epoch/RCU/hazard-pointer scheme if they
+ *   need safe payload reclamation (see tl_on_drop_fn docs in timelog.h)
+ *
+ * Reference: timelog_v1_lld_compaction_policy.md
+ *===========================================================================*/
+
+/* Forward declaration - actual struct in tl_timelog_internal.h */
+struct tl_timelog;
+typedef struct tl_timelog tl_timelog_t;
+
+/*===========================================================================
+ * Compaction Context
+ *
+ * Holds all state for a single compaction operation.
+ * Created by select, populated by merge, consumed by publish.
+ *===========================================================================*/
+
+typedef struct tl_compact_ctx {
+    tl_timelog_t*       tl;              /* Parent instance */
+    tl_alloc_ctx_t*     alloc;           /* Allocator */
+
+    /* Input segments (pinned during compaction) */
+    tl_segment_t**      input_l0;        /* Selected L0 segments */
+    size_t              input_l0_len;
+    tl_segment_t**      input_l1;        /* Selected L1 segments */
+    size_t              input_l1_len;
+
+    /* Manifest snapshot at selection time */
+    tl_manifest_t*      base_manifest;   /* Pinned base manifest */
+
+    /* Effective tombstone set */
+    tl_intervals_t      tombs;           /* Union of all tombstones (unclipped) */
+    tl_intervals_t      tombs_clipped;   /* Tombstones clipped to output range */
+
+    /* Output segments */
+    tl_segment_t**      output_l1;       /* New L1 segments */
+    size_t              output_l1_len;
+    size_t              output_l1_cap;
+
+    tl_segment_t*       residual_tomb;   /* Tombstone-only L0 for residuals */
+
+    /* Configuration (copied from tl) */
+    tl_ts_t             window_size;
+    tl_ts_t             window_origin;
+    size_t              target_page_bytes;
+    uint32_t            generation;
+
+    /* Handle drop callback (matches tl_config_t naming) */
+    tl_on_drop_fn       on_drop_handle;
+    void*               on_drop_ctx;
+
+    /* Output range (computed from input selection) */
+    tl_ts_t             output_min_ts;
+    tl_ts_t             output_max_ts;
+    int64_t             output_min_wid;  /* First output window ID */
+    int64_t             output_max_wid;  /* Last output window ID (inclusive) */
+} tl_compact_ctx_t;
+
+/*===========================================================================
+ * Context Lifecycle
+ *===========================================================================*/
+
+/**
+ * Initialize compaction context.
+ * Does NOT select segments - call tl_compact_select() next.
+ */
+void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
+                          tl_timelog_t* tl,
+                          tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy compaction context and release all pinned resources.
+ * Safe to call at any point (partial initialization cleanup).
+ */
+void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
+
+/*===========================================================================
+ * Compaction Phases
+ *===========================================================================*/
+
+/**
+ * Phase 1: Check if compaction is needed.
+ *
+ * Returns true if:
+ * - L0 count >= max_delta_segments
+ * - compact_pending flag is set (checked by caller)
+ * - Delete debt threshold exceeded (optional)
+ *
+ * Briefly acquires writer_mu to pin manifest (prevents UAF).
+ * This is an advisory check; selection re-validates.
+ */
+bool tl_compact_needed(const tl_timelog_t* tl);
+
+/**
+ * Phase 2: Select segments for compaction.
+ *
+ * Implements baseline policy (Compaction Policy LLD Section 6.1):
+ * 1. Pin current manifest
+ * 2. Select all L0 segments
+ * 3. Compute covered time range (records + tombstones)
+ * 4. Select overlapping L1 segments
+ *
+ * @param ctx  Initialized compaction context
+ * @return TL_OK on success (inputs selected and pinned)
+ *         TL_EOF if no work needed
+ *         TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
+
+/**
+ * Phase 3: Execute compaction merge.
+ *
+ * Implements merge algorithm (Compaction Policy LLD Section 7):
+ * 1. Build effective tombstone set
+ * 2. K-way merge all input segments
+ * 3. Skip deleted records (tombstone filtering)
+ * 4. Partition output by window boundaries
+ * 5. Build L1 segments for windows with live records
+ * 6. Build residual tombstone segment if needed
+ *
+ * Handle drop callback is invoked for each deleted record.
+ *
+ * @param ctx  Context with selected inputs
+ * @return TL_OK on success (outputs built)
+ *         TL_ENOMEM on allocation failure
+ *         TL_EOVERFLOW if window span too large
+ */
+tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx);
+
+/**
+ * Phase 4: Publish compaction results.
+ *
+ * Implements publication protocol (Compaction Policy LLD Section 8):
+ * 1. Build new manifest (OFF-LOCK - this is the expensive part)
+ * 2. Acquire writer_mu + seqlock
+ * 3. Verify manifest unchanged (abort if changed)
+ * 4. Swap manifest pointer (O(1))
+ * 5. Release locks
+ * 6. Release old manifest
+ *
+ * @param ctx  Context with built outputs
+ * @return TL_OK on success
+ *         TL_EBUSY if manifest changed (caller should retry)
+ *         TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
+
+/**
+ * Complete compaction (all phases).
+ *
+ * Convenience function that runs select -> merge -> publish.
+ * On TL_EBUSY from publish, retries up to max_retries times.
+ *
+ * @param tl          Timelog instance
+ * @param max_retries Max publish retries (default 3)
+ * @return TL_OK on success
+ *         TL_EOF if no work needed
+ *         TL_EBUSY if all retries exhausted
+ *         TL_ENOMEM on allocation failure
+ *         TL_EOVERFLOW if window span too large
+ */
+tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries);
+
+#endif /* TL_COMPACTION_H */

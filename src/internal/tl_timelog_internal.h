@@ -18,10 +18,27 @@
 #include "tl_alloc.h"
 #include "tl_log.h"
 #include "tl_sync.h"
-#include "tl_atomic.h"
 #include "tl_seqlock.h"
 #include "../delta/tl_memtable.h"
 #include "../storage/tl_manifest.h"
+
+/*===========================================================================
+ * Maintenance Worker State Machine (Phase 7)
+ *
+ * Protected by maint_mu. State transitions:
+ *   STOPPED  -> RUNNING  (tl_maint_start)
+ *   RUNNING  -> STOPPING (tl_maint_stop initiated)
+ *   STOPPING -> STOPPED  (tl_maint_stop completed)
+ *
+ * The 3-state machine prevents:
+ * - Double-spawn: start during RUNNING returns TL_OK (idempotent)
+ * - Double-join: start/stop during STOPPING returns TL_EBUSY/TL_OK
+ *===========================================================================*/
+typedef enum tl_worker_state {
+    TL_WORKER_STOPPED  = 0,  /* No worker thread */
+    TL_WORKER_RUNNING  = 1,  /* Worker thread active */
+    TL_WORKER_STOPPING = 2   /* Stop requested, join in progress */
+} tl_worker_state_t;
 
 /**
  * Core timelog instance structure.
@@ -71,26 +88,31 @@ struct tl_timelog {
     tl_seqlock_t    view_seq;
 
     /*-----------------------------------------------------------------------
-     * State Flags
-     *
-     * IMPORTANT: All flags accessed by multiple threads must be atomic.
-     * - maint_started: read in tl__request_flush/compact without lock
-     * - maint_shutdown: read by worker, set by close
-     * - flush_pending/compact_pending: set by writers, read by maintenance
+     * Lifecycle Flag
      *
      * is_open is only modified at open/close boundaries when no other
      * threads should be accessing the instance.
      *-----------------------------------------------------------------------*/
     bool            is_open;
-    tl_atomic_u32   maint_started;        /* Worker thread running (0=no, 1=yes) */
-    tl_atomic_u32   maint_shutdown;       /* Signal worker to exit (0=running, 1=shutdown) */
-    tl_atomic_u32   flush_pending;        /* Work available for flush (0=no, 1=yes) */
-    tl_atomic_u32   compact_pending;      /* Work available for compaction (0=no, 1=yes) */
 
     /*-----------------------------------------------------------------------
-     * Maintenance Thread (Phase 7)
+     * Maintenance State (Phase 7)
+     *
+     * CRITICAL: All fields in this section are protected by maint_mu.
+     * NO atomics are used. This eliminates the lost-work race condition
+     * that exists with load-then-store patterns on atomic flags.
+     *
+     * The state machine + plain bools pattern from plan_phase7.md:
+     * - State machine prevents double-spawn/double-join races
+     * - Mutex-protected flags ensure work is never lost
+     * - Flag set always happens (even if worker not RUNNING)
+     * - Signal gated on state (only when RUNNING)
      *-----------------------------------------------------------------------*/
-    tl_thread_t     maint_thread;
+    tl_worker_state_t maint_state;      /* State machine: STOPPED/RUNNING/STOPPING */
+    bool              maint_shutdown;   /* Signal worker to exit */
+    bool              flush_pending;    /* Sealed memruns exist */
+    bool              compact_pending;  /* Compaction requested */
+    tl_thread_t       maint_thread;     /* Worker thread handle (valid when RUNNING) */
 
     /*-----------------------------------------------------------------------
      * Delta Layer (Phase 4)

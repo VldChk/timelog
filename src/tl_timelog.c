@@ -16,6 +16,7 @@
 #include "query/tl_merge_iter.h"
 #include "query/tl_filter.h"
 #include "query/tl_point.h"
+#include "maint/tl_compaction.h"
 
 #include <string.h>
 
@@ -404,12 +405,16 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     }
     tl->next_gen = 1;
 
-    /* Initialize state flags */
+    /* Initialize lifecycle state */
     tl->is_open = true;
-    tl_atomic_init_u32(&tl->maint_started, 0);
-    tl_atomic_init_u32(&tl->maint_shutdown, 0);
-    tl_atomic_init_u32(&tl->flush_pending, 0);
-    tl_atomic_init_u32(&tl->compact_pending, 0);
+
+    /* Initialize maintenance state (Phase 7).
+     * All fields are plain bools/enum protected by maint_mu.
+     * Worker is NOT started here - caller must invoke tl_maint_start(). */
+    tl->maint_state = TL_WORKER_STOPPED;
+    tl->maint_shutdown = false;
+    tl->flush_pending = false;
+    tl->compact_pending = false;
 
     /* Log successful open */
     tl_log_ctx_t* log = &tl->log;
@@ -434,19 +439,14 @@ void tl_close(tl_timelog_t* tl) {
     tl_log_ctx_t* log = &tl->log;
     TL_LOG_INFO("timelog closing");
 
-    /* Mark as closed first (prevents further operations) */
+    /* Stop maintenance worker before closing (Phase 7).
+     * tl_maint_stop() is idempotent and works for any mode.
+     * We do this BEFORE setting is_open = false because tl_maint_stop
+     * doesn't check is_open (allowing cleanup flexibility). */
+    tl_maint_stop(tl);
+
+    /* Mark as closed (prevents further operations) */
     tl->is_open = false;
-
-    /* Stop maintenance thread if running (Phase 7) */
-    if (tl_atomic_load_acquire_u32(&tl->maint_started)) {
-        TL_LOCK_MAINT(tl);
-        tl_atomic_store_release_u32(&tl->maint_shutdown, 1);
-        tl_cond_signal(&tl->maint_cond);
-        TL_UNLOCK_MAINT(tl);
-
-        tl_thread_join(&tl->maint_thread, NULL);
-        tl_atomic_store_release_u32(&tl->maint_started, 0);
-    }
 
     /*
      * TODO (Phase 5+): Wait for and release all snapshots
@@ -479,17 +479,28 @@ void tl_close(tl_timelog_t* tl) {
  * Write Path Implementation (Phase 4)
  *===========================================================================*/
 
+/* Forward declaration for deferred signaling (defined in maintenance section) */
+static void tl__maint_request_flush(tl_timelog_t* tl);
+
 /**
  * Handle sealing with backpressure after a successful write.
  *
  * Must be called with writer_mu held. Returns with writer_mu held.
  * Will temporarily drop writer_mu if waiting for space.
  *
- * @param tl  Timelog instance
+ * DEFERRED SIGNALING: This function does NOT signal the maintenance worker.
+ * The caller MUST check *need_signal after releasing writer_mu and call
+ * tl__maint_request_flush() if true. This respects lock ordering.
+ *
+ * @param tl          Timelog instance
+ * @param need_signal Output: true if caller should signal maintenance worker
  * @return TL_OK if seal succeeded or not needed,
  *         TL_EBUSY if caller should trigger flush (manual mode only)
  */
-static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl) {
+static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
+                                                  bool* need_signal) {
+    *need_signal = false;
+
     /* Check if seal is needed */
     if (!tl_memtable_should_seal(&tl->memtable)) {
         return TL_OK;
@@ -500,8 +511,8 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl) {
                                             &tl->memtable_mu,
                                             &tl->maint_cond);
     if (seal_st == TL_OK) {
-        /* Signal maintenance thread if running */
-        tl_atomic_store_release_u32(&tl->flush_pending, 1);
+        /* Seal succeeded - signal needed (deferred until after unlock) */
+        *need_signal = true;
         return TL_OK;
     }
 
@@ -542,7 +553,8 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl) {
                                 &tl->memtable_mu,
                                 &tl->maint_cond);
     if (seal_st == TL_OK) {
-        tl_atomic_store_release_u32(&tl->flush_pending, 1);
+        /* Seal succeeded - signal needed (deferred until after unlock) */
+        *need_signal = true;
     }
     /* Ignore any error - write succeeded, this is best-effort */
     return TL_OK;
@@ -557,6 +569,7 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     }
 
     tl_status_t st;
+    bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
@@ -568,10 +581,16 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
         return st;
     }
 
-    /* Handle seal with backpressure */
-    st = handle_seal_with_backpressure(tl);
+    /* Handle seal with backpressure (deferred signaling) */
+    st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
+
+    /* Deferred signal AFTER releasing writer_mu (respects lock ordering) */
+    if (need_signal) {
+        tl__maint_request_flush(tl);
+    }
+
     return st;
 }
 
@@ -591,6 +610,7 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     }
 
     tl_status_t st;
+    bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
@@ -602,10 +622,16 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
         return st;
     }
 
-    /* Handle seal with backpressure */
-    st = handle_seal_with_backpressure(tl);
+    /* Handle seal with backpressure (deferred signaling) */
+    st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
+
+    /* Deferred signal AFTER releasing writer_mu (respects lock ordering) */
+    if (need_signal) {
+        tl__maint_request_flush(tl);
+    }
+
     return st;
 }
 
@@ -618,6 +644,7 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     }
 
     tl_status_t st;
+    bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
@@ -629,10 +656,16 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
         return st;
     }
 
-    /* Handle seal with backpressure */
-    st = handle_seal_with_backpressure(tl);
+    /* Handle seal with backpressure (deferred signaling) */
+    st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
+
+    /* Deferred signal AFTER releasing writer_mu (respects lock ordering) */
+    if (need_signal) {
+        tl__maint_request_flush(tl);
+    }
+
     return st;
 }
 
@@ -645,6 +678,7 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     }
 
     tl_status_t st;
+    bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
@@ -656,12 +690,46 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
         return st;
     }
 
-    /* Handle seal with backpressure */
-    st = handle_seal_with_backpressure(tl);
+    /* Handle seal with backpressure (deferred signaling) */
+    st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
+
+    /* Deferred signal AFTER releasing writer_mu (respects lock ordering) */
+    if (need_signal) {
+        tl__maint_request_flush(tl);
+    }
+
     return st;
 }
+
+/*===========================================================================
+ * Phase 8 Stubs (Compaction)
+ *
+ * These functions are placeholders for Phase 8 implementation.
+ * They return appropriate values for Phase 7 testing.
+ *===========================================================================*/
+
+/**
+ * Check if compaction is needed.
+ * Delegates to compaction module (Phase 8).
+ */
+static bool tl__compaction_needed(tl_timelog_t* tl) {
+    return tl_compact_needed(tl);
+}
+
+/**
+ * Perform one compaction step.
+ * Delegates to compaction module (Phase 8).
+ */
+static tl_status_t tl__compact_one_step(tl_timelog_t* tl) {
+    /* Use 3 retries per Compaction Policy LLD Section 8 */
+    return tl_compact_one(tl, 3);
+}
+
+/*===========================================================================
+ * Flush Implementation
+ *===========================================================================*/
 
 /**
  * Flush a single memrun to L0 segment and publish to manifest.
@@ -750,6 +818,49 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     return TL_OK;
 }
 
+/*===========================================================================
+ * tl__flush_one - Flush One Sealed Memrun
+ *
+ * This is a wrapper around flush_one_memrun that handles:
+ * 1. Acquire flush_mu (serializes flush operations)
+ * 2. Peek + pin memrun from sealed queue
+ * 3. Call flush_one_memrun
+ * 4. Handle errors with proper cleanup
+ *
+ * @return TL_OK     - One memrun flushed successfully
+ *         TL_EOF    - No sealed memruns to flush
+ *         TL_ENOMEM - Build failed (memrun preserved for retry)
+ *         TL_EINTERNAL - Publication failed
+ *===========================================================================*/
+static tl_status_t tl__flush_one(tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+
+    /* Serialize flush operations */
+    TL_LOCK_FLUSH(tl);
+
+    /* Peek and pin oldest sealed memrun */
+    tl_memrun_t* mr = NULL;
+    TL_LOCK_MEMTABLE(tl);
+    tl_status_t st = tl_memtable_peek_oldest(&tl->memtable, &mr);
+    TL_UNLOCK_MEMTABLE(tl);
+
+    if (st != TL_OK || mr == NULL) {
+        TL_UNLOCK_FLUSH(tl);
+        return TL_EOF;  /* No work */
+    }
+
+    /* Build and publish (releases our reference on success) */
+    st = flush_one_memrun(tl, mr);
+
+    if (st != TL_OK) {
+        /* On failure, release our pin - memrun stays in queue for retry */
+        tl_memrun_release(mr);
+    }
+
+    TL_UNLOCK_FLUSH(tl);
+    return st;
+}
+
 tl_status_t tl_flush(tl_timelog_t* tl) {
     if (tl == NULL) {
         return TL_EINVAL;
@@ -814,23 +925,95 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
         /* Loop to flush more or retry sealing */
     }
 
-    /* Clear flush pending flag */
-    tl_atomic_store_release_u32(&tl->flush_pending, 0);
-
     TL_UNLOCK_FLUSH(tl);
     return TL_OK;
 }
 
 /*===========================================================================
- * Stub Implementations for Remaining API
+ * Maintenance Request Helpers (Phase 7)
  *
- * These are placeholder stubs that return TL_ESTATE (invalid state) until
- * implemented in later phases.
+ * These functions implement the deferred signaling pattern:
+ * - Set flag UNDER maint_mu (atomically with respect to worker)
+ * - Signal condvar only if worker is RUNNING
+ * - MUST be called AFTER releasing writer_mu (lock ordering)
+ *
+ * CRITICAL: Always set the flag, but only signal if worker is RUNNING.
+ * This ensures work isn't lost if writes happen before tl_maint_start().
+ *===========================================================================*/
+
+/**
+ * Request flush work from background worker.
+ *
+ * Sets flush_pending flag and signals worker if running.
+ * Called from write path after detecting sealed memruns exist.
+ *
+ * MUST be called AFTER releasing writer_mu (deferred signaling pattern).
+ */
+static void tl__maint_request_flush(tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+
+    /* Skip if not in background mode */
+    if (tl->config.maintenance_mode != TL_MAINT_BACKGROUND) {
+        return;
+    }
+
+    TL_LOCK_MAINT(tl);
+
+    /* ALWAYS set flag - preserves work even if worker not yet started */
+    tl->flush_pending = true;
+
+    /* Only signal if worker is actually running */
+    if (tl->maint_state == TL_WORKER_RUNNING) {
+        tl_cond_signal(&tl->maint_cond);
+    }
+
+    TL_UNLOCK_MAINT(tl);
+}
+
+/**
+ * Request compaction work.
+ *
+ * Sets compact_pending flag and signals worker if running in background mode.
+ * In manual mode, sets the flag for tl_maint_step() to honor.
+ * Called from tl_compact() API.
+ *
+ * MUST be called AFTER releasing any higher-priority locks.
+ */
+static void tl__maint_request_compact(tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+
+    TL_LOCK_MAINT(tl);
+
+    /* ALWAYS set flag - in manual mode, tl_maint_step() checks this;
+     * in background mode, worker checks this. */
+    tl->compact_pending = true;
+
+    /* Only signal if background mode AND worker is actually running */
+    if (tl->config.maintenance_mode == TL_MAINT_BACKGROUND &&
+        tl->maint_state == TL_WORKER_RUNNING) {
+        tl_cond_signal(&tl->maint_cond);
+    }
+
+    TL_UNLOCK_MAINT(tl);
+}
+
+/*===========================================================================
+ * Compaction API
  *===========================================================================*/
 
 tl_status_t tl_compact(tl_timelog_t* tl) {
-    (void)tl;
-    return TL_ESTATE; /* Not yet implemented */
+    if (tl == NULL) {
+        return TL_EINVAL;
+    }
+
+    if (!tl->is_open) {
+        return TL_ESTATE;
+    }
+
+    /* Request compaction (deferred signaling handled internally) */
+    tl__maint_request_compact(tl);
+
+    return TL_OK;
 }
 
 /*===========================================================================
@@ -1189,7 +1372,7 @@ tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
     tl_ts_t last_ts = 0;
     bool found = false;
 
-    while ((st = tl_iter_next(it, &rec)) == TL_OK) {
+    while (tl_iter_next(it, &rec) == TL_OK) {
         last_ts = rec.ts;
         found = true;
     }
@@ -1262,7 +1445,7 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     tl_ts_t last_ts = 0;
     bool found = false;
 
-    while ((st = tl_iter_next(it, &rec)) == TL_OK) {
+    while (tl_iter_next(it, &rec) == TL_OK) {
         last_ts = rec.ts;
         found = true;
     }
@@ -1277,19 +1460,400 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     return TL_OK;
 }
 
-tl_status_t tl_maint_start(tl_timelog_t* tl) {
-    (void)tl;
-    return TL_ESTATE; /* Not yet implemented */
+/*===========================================================================
+ * Background Maintenance Worker (Phase 7)
+ *
+ * The worker thread loop follows the Background Maintenance LLD Section 6:
+ * 1. Wait for work (flush_pending OR compact_pending) or shutdown
+ * 2. Copy and clear flags under maint_mu (atomically, no race)
+ * 3. Execute work outside maint_mu (respects lock ordering)
+ * 4. Repeat until shutdown
+ *
+ * Lock acquisition order within loop:
+ * - maint_mu: held only during wait and flag copy/clear
+ * - flush_mu: held during flush work (via tl__flush_one)
+ * - writer_mu: held during publication (via flush_one_memrun)
+ *
+ * CRITICAL: All pending flags are plain bools protected by maint_mu.
+ * No atomics are used. This eliminates the lost-work race.
+ *===========================================================================*/
+
+/* Backoff state for ENOMEM retry (prevents CPU spin) */
+#define TL_MAINT_BACKOFF_INIT_MS   10
+#define TL_MAINT_BACKOFF_MAX_MS    100
+
+static void* tl__maint_worker_entry(void* arg) {
+    tl_timelog_t* tl = (tl_timelog_t*)arg;
+    uint32_t backoff_ms = TL_MAINT_BACKOFF_INIT_MS;
+
+    for (;;) {
+        bool do_flush = false;
+        bool do_compact = false;
+
+        /*-------------------------------------------------------------------
+         * Phase 1: Wait for work or shutdown (under maint_mu)
+         *
+         * All state is protected by maint_mu - plain reads, no atomics.
+         *-------------------------------------------------------------------*/
+        TL_LOCK_MAINT(tl);
+
+        /* Predicate loop handles spurious wakeups.
+         * All fields are plain bools, read under maint_mu. */
+        while (!tl->maint_shutdown &&
+               !tl->flush_pending &&
+               !tl->compact_pending) {
+            tl_cond_wait(&tl->maint_cond, &tl->maint_mu);
+        }
+
+        /* Check shutdown first (takes priority) */
+        if (tl->maint_shutdown) {
+            TL_UNLOCK_MAINT(tl);
+            break;  /* Exit loop, thread will terminate */
+        }
+
+        /* Copy flags and clear under maint_mu.
+         * Since we hold the lock, this is atomic with respect to setters. */
+        do_flush = tl->flush_pending;
+        do_compact = tl->compact_pending;
+
+        tl->flush_pending = false;
+        tl->compact_pending = false;
+
+        TL_UNLOCK_MAINT(tl);
+
+        /*-------------------------------------------------------------------
+         * Phase 2: Execute flush work (outside maint_mu)
+         *
+         * Flush loop with fairness: after each flush batch, if compaction
+         * is needed, run one compaction step to prevent L0 growth.
+         *-------------------------------------------------------------------*/
+        if (do_flush) {
+            tl_status_t st;
+            while ((st = tl__flush_one(tl)) == TL_OK) {
+                /* After successful flush, check if compaction needed.
+                 * If so, break to allow one compaction step (fairness). */
+                if (tl__compaction_needed(tl)) {
+                    do_compact = true;
+                    break;
+                }
+            }
+
+            /* Handle transient errors: backoff sleep to prevent CPU spin.
+             * Both ENOMEM (memory pressure) and EINTERNAL (publication failure)
+             * may be transient and benefit from backoff before retry. */
+            if (st == TL_ENOMEM || st == TL_EINTERNAL) {
+                tl_sleep_ms(backoff_ms);
+                backoff_ms = (backoff_ms * 2 > TL_MAINT_BACKOFF_MAX_MS)
+                           ? TL_MAINT_BACKOFF_MAX_MS : backoff_ms * 2;
+            } else {
+                backoff_ms = TL_MAINT_BACKOFF_INIT_MS;  /* Reset on success */
+            }
+
+            /* Re-signal if more work remains.
+             * This handles:
+             * - ENOMEM: retry after backoff (memory may free up)
+             * - EINTERNAL: retry after backoff (transient issue may resolve)
+             * - TL_OK: broke for compaction fairness, more memruns may exist
+             *
+             * TL_EOF means no more sealed memruns - no re-signal needed.
+             *
+             * CRITICAL: Without this, TL_EINTERNAL would silently drop work.
+             * The memrun stays in the queue but flush_pending wouldn't be set,
+             * leaving the worker sleeping forever. */
+            if (st != TL_EOF) {
+                TL_LOCK_MEMTABLE(tl);
+                bool more_work = tl_memtable_has_sealed(&tl->memtable);
+                TL_UNLOCK_MEMTABLE(tl);
+                if (more_work) {
+                    /* Re-set flag under maint_mu (atomically with potential signal) */
+                    TL_LOCK_MAINT(tl);
+                    tl->flush_pending = true;
+                    TL_UNLOCK_MAINT(tl);
+                }
+            }
+        }
+
+        /*-------------------------------------------------------------------
+         * Phase 3: Execute compaction work (outside maint_mu)
+         *
+         * Compaction is triggered by:
+         * - Explicit request (compact_pending was set)
+         * - Automatic heuristic (tl__compaction_needed returned true during flush)
+         *
+         * Error handling mirrors flush: backoff on transient errors,
+         * re-set compact_pending to ensure retry.
+         *-------------------------------------------------------------------*/
+        if (do_compact) {
+            tl_status_t st = tl__compact_one_step(tl);
+
+            /* Handle transient errors with backoff */
+            if (st == TL_ENOMEM || st == TL_EBUSY || st == TL_EINTERNAL) {
+                tl_sleep_ms(backoff_ms);
+                backoff_ms = (backoff_ms * 2 > TL_MAINT_BACKOFF_MAX_MS)
+                           ? TL_MAINT_BACKOFF_MAX_MS : backoff_ms * 2;
+
+                /* Re-set compact_pending for retry.
+                 * EBUSY = manifest changed during publish (will retry).
+                 * ENOMEM/EINTERNAL = transient, worth retrying after backoff. */
+                TL_LOCK_MAINT(tl);
+                tl->compact_pending = true;
+                TL_UNLOCK_MAINT(tl);
+            } else if (st == TL_EOVERFLOW) {
+                /* Non-retryable: window span too large for this dataset.
+                 * Log and continue - don't set compact_pending (no point retrying).
+                 * Reset backoff since this isn't a transient failure. */
+                tl_log_ctx_t* log = &tl->log;
+                TL_LOG_ERROR("Compaction failed: window span overflow (TL_EOVERFLOW)");
+                (void)log;  /* Silence unused warning if logging disabled */
+                backoff_ms = TL_MAINT_BACKOFF_INIT_MS;
+            } else if (st == TL_OK) {
+                /* Success - reset backoff */
+                backoff_ms = TL_MAINT_BACKOFF_INIT_MS;
+            }
+            /* TL_EOF = no work needed, no action required */
+        }
+    }
+
+    return NULL;
 }
+
+/*===========================================================================
+ * tl_maint_start - Start Background Worker
+ *
+ * State machine transitions: STOPPED -> RUNNING
+ *
+ * Algorithm:
+ * 1. Validate inputs and mode
+ * 2. Check state machine (STOPPED required)
+ * 3. Reset shutdown flag
+ * 4. Create worker thread
+ * 5. Transition to RUNNING state
+ * 6. Signal worker if pending work already exists
+ *
+ * Idempotency: If state is RUNNING, returns TL_OK without action.
+ *
+ * Returns:
+ * - TL_OK       Worker started (or already running)
+ * - TL_EINVAL   tl is NULL
+ * - TL_ESTATE   Not open or not in BACKGROUND mode
+ * - TL_EBUSY    Stop in progress (state is STOPPING) - retry later
+ * - TL_EINTERNAL Thread creation failed
+ *
+ * All state access is under maint_mu - no atomics needed.
+ *===========================================================================*/
+
+tl_status_t tl_maint_start(tl_timelog_t* tl) {
+    if (tl == NULL) {
+        return TL_EINVAL;
+    }
+
+    /* Lifecycle validation */
+    if (!tl->is_open) {
+        return TL_ESTATE;
+    }
+
+    /* Mode validation */
+    if (tl->config.maintenance_mode != TL_MAINT_BACKGROUND) {
+        return TL_ESTATE;
+    }
+
+    TL_LOCK_MAINT(tl);
+
+    /* State machine check */
+    switch (tl->maint_state) {
+        case TL_WORKER_RUNNING:
+            /* Idempotency: already running */
+            TL_UNLOCK_MAINT(tl);
+            return TL_OK;
+
+        case TL_WORKER_STOPPING:
+            /* Another thread is stopping - cannot start until stop completes.
+             * Return TL_EBUSY so caller knows to retry later. */
+            TL_UNLOCK_MAINT(tl);
+            return TL_EBUSY;
+
+        case TL_WORKER_STOPPED:
+            /* Valid state for start - continue */
+            break;
+    }
+
+    /* Reset shutdown flag (may be set from previous stop) */
+    tl->maint_shutdown = false;
+
+    /* Create worker thread */
+    tl_status_t st = tl_thread_create(&tl->maint_thread,
+                                       tl__maint_worker_entry,
+                                       tl);
+    if (st != TL_OK) {
+        TL_UNLOCK_MAINT(tl);
+        return TL_EINTERNAL;
+    }
+
+    /* Transition to RUNNING state */
+    tl->maint_state = TL_WORKER_RUNNING;
+
+    /* If pending work already exists (writes happened before start),
+     * signal the worker so it doesn't sleep forever waiting. */
+    if (tl->flush_pending || tl->compact_pending) {
+        tl_cond_signal(&tl->maint_cond);
+    }
+
+    TL_UNLOCK_MAINT(tl);
+    return TL_OK;
+}
+
+/*===========================================================================
+ * tl_maint_stop - Stop Background Worker
+ *
+ * State machine transitions: RUNNING -> STOPPING -> STOPPED
+ *
+ * Algorithm:
+ * 1. Validate inputs (not mode - allows cleanup flexibility)
+ * 2. Check state machine (RUNNING required for action)
+ * 3. Transition to STOPPING state
+ * 4. Set shutdown flag + signal worker
+ * 5. Join thread (blocking, OUTSIDE maint_mu)
+ * 6. Transition to STOPPED state (only on successful join)
+ *
+ * CRITICAL: Thread join must happen on the original struct member, NOT a copy.
+ * tl_thread_join() may modify the tl_thread_t struct (e.g., to mark as joined).
+ * Joining a copy is undefined behavior on some platforms.
+ *
+ * The join is performed OUTSIDE maint_mu to prevent deadlock:
+ * - Worker may be inside flush work holding lower-priority locks
+ * - We must not block while holding maint_mu
+ *
+ * We do NOT check mode here. This allows tl_close() to call stop
+ * unconditionally without checking mode.
+ *===========================================================================*/
 
 tl_status_t tl_maint_stop(tl_timelog_t* tl) {
-    (void)tl;
-    return TL_ESTATE; /* Not yet implemented */
+    if (tl == NULL) {
+        return TL_EINVAL;
+    }
+
+    TL_LOCK_MAINT(tl);
+
+    /* State machine check */
+    switch (tl->maint_state) {
+        case TL_WORKER_STOPPED:
+            /* Idempotency: already stopped - fall through */
+        case TL_WORKER_STOPPING:
+            /* Another thread is stopping - let it complete.
+             * Both cases are safe: return OK without action.
+             * This prevents double-join (undefined behavior). */
+            TL_UNLOCK_MAINT(tl);
+            return TL_OK;
+
+        case TL_WORKER_RUNNING:
+            /* Valid state for stop - continue */
+            break;
+    }
+
+    /* Transition to STOPPING state.
+     * This prevents concurrent stop calls from attempting double-join. */
+    tl->maint_state = TL_WORKER_STOPPING;
+
+    /* Signal shutdown to worker */
+    tl->maint_shutdown = true;
+
+    /* Wake worker from cond_wait */
+    tl_cond_signal(&tl->maint_cond);
+
+    TL_UNLOCK_MAINT(tl);
+
+    /* Join thread OUTSIDE maint_mu (may block while worker finishes).
+     * CRITICAL: Join on the original struct member, NOT a copy.
+     * tl_thread_join() may modify the struct. */
+    tl_status_t st = tl_thread_join(&tl->maint_thread, NULL);
+
+    /* Final state transition */
+    TL_LOCK_MAINT(tl);
+    if (st == TL_OK) {
+        /* Successful join: transition to STOPPED, reset flags */
+        tl->maint_state = TL_WORKER_STOPPED;
+        tl->maint_shutdown = false;
+    } else {
+        /* Join failed: stay in STOPPING state.
+         * This is a severe error - system may be inconsistent.
+         * DO NOT clear shutdown - thread may still be running. */
+        /* maint_state remains STOPPING - caller must handle */
+    }
+    TL_UNLOCK_MAINT(tl);
+
+    return (st == TL_OK) ? TL_OK : TL_EINTERNAL;
 }
 
+/*===========================================================================
+ * tl_maint_step - Manual Mode One Unit of Work
+ *
+ * Priority (from Background Maintenance LLD Section 5):
+ * 1. Flush one sealed memrun (bounds memory)
+ * 2. Compact one step if needed (bounds read amplification)
+ *
+ * This function is synchronous - it performs work and returns.
+ *
+ * Compaction is triggered by EITHER:
+ * - Automatic heuristic (L0 count, delete debt)
+ * - Explicit request via tl_compact() (sets compact_pending flag)
+ *===========================================================================*/
+
 tl_status_t tl_maint_step(tl_timelog_t* tl) {
-    (void)tl;
-    return TL_ESTATE; /* Not yet implemented */
+    if (tl == NULL) {
+        return TL_EINVAL;
+    }
+
+    /* Lifecycle validation */
+    if (!tl->is_open) {
+        return TL_ESTATE;
+    }
+
+    /* Mode validation */
+    if (tl->config.maintenance_mode != TL_MAINT_DISABLED) {
+        return TL_ESTATE;
+    }
+
+    /* Priority 1: Flush */
+    TL_LOCK_MEMTABLE(tl);
+    bool has_sealed = tl_memtable_has_sealed(&tl->memtable);
+    TL_UNLOCK_MEMTABLE(tl);
+
+    if (has_sealed) {
+        tl_status_t st = tl__flush_one(tl);
+        if (st == TL_OK || st == TL_ENOMEM) {
+            return st;  /* Work done (or failed with recoverable error) */
+        }
+        /* TL_EOF from flush_one means queue was empty (race), fall through */
+    }
+
+    /* Priority 2: Compaction - triggered by heuristic OR explicit request */
+    bool was_explicit = false;
+
+    TL_LOCK_MAINT(tl);
+    if (tl->compact_pending) {
+        was_explicit = true;
+        /* DON'T clear yet - only clear on success to match background behavior */
+    }
+    TL_UNLOCK_MAINT(tl);
+
+    /* Also check automatic heuristic (L0 count, delete debt) */
+    bool do_compact = was_explicit || tl__compaction_needed(tl);
+
+    if (do_compact) {
+        tl_status_t st = tl__compact_one_step(tl);
+
+        /* Only clear compact_pending on success or EOF (no work).
+         * On transient errors, preserve the request for retry. */
+        if (was_explicit && (st == TL_OK || st == TL_EOF)) {
+            TL_LOCK_MAINT(tl);
+            tl->compact_pending = false;
+            TL_UNLOCK_MAINT(tl);
+        }
+
+        return st;
+    }
+
+    return TL_EOF;  /* No work to do */
 }
 
 /*===========================================================================
