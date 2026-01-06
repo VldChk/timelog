@@ -170,44 +170,57 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
         return TL_EOF;
     }
 
-    /* Pop minimum from heap */
-    tl_heap_entry_t entry;
-    tl_status_t st = tl_heap_pop(&it->heap, &entry);
+    /*
+     * Use peek + replace_top pattern to eliminate allocation failure window.
+     *
+     * Previous code used pop + push, which had a failure window: if push
+     * failed after pop, the next record from that source would be lost.
+     * Since init() reserves capacity for source_count entries, push "should"
+     * never allocate, but relying on that is fragile.
+     *
+     * New pattern:
+     * 1. Peek minimum (no modification)
+     * 2. Output the record
+     * 3. Advance source
+     * 4. If source has more: replace_top (cannot fail - no allocation)
+     * 5. If source exhausted: pop (cannot fail - just removes)
+     *
+     * This guarantees no data loss regardless of allocation behavior.
+     */
 
-    if (st == TL_EOF) {
+    /* Step 1: Peek minimum (heap unchanged) */
+    const tl_heap_entry_t* peek = tl_heap_peek(&it->heap);
+    if (peek == NULL) {
         it->done = true;
         return TL_EOF;
     }
-    TL_ASSERT(st == TL_OK);
 
-    /* Output the record */
-    out->ts = entry.ts;
-    out->handle = entry.handle;
+    /* Step 2: Output the record */
+    out->ts = peek->ts;
+    out->handle = peek->handle;
 
-    /* Advance the source that produced this record */
-    tl_iter_source_t* src = (tl_iter_source_t*)entry.iter;
+    /* Get source pointer and component_id while peek is still valid */
+    tl_iter_source_t* src = (tl_iter_source_t*)peek->iter;
+    uint32_t component_id = peek->component_id;
 
+    /* Step 3: Advance the source that produced this record */
     tl_record_t next_rec;
-    st = source_next(src, &next_rec);
+    tl_status_t st = source_next(src, &next_rec);
 
     if (st == TL_OK) {
-        /* Push replacement entry */
+        /* Step 4: Source has more - replace top entry (no allocation) */
         tl_heap_entry_t new_entry = {
             .ts = next_rec.ts,
-            .component_id = entry.component_id,
+            .component_id = component_id,
             .handle = next_rec.handle,
             .iter = src
         };
-
-        st = tl_heap_push(&it->heap, &new_entry);
-        if (st != TL_OK) {
-            /* Heap push failed - iterator is in inconsistent state.
-             * Mark as done to prevent further use. */
-            it->done = true;
-            return st;
-        }
+        tl_heap_replace_top(&it->heap, &new_entry);
+    } else {
+        /* Step 5: Source exhausted - remove entry from heap (no allocation) */
+        tl_heap_entry_t discard;
+        (void)tl_heap_pop(&it->heap, &discard);
     }
-    /* If TL_EOF, source is exhausted - don't push replacement */
 
     /* Check if heap is now empty */
     if (tl_heap_is_empty(&it->heap)) {

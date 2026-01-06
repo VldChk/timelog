@@ -331,6 +331,24 @@ void tl_page_catalog_destroy(tl_page_catalog_t* cat) {
     cat->capacity = 0;
 }
 
+/**
+ * Reserve capacity in page catalog.
+ *
+ * Error handling:
+ * - TL_EINVAL: n exceeds UINT32_MAX (invalid argument)
+ * - TL_EOVERFLOW: Internal size_t overflow during growth calculation
+ * - TL_ENOMEM: Allocation failed
+ *
+ * On ANY error, the catalog state remains unchanged. The existing pages
+ * array is preserved (per realloc semantics), so callers can:
+ * - Retry the operation later
+ * - Continue with existing capacity
+ * - Safely destroy the catalog
+ *
+ * @param cat  Catalog to reserve space in
+ * @param n    Minimum capacity needed
+ * @return TL_OK on success, error code on failure
+ */
 tl_status_t tl_page_catalog_reserve(tl_page_catalog_t* cat, size_t n) {
     TL_ASSERT(cat != NULL);
 

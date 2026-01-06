@@ -174,10 +174,19 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
             return st;
         }
 
-        /* Copy all records (cannot fail after reserve) */
+        /* Copy all records (cannot fail after reserve).
+         *
+         * ATOMICITY: push_n is a memcpy-based operation that cannot partially
+         * fail after successful reserve. If it returns error (shouldn't happen),
+         * no records were inserted (memcpy is all-or-nothing). Therefore we
+         * return without updating metadata - this maintains consistency.
+         *
+         * If push_n ever changed to allow partial writes, this would need
+         * to handle partial metadata updates like the slow path does. */
         st = tl_recvec_push_n(&mt->active_run, records, n);
         if (st != TL_OK) {
-            /* Defensive: should not fail after reserve, but handle it */
+            /* Reserve succeeded but push_n failed - should never happen.
+             * No records were inserted, return without metadata update. */
             return st;
         }
 

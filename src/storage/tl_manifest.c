@@ -120,6 +120,18 @@ size_t tl_manifest_l1_find_first_overlap(const tl_manifest_t* m, tl_ts_t t1) {
 
 /*===========================================================================
  * Builder: Lifecycle
+ *
+ * Ownership semantics:
+ * - Builder does NOT own segments in add/remove arrays (just stores pointers)
+ * - Segments must remain valid until build() completes or builder is destroyed
+ * - On build() success: new manifest acquires refs; caller may release originals
+ * - On build() failure: caller still owns segments, must handle cleanup
+ * - destroy() frees internal arrays only, does NOT release segments
+ *
+ * Rollback safety:
+ * - All array allocations happen before segment acquisitions in build()
+ * - If allocation fails, no segment refs have been modified
+ * - Caller can retry build() or destroy builder and handle segments
  *===========================================================================*/
 
 void tl_manifest_builder_init(tl_manifest_builder_t* mb,

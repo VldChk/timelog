@@ -65,12 +65,25 @@ void* tl__malloc(tl_alloc_ctx_t* ctx, size_t size);
 void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size);
 
 /**
- * Reallocate memory. Returns NULL on failure (original ptr still valid).
+ * Reallocate memory.
+ *
+ * NULL is returned in two cases:
+ * 1. realloc_fn was not provided in the user allocator (configuration issue)
+ * 2. The underlying realloc operation failed (ENOMEM)
+ *
+ * In case 1, the caller should ensure realloc_fn is provided during init
+ * if resize operations are needed. This is a programming error.
+ *
+ * In case 2, the original ptr remains valid and must still be freed.
+ * Callers must handle NULL return by either retrying, failing gracefully,
+ * or continuing with the existing allocation.
+ *
+ * Note: If ptr==NULL, delegates to tl__malloc. If new_size==0, frees ptr.
  *
  * @param ctx      Allocator context
  * @param ptr      Pointer to reallocate (may be NULL)
  * @param new_size New size in bytes
- * @return Pointer to reallocated memory or NULL
+ * @return Pointer to reallocated memory, or NULL on failure
  */
 void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size);
 

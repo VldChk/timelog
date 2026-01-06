@@ -50,19 +50,39 @@ typedef struct tl_record {
 
 /*===========================================================================
  * Status codes
+ *
+ * Error code semantics:
+ * - TL_OK:        Operation succeeded
+ * - TL_EOF:       End of iteration, or no work to do (not an error)
+ * - TL_EINVAL:    Invalid argument (NULL pointer, invalid range t1>=t2,
+ *                 invalid config value, out-of-bounds index)
+ * - TL_ESTATE:    Invalid state (e.g., instance not open, wrong maint mode)
+ * - TL_EBUSY:     Resource temporarily busy (e.g., backpressure from sealed
+ *                 memruns, compaction manifest conflict - retryable)
+ * - TL_ENOMEM:    Memory allocation failed (often retryable after wait)
+ * - TL_EOVERFLOW: Arithmetic overflow (extreme timestamp calculations,
+ *                 array size overflow - usually non-retryable)
+ * - TL_EINTERNAL: Internal error (thread creation failed, invariant violation
+ *                 - should not occur in normal operation)
+ *
+ * Retryability:
+ * - TL_EBUSY, TL_ENOMEM: Typically retryable after short delay
+ * - TL_EINVAL, TL_ESTATE, TL_EOVERFLOW: Not retryable without caller fix
+ * - TL_EINTERNAL: Usually indicates a bug; may or may not be retryable
  *===========================================================================*/
 
 typedef enum tl_status {
-    TL_OK        = 0,
-    TL_EOF       = 1,
-    TL_EINVAL    = 10,
-    TL_ESTATE    = 20,
-    TL_EBUSY     = 21,
-    TL_ENOMEM    = 30,
-    TL_EOVERFLOW = 31,  /* Arithmetic overflow (extreme timestamp values) */
-    TL_EINTERNAL = 90
+    TL_OK        = 0,   /* Success */
+    TL_EOF       = 1,   /* End of iteration / no work */
+    TL_EINVAL    = 10,  /* Invalid argument */
+    TL_ESTATE    = 20,  /* Invalid state */
+    TL_EBUSY     = 21,  /* Resource busy (retryable) */
+    TL_ENOMEM    = 30,  /* Out of memory (often retryable) */
+    TL_EOVERFLOW = 31,  /* Arithmetic overflow */
+    TL_EINTERNAL = 90   /* Internal error (bug or system failure) */
 } tl_status_t;
 
+/** Get human-readable description of status code. */
 const char* tl_strerror(tl_status_t s);
 
 /*===========================================================================

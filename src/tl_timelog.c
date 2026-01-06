@@ -643,6 +643,13 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
         return TL_ESTATE;
     }
 
+    /* Validate range: half-open interval [t1, t2) must not be negative.
+     * - t1 == t2: Empty range, allowed as no-op (no work, returns TL_OK)
+     * - t1 > t2:  Invalid negative range, rejected as TL_EINVAL */
+    if (t1 > t2) {
+        return TL_EINVAL;
+    }
+
     tl_status_t st;
     bool need_signal = false;
 
@@ -1433,9 +1440,14 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
         return TL_EOF;
     }
 
-    /* Create iterator for [min_ts, ts) and scan to find the last */
+    /* Create iterator for [TL_TS_MIN, ts) and scan to find the last.
+     *
+     * Note: We use TL_TS_MIN instead of snap->min_ts for defensive safety.
+     * If snap->min_ts was incorrectly set (bug elsewhere), this ensures we
+     * still search the full valid range. Performance is acceptable since
+     * we're doing a full scan anyway to find the last timestamp. */
     tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_range(snap, snap->min_ts, ts, &it);
+    tl_status_t st = tl_iter_range(snap, TL_TS_MIN, ts, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -1545,6 +1557,15 @@ static void* tl__maint_worker_entry(void* arg) {
                 tl_sleep_ms(backoff_ms);
                 backoff_ms = (backoff_ms * 2 > TL_MAINT_BACKOFF_MAX_MS)
                            ? TL_MAINT_BACKOFF_MAX_MS : backoff_ms * 2;
+
+                /* Log transient error (once per backoff cycle = natural throttling).
+                 * Per Background Maintenance LLD Section 12. */
+                {
+                    tl_log_ctx_t* log = &tl->log;
+                    TL_LOG_WARN("Flush failed (%s), retrying after %u ms backoff",
+                                tl_strerror(st), backoff_ms);
+                    (void)log;  /* Silence unused warning if logging disabled */
+                }
             } else {
                 backoff_ms = TL_MAINT_BACKOFF_INIT_MS;  /* Reset on success */
             }
@@ -1591,6 +1612,17 @@ static void* tl__maint_worker_entry(void* arg) {
                 tl_sleep_ms(backoff_ms);
                 backoff_ms = (backoff_ms * 2 > TL_MAINT_BACKOFF_MAX_MS)
                            ? TL_MAINT_BACKOFF_MAX_MS : backoff_ms * 2;
+
+                /* Log transient error (once per backoff cycle = natural throttling).
+                 * Per Background Maintenance LLD Section 12: "Any fatal error should
+                 * be surfaced... and logged in background mode." Transient errors
+                 * also benefit from logging for diagnostics. */
+                {
+                    tl_log_ctx_t* log = &tl->log;
+                    TL_LOG_WARN("Compaction failed (%s), retrying after %u ms backoff",
+                                tl_strerror(st), backoff_ms);
+                    (void)log;  /* Silence unused warning if logging disabled */
+                }
 
                 /* Re-set compact_pending for retry.
                  * EBUSY = manifest changed during publish (will retry).
@@ -1842,12 +1874,21 @@ tl_status_t tl_maint_step(tl_timelog_t* tl) {
     if (do_compact) {
         tl_status_t st = tl__compact_one_step(tl);
 
-        /* Only clear compact_pending on success or EOF (no work).
-         * On transient errors, preserve the request for retry. */
-        if (was_explicit && (st == TL_OK || st == TL_EOF)) {
+        /* Clear compact_pending on success, no-work, or fatal errors.
+         * Transient errors (ENOMEM, EBUSY, EINTERNAL) preserve the request.
+         * EOVERFLOW is fatal (non-retryable) - clear to prevent infinite loop. */
+        if (was_explicit && (st == TL_OK || st == TL_EOF || st == TL_EOVERFLOW)) {
             TL_LOCK_MAINT(tl);
             tl->compact_pending = false;
             TL_UNLOCK_MAINT(tl);
+        }
+
+        /* Log fatal errors in manual mode for diagnostics.
+         * Transient errors are caller's responsibility to handle/log. */
+        if (st == TL_EOVERFLOW) {
+            tl_log_ctx_t* log = &tl->log;
+            TL_LOG_ERROR("Compaction failed: window span overflow (TL_EOVERFLOW)");
+            (void)log;
         }
 
         return st;

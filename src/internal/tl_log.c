@@ -64,7 +64,12 @@ void tl__log_v(tl_log_ctx_t* log, tl_log_level_t level,
                         fmt, args);
 
     if (msg_len < 0) {
-        return;
+        /* Format error (encoding issue, etc.) - don't silently drop.
+         * Log a placeholder so the user knows a log was attempted.
+         * This helps catch format string bugs during development. */
+        snprintf(buffer + prefix_len,
+                 sizeof(buffer) - (size_t)prefix_len,
+                 "<log format error>");
     }
 
     /* Call user's log function */

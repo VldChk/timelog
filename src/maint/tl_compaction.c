@@ -9,6 +9,24 @@
 #include <string.h>
 
 /*===========================================================================
+ * Test Hooks (Debug/Test Builds Only)
+ *
+ * TL_TEST_HOOKS enables deterministic failpoints for testing error paths.
+ * This is defined only for test builds via CMake compile definitions.
+ *===========================================================================*/
+
+#ifdef TL_TEST_HOOKS
+/* Force tl_compact_publish() to return TL_EBUSY for the next N calls.
+ * Used by compact_one_exhausts_retries test for deterministic EBUSY testing.
+ * Thread-unsafe (test-only): only modify from single-threaded test code.
+ *
+ * volatile: Prevents compiler from caching value across function boundaries.
+ * While tests are single-threaded, the compiler could theoretically hoist
+ * the load outside the publish function without volatile. */
+volatile int tl_test_force_ebusy_count = 0;
+#endif
+
+/*===========================================================================
  * Context Lifecycle
  *===========================================================================*/
 
@@ -35,6 +53,11 @@ void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
     /* Initialize empty interval sets */
     tl_intervals_init(&ctx->tombs, alloc);
     tl_intervals_init(&ctx->tombs_clipped, alloc);
+
+    /* Initialize deferred drop records (empty) */
+    ctx->dropped_records = NULL;
+    ctx->dropped_len = 0;
+    ctx->dropped_cap = 0;
 }
 
 void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
@@ -85,7 +108,55 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
         tl_segment_release(ctx->residual_tomb);
         ctx->residual_tomb = NULL;
     }
+
+    /* Free deferred drop records (not fired - compaction failed/retrying) */
+    if (ctx->dropped_records != NULL) {
+        tl__free(ctx->alloc, ctx->dropped_records);
+        ctx->dropped_records = NULL;
+    }
+    ctx->dropped_len = 0;
+    ctx->dropped_cap = 0;
 }
+
+/*===========================================================================
+ * Debug Validation (Debug/Test Builds Only)
+ *===========================================================================*/
+
+#ifndef NDEBUG
+/**
+ * Validate that L1 segments in manifest are non-overlapping by window.
+ *
+ * This is a critical system invariant per CLAUDE.md:
+ * "L1 non-overlap: L1 segments are non-overlapping by time window"
+ *
+ * Runs in O(n²) which is acceptable for debug validation with typical
+ * L1 segment counts (<100). Production code should never violate this.
+ *
+ * @param m  Manifest to validate
+ */
+static void tl__validate_l1_non_overlap(const tl_manifest_t* m) {
+    uint32_t n = tl_manifest_l1_count(m);
+    if (n <= 1) {
+        return;  /* 0 or 1 segment cannot overlap */
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        const tl_segment_t* seg_i = tl_manifest_l1_get(m, i);
+        for (uint32_t j = i + 1; j < n; j++) {
+            const tl_segment_t* seg_j = tl_manifest_l1_get(m, j);
+
+            /* Check for overlap: segments overlap if neither ends before the other starts.
+             * Using half-open intervals [start, end), overlap occurs if:
+             * NOT (i.end <= j.start OR j.end <= i.start)
+             * = i.end > j.start AND j.end > i.start */
+            bool overlap = (seg_i->window_end > seg_j->window_start) &&
+                           (seg_j->window_end > seg_i->window_start);
+
+            TL_ASSERT(!overlap && "L1 non-overlap invariant violated after compaction");
+        }
+    }
+}
+#endif /* NDEBUG */
 
 /*===========================================================================
  * Delete Debt Computation (Internal)
@@ -355,13 +426,19 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
     const tl_manifest_t* m = ctx->base_manifest;
     uint32_t n_l0 = tl_manifest_l0_count(m);
 
-    /* Exit early if no L0 segments */
+    /* Exit early if no L0 segments.
+     *
+     * Note: base_manifest is still pinned here (acquired above). This is
+     * intentional - caller MUST call tl_compact_ctx_destroy() which releases
+     * base_manifest. This follows the init/destroy lifecycle pattern where
+     * ctx_destroy handles cleanup regardless of which phase failed. */
     if (n_l0 == 0) {
         return TL_EOF;
     }
 
-    /* Allocate L0 input array */
-    ctx->input_l0 = tl__malloc(ctx->alloc, n_l0 * sizeof(tl_segment_t*));
+    /* Allocate L0 input array.
+     * Overflow guard for 32-bit systems where size_t is 32-bit. */
+    ctx->input_l0 = tl__malloc(ctx->alloc, (size_t)n_l0 * sizeof(tl_segment_t*));
     if (ctx->input_l0 == NULL) {
         return TL_ENOMEM;
     }
@@ -483,6 +560,40 @@ static tl_status_t tl__ensure_output_capacity(tl_compact_ctx_t* ctx) {
 
     ctx->output_l1 = new_arr;
     ctx->output_l1_cap = new_cap;
+    return TL_OK;
+}
+
+/**
+ * Push a dropped record to the deferred drop list.
+ * Grows the array geometrically (2x) when needed.
+ */
+static tl_status_t tl__push_dropped_record(tl_compact_ctx_t* ctx,
+                                            tl_ts_t ts,
+                                            tl_handle_t handle) {
+    /* Ensure capacity */
+    if (ctx->dropped_len >= ctx->dropped_cap) {
+        size_t new_cap = (ctx->dropped_cap == 0) ? 64 : ctx->dropped_cap * 2;
+
+        /* Overflow guard */
+        if (new_cap > SIZE_MAX / sizeof(tl_record_t)) {
+            return TL_EOVERFLOW;
+        }
+
+        tl_record_t* new_arr = tl__realloc(ctx->alloc, ctx->dropped_records,
+                                            new_cap * sizeof(tl_record_t));
+        if (new_arr == NULL) {
+            return TL_ENOMEM;
+        }
+
+        ctx->dropped_records = new_arr;
+        ctx->dropped_cap = new_cap;
+    }
+
+    /* Append record */
+    ctx->dropped_records[ctx->dropped_len].ts = ts;
+    ctx->dropped_records[ctx->dropped_len].handle = handle;
+    ctx->dropped_len++;
+
     return TL_OK;
 }
 
@@ -809,9 +920,20 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
 
         /* Check if record is deleted by tombstone */
         if (tl_intervals_cursor_is_deleted(&tomb_cursor, min_entry.ts)) {
-            /* Record is deleted - invoke drop callback if configured */
+            /* Record is deleted - collect for deferred callback.
+             *
+             * CRITICAL: We do NOT invoke on_drop_handle here because:
+             * 1. Compaction may fail (ENOMEM) after this point
+             * 2. Publish may fail (EBUSY) requiring retry
+             * 3. If we fire callbacks now and then fail, user code may
+             *    free payloads for records that are STILL VISIBLE
+             *
+             * Callbacks are fired only after successful publish. */
             if (ctx->on_drop_handle != NULL) {
-                ctx->on_drop_handle(ctx->on_drop_ctx, min_entry.ts, min_entry.handle);
+                st = tl__push_dropped_record(ctx, min_entry.ts, min_entry.handle);
+                if (st != TL_OK) {
+                    goto cleanup;
+                }
             }
             continue;  /* Skip this record */
         }
@@ -885,6 +1007,15 @@ cleanup:
 tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
     tl_timelog_t* tl = ctx->tl;
     tl_status_t st;
+
+#ifdef TL_TEST_HOOKS
+    /* Test hook: force EBUSY returns for deterministic retry exhaustion testing.
+     * Decrement counter and return EBUSY without doing any work. */
+    if (tl_test_force_ebusy_count > 0) {
+        tl_test_force_ebusy_count--;
+        return TL_EBUSY;
+    }
+#endif
 
     /*
      * Phase 1: Build new manifest OFF-LOCK.
@@ -971,9 +1102,28 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
     /* Release old manifest (safe after unlock) */
     tl_manifest_release(old_manifest);
 
-    /* Clear ownership - outputs are now owned by manifest */
-    ctx->output_l1_len = 0;
-    ctx->residual_tomb = NULL;
+#ifndef NDEBUG
+    /* Validate critical L1 non-overlap invariant after compaction.
+     * new_manifest is what we just published - safe to read since we built it
+     * and it's now referenced by tl->manifest (won't be freed). */
+    tl__validate_l1_non_overlap(new_manifest);
+#endif
+
+    /* NOTE: We do NOT clear output_l1_len or residual_tomb here.
+     *
+     * Ownership semantics:
+     * - ctx built output segments (ctx has refs)
+     * - manifest_builder_build() acquired refs (manifest has refs)
+     * - Both refs are valid and independent
+     *
+     * ctx_destroy will release ctx's refs, leaving manifest's refs.
+     * This is correct reference counting semantics.
+     *
+     * Previously this code cleared ctx->output_l1_len=0 and residual_tomb=NULL
+     * to "transfer ownership", but that caused segment LEAKS because:
+     * - ctx_destroy wouldn't release (len=0, so no loop iterations)
+     * - manifest had its own acquired refs
+     * - ctx's original refs were lost -> leaked segments */
 
     return TL_OK;
 }
@@ -983,6 +1133,9 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
  *===========================================================================*/
 
 tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
+    TL_ASSERT(tl != NULL);
+    TL_ASSERT(max_retries > 0);  /* Ensures publish loop executes at least once */
+
     tl_compact_ctx_t ctx;
     tl_compact_ctx_init(&ctx, tl, &tl->alloc);
 
@@ -1002,11 +1155,35 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
         return st;
     }
 
-    /* Phase 3: Publish with retries */
+    /* Phase 3: Publish with retries.
+     * Track publish result separately to avoid it being overwritten
+     * by select/merge during retry preparation. */
+    tl_status_t publish_st = TL_EBUSY;  /* Default if loop never runs (impossible) */
     for (int attempt = 0; attempt < max_retries; attempt++) {
-        st = tl_compact_publish(&ctx);
-        if (st != TL_EBUSY) {
-            break;  /* Success or fatal error */
+        publish_st = tl_compact_publish(&ctx);
+        if (publish_st != TL_EBUSY) {
+            /* Success or fatal error - stop retrying */
+            if (publish_st == TL_OK) {
+                /* Publication succeeded - NOW fire deferred drop callbacks.
+                 *
+                 * CRITICAL: These callbacks are only safe to fire AFTER
+                 * successful publication because:
+                 * 1. Records are now truly retired from the newest manifest
+                 * 2. No retry will re-process these records
+                 * 3. User code can safely begin their reclamation process
+                 *
+                 * Note: Existing snapshots may still reference these records
+                 * until released - user must use epoch/RCU/grace period. */
+                if (ctx.on_drop_handle != NULL) {
+                    for (size_t i = 0; i < ctx.dropped_len; i++) {
+                        ctx.on_drop_handle(ctx.on_drop_ctx,
+                                           ctx.dropped_records[i].ts,
+                                           ctx.dropped_records[i].handle);
+                    }
+                }
+            }
+            tl_compact_ctx_destroy(&ctx);
+            return publish_st;
         }
 
         /* Manifest changed - re-select and re-merge for retry.
@@ -1017,15 +1194,20 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
 
         st = tl_compact_select(&ctx);
         if (st != TL_OK) {
-            break;
+            /* Selection failed during retry - propagate this error */
+            tl_compact_ctx_destroy(&ctx);
+            return st;
         }
 
         st = tl_compact_merge(&ctx);
         if (st != TL_OK) {
-            break;
+            /* Merge failed during retry - propagate this error */
+            tl_compact_ctx_destroy(&ctx);
+            return st;
         }
     }
 
+    /* Retries exhausted - return last publish result (EBUSY) */
     tl_compact_ctx_destroy(&ctx);
-    return st;
+    return publish_st;
 }

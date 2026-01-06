@@ -112,6 +112,14 @@ void tl_heap_destroy(tl_heap_t* h) {
         return;
     }
 
+    /* State validation in debug builds.
+     * If data is allocated, we need a valid allocator to free it.
+     * If this fires, the heap was likely corrupted or double-destroyed. */
+    TL_ASSERT(h->data == NULL || h->alloc != NULL);
+
+    /* Invariant check: len cannot exceed cap */
+    TL_ASSERT(h->len <= h->cap);
+
     if (h->data != NULL) {
         tl__free(h->alloc, h->data);
     }
@@ -119,6 +127,8 @@ void tl_heap_destroy(tl_heap_t* h) {
     h->data = NULL;
     h->len = 0;
     h->cap = 0;
+    /* Note: h->alloc is left as-is (not set to NULL) since destroy may be
+     * called before full cleanup. Caller owns alloc lifetime. */
 }
 
 void tl_heap_clear(tl_heap_t* h) {

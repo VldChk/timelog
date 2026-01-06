@@ -224,6 +224,13 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     /* Create tombstones (copies the array) */
     tl_status_t st = create_tombstones(alloc, tombstones, tombstones_len, &seg->tombstones);
     if (st != TL_OK) {
+        /*
+         * Cleanup: destroy catalog for consistency with build_pages error path.
+         * Note: catalog.pages is NULL at this point (no reserve called yet),
+         * so destroy is a no-op. However, calling it maintains consistent
+         * cleanup patterns and is defensive against future changes.
+         */
+        tl_page_catalog_destroy(&seg->catalog);
         TL_FREE(alloc, seg);
         return st;
     }

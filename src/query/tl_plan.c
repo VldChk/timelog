@@ -429,6 +429,14 @@ static void coalesce_tombstones(tl_plan_t* plan) {
 
 /*===========================================================================
  * Lifecycle
+ *
+ * Allocation and cleanup semantics:
+ * - tl_plan_build() initializes plan with memset(0) first, so partial
+ *   allocations on failure leave plan in a safe state (NULL pointers)
+ * - On any allocation failure, build() calls tl_plan_destroy() internally
+ *   before returning error, so caller does NOT need to clean up on failure
+ * - tl_plan_destroy() safely handles NULL arrays (checks before free)
+ * - Caller MUST call tl_plan_destroy() on success to free sources/tombstones
  *===========================================================================*/
 
 tl_status_t tl_plan_build(tl_plan_t* plan,

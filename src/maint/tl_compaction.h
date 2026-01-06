@@ -31,8 +31,10 @@
  * - Long-running merge happens without locks
  *
  * Handle Drop Callback Semantics:
- * - The on_drop_handle callback is invoked during merge phase when a record
- *   is filtered by tombstones (will not appear in the new L1 output)
+ * - Callbacks are DEFERRED until AFTER successful publication
+ * - During merge, dropped records are collected but NOT fired
+ * - Only after publish succeeds are callbacks invoked for all dropped records
+ * - If compaction fails/retries, pending drops are discarded (will be re-collected)
  * - IMPORTANT: This is a "retire" notification, NOT a "safe to free" signal
  * - Existing snapshots may still reference the dropped record until released
  * - User must implement their own epoch/RCU/hazard-pointer scheme if they
@@ -86,6 +88,23 @@ typedef struct tl_compact_ctx {
     tl_on_drop_fn       on_drop_handle;
     void*               on_drop_ctx;
 
+    /* Deferred drop records - collected during merge, fired after publish.
+     *
+     * CRITICAL CORRECTNESS INVARIANT: If compaction fails (ENOMEM/EBUSY)
+     * or retries, callbacks MUST NOT fire for records still visible in
+     * the manifest. This would violate the on_drop_handle contract and
+     * can cause double-free/UAF in user code that treats it as final
+     * reclamation.
+     *
+     * Solution: Collect dropped (ts, handle) pairs during merge, but only
+     * invoke callbacks after successful publish. On failure/retry, the
+     * drops are discarded when ctx is destroyed; re-merge re-collects them.
+     *
+     * Uses tl_record_t for storage since it has (ts, handle) pair. */
+    tl_record_t*        dropped_records;
+    size_t              dropped_len;
+    size_t              dropped_cap;
+
     /* Output range (computed from input selection) */
     tl_ts_t             output_min_ts;
     tl_ts_t             output_max_ts;
@@ -137,10 +156,16 @@ bool tl_compact_needed(const tl_timelog_t* tl);
  * 3. Compute covered time range (records + tombstones)
  * 4. Select overlapping L1 segments
  *
+ * IMPORTANT: Caller MUST call tl_compact_ctx_destroy() regardless of
+ * return status. This function acquires resources (manifest pin, segment
+ * refs) that are cleaned up by destroy. This follows the init/destroy
+ * lifecycle pattern - select may partially succeed before failing.
+ *
  * @param ctx  Initialized compaction context
  * @return TL_OK on success (inputs selected and pinned)
  *         TL_EOF if no work needed
  *         TL_ENOMEM on allocation failure
+ *         TL_EOVERFLOW if window ID computation overflows
  */
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 
@@ -155,7 +180,9 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
  * 5. Build L1 segments for windows with live records
  * 6. Build residual tombstone segment if needed
  *
- * Handle drop callback is invoked for each deleted record.
+ * Deleted records are COLLECTED but callbacks are NOT fired here.
+ * See header comment for deferred callback semantics - callbacks
+ * are only invoked after successful publish in tl_compact_one().
  *
  * @param ctx  Context with selected inputs
  * @return TL_OK on success (outputs built)
