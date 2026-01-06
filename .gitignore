@@ -2,6 +2,10 @@ build/
 docs/
 build_x64/
 build_x64_debug/
+build_clang/
+build_ninja/
+llvm_bin/
 .vscode/
 .claude/
 **.md
+**.idx
