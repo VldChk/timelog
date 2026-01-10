@@ -283,6 +283,17 @@ bool tl_memtable_should_seal(const tl_memtable_t* mt) {
     return false;
 }
 
+bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt) {
+    TL_ASSERT(mt != NULL);
+
+    if (mt->ooo_budget_bytes == 0) {
+        return false;  /* Unlimited budget */
+    }
+
+    size_t ooo_bytes = tl_recvec_len(&mt->active_ooo) * TL_RECORD_SIZE;
+    return ooo_bytes >= mt->ooo_budget_bytes;
+}
+
 bool tl_memtable_is_active_empty(const tl_memtable_t* mt) {
     TL_ASSERT(mt != NULL);
     return tl_recvec_is_empty(&mt->active_run) &&

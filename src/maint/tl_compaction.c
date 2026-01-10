@@ -438,7 +438,11 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
 
     /* Allocate L0 input array.
      * Overflow guard for 32-bit systems where size_t is 32-bit. */
-    ctx->input_l0 = tl__malloc(ctx->alloc, (size_t)n_l0 * sizeof(tl_segment_t*));
+    size_t l0_count = (size_t)n_l0;
+    if (l0_count > SIZE_MAX / sizeof(tl_segment_t*)) {
+        return TL_EOVERFLOW;
+    }
+    ctx->input_l0 = tl__malloc(ctx->alloc, l0_count * sizeof(tl_segment_t*));
     if (ctx->input_l0 == NULL) {
         return TL_ENOMEM;
     }
@@ -617,8 +621,6 @@ static tl_status_t tl__flush_window_records(tl_compact_ctx_t* ctx,
                                              tl_ts_t window_start,
                                              tl_ts_t window_end,
                                              bool end_unbounded) {
-    (void)end_unbounded;  /* Used for documentation; window_end already correct */
-
     if (tl_recvec_len(records) == 0) {
         return TL_OK;  /* Empty window - no segment */
     }
@@ -629,9 +631,8 @@ static tl_status_t tl__flush_window_records(tl_compact_ctx_t* ctx,
         return st;
     }
 
-    /* Build L1 segment.
-     * When end_unbounded=true, window_end is TL_TS_MAX (per tl_window_bounds).
-     * This is the correct boundary for the segment. */
+    /* Build L1 segment with explicit unbounded flag.
+     * When end_unbounded=true, window_end is TL_TS_MAX (per tl_window_bounds). */
     tl_segment_t* seg = NULL;
     st = tl_segment_build_l1(
         ctx->alloc,
@@ -640,6 +641,7 @@ static tl_status_t tl__flush_window_records(tl_compact_ctx_t* ctx,
         ctx->target_page_bytes,
         window_start,
         window_end,
+        end_unbounded,
         ctx->generation,
         &seg
     );
@@ -1181,6 +1183,9 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
                                            ctx.dropped_records[i].handle);
                     }
                 }
+
+                /* Increment compaction counter */
+                tl_atomic_inc_u64(&tl->compactions_total);
             }
             tl_compact_ctx_destroy(&ctx);
             return publish_st;

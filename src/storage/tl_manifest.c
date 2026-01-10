@@ -555,6 +555,7 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
      * L1 Segment Validation
      *=========================================================================*/
     tl_ts_t prev_window_end = TL_TS_MIN;
+    bool prev_window_unbounded = false;
 
     for (uint32_t i = 0; i < m->n_l1; i++) {
         /* Pointer non-NULL */
@@ -570,11 +571,11 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
         /*
          * CRITICAL: Unbounded window guard
          *
-         * If the previous window was unbounded (window_end == TL_TS_MAX),
-         * there MUST NOT be any more segments after it. An unbounded window
-         * covers all future timestamps, so any subsequent segment is invalid.
+         * If the previous window was unbounded, there MUST NOT be any more
+         * segments after it. An unbounded window covers all future timestamps,
+         * so any subsequent segment is invalid.
          */
-        if (prev_window_end == TL_TS_MAX) {
+        if (prev_window_unbounded) {
             return false;  /* Unbounded window must be last */
         }
 
@@ -596,6 +597,7 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
         }
 
         prev_window_end = m->l1[i]->window_end;
+        prev_window_unbounded = m->l1[i]->window_end_unbounded;
     }
 
     /*=========================================================================

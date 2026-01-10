@@ -194,6 +194,17 @@ tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt, tl_ts_t t1
 bool tl_memtable_should_seal(const tl_memtable_t* mt);
 
 /**
+ * Check if OOO budget is exceeded (used for instrumentation).
+ *
+ * Returns true if:
+ * - ooo_budget_bytes > 0 AND
+ * - OOO bytes >= ooo_budget_bytes
+ *
+ * Does NOT require memtable_mu (reads active state under writer_mu only).
+ */
+bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt);
+
+/**
  * Seal active state into a memrun and push to sealed queue.
  *
  * CRITICAL: This function PRESERVES active state on failure.

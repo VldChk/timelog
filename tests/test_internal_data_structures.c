@@ -1,3 +1,20 @@
+/*===========================================================================
+ * test_internal_data_structures.c - Internal Data Structure Tests
+ *
+ * Tests for fundamental data structures:
+ * - Record Vector (recvec): Dynamic array of (ts, handle) pairs
+ * - Intervals: Tombstone interval set with coalescing
+ * - Heap: Min-heap for k-way merge iteration
+ *
+ * These tests validate the building blocks used by storage,
+ * query, and maintenance subsystems.
+ *
+ * Part of Phase 10: Integration Testing and Hardening
+ *
+ * Migration Status: COMPLETE (migrated from test_phase2.c)
+ * Note: Test names prefixed with "ds_" to avoid conflicts during migration.
+ *===========================================================================*/
+
 #include "test_harness.h"
 #include "timelog/timelog.h"
 #include "internal/tl_alloc.h"
@@ -5,11 +22,13 @@
 #include "internal/tl_intervals.h"
 #include "internal/tl_heap.h"
 
+#include <string.h>
+
 /*===========================================================================
- * Record Vector Tests
+ * Record Vector Tests (16 tests)
  *===========================================================================*/
 
-TEST_DECLARE(recvec_init_empty) {
+TEST_DECLARE(ds_recvec_init_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -24,7 +43,7 @@ TEST_DECLARE(recvec_init_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_push_single) {
+TEST_DECLARE(ds_recvec_push_single) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -42,7 +61,7 @@ TEST_DECLARE(recvec_push_single) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_push_growth) {
+TEST_DECLARE(ds_recvec_push_growth) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -65,7 +84,7 @@ TEST_DECLARE(recvec_push_growth) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_lower_bound_empty) {
+TEST_DECLARE(ds_recvec_lower_bound_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -77,18 +96,18 @@ TEST_DECLARE(recvec_lower_bound_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_lower_bound_found) {
+TEST_DECLARE(ds_recvec_lower_bound_found) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
     tl_recvec_init(&rv, &alloc);
 
     /* Push sorted: 10, 20, 30, 40, 50 */
-    tl_recvec_push(&rv, 10, 0);
-    tl_recvec_push(&rv, 20, 0);
-    tl_recvec_push(&rv, 30, 0);
-    tl_recvec_push(&rv, 40, 0);
-    tl_recvec_push(&rv, 50, 0);
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 10, 0));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 0));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 30, 0));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 40, 0));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 50, 0));
 
     TEST_ASSERT_EQ(0, tl_recvec_lower_bound(&rv, 5));   /* Before all */
     TEST_ASSERT_EQ(0, tl_recvec_lower_bound(&rv, 10));  /* Exact match */
@@ -100,18 +119,18 @@ TEST_DECLARE(recvec_lower_bound_found) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_upper_bound) {
+TEST_DECLARE(ds_recvec_upper_bound) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
     tl_recvec_init(&rv, &alloc);
 
     /* Push with duplicates: 10, 20, 20, 20, 30 */
-    tl_recvec_push(&rv, 10, 0);
-    tl_recvec_push(&rv, 20, 1);
-    tl_recvec_push(&rv, 20, 2);
-    tl_recvec_push(&rv, 20, 3);
-    tl_recvec_push(&rv, 30, 0);
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 10, 0));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 30, 0));
 
     TEST_ASSERT_EQ(0, tl_recvec_upper_bound(&rv, 5));
     TEST_ASSERT_EQ(1, tl_recvec_upper_bound(&rv, 10));
@@ -122,7 +141,7 @@ TEST_DECLARE(recvec_upper_bound) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_range_bounds) {
+TEST_DECLARE(ds_recvec_range_bounds) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -130,7 +149,7 @@ TEST_DECLARE(recvec_range_bounds) {
 
     /* 10, 20, 30, 40, 50 */
     for (tl_ts_t ts = 10; ts <= 50; ts += 10) {
-        tl_recvec_push(&rv, ts, 0);
+        TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, ts, 0));
     }
 
     size_t lo, hi;
@@ -154,7 +173,7 @@ TEST_DECLARE(recvec_range_bounds) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_insert_middle) {
+TEST_DECLARE(ds_recvec_insert_middle) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -176,7 +195,7 @@ TEST_DECLARE(recvec_insert_middle) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_clear_and_reuse) {
+TEST_DECLARE(ds_recvec_clear_and_reuse) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -199,7 +218,7 @@ TEST_DECLARE(recvec_clear_and_reuse) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_take_ownership) {
+TEST_DECLARE(ds_recvec_take_ownership) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -226,7 +245,7 @@ TEST_DECLARE(recvec_take_ownership) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_take_empty) {
+TEST_DECLARE(ds_recvec_take_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -242,7 +261,7 @@ TEST_DECLARE(recvec_take_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_reserve_zero) {
+TEST_DECLARE(ds_recvec_reserve_zero) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -257,7 +276,7 @@ TEST_DECLARE(recvec_reserve_zero) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_push_n_zero) {
+TEST_DECLARE(ds_recvec_push_n_zero) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -271,7 +290,7 @@ TEST_DECLARE(recvec_push_n_zero) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_insert_invalid_idx) {
+TEST_DECLARE(ds_recvec_insert_invalid_idx) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -288,7 +307,7 @@ TEST_DECLARE(recvec_insert_invalid_idx) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_shrink_to_fit_empty) {
+TEST_DECLARE(ds_recvec_shrink_to_fit_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -310,7 +329,7 @@ TEST_DECLARE(recvec_shrink_to_fit_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(recvec_destroy_idempotent) {
+TEST_DECLARE(ds_recvec_destroy_idempotent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_recvec_t rv;
@@ -326,10 +345,10 @@ TEST_DECLARE(recvec_destroy_idempotent) {
 }
 
 /*===========================================================================
- * Interval Set Tests
+ * Interval Set Tests (24 tests, 1 debug-only)
  *===========================================================================*/
 
-TEST_DECLARE(intervals_init_empty) {
+TEST_DECLARE(ds_intervals_init_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
@@ -342,7 +361,7 @@ TEST_DECLARE(intervals_init_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_insert_single) {
+TEST_DECLARE(ds_intervals_insert_single) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
@@ -361,7 +380,7 @@ TEST_DECLARE(intervals_insert_single) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_insert_empty_is_noop) {
+TEST_DECLARE(ds_intervals_insert_empty_is_noop) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
@@ -379,15 +398,15 @@ TEST_DECLARE(intervals_insert_empty_is_noop) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_coalesce_overlapping) {
+TEST_DECLARE(ds_intervals_coalesce_overlapping) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* Insert [10, 30), then [20, 40) => should coalesce to [10, 40) */
-    tl_intervals_insert(&iv, 10, 30);
-    tl_intervals_insert(&iv, 20, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 20, 40));
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT_EQ(10, tl_intervals_get(&iv, 0)->start);
@@ -397,15 +416,15 @@ TEST_DECLARE(intervals_coalesce_overlapping) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_coalesce_adjacent) {
+TEST_DECLARE(ds_intervals_coalesce_adjacent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* [10, 20) and [20, 30) are adjacent => [10, 30) */
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 20, 30);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 20, 30));
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT_EQ(10, tl_intervals_get(&iv, 0)->start);
@@ -415,15 +434,15 @@ TEST_DECLARE(intervals_coalesce_adjacent) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_no_coalesce_gap) {
+TEST_DECLARE(ds_intervals_no_coalesce_gap) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* [10, 20) and [30, 40) have gap => remain separate */
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
 
     TEST_ASSERT_EQ(2, tl_intervals_len(&iv));
 
@@ -431,20 +450,20 @@ TEST_DECLARE(intervals_no_coalesce_gap) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_coalesce_multi) {
+TEST_DECLARE(ds_intervals_coalesce_multi) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* Three intervals, then one that spans all */
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
-    tl_intervals_insert(&iv, 50, 60);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 60));
     TEST_ASSERT_EQ(3, tl_intervals_len(&iv));
 
     /* Insert [15, 55) => merges all three into [10, 60) */
-    tl_intervals_insert(&iv, 15, 55);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 15, 55));
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT_EQ(10, tl_intervals_get(&iv, 0)->start);
     TEST_ASSERT_EQ(60, tl_intervals_get(&iv, 0)->end);
@@ -453,14 +472,14 @@ TEST_DECLARE(intervals_coalesce_multi) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_contains_basic) {
+TEST_DECLARE(ds_intervals_contains_basic) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
 
     /* In first interval */
     TEST_ASSERT(tl_intervals_contains(&iv, 10));
@@ -483,26 +502,26 @@ TEST_DECLARE(intervals_contains_basic) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_unbounded) {
+TEST_DECLARE(ds_intervals_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert_unbounded(&iv, 50);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT(tl_intervals_get(&iv, 0)->end_unbounded);
 
     TEST_ASSERT(!tl_intervals_contains(&iv, 49));
     TEST_ASSERT(tl_intervals_contains(&iv, 50));
-    TEST_ASSERT(tl_intervals_contains(&iv, INT64_MAX));
+    TEST_ASSERT(tl_intervals_contains(&iv, TL_TS_MAX));
 
     tl_intervals_destroy(&iv);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_union_basic) {
+TEST_DECLARE(ds_intervals_union_basic) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -511,8 +530,8 @@ TEST_DECLARE(intervals_union_basic) {
     tl_intervals_init(&b, &alloc);
     tl_intervals_init(&out, &alloc);
 
-    tl_intervals_insert(&a, 10, 30);
-    tl_intervals_insert(&b, 20, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&a, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&b, 20, 40));
 
     tl_status_t s = tl_intervals_union(&out, &a, &b);
     TEST_ASSERT_STATUS(TL_OK, s);
@@ -526,13 +545,13 @@ TEST_DECLARE(intervals_union_basic) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_clip) {
+TEST_DECLARE(ds_intervals_clip) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 0, 100);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 0, 100));
     tl_intervals_clip(&iv, 25, 75);
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
@@ -543,15 +562,15 @@ TEST_DECLARE(intervals_clip) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_clip_removes_outside) {
+TEST_DECLARE(ds_intervals_clip_removes_outside) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
-    tl_intervals_insert(&iv, 50, 60);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 60));
 
     /* Clip to [25, 55) => removes [10,20), keeps [30,40), clips [50,60) to [50,55) */
     tl_intervals_clip(&iv, 25, 55);
@@ -566,15 +585,95 @@ TEST_DECLARE(intervals_clip_removes_outside) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_unbounded_merge_with_bounded) {
+/*---------------------------------------------------------------------------
+ * clip_lower tests - Added for coverage (Phase 10)
+ *---------------------------------------------------------------------------*/
+
+TEST_DECLARE(ds_intervals_clip_lower_removes_before) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+    tl_intervals_t iv;
+    tl_intervals_init(&iv, &alloc);
+
+    /* Insert [10, 20), [30, 40), [50, 60) */
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 60));
+    TEST_ASSERT_EQ(3, tl_intervals_len(&iv));
+
+    /* clip_lower(35) removes [10,20), truncates [30,40) to [35,40), keeps [50,60) */
+    tl_intervals_clip_lower(&iv, 35);
+
+    TEST_ASSERT_EQ(2, tl_intervals_len(&iv));
+    TEST_ASSERT_EQ(35, tl_intervals_get(&iv, 0)->start);
+    TEST_ASSERT_EQ(40, tl_intervals_get(&iv, 0)->end);
+    TEST_ASSERT_EQ(50, tl_intervals_get(&iv, 1)->start);
+    TEST_ASSERT_EQ(60, tl_intervals_get(&iv, 1)->end);
+
+    tl_intervals_destroy(&iv);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_clip_lower_truncates_overlapping) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+    tl_intervals_t iv;
+    tl_intervals_init(&iv, &alloc);
+
+    /* Insert [10, 50) */
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 50));
+
+    /* clip_lower(25) truncates to [25, 50) */
+    tl_intervals_clip_lower(&iv, 25);
+
+    TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
+    TEST_ASSERT_EQ(25, tl_intervals_get(&iv, 0)->start);
+    TEST_ASSERT_EQ(50, tl_intervals_get(&iv, 0)->end);
+    TEST_ASSERT(!tl_intervals_get(&iv, 0)->end_unbounded);
+
+    tl_intervals_destroy(&iv);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_clip_lower_unbounded) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+    tl_intervals_t iv;
+    tl_intervals_init(&iv, &alloc);
+
+    /* Insert bounded [10, 30) and unbounded [50, +inf) */
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
+    TEST_ASSERT_EQ(2, tl_intervals_len(&iv));
+
+    /* clip_lower(40) removes [10,30), truncates unbounded to [50,+inf) unchanged */
+    tl_intervals_clip_lower(&iv, 40);
+
+    TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
+    TEST_ASSERT_EQ(50, tl_intervals_get(&iv, 0)->start);
+    TEST_ASSERT(tl_intervals_get(&iv, 0)->end_unbounded);
+
+    /* Now test with clip_lower inside unbounded range */
+    tl_intervals_clip_lower(&iv, 75);
+
+    /* Unbounded [50, +inf) truncated to [75, +inf) */
+    TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
+    TEST_ASSERT_EQ(75, tl_intervals_get(&iv, 0)->start);
+    TEST_ASSERT(tl_intervals_get(&iv, 0)->end_unbounded);
+
+    tl_intervals_destroy(&iv);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_unbounded_merge_with_bounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* Insert bounded [10, 30), then overlapping unbounded [20, +inf) */
-    tl_intervals_insert(&iv, 10, 30);
-    tl_intervals_insert_unbounded(&iv, 20);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 20));
 
     /* Should merge to [10, +inf) */
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
@@ -584,26 +683,26 @@ TEST_DECLARE(intervals_unbounded_merge_with_bounded) {
     /* Verify containment */
     TEST_ASSERT(!tl_intervals_contains(&iv, 9));
     TEST_ASSERT(tl_intervals_contains(&iv, 10));
-    TEST_ASSERT(tl_intervals_contains(&iv, INT64_MAX));
+    TEST_ASSERT(tl_intervals_contains(&iv, TL_TS_MAX));
 
     tl_intervals_destroy(&iv);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_unbounded_absorbs_successors) {
+TEST_DECLARE(ds_intervals_unbounded_absorbs_successors) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
     /* Insert multiple bounded intervals */
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
-    tl_intervals_insert(&iv, 50, 60);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 60));
     TEST_ASSERT_EQ(3, tl_intervals_len(&iv));
 
     /* Insert unbounded that overlaps first - should absorb all */
-    tl_intervals_insert_unbounded(&iv, 15);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 15));
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT_EQ(10, tl_intervals_get(&iv, 0)->start);
@@ -613,7 +712,7 @@ TEST_DECLARE(intervals_unbounded_absorbs_successors) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_union_with_unbounded) {
+TEST_DECLARE(ds_intervals_union_with_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -622,8 +721,8 @@ TEST_DECLARE(intervals_union_with_unbounded) {
     tl_intervals_init(&b, &alloc);
     tl_intervals_init(&out, &alloc);
 
-    tl_intervals_insert(&a, 10, 30);
-    tl_intervals_insert_unbounded(&b, 20);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&a, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&b, 20));
 
     tl_status_t s = tl_intervals_union(&out, &a, &b);
     TEST_ASSERT_STATUS(TL_OK, s);
@@ -637,13 +736,13 @@ TEST_DECLARE(intervals_union_with_unbounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_clip_unbounded) {
+TEST_DECLARE(ds_intervals_clip_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert_unbounded(&iv, 50);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
     tl_intervals_clip(&iv, 25, 75);
 
     /* Unbounded [50, +inf) clipped to [25, 75) => [50, 75) bounded */
@@ -656,14 +755,14 @@ TEST_DECLARE(intervals_clip_unbounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_covered_span_bounded) {
+TEST_DECLARE(ds_intervals_covered_span_bounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 30); /* span = 20 */
-    tl_intervals_insert(&iv, 50, 70); /* span = 20 */
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30)); /* span = 20 */
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 70)); /* span = 20 */
 
     TEST_ASSERT_EQ(40, tl_intervals_covered_span(&iv));
 
@@ -671,14 +770,14 @@ TEST_DECLARE(intervals_covered_span_bounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_covered_span_unbounded) {
+TEST_DECLARE(ds_intervals_covered_span_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 30);
-    tl_intervals_insert_unbounded(&iv, 50);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
 
     /* Unbounded => returns TL_TS_MAX (saturated) */
     TEST_ASSERT_EQ(TL_TS_MAX, tl_intervals_covered_span(&iv));
@@ -687,14 +786,14 @@ TEST_DECLARE(intervals_covered_span_unbounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_cursor_basic) {
+TEST_DECLARE(ds_intervals_cursor_basic) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
 
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
@@ -715,32 +814,32 @@ TEST_DECLARE(intervals_cursor_basic) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_cursor_unbounded) {
+TEST_DECLARE(ds_intervals_cursor_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert_unbounded(&iv, 50);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
 
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
 
     TEST_ASSERT(!tl_intervals_cursor_is_deleted(&cur, 49));
     TEST_ASSERT(tl_intervals_cursor_is_deleted(&cur, 50));
-    TEST_ASSERT(tl_intervals_cursor_is_deleted(&cur, INT64_MAX));
+    TEST_ASSERT(tl_intervals_cursor_is_deleted(&cur, TL_TS_MAX));
 
     tl_intervals_destroy(&iv);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_cursor_skip_to) {
+TEST_DECLARE(ds_intervals_cursor_skip_to) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 30);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
 
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
@@ -759,13 +858,13 @@ TEST_DECLARE(intervals_cursor_skip_to) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_cursor_skip_to_unbounded) {
+TEST_DECLARE(ds_intervals_cursor_skip_to_unbounded) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert_unbounded(&iv, 50);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
 
     tl_intervals_cursor_t cur;
     tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
@@ -783,13 +882,13 @@ TEST_DECLARE(intervals_cursor_skip_to_unbounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(intervals_destroy_idempotent) {
+TEST_DECLARE(ds_intervals_destroy_idempotent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 20);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
     tl_intervals_destroy(&iv);
 
     /* Second destroy should be safe */
@@ -799,14 +898,14 @@ TEST_DECLARE(intervals_destroy_idempotent) {
 }
 
 #ifdef TL_DEBUG
-TEST_DECLARE(intervals_validate_correct) {
+TEST_DECLARE(ds_intervals_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    tl_intervals_insert(&iv, 10, 20);
-    tl_intervals_insert(&iv, 30, 40);
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 30, 40));
 
     TEST_ASSERT(tl_intervals_validate(&iv));
 
@@ -816,10 +915,10 @@ TEST_DECLARE(intervals_validate_correct) {
 #endif
 
 /*===========================================================================
- * Min-Heap Tests
+ * Min-Heap Tests (11 tests)
  *===========================================================================*/
 
-TEST_DECLARE(heap_init_empty) {
+TEST_DECLARE(ds_heap_init_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -833,7 +932,7 @@ TEST_DECLARE(heap_init_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_push_pop_single) {
+TEST_DECLARE(ds_heap_push_pop_single) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -857,7 +956,7 @@ TEST_DECLARE(heap_push_pop_single) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_pop_empty) {
+TEST_DECLARE(ds_heap_pop_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -870,7 +969,7 @@ TEST_DECLARE(heap_pop_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_ordering) {
+TEST_DECLARE(ds_heap_ordering) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -883,7 +982,7 @@ TEST_DECLARE(heap_ordering) {
     for (tl_ts_t ts = 50; ts >= 10; ts -= 10) {
         e.ts = ts;
         e.handle = (tl_handle_t)ts;
-        tl_heap_push(&h, &e);
+        TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     }
     TEST_ASSERT_EQ(5, tl_heap_len(&h));
 
@@ -899,7 +998,7 @@ TEST_DECLARE(heap_ordering) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_tie_break_by_component) {
+TEST_DECLARE(ds_heap_tie_break_by_component) {
     /*
      * NOTE: This test verifies a DOCUMENTED INVARIANT, not an implementation
      * detail. The K-way merge relies on deterministic tie-breaking by
@@ -919,24 +1018,24 @@ TEST_DECLARE(heap_tie_break_by_component) {
     tl_heap_entry_t e2 = { .ts = 100, .component_id = 2, .handle = 2, .iter = NULL };
     tl_heap_entry_t e3 = { .ts = 100, .component_id = 8, .handle = 3, .iter = NULL };
 
-    tl_heap_push(&h, &e1);
-    tl_heap_push(&h, &e2);
-    tl_heap_push(&h, &e3);
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e1));
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e2));
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e3));
 
     /* Should pop in ascending component_id order (documented tie-breaker) */
     tl_heap_entry_t out;
-    tl_heap_pop(&h, &out);
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
     TEST_ASSERT_EQ(2, out.component_id);
-    tl_heap_pop(&h, &out);
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
     TEST_ASSERT_EQ(5, out.component_id);
-    tl_heap_pop(&h, &out);
+    TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
     TEST_ASSERT_EQ(8, out.component_id);
 
     tl_heap_destroy(&h);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_build_heapify) {
+TEST_DECLARE(ds_heap_build_heapify) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -968,7 +1067,7 @@ TEST_DECLARE(heap_build_heapify) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_replace_top) {
+TEST_DECLARE(ds_heap_replace_top) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -980,7 +1079,7 @@ TEST_DECLARE(heap_replace_top) {
     e.handle = 0;
     for (tl_ts_t ts = 10; ts <= 50; ts += 10) {
         e.ts = ts;
-        tl_heap_push(&h, &e);
+        TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     }
 
     /* Replace top (10) with 25 */
@@ -994,7 +1093,7 @@ TEST_DECLARE(heap_replace_top) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_stress) {
+TEST_DECLARE(ds_heap_stress) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -1008,7 +1107,7 @@ TEST_DECLARE(heap_stress) {
         /* Simple pseudo-random: (i * 7 + 13) % 1000 */
         e.ts = (tl_ts_t)((i * 7 + 13) % 1000);
         e.handle = (tl_handle_t)i;
-        tl_heap_push(&h, &e);
+        TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     }
 
     TEST_ASSERT_EQ(1000, tl_heap_len(&h));
@@ -1028,7 +1127,7 @@ TEST_DECLARE(heap_stress) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_build_empty) {
+TEST_DECLARE(ds_heap_build_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -1043,7 +1142,7 @@ TEST_DECLARE(heap_build_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_destroy_idempotent) {
+TEST_DECLARE(ds_heap_destroy_idempotent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -1059,7 +1158,7 @@ TEST_DECLARE(heap_destroy_idempotent) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(heap_replace_top_becomes_smallest) {
+TEST_DECLARE(ds_heap_replace_top_becomes_smallest) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
     tl_heap_t h;
@@ -1089,63 +1188,68 @@ TEST_DECLARE(heap_replace_top_becomes_smallest) {
  * Test Runner
  *===========================================================================*/
 
-void run_phase2_tests(void) {
-    /* Record Vector tests */
-    RUN_TEST(recvec_init_empty);
-    RUN_TEST(recvec_push_single);
-    RUN_TEST(recvec_push_growth);
-    RUN_TEST(recvec_lower_bound_empty);
-    RUN_TEST(recvec_lower_bound_found);
-    RUN_TEST(recvec_upper_bound);
-    RUN_TEST(recvec_range_bounds);
-    RUN_TEST(recvec_insert_middle);
-    RUN_TEST(recvec_clear_and_reuse);
-    RUN_TEST(recvec_take_ownership);
-    RUN_TEST(recvec_take_empty);
-    RUN_TEST(recvec_reserve_zero);
-    RUN_TEST(recvec_push_n_zero);
-    RUN_TEST(recvec_insert_invalid_idx);
-    RUN_TEST(recvec_shrink_to_fit_empty);
-    RUN_TEST(recvec_destroy_idempotent);
+void run_internal_data_structures_tests(void) {
+    /* Record Vector tests (16 tests) */
+    RUN_TEST(ds_recvec_init_empty);
+    RUN_TEST(ds_recvec_push_single);
+    RUN_TEST(ds_recvec_push_growth);
+    RUN_TEST(ds_recvec_lower_bound_empty);
+    RUN_TEST(ds_recvec_lower_bound_found);
+    RUN_TEST(ds_recvec_upper_bound);
+    RUN_TEST(ds_recvec_range_bounds);
+    RUN_TEST(ds_recvec_insert_middle);
+    RUN_TEST(ds_recvec_clear_and_reuse);
+    RUN_TEST(ds_recvec_take_ownership);
+    RUN_TEST(ds_recvec_take_empty);
+    RUN_TEST(ds_recvec_reserve_zero);
+    RUN_TEST(ds_recvec_push_n_zero);
+    RUN_TEST(ds_recvec_insert_invalid_idx);
+    RUN_TEST(ds_recvec_shrink_to_fit_empty);
+    RUN_TEST(ds_recvec_destroy_idempotent);
 
-    /* Interval Set tests */
-    RUN_TEST(intervals_init_empty);
-    RUN_TEST(intervals_insert_single);
-    RUN_TEST(intervals_insert_empty_is_noop);
-    RUN_TEST(intervals_coalesce_overlapping);
-    RUN_TEST(intervals_coalesce_adjacent);
-    RUN_TEST(intervals_no_coalesce_gap);
-    RUN_TEST(intervals_coalesce_multi);
-    RUN_TEST(intervals_contains_basic);
-    RUN_TEST(intervals_unbounded);
-    RUN_TEST(intervals_union_basic);
-    RUN_TEST(intervals_clip);
-    RUN_TEST(intervals_clip_removes_outside);
-    RUN_TEST(intervals_unbounded_merge_with_bounded);
-    RUN_TEST(intervals_unbounded_absorbs_successors);
-    RUN_TEST(intervals_union_with_unbounded);
-    RUN_TEST(intervals_clip_unbounded);
-    RUN_TEST(intervals_covered_span_bounded);
-    RUN_TEST(intervals_covered_span_unbounded);
-    RUN_TEST(intervals_cursor_basic);
-    RUN_TEST(intervals_cursor_unbounded);
-    RUN_TEST(intervals_cursor_skip_to);
-    RUN_TEST(intervals_cursor_skip_to_unbounded);
-    RUN_TEST(intervals_destroy_idempotent);
+    /* Interval Set tests (27 tests, 1 debug-only) */
+    RUN_TEST(ds_intervals_init_empty);
+    RUN_TEST(ds_intervals_insert_single);
+    RUN_TEST(ds_intervals_insert_empty_is_noop);
+    RUN_TEST(ds_intervals_coalesce_overlapping);
+    RUN_TEST(ds_intervals_coalesce_adjacent);
+    RUN_TEST(ds_intervals_no_coalesce_gap);
+    RUN_TEST(ds_intervals_coalesce_multi);
+    RUN_TEST(ds_intervals_contains_basic);
+    RUN_TEST(ds_intervals_unbounded);
+    RUN_TEST(ds_intervals_union_basic);
+    RUN_TEST(ds_intervals_clip);
+    RUN_TEST(ds_intervals_clip_removes_outside);
+    RUN_TEST(ds_intervals_clip_lower_removes_before);
+    RUN_TEST(ds_intervals_clip_lower_truncates_overlapping);
+    RUN_TEST(ds_intervals_clip_lower_unbounded);
+    RUN_TEST(ds_intervals_unbounded_merge_with_bounded);
+    RUN_TEST(ds_intervals_unbounded_absorbs_successors);
+    RUN_TEST(ds_intervals_union_with_unbounded);
+    RUN_TEST(ds_intervals_clip_unbounded);
+    RUN_TEST(ds_intervals_covered_span_bounded);
+    RUN_TEST(ds_intervals_covered_span_unbounded);
+    RUN_TEST(ds_intervals_cursor_basic);
+    RUN_TEST(ds_intervals_cursor_unbounded);
+    RUN_TEST(ds_intervals_cursor_skip_to);
+    RUN_TEST(ds_intervals_cursor_skip_to_unbounded);
+    RUN_TEST(ds_intervals_destroy_idempotent);
 #ifdef TL_DEBUG
-    RUN_TEST(intervals_validate_correct);
+    RUN_TEST(ds_intervals_validate_correct);
 #endif
 
-    /* Min-Heap tests */
-    RUN_TEST(heap_init_empty);
-    RUN_TEST(heap_push_pop_single);
-    RUN_TEST(heap_pop_empty);
-    RUN_TEST(heap_ordering);
-    RUN_TEST(heap_tie_break_by_component);
-    RUN_TEST(heap_build_heapify);
-    RUN_TEST(heap_replace_top);
-    RUN_TEST(heap_stress);
-    RUN_TEST(heap_build_empty);
-    RUN_TEST(heap_destroy_idempotent);
-    RUN_TEST(heap_replace_top_becomes_smallest);
+    /* Min-Heap tests (11 tests) */
+    RUN_TEST(ds_heap_init_empty);
+    RUN_TEST(ds_heap_push_pop_single);
+    RUN_TEST(ds_heap_pop_empty);
+    RUN_TEST(ds_heap_ordering);
+    RUN_TEST(ds_heap_tie_break_by_component);
+    RUN_TEST(ds_heap_build_heapify);
+    RUN_TEST(ds_heap_replace_top);
+    RUN_TEST(ds_heap_stress);
+    RUN_TEST(ds_heap_build_empty);
+    RUN_TEST(ds_heap_destroy_idempotent);
+    RUN_TEST(ds_heap_replace_top_becomes_smallest);
+
+    /* Total: 53 tests in release, 54 in debug */
 }

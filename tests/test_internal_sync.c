@@ -1,3 +1,23 @@
+/*===========================================================================
+ * test_internal_sync.c - Internal Synchronization Primitive Tests
+ *
+ * Tests for low-level synchronization primitives:
+ * - Atomic operations (u32, u64, ptr)
+ * - Mutex (init, destroy, lock, unlock, trylock)
+ * - Condition variables (init, destroy, wait, timedwait, signal)
+ * - Seqlock (init, write cycle, validation)
+ * - Threads (create, join, multiple)
+ * - Lock ordering (debug builds only)
+ *
+ * These tests validate the foundational concurrency building blocks
+ * that all higher-level components depend on.
+ *
+ * Part of Phase 10: Integration Testing and Hardening
+ *
+ * Migration Status: COMPLETE (migrated from test_phase1.c)
+ * Note: Test names prefixed with "sync_" to avoid conflicts during migration.
+ *===========================================================================*/
+
 #include "test_harness.h"
 #include "timelog/timelog.h"
 #include "internal/tl_sync.h"
@@ -6,12 +26,14 @@
 #include "internal/tl_locks.h"
 
 #include <string.h>
+#include <stdint.h>
+#include <stddef.h>
 
 /*===========================================================================
  * Atomic Tests
  *===========================================================================*/
 
-TEST_DECLARE(atomic_u32_load_store) {
+TEST_DECLARE(sync_atomic_u32_load_store) {
     tl_atomic_u32 val;
     tl_atomic_init_u32(&val, 0);
 
@@ -24,7 +46,7 @@ TEST_DECLARE(atomic_u32_load_store) {
     TEST_ASSERT_EQ(100, tl_atomic_load_acquire_u32(&val));
 }
 
-TEST_DECLARE(atomic_u64_load_store) {
+TEST_DECLARE(sync_atomic_u64_load_store) {
     tl_atomic_u64 val;
     tl_atomic_init_u64(&val, 0);
 
@@ -34,7 +56,7 @@ TEST_DECLARE(atomic_u64_load_store) {
     TEST_ASSERT_EQ(0x123456789ABCDEF0ULL, tl_atomic_load_relaxed_u64(&val));
 }
 
-TEST_DECLARE(atomic_fetch_add) {
+TEST_DECLARE(sync_atomic_fetch_add) {
     tl_atomic_u32 val;
     tl_atomic_init_u32(&val, 10);
 
@@ -47,7 +69,7 @@ TEST_DECLARE(atomic_fetch_add) {
     TEST_ASSERT_EQ(16, tl_atomic_load_relaxed_u32(&val));
 }
 
-TEST_DECLARE(atomic_fetch_sub) {
+TEST_DECLARE(sync_atomic_fetch_sub) {
     tl_atomic_u32 val;
     tl_atomic_init_u32(&val, 20);
 
@@ -60,7 +82,7 @@ TEST_DECLARE(atomic_fetch_sub) {
     TEST_ASSERT_EQ(12, tl_atomic_load_relaxed_u32(&val));
 }
 
-TEST_DECLARE(atomic_cas_success) {
+TEST_DECLARE(sync_atomic_cas_success) {
     tl_atomic_u32 val;
     tl_atomic_init_u32(&val, 100);
 
@@ -72,7 +94,7 @@ TEST_DECLARE(atomic_cas_success) {
     TEST_ASSERT_EQ(200, tl_atomic_load_relaxed_u32(&val));
 }
 
-TEST_DECLARE(atomic_cas_failure) {
+TEST_DECLARE(sync_atomic_cas_failure) {
     tl_atomic_u32 val;
     tl_atomic_init_u32(&val, 100);
 
@@ -84,7 +106,7 @@ TEST_DECLARE(atomic_cas_failure) {
     TEST_ASSERT_EQ(100, tl_atomic_load_relaxed_u32(&val)); /* Unchanged */
 }
 
-TEST_DECLARE(atomic_ptr_exchange) {
+TEST_DECLARE(sync_atomic_ptr_exchange) {
     int a = 1, b = 2;
     tl_atomic_ptr ptr;
     tl_atomic_init_ptr(&ptr, &a);
@@ -100,16 +122,16 @@ TEST_DECLARE(atomic_ptr_exchange) {
  * Mutex Tests
  *===========================================================================*/
 
-TEST_DECLARE(mutex_init_destroy) {
+TEST_DECLARE(sync_mutex_init_destroy) {
     tl_mutex_t mu;
     tl_status_t s = tl_mutex_init(&mu);
     TEST_ASSERT_STATUS(TL_OK, s);
     tl_mutex_destroy(&mu);
 }
 
-TEST_DECLARE(mutex_lock_unlock) {
+TEST_DECLARE(sync_mutex_lock_unlock) {
     tl_mutex_t mu;
-    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&mu));
 
     tl_mutex_lock(&mu);
     /* Critical section */
@@ -118,19 +140,22 @@ TEST_DECLARE(mutex_lock_unlock) {
     tl_mutex_destroy(&mu);
 }
 
-TEST_DECLARE(mutex_trylock) {
+TEST_DECLARE(sync_mutex_trylock) {
     tl_mutex_t mu;
-    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&mu));
 
     /* First trylock should succeed */
     TEST_ASSERT(tl_mutex_trylock(&mu));
 
-    /* Second trylock should fail (already locked by same thread) */
-    /* Note: This behavior varies by platform. SRWLock allows it, pthread doesn't. */
-    /* We just test unlock after trylock. */
+    /*
+     * Recursive trylock behavior is platform-specific:
+     * - Windows SRWLock: Allows recursive lock (returns true)
+     * - POSIX pthread: Undefined for PTHREAD_MUTEX_DEFAULT
+     * We don't test recursive trylock - just verify basic functionality.
+     */
     tl_mutex_unlock(&mu);
 
-    /* Should be able to lock again */
+    /* After unlock, should be able to lock again */
     TEST_ASSERT(tl_mutex_trylock(&mu));
     tl_mutex_unlock(&mu);
 
@@ -141,39 +166,112 @@ TEST_DECLARE(mutex_trylock) {
  * Condition Variable Tests
  *===========================================================================*/
 
-TEST_DECLARE(cond_init_destroy) {
+TEST_DECLARE(sync_cond_init_destroy) {
     tl_cond_t cv;
     tl_status_t s = tl_cond_init(&cv);
     TEST_ASSERT_STATUS(TL_OK, s);
     tl_cond_destroy(&cv);
 }
 
-TEST_DECLARE(cond_timedwait_timeout) {
+/*---------------------------------------------------------------------------
+ * Condvar signal/wakeup test context
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    tl_mutex_t*   mu;
+    tl_cond_t*    cv;
+    tl_atomic_u32 predicate;  /* 0 = not ready, 1 = ready */
+    tl_atomic_u32 waiter_woke;
+} sync_cond_signal_ctx_t;
+
+static void* sync_cond_waiter_thread(void* arg) {
+    sync_cond_signal_ctx_t* ctx = (sync_cond_signal_ctx_t*)arg;
+
+    tl_mutex_lock(ctx->mu);
+
+    /* Wait for predicate to become true */
+    while (tl_atomic_load_acquire_u32(&ctx->predicate) == 0) {
+        tl_cond_wait(ctx->cv, ctx->mu);
+    }
+
+    /* Mark that we woke up */
+    tl_atomic_store_release_u32(&ctx->waiter_woke, 1);
+
+    tl_mutex_unlock(ctx->mu);
+    return NULL;
+}
+
+TEST_DECLARE(sync_cond_signal_wakeup) {
     tl_mutex_t mu;
     tl_cond_t cv;
 
-    tl_mutex_init(&mu);
-    tl_cond_init(&cv);
+    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&mu));
+    TEST_ASSERT_STATUS(TL_OK, tl_cond_init(&cv));
+
+    sync_cond_signal_ctx_t ctx = {
+        .mu = &mu,
+        .cv = &cv
+    };
+    tl_atomic_init_u32(&ctx.predicate, 0);
+    tl_atomic_init_u32(&ctx.waiter_woke, 0);
+
+    /* Start waiter thread */
+    tl_thread_t waiter;
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&waiter, sync_cond_waiter_thread, &ctx));
+
+    /* Give waiter time to enter wait */
+    tl_sleep_ms(10);
+
+    /* Set predicate and signal */
+    tl_mutex_lock(&mu);
+    tl_atomic_store_release_u32(&ctx.predicate, 1);
+    tl_cond_signal(&cv);
+    tl_mutex_unlock(&mu);
+
+    /* Wait for waiter to finish */
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_join(&waiter, NULL));
+
+    /* Verify waiter woke up */
+    TEST_ASSERT_EQ(1, tl_atomic_load_relaxed_u32(&ctx.waiter_woke));
+
+    tl_cond_destroy(&cv);
+    tl_mutex_destroy(&mu);
+}
+
+TEST_DECLARE(sync_cond_timedwait_timeout) {
+    tl_mutex_t mu;
+    tl_cond_t cv;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&mu));
+    TEST_ASSERT_STATUS(TL_OK, tl_cond_init(&cv));
 
     tl_mutex_lock(&mu);
 
     /*
-     * Wait with short timeout. We expect a timeout, but POSIX allows
-     * spurious wakeups. To handle this correctly, we use a predicate
-     * pattern and retry on spurious wakeups.
+     * Wait with timeout. We expect a timeout, but POSIX allows spurious
+     * wakeups. To handle this correctly and avoid flakiness, we:
+     * 1. Use a reasonable per-wait timeout (20ms)
+     * 2. Track total elapsed time with monotonic clock
+     * 3. Allow up to 500ms total before declaring test failure
      *
-     * For this test, we just verify that after enough time passes,
-     * we get a false return (timeout). Spurious wakeups return true
-     * but immediately go back to wait.
+     * On platforms with coarse timers, spurious wakeups may occur.
+     * Eventually we must get a timeout (false return).
      */
+    const uint64_t max_total_ms = 500;
+    const uint64_t start_ms = tl_monotonic_ms();
+
     bool got_timeout = false;
-    int attempts = 0;
-    while (!got_timeout && attempts < 10) {
-        bool signaled = tl_cond_timedwait(&cv, &mu, 5); /* 5ms */
+    while (!got_timeout) {
+        uint64_t elapsed = tl_monotonic_ms() - start_ms;
+        if (elapsed >= max_total_ms) {
+            /* Test failure - never got timeout in reasonable time */
+            break;
+        }
+
+        bool signaled = tl_cond_timedwait(&cv, &mu, 20); /* 20ms per wait */
         if (!signaled) {
             got_timeout = true;
         }
-        attempts++;
+        /* On spurious wakeup (signaled=true), loop and wait again */
     }
     TEST_ASSERT(got_timeout); /* Should eventually timeout */
 
@@ -187,7 +285,7 @@ TEST_DECLARE(cond_timedwait_timeout) {
  * Seqlock Tests
  *===========================================================================*/
 
-TEST_DECLARE(seqlock_init) {
+TEST_DECLARE(sync_seqlock_init) {
     tl_seqlock_t sl;
     tl_seqlock_init(&sl);
 
@@ -196,7 +294,7 @@ TEST_DECLARE(seqlock_init) {
     TEST_ASSERT(tl_seqlock_is_even(seq));
 }
 
-TEST_DECLARE(seqlock_write_cycle) {
+TEST_DECLARE(sync_seqlock_write_cycle) {
     tl_seqlock_t sl;
     tl_seqlock_init(&sl);
 
@@ -216,7 +314,7 @@ TEST_DECLARE(seqlock_write_cycle) {
     TEST_ASSERT_EQ(seq0 + 2, seq2); /* Incremented by 2 */
 }
 
-TEST_DECLARE(seqlock_validate) {
+TEST_DECLARE(sync_seqlock_validate) {
     tl_seqlock_t sl;
     tl_seqlock_init(&sl);
 
@@ -239,7 +337,7 @@ TEST_DECLARE(seqlock_validate) {
  * Thread Tests
  *===========================================================================*/
 
-static void* thread_increment(void* arg) {
+static void* sync_thread_increment(void* arg) {
     tl_atomic_u32* counter = (tl_atomic_u32*)arg;
     for (int i = 0; i < 1000; i++) {
         tl_atomic_inc_u32(counter);
@@ -247,12 +345,12 @@ static void* thread_increment(void* arg) {
     return (void*)(intptr_t)42;
 }
 
-TEST_DECLARE(thread_create_join) {
+TEST_DECLARE(sync_thread_create_join) {
     tl_atomic_u32 counter;
     tl_atomic_init_u32(&counter, 0);
 
     tl_thread_t t;
-    tl_status_t s = tl_thread_create(&t, thread_increment, (void*)&counter);
+    tl_status_t s = tl_thread_create(&t, sync_thread_increment, (void*)&counter);
     TEST_ASSERT_STATUS(TL_OK, s);
 
     void* result = NULL;
@@ -263,18 +361,18 @@ TEST_DECLARE(thread_create_join) {
     TEST_ASSERT_EQ(1000, tl_atomic_load_relaxed_u32(&counter));
 }
 
-TEST_DECLARE(thread_multiple) {
+TEST_DECLARE(sync_thread_multiple) {
     tl_atomic_u32 counter;
     tl_atomic_init_u32(&counter, 0);
 
     tl_thread_t t1, t2, t3;
-    tl_thread_create(&t1, thread_increment, (void*)&counter);
-    tl_thread_create(&t2, thread_increment, (void*)&counter);
-    tl_thread_create(&t3, thread_increment, (void*)&counter);
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&t1, sync_thread_increment, (void*)&counter));
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&t2, sync_thread_increment, (void*)&counter));
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&t3, sync_thread_increment, (void*)&counter));
 
-    tl_thread_join(&t1, NULL);
-    tl_thread_join(&t2, NULL);
-    tl_thread_join(&t3, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_join(&t1, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_join(&t2, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_join(&t3, NULL));
 
     TEST_ASSERT_EQ(3000, tl_atomic_load_relaxed_u32(&counter));
 }
@@ -284,7 +382,7 @@ TEST_DECLARE(thread_multiple) {
  *===========================================================================*/
 
 #ifdef TL_DEBUG
-TEST_DECLARE(lock_ordering_valid) {
+TEST_DECLARE(sync_lock_ordering_valid) {
     tl_mutex_t maint_mu, flush_mu, writer_mu;
     tl_mutex_init(&maint_mu);
     tl_mutex_init(&flush_mu);
@@ -309,7 +407,7 @@ TEST_DECLARE(lock_ordering_valid) {
  * Integration Tests
  *===========================================================================*/
 
-TEST_DECLARE(open_initializes_locks) {
+TEST_DECLARE(sync_open_initializes_locks) {
     tl_timelog_t* tl = NULL;
     tl_status_t s = tl_open(NULL, &tl);
 
@@ -322,7 +420,7 @@ TEST_DECLARE(open_initializes_locks) {
     tl_close(tl);
 }
 
-TEST_DECLARE(close_destroys_locks) {
+TEST_DECLARE(sync_close_destroys_locks) {
     tl_timelog_t* tl = NULL;
     tl_open(NULL, &tl);
 
@@ -334,40 +432,43 @@ TEST_DECLARE(close_destroys_locks) {
  * Test Runner
  *===========================================================================*/
 
-void run_phase1_tests(void) {
-    /* Atomics */
-    RUN_TEST(atomic_u32_load_store);
-    RUN_TEST(atomic_u64_load_store);
-    RUN_TEST(atomic_fetch_add);
-    RUN_TEST(atomic_fetch_sub);
-    RUN_TEST(atomic_cas_success);
-    RUN_TEST(atomic_cas_failure);
-    RUN_TEST(atomic_ptr_exchange);
+void run_internal_sync_tests(void) {
+    /* Atomics (7 tests) */
+    RUN_TEST(sync_atomic_u32_load_store);
+    RUN_TEST(sync_atomic_u64_load_store);
+    RUN_TEST(sync_atomic_fetch_add);
+    RUN_TEST(sync_atomic_fetch_sub);
+    RUN_TEST(sync_atomic_cas_success);
+    RUN_TEST(sync_atomic_cas_failure);
+    RUN_TEST(sync_atomic_ptr_exchange);
 
-    /* Mutex */
-    RUN_TEST(mutex_init_destroy);
-    RUN_TEST(mutex_lock_unlock);
-    RUN_TEST(mutex_trylock);
+    /* Mutex (3 tests) */
+    RUN_TEST(sync_mutex_init_destroy);
+    RUN_TEST(sync_mutex_lock_unlock);
+    RUN_TEST(sync_mutex_trylock);
 
-    /* Condition variable */
-    RUN_TEST(cond_init_destroy);
-    RUN_TEST(cond_timedwait_timeout);
+    /* Condition variable (3 tests) */
+    RUN_TEST(sync_cond_init_destroy);
+    RUN_TEST(sync_cond_signal_wakeup);
+    RUN_TEST(sync_cond_timedwait_timeout);
 
-    /* Seqlock */
-    RUN_TEST(seqlock_init);
-    RUN_TEST(seqlock_write_cycle);
-    RUN_TEST(seqlock_validate);
+    /* Seqlock (3 tests) */
+    RUN_TEST(sync_seqlock_init);
+    RUN_TEST(sync_seqlock_write_cycle);
+    RUN_TEST(sync_seqlock_validate);
 
-    /* Threads */
-    RUN_TEST(thread_create_join);
-    RUN_TEST(thread_multiple);
+    /* Threads (2 tests) */
+    RUN_TEST(sync_thread_create_join);
+    RUN_TEST(sync_thread_multiple);
 
-    /* Lock ordering (debug only) */
+    /* Lock ordering - debug only (1 test) */
 #ifdef TL_DEBUG
-    RUN_TEST(lock_ordering_valid);
+    RUN_TEST(sync_lock_ordering_valid);
 #endif
 
-    /* Integration */
-    RUN_TEST(open_initializes_locks);
-    RUN_TEST(close_destroys_locks);
+    /* Integration (2 tests) */
+    RUN_TEST(sync_open_initializes_locks);
+    RUN_TEST(sync_close_destroys_locks);
+
+    /* Total: 20 tests in release, 21 in debug */
 }

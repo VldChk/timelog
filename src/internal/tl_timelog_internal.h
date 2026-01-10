@@ -129,6 +129,29 @@ struct tl_timelog {
      *-----------------------------------------------------------------------*/
     tl_manifest_t*  manifest;       /* Current manifest (atomic publication root) */
     uint32_t        next_gen;       /* Monotonic generation for new segments */
+
+    /*-----------------------------------------------------------------------
+     * Operational Counters (cumulative since open)
+     *
+     * These are atomic because they may be incremented by the writer thread
+     * (seals, ooo_budget_hits, backpressure) or the maintenance thread
+     * (flushes, compactions) while being read by stats queries.
+     *-----------------------------------------------------------------------*/
+    tl_atomic_u64   seals_total;        /* Memtable seals performed */
+    tl_atomic_u64   ooo_budget_hits;    /* OOO budget exceeded (forced sort) */
+    tl_atomic_u64   backpressure_waits; /* Writer blocked on sealed queue */
+    tl_atomic_u64   flushes_total;      /* Flush operations completed */
+    tl_atomic_u64   compactions_total;  /* Compaction operations completed */
+
+#ifdef TL_DEBUG
+    /*-----------------------------------------------------------------------
+     * Debug-Only Snapshot Tracking
+     *
+     * Counts outstanding snapshots to detect leaks at close time.
+     * Atomic because snapshots can be acquired/released from multiple threads.
+     *-----------------------------------------------------------------------*/
+    tl_atomic_u32   snapshot_count; /* Outstanding snapshot count */
+#endif
 };
 
 #endif /* TL_TIMELOG_INTERNAL_H */

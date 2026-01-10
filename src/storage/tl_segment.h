@@ -79,6 +79,7 @@ typedef struct tl_segment {
     /* Window bounds (L1 only, 0 for L0) */
     tl_ts_t   window_start;     /* Inclusive start (L1 only) */
     tl_ts_t   window_end;       /* Exclusive end (L1 only) */
+    bool      window_end_unbounded; /* True if window extends to +infinity (L1 only) */
 
     /* Page catalog */
     tl_page_catalog_t catalog;
@@ -133,17 +134,20 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
  *
  * Used by compaction builder (Compaction Policy LLD Section 7).
  *
- * @param alloc             Allocator context
- * @param records           Sorted record array (must not be NULL, count > 0)
- * @param record_count      Number of records
- * @param target_page_bytes Target page size
- * @param window_start      Window start (inclusive)
- * @param window_end        Window end (exclusive)
- * @param generation        Generation counter
- * @param out               Output segment pointer
+ * @param alloc               Allocator context
+ * @param records             Sorted record array (must not be NULL, count > 0)
+ * @param record_count        Number of records
+ * @param target_page_bytes   Target page size
+ * @param window_start        Window start (inclusive)
+ * @param window_end          Window end (exclusive); TL_TS_MAX when unbounded
+ * @param window_end_unbounded True if window extends to +infinity
+ * @param generation          Generation counter
+ * @param out                 Output segment pointer
  * @return TL_OK on success, TL_ENOMEM on failure, TL_EINVAL if records empty
  *
- * Precondition: All records satisfy window_start <= ts < window_end.
+ * Precondition: All records satisfy window_start <= ts < window_end
+ *               (or ts >= window_start if window_end_unbounded).
+ * Invariant: window_end_unbounded implies window_end == TL_TS_MAX.
  *
  * Returned segment has refcnt = 1 (caller owns reference).
  */
@@ -151,6 +155,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  const tl_record_t* records, size_t record_count,
                                  size_t target_page_bytes,
                                  tl_ts_t window_start, tl_ts_t window_end,
+                                 bool window_end_unbounded,
                                  uint32_t generation,
                                  tl_segment_t** out);
 

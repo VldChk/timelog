@@ -5,19 +5,10 @@
 #include <stdarg.h>
 
 /*===========================================================================
- * Log Levels
- *===========================================================================*/
-
-typedef enum tl_log_level {
-    TL_LOG_LEVEL_ERROR = 0,
-    TL_LOG_LEVEL_WARN  = 1,
-    TL_LOG_LEVEL_INFO  = 2,
-    TL_LOG_LEVEL_DEBUG = 3,
-    TL_LOG_LEVEL_TRACE = 4
-} tl_log_level_t;
-
-/*===========================================================================
  * Log Context
+ *
+ * Uses tl_log_level_t from public API (timelog/timelog.h, included via tl_defs.h).
+ * Internal code uses TL_LOG_* values directly.
  *===========================================================================*/
 
 typedef struct tl_log_ctx {
@@ -33,8 +24,9 @@ typedef struct tl_log_ctx {
 /**
  * Initialize log context from user configuration.
  * If fn is NULL, logging is disabled.
+ * @param level Max log level to accept (use TL_LOG_NONE to disable all)
  */
-void tl__log_init(tl_log_ctx_t* log, tl_log_fn fn, void* ctx);
+void tl__log_init(tl_log_ctx_t* log, tl_log_fn fn, void* ctx, tl_log_level_t level);
 
 /*===========================================================================
  * Logging Functions
@@ -60,19 +52,19 @@ void tl__log_v(tl_log_ctx_t* log, tl_log_level_t level,
 /* These require a `tl_log_ctx_t* log` in scope */
 
 #define TL_LOG_ERROR(...) \
-    tl__log(log, TL_LOG_LEVEL_ERROR, __VA_ARGS__)
+    tl__log(log, TL_LOG_ERROR, __VA_ARGS__)
 
 #define TL_LOG_WARN(...) \
-    tl__log(log, TL_LOG_LEVEL_WARN, __VA_ARGS__)
+    tl__log(log, TL_LOG_WARN, __VA_ARGS__)
 
 #define TL_LOG_INFO(...) \
-    tl__log(log, TL_LOG_LEVEL_INFO, __VA_ARGS__)
+    tl__log(log, TL_LOG_INFO, __VA_ARGS__)
 
 #ifdef TL_DEBUG
     #define TL_LOG_DEBUG(...) \
-        tl__log(log, TL_LOG_LEVEL_DEBUG, __VA_ARGS__)
+        tl__log(log, TL_LOG_DEBUG, __VA_ARGS__)
     #define TL_LOG_TRACE(...) \
-        tl__log(log, TL_LOG_LEVEL_TRACE, __VA_ARGS__)
+        tl__log(log, TL_LOG_TRACE, __VA_ARGS__)
 #else
     #define TL_LOG_DEBUG(...) ((void)0)
     #define TL_LOG_TRACE(...) ((void)0)

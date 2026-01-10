@@ -52,6 +52,27 @@ static bool source_done(const tl_iter_source_t* src) {
     return true;
 }
 
+/**
+ * Seek a source iterator to target timestamp.
+ * After seek, caller should call source_next to get the first record >= target.
+ */
+static void source_seek(tl_iter_source_t* src, tl_ts_t target) {
+    if (src->kind == TL_ITER_SEGMENT) {
+        tl_segment_iter_seek(&src->iter.segment, target);
+        return;
+    }
+    if (src->kind == TL_ITER_MEMRUN) {
+        tl_memrun_iter_seek(&src->iter.memrun, target);
+        return;
+    }
+    if (src->kind == TL_ITER_ACTIVE) {
+        tl_active_iter_seek(&src->iter.active, target);
+        return;
+    }
+    /* Should never reach here - all enum values handled above */
+    TL_ASSERT(false && "Invalid source kind");
+}
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -217,7 +238,9 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
         };
         tl_heap_replace_top(&it->heap, &new_entry);
     } else {
-        /* Step 5: Source exhausted - remove entry from heap (no allocation) */
+        /* Source exhausted - remove entry from heap (no allocation).
+         * Source iterators are expected to return TL_OK or TL_EOF only. */
+        TL_ASSERT(st == TL_EOF);
         tl_heap_entry_t discard;
         (void)tl_heap_pop(&it->heap, &discard);
     }
@@ -228,4 +251,88 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
     }
 
     return TL_OK;
+}
+
+/*===========================================================================
+ * Seek
+ *===========================================================================*/
+
+void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
+    TL_ASSERT(it != NULL);
+    TL_ASSERT(it->plan != NULL);
+
+    if (it->done) {
+        return;
+    }
+
+    /*
+     * Optimization: Check if target is at or before current minimum.
+     * If so, this is a no-op (forward-only seek).
+     */
+    const tl_ts_t* current_min = tl_kmerge_iter_peek_ts(it);
+    if (current_min != NULL && target <= *current_min) {
+        return;
+    }
+
+    /*
+     * Seek algorithm:
+     * 1. Seek all source iterators to target
+     * 2. Clear the heap
+     * 3. Re-prime each source and rebuild the heap
+     *
+     * This is O(K log K) where K = source count, which is acceptable
+     * since seek is used to skip large tombstone spans (amortized gain).
+     */
+
+    /* Clear the heap - we'll rebuild it */
+    tl_heap_clear(&it->heap);
+
+    /* Seek all sources and re-prime */
+    for (size_t i = 0; i < it->plan->source_count; i++) {
+        tl_iter_source_t* src = tl_plan_source(it->plan, i);
+
+        /* Seek this source */
+        source_seek(src, target);
+
+        /* Check if source is exhausted after seek */
+        if (source_done(src)) {
+            continue;
+        }
+
+        /* Prime the iterator with next record */
+        tl_record_t rec;
+        tl_status_t st = source_next(src, &rec);
+
+        if (st == TL_EOF) {
+            continue;
+        }
+
+        if (st != TL_OK) {
+            /* Error - mark as done and return.
+             * Caller will see done state on next operation. */
+            it->done = true;
+            return;
+        }
+
+        /* Push onto heap.
+         * Note: heap was reserved during init, so this should not fail.
+         * If it does somehow fail, we mark as done. */
+        tl_heap_entry_t entry = {
+            .ts = rec.ts,
+            .component_id = src->priority,
+            .handle = rec.handle,
+            .iter = src
+        };
+
+        tl_status_t push_st = tl_heap_push(&it->heap, &entry);
+        if (push_st != TL_OK) {
+            it->done = true;
+            return;
+        }
+    }
+
+    /* Check if all sources exhausted */
+    if (tl_heap_is_empty(&it->heap)) {
+        it->done = true;
+    }
 }

@@ -1,5 +1,6 @@
 #include "test_harness.h"
 #include "timelog/timelog.h"
+#include <inttypes.h>
 
 /*===========================================================================
  * Global Test Context
@@ -58,6 +59,36 @@ void test_fail_eq(const char* file, int line,
     test_fail(file, line, msg);
 }
 
+void test_fail_eq_u64(const char* file, int line,
+                      const char* expected_expr, const char* actual_expr,
+                      uint64_t expected, uint64_t actual) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "Expected %s == %s, got %" PRIu64 " != %" PRIu64,
+             expected_expr, actual_expr, expected, actual);
+    test_fail(file, line, msg);
+}
+
+void test_fail_eq_size(const char* file, int line,
+                       const char* expected_expr, const char* actual_expr,
+                       size_t expected, size_t actual) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "Expected %s == %s, got %zu != %zu",
+             expected_expr, actual_expr, expected, actual);
+    test_fail(file, line, msg);
+}
+
+void test_fail_eq_ptr(const char* file, int line,
+                      const char* expected_expr, const char* actual_expr,
+                      const void* expected, const void* actual) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "Expected %s == %s, got %p != %p",
+             expected_expr, actual_expr, expected, actual);
+    test_fail(file, line, msg);
+}
+
 void test_fail_status(const char* file, int line,
                       tl_status_t expected, tl_status_t actual) {
     char msg[512];
@@ -91,34 +122,47 @@ int test_report(void) {
 
 /*===========================================================================
  * External Test Declarations
+ *
+ * Tests organized by category:
+ * - Internal: Low-level primitives (sync, data structures, storage, delta)
+ * - Functional: End-to-end behavior through public API
+ * - API Semantics: Contract and error handling
+ * - Concurrency/Stress: Thread safety and load testing
+ * - Invariants: Structural correctness verification
  *===========================================================================*/
 
-/* Phase 0 tests */
-extern void run_phase0_tests(void);
+/* Internal synchronization primitives */
+extern void run_internal_sync_tests(void);
 
-/* Phase 1 tests */
-extern void run_phase1_tests(void);
+/* Internal data structures */
+extern void run_internal_data_structures_tests(void);
 
-/* Phase 2 tests */
-extern void run_phase2_tests(void);
+/* Core functional tests */
+extern void run_functional_tests(void);
 
-/* Phase 3 tests */
-extern void run_phase3_tests(void);
+/* API semantics and contract tests */
+extern void run_api_semantics_tests(void);
 
-/* Phase 4 tests */
-extern void run_phase4_tests(void);
+/* Concurrency and thread safety tests */
+extern void run_concurrency_tests(void);
 
-/* Phase 5 tests */
-extern void run_phase5_tests(void);
+/* Structural invariant tests */
+extern void run_invariants_tests(void);
 
-/* Phase 6 tests */
-extern void run_phase6_tests(void);
+/* Stress tests (conditional) */
+extern void run_stress_tests(void);
 
-/* Phase 8 tests */
-extern void run_phase8_tests(void);
+/* Snapshot lifetime tests */
+extern void run_snapshot_lifetime_tests(void);
 
-/* Phase 9 tests */
-extern void run_phase9_tests(void);
+/* Storage layer internal tests (LLD-driven) */
+extern void run_storage_internal_tests(void);
+
+/* Delta layer internal tests (LLD-driven) */
+extern void run_delta_internal_tests(void);
+
+/* Compaction internal tests (LLD-driven) */
+extern void run_compaction_internal_tests(void);
 
 /*===========================================================================
  * Main Entry Point
@@ -133,41 +177,61 @@ int main(int argc, char* argv[]) {
 
     test_init();
 
-    printf("Phase 0: Contract and Lifecycle\n");
-    printf("----------------------------------------\n");
-    run_phase0_tests();
+    /*-----------------------------------------------------------------------
+     * Internal Tests (LLD-driven implementation verification)
+     *-----------------------------------------------------------------------*/
 
-    printf("\nPhase 1: Concurrency Primitives\n");
+    printf("[Internal] Sync Primitives\n");
     printf("----------------------------------------\n");
-    run_phase1_tests();
+    run_internal_sync_tests();
 
-    printf("\nPhase 2: Shared Data Structures\n");
+    printf("\n[Internal] Data Structures\n");
     printf("----------------------------------------\n");
-    run_phase2_tests();
+    run_internal_data_structures_tests();
 
-    printf("\nPhase 3: Immutable Storage Layer\n");
+    printf("\n[Internal] Storage Layer\n");
     printf("----------------------------------------\n");
-    run_phase3_tests();
+    run_storage_internal_tests();
 
-    printf("\nPhase 4: Memtable and Write Path\n");
+    printf("\n[Internal] Delta Layer\n");
     printf("----------------------------------------\n");
-    run_phase4_tests();
+    run_delta_internal_tests();
 
-    printf("\nPhase 5: Snapshot and Read Path\n");
+    printf("\n[Internal] Compaction\n");
     printf("----------------------------------------\n");
-    run_phase5_tests();
+    run_compaction_internal_tests();
 
-    printf("\nPhase 6: Statistics and Diagnostics\n");
-    printf("----------------------------------------\n");
-    run_phase6_tests();
+    /*-----------------------------------------------------------------------
+     * Functional Tests (Public API behavior)
+     *-----------------------------------------------------------------------*/
 
-    printf("\nPhase 8: Compaction\n");
+    printf("\n[Functional] Core Operations\n");
     printf("----------------------------------------\n");
-    run_phase8_tests();
+    run_functional_tests();
 
-    printf("\nPhase 9: Failure Handling\n");
+    printf("\n[Functional] API Semantics\n");
     printf("----------------------------------------\n");
-    run_phase9_tests();
+    run_api_semantics_tests();
+
+    printf("\n[Functional] Snapshot Lifetime\n");
+    printf("----------------------------------------\n");
+    run_snapshot_lifetime_tests();
+
+    printf("\n[Functional] Invariants\n");
+    printf("----------------------------------------\n");
+    run_invariants_tests();
+
+    /*-----------------------------------------------------------------------
+     * Concurrency and Stress Tests
+     *-----------------------------------------------------------------------*/
+
+    printf("\n[Concurrency] Thread Safety\n");
+    printf("----------------------------------------\n");
+    run_concurrency_tests();
+
+    printf("\n[Stress] Load Testing\n");
+    printf("----------------------------------------\n");
+    run_stress_tests();
 
     return test_report();
 }

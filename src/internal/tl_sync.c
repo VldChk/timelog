@@ -198,6 +198,58 @@ uint64_t tl_thread_self_id(void) {
     return (uint64_t)GetCurrentThreadId();
 }
 
+#ifdef TL_DEBUG
+/*
+ * Thread-safe one-time initialization for SetThreadDescription.
+ * Uses InitOnceExecuteOnce to avoid data races when multiple threads
+ * call tl_thread_set_name() concurrently at startup.
+ */
+typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
+
+static INIT_ONCE g_thread_name_init_once = INIT_ONCE_STATIC_INIT;
+static SetThreadDescriptionFn g_set_thread_desc_fn = NULL;
+
+static BOOL CALLBACK thread_name_init_callback(
+    PINIT_ONCE init_once,
+    PVOID parameter,
+    PVOID* context)
+{
+    (void)init_once;
+    (void)parameter;
+    (void)context;
+
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32) {
+        g_set_thread_desc_fn = (SetThreadDescriptionFn)GetProcAddress(
+            kernel32, "SetThreadDescription");
+    }
+    return TRUE;
+}
+
+void tl_thread_set_name(const char* name) {
+    if (name == NULL) return;
+
+    /*
+     * SetThreadDescription requires Windows 10 1607+.
+     * We dynamically load it to avoid breaking older systems.
+     * InitOnceExecuteOnce ensures thread-safe one-time initialization.
+     */
+    InitOnceExecuteOnce(&g_thread_name_init_once, thread_name_init_callback, NULL, NULL);
+
+    if (g_set_thread_desc_fn) {
+        /* Convert to wide string (simple ASCII conversion sufficient for thread names) */
+        wchar_t wname[64];
+        int i = 0;
+        while (i < 63 && name[i]) {  /* Check bounds before array access */
+            wname[i] = (wchar_t)(unsigned char)name[i];
+            i++;
+        }
+        wname[i] = L'\0';
+        g_set_thread_desc_fn(GetCurrentThread(), wname);
+    }
+}
+#endif
+
 void tl_thread_yield(void) {
     SwitchToThread();
 }
@@ -501,6 +553,23 @@ uint64_t tl_thread_self_id(void) {
     memcpy(&id, &self, copy_size);
     return id;
 }
+
+#ifdef TL_DEBUG
+void tl_thread_set_name(const char* name) {
+    if (name == NULL) return;
+
+#if defined(__APPLE__)
+    /* macOS: pthread_setname_np takes only the name (current thread implicit) */
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    /* Linux: pthread_setname_np takes thread handle and name (max 15 chars + NUL) */
+    pthread_setname_np(pthread_self(), name);
+#else
+    /* Other POSIX: best-effort no-op */
+    (void)name;
+#endif
+}
+#endif
 
 void tl_thread_yield(void) {
     sched_yield();

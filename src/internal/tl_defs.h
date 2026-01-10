@@ -34,6 +34,25 @@
 #define TL_RECORD_SIZE                    (sizeof(tl_record_t))
 
 /*===========================================================================
+ * Type Size/Layout Validation
+ *
+ * Static asserts to catch platform issues at compile time.
+ * These assumptions are critical for:
+ * - Memory accounting (TL_RECORD_SIZE)
+ * - Page layout calculations
+ * - Serialization compatibility (if added later)
+ *===========================================================================*/
+
+_Static_assert(sizeof(tl_ts_t) == 8,
+    "tl_ts_t must be 8 bytes (int64_t)");
+_Static_assert(sizeof(tl_handle_t) == 8,
+    "tl_handle_t must be 8 bytes (uint64_t)");
+_Static_assert(sizeof(tl_record_t) == 16,
+    "tl_record_t must be 16 bytes (ts + handle, no padding)");
+_Static_assert(_Alignof(tl_record_t) == 8,
+    "tl_record_t must be 8-byte aligned for efficient access");
+
+/*===========================================================================
  * Window Defaults (in time units)
  *===========================================================================*/
 

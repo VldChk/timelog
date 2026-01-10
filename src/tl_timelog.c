@@ -141,8 +141,9 @@ tl_status_t tl_config_init_defaults(tl_config_t* cfg) {
     cfg->allocator.free_fn    = NULL;
 
     /* Logging: NULL means disabled */
-    cfg->log_fn  = NULL;
-    cfg->log_ctx = NULL;
+    cfg->log_fn    = NULL;
+    cfg->log_ctx   = NULL;
+    cfg->log_level = TL_LOG_INFO;  /* Default: INFO and below */
 
     /* Drop callback: NULL means disabled */
     cfg->on_drop_handle = NULL;
@@ -368,7 +369,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl__alloc_init(&tl->alloc, &cfg->allocator);
 
     /* Initialize logger */
-    tl__log_init(&tl->log, cfg->log_fn, cfg->log_ctx);
+    tl__log_init(&tl->log, cfg->log_fn, cfg->log_ctx, cfg->log_level);
 
     /* Normalize configuration values */
     normalize_config(tl);
@@ -404,6 +405,18 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
         return status;
     }
     tl->next_gen = 1;
+
+#ifdef TL_DEBUG
+    /* Initialize debug snapshot counter */
+    tl_atomic_init_u32(&tl->snapshot_count, 0);
+#endif
+
+    /* Initialize operational counters (cumulative since open) */
+    tl_atomic_init_u64(&tl->seals_total, 0);
+    tl_atomic_init_u64(&tl->ooo_budget_hits, 0);
+    tl_atomic_init_u64(&tl->backpressure_waits, 0);
+    tl_atomic_init_u64(&tl->flushes_total, 0);
+    tl_atomic_init_u64(&tl->compactions_total, 0);
 
     /* Initialize lifecycle state */
     tl->is_open = true;
@@ -448,10 +461,16 @@ void tl_close(tl_timelog_t* tl) {
     /* Mark as closed (prevents further operations) */
     tl->is_open = false;
 
+#ifdef TL_DEBUG
     /*
-     * TODO (Phase 5+): Wait for and release all snapshots
-     *    - In debug builds, assert no outstanding snapshots
+     * Debug-only check: assert no outstanding snapshots.
+     * If this assertion fires, the caller has a snapshot leak.
+     * All snapshots must be released before calling tl_close().
      */
+    uint32_t outstanding = tl_atomic_load_relaxed_u32(&tl->snapshot_count);
+    TL_ASSERT_MSG(outstanding == 0,
+        "tl_close() called with outstanding snapshots - caller must release all snapshots first");
+#endif
 
     /* Release manifest (Phase 5) */
     if (tl->manifest != NULL) {
@@ -506,12 +525,19 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         return TL_OK;
     }
 
+    /* Track if OOO budget triggered the seal (for instrumentation) */
+    bool ooo_triggered = tl_memtable_ooo_budget_exceeded(&tl->memtable);
+
     /* Try to seal */
     tl_status_t seal_st = tl_memtable_seal(&tl->memtable,
                                             &tl->memtable_mu,
                                             &tl->maint_cond);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
+        tl_atomic_inc_u64(&tl->seals_total);
+        if (ooo_triggered) {
+            tl_atomic_inc_u64(&tl->ooo_budget_hits);
+        }
         *need_signal = true;
         return TL_OK;
     }
@@ -530,6 +556,7 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     /* Background mode: wait for flush to make space, then retry seal.
      * Must drop writer_mu while waiting to allow flush to proceed.
      * This is safe because the write already succeeded. */
+    tl_atomic_inc_u64(&tl->backpressure_waits);
     TL_UNLOCK_WRITER(tl);
 
     TL_LOCK_MEMTABLE(tl);
@@ -554,6 +581,7 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
                                 &tl->maint_cond);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
+        tl_atomic_inc_u64(&tl->seals_total);
         *need_signal = true;
     }
     /* Ignore any error - write succeeded, this is best-effort */
@@ -821,6 +849,9 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     /* Step 3: Release old references (safe after unlock) */
     tl_manifest_release(old_manifest);
     tl_memrun_release(mr);  /* Release our pin from peek_oldest */
+
+    /* Increment flush counter */
+    tl_atomic_inc_u64(&tl->flushes_total);
 
     return TL_OK;
 }
@@ -2020,6 +2051,32 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
     }
 
     out->tombstone_count = tombstone_count;
+
+    /*
+     * Memtable metrics: snapshot-time values from memview.
+     *
+     * These reflect the state at snapshot acquisition time:
+     * - active_records: records in active run buffer (not yet sealed)
+     * - ooo_records: records in OOO buffer (out-of-order inserts)
+     * - sealed_runs: memruns queued for flush
+     */
+    out->memtable_active_records = (uint64_t)tl_memview_run_len(memview);
+    out->memtable_ooo_records = (uint64_t)tl_memview_ooo_len(memview);
+    out->memtable_sealed_runs = (uint64_t)tl_memview_sealed_len(memview);
+
+    /*
+     * Operational counters (cumulative since open).
+     * Read from parent timelog instance with relaxed ordering.
+     * These are monotonically increasing counters.
+     */
+    const tl_timelog_t* tl = snap->parent;
+    if (tl != NULL) {
+        out->seals_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->seals_total);
+        out->ooo_budget_hits = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->ooo_budget_hits);
+        out->backpressure_waits = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->backpressure_waits);
+        out->flushes_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->flushes_total);
+        out->compactions_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->compactions_total);
+    }
 
     return TL_OK;
 }

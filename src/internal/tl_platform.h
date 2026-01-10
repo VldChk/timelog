@@ -82,8 +82,53 @@
 
 #ifdef TL_DEBUG
     #include <assert.h>
-    #define TL_ASSERT(cond) assert(cond)
-    #define TL_ASSERT_MSG(cond, msg) assert((cond) && (msg))
+    #include <stdio.h>
+    #include <stdlib.h>  /* for abort() */
+
+    #ifdef TL_TEST_HOOKS
+        /*
+         * Test hook for intercepting assertions without aborting.
+         * When tl__test_assert_hook is set, TL_ASSERT calls the hook
+         * instead of aborting, allowing tests to verify assertion conditions.
+         *
+         * Usage in tests:
+         *   tl__test_set_assert_hook(my_hook);
+         *   // ... code that should trigger assertion ...
+         *   tl__test_set_assert_hook(NULL);
+         */
+        typedef void (*tl_assert_hook_fn)(const char* file, int line, const char* expr);
+        extern tl_assert_hook_fn tl__test_assert_hook;
+        void tl__test_set_assert_hook(tl_assert_hook_fn hook);
+
+        #define TL_ASSERT(cond) \
+            do { \
+                if (!(cond)) { \
+                    if (tl__test_assert_hook) { \
+                        tl__test_assert_hook(__FILE__, __LINE__, #cond); \
+                    } else { \
+                        fprintf(stderr, "ASSERT FAILED: %s at %s:%d\n", \
+                                #cond, __FILE__, __LINE__); \
+                        abort(); \
+                    } \
+                } \
+            } while(0)
+
+        #define TL_ASSERT_MSG(cond, msg) \
+            do { \
+                if (!(cond)) { \
+                    if (tl__test_assert_hook) { \
+                        tl__test_assert_hook(__FILE__, __LINE__, #cond ": " msg); \
+                    } else { \
+                        fprintf(stderr, "ASSERT FAILED: %s (%s) at %s:%d\n", \
+                                #cond, msg, __FILE__, __LINE__); \
+                        abort(); \
+                    } \
+                } \
+            } while(0)
+    #else
+        #define TL_ASSERT(cond) assert(cond)
+        #define TL_ASSERT_MSG(cond, msg) assert((cond) && (msg))
+    #endif /* TL_TEST_HOOKS */
 #else
     #define TL_ASSERT(cond) TL_ASSUME(cond)
     #define TL_ASSERT_MSG(cond, msg) TL_ASSUME(cond)

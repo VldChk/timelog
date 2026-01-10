@@ -93,6 +93,23 @@ void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it);
  */
 tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
 
+/**
+ * Seek all sources to first record with ts >= target.
+ *
+ * Used for skip-ahead optimization when filtering tombstones.
+ * After seek, the iterator is repositioned so that the next call to
+ * tl_kmerge_iter_next() returns the first record with ts >= target.
+ *
+ * Semantics:
+ * - Forward-only: if target <= current position, this is a no-op
+ * - After seek, the heap is rebuilt with new positions from all sources
+ * - If all sources are exhausted after seek, iterator becomes done
+ *
+ * @param it     Iterator
+ * @param target Target timestamp to seek to
+ */
+void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target);
+
 /*===========================================================================
  * State Queries
  *===========================================================================*/

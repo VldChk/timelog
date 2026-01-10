@@ -142,6 +142,8 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
 
 #ifdef TL_DEBUG
     snap->iter_count = 0;
+    /* Increment outstanding snapshot count for leak detection at close */
+    tl_atomic_fetch_add_u32(&tl->snapshot_count, 1, TL_MO_RELAXED);
 #endif
 
     *out = snap;
@@ -155,6 +157,10 @@ void tl_snapshot_release_internal(tl_snapshot_t* snap) {
 
 #ifdef TL_DEBUG
     TL_ASSERT(snap->iter_count == 0 && "Outstanding iterators on snapshot release");
+    /* Decrement outstanding snapshot count (cast away const for atomic update) */
+    if (snap->parent != NULL) {
+        tl_atomic_fetch_sub_u32(&((struct tl_timelog*)snap->parent)->snapshot_count, 1, TL_MO_RELAXED);
+    }
 #endif
 
     /* Release memview (frees copies, releases pinned memruns) */

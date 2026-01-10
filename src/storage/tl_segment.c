@@ -216,6 +216,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->generation = generation;
     seg->window_start = 0;
     seg->window_end = 0;
+    seg->window_end_unbounded = false;  /* L0 doesn't use windows */
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -291,10 +292,13 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  const tl_record_t* records, size_t record_count,
                                  size_t target_page_bytes,
                                  tl_ts_t window_start, tl_ts_t window_end,
+                                 bool window_end_unbounded,
                                  uint32_t generation,
                                  tl_segment_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
+    /* Invariant: unbounded implies window_end == TL_TS_MAX */
+    TL_ASSERT(!window_end_unbounded || window_end == TL_TS_MAX);
 
     /* L1 must have records */
     if (record_count == 0 || records == NULL) {
@@ -312,6 +316,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->generation = generation;
     seg->window_start = window_start;
     seg->window_end = window_end;
+    seg->window_end_unbounded = window_end_unbounded;
     seg->tombstones = NULL;  /* L1 never has tombstones */
     tl_atomic_init_u32(&seg->refcnt, 1);
 
@@ -529,12 +534,17 @@ bool tl_segment_validate(const tl_segment_t* seg) {
          * L1: window bounds validation
          *
          * Normal case: window_start < window_end
-         * Unbounded-end: window_end == TL_TS_MAX (covers all future timestamps)
+         * Unbounded-end: window_end_unbounded == true (covers all future timestamps)
+         *
+         * Invariant: window_end_unbounded implies window_end == TL_TS_MAX
          */
-        if (seg->window_start >= seg->window_end) {
-            /* Only valid if window_end is the unbounded sentinel */
+        if (seg->window_end_unbounded) {
             if (seg->window_end != TL_TS_MAX) {
-                return false;
+                return false;  /* Invariant violation */
+            }
+        } else {
+            if (seg->window_start >= seg->window_end) {
+                return false;  /* Bounded window must have start < end */
             }
         }
 
@@ -546,12 +556,10 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             }
 
             /*
-             * For bounded windows (window_end != TL_TS_MAX):
-             *   max_ts must be < window_end (half-open interval)
-             * For unbounded windows (window_end == TL_TS_MAX):
-             *   No upper bound check needed
+             * For bounded windows: max_ts must be < window_end (half-open interval)
+             * For unbounded windows: no upper bound check needed
              */
-            if (seg->window_end != TL_TS_MAX) {
+            if (!seg->window_end_unbounded) {
                 if (seg->max_ts >= seg->window_end) {
                     return false;
                 }

@@ -15,14 +15,46 @@
  * - Handles are opaque uint64_t tokens for payloads
  * - Duplicates (same timestamp) are allowed; tie order is unspecified
  * - Reads use snapshot isolation; writes require external single-writer coordination
+ *
+ * Timestamp Range Semantics:
+ * - Timestamps span the FULL int64 range: TL_TS_MIN to TL_TS_MAX are valid data values
+ * - TL_TS_MAX (INT64_MAX) is NOT a sentinel; records at TL_TS_MAX are fully supported
+ * - All range APIs use half-open intervals [t1, t2) where t1 is inclusive, t2 exclusive
+ * - Unbounded queries (since/until) use explicit API functions, not sentinel values
+ *
+ * Example - querying at timestamp boundaries:
+ *   tl_iter_t* it;
+ *   tl_iter_equal(snap, TL_TS_MAX, &it);   // All records at INT64_MAX
+ *   tl_iter_point(snap, TL_TS_MAX, &it);   // First record at INT64_MAX
+ *   tl_iter_since(snap, TL_TS_MAX, &it);   // Records from INT64_MAX to +inf
  */
 
 #include <stdint.h>
 #include <stddef.h>
 
+#include "tl_export.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*===========================================================================
+ * Thread-Safety Model (consolidated)
+ *
+ * Concurrency contract:
+ * - Writes (tl_append*, tl_delete*, tl_flush, tl_compact):
+ *   Single-writer required. Caller must serialize writes externally.
+ *
+ * - Reads (tl_snapshot_acquire, tl_iter_*, tl_scan_*, tl_min/max/next/prev_ts):
+ *   Thread-safe. Multiple concurrent readers are supported via snapshots.
+ *
+ * - Snapshots:
+ *   Iterators derived from a snapshot must be destroyed before releasing it.
+ *
+ * - Maintenance (tl_maint_start, tl_maint_stop):
+ *   Thread-safe. See function docs for mode constraints and idempotency.
+ *   tl_maint_step is NOT thread-safe (manual mode only).
+ *===========================================================================*/
 
 /*===========================================================================
  * Forward declarations (opaque types)
@@ -38,6 +70,27 @@ typedef struct tl_iter     tl_iter_t;
 
 /** Timestamp type (unit determined by configuration) */
 typedef int64_t  tl_ts_t;
+
+/**
+ * Timestamp boundary constants.
+ *
+ * IMPORTANT: These are valid data values, NOT sentinels.
+ * Records with ts == TL_TS_MAX are fully supported and can be:
+ * - Appended via tl_append()
+ * - Queried via tl_iter_equal(snap, TL_TS_MAX, &it)
+ * - Deleted via tl_delete_range(): use a range ending before TL_TS_MAX,
+ *   or use internal unbounded tombstone APIs for [TL_TS_MAX, +inf)
+ *
+ * NOTE: The half-open interval [TL_TS_MAX, TL_TS_MAX+1) cannot be expressed
+ * in signed int64 arithmetic without overflow. For records at exactly TL_TS_MAX,
+ * use either an unbounded tombstone or avoid storing critical data at this boundary.
+ *
+ * For unbounded queries, use the explicit API functions:
+ * - tl_iter_since(snap, t1, &it)  for [t1, +inf)
+ * - tl_iter_until(snap, t2, &it)  for (-inf, t2)
+ */
+#define TL_TS_MIN  INT64_MIN
+#define TL_TS_MAX  INT64_MAX
 
 /** Opaque payload handle */
 typedef uint64_t tl_handle_t;
@@ -83,7 +136,7 @@ typedef enum tl_status {
 } tl_status_t;
 
 /** Get human-readable description of status code. */
-const char* tl_strerror(tl_status_t s);
+TL_API const char* tl_strerror(tl_status_t s);
 
 /*===========================================================================
  * Configuration
@@ -101,6 +154,19 @@ typedef enum tl_maint_mode {
     TL_MAINT_BACKGROUND = 1
 } tl_maint_mode_t;
 
+/**
+ * Log verbosity levels (passed to log_fn callback).
+ * Use TL_LOG_NONE in config to disable all logging.
+ */
+typedef enum tl_log_level {
+    TL_LOG_ERROR = 0,   /* Critical errors only */
+    TL_LOG_WARN  = 1,   /* Warnings and errors */
+    TL_LOG_INFO  = 2,   /* Informational messages */
+    TL_LOG_DEBUG = 3,   /* Debug output */
+    TL_LOG_TRACE = 4,   /* Verbose tracing */
+    TL_LOG_NONE  = -1   /* Disable all logging */
+} tl_log_level_t;
+
 /** Custom allocator interface */
 typedef struct tl_allocator {
     void* ctx;
@@ -114,12 +180,19 @@ typedef struct tl_allocator {
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 
 /**
- * Handle drop callback (invoked during compaction when records are removed).
+ * Handle drop callback (invoked after compaction when records are removed).
  *
- * IMPORTANT SEMANTICS (read carefully):
+ * WHEN INVOKED:
+ * - Only for records PHYSICALLY dropped during compaction (tombstone application)
+ * - NOT called for logical tombstone insertion (tl_delete_range/tl_delete_before)
+ * - Callbacks are DEFERRED until after successful manifest publish, ensuring
+ *   that only truly committed drops trigger the callback
+ *
+ * SNAPSHOT SAFETY (read carefully):
  * This callback indicates a record is being RETIRED from the newest manifest,
  * NOT that it's safe to free immediately. Existing snapshots acquired before
  * compaction may still reference this handle until those snapshots are released.
+ * Treat this as a "retire" notification, not a "free now" signal.
  *
  * SAFE usage patterns:
  * - Epoch-based reclamation: track callback timestamp, defer free until all
@@ -130,8 +203,9 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * UNSAFE usage (can cause use-after-free):
  * - Immediately freeing user payload in this callback
  *
- * The callback is invoked synchronously during compaction merge phase,
- * without holding locks. It must not call back into timelog APIs.
+ * The callback is invoked after manifest publish completes, without holding
+ * locks. It must not call back into timelog APIs. If compaction fails before
+ * publish, no callbacks are invoked for that compaction attempt.
  *
  * @param ctx    User-provided context (from tl_config_t.on_drop_ctx)
  * @param ts     Timestamp of the dropped record
@@ -165,11 +239,12 @@ typedef struct tl_config {
     tl_allocator_t  allocator;
     tl_log_fn       log_fn;
     void*           log_ctx;
+    tl_log_level_t  log_level;              /* max log level (default: TL_LOG_INFO) */
     tl_on_drop_fn   on_drop_handle;         /* physical delete callback */
     void*           on_drop_ctx;
 } tl_config_t;
 
-tl_status_t tl_config_init_defaults(tl_config_t* cfg);
+TL_API tl_status_t tl_config_init_defaults(tl_config_t* cfg);
 
 /*===========================================================================
  * Lifecycle
@@ -187,17 +262,25 @@ tl_status_t tl_config_init_defaults(tl_config_t* cfg);
  * If a log_fn callback is configured, informational messages may be logged
  * during open (and close) operations.
  */
-tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
+TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
 
 /**
  * Destroy a timelog instance and release all resources.
  *
  * @param tl Instance to close (NULL is safe)
  *
- * The caller must ensure all snapshots and iterators are released before
- * calling tl_close().
+ * DATA LOSS WARNING:
+ * tl_close() does NOT flush unflushed records from the memtable.
+ * Any records appended after the last tl_flush() call will be dropped.
+ * To persist all data before close:
+ *   tl_flush(tl);   // Flush remaining memtable records
+ *   tl_close(tl);   // Now safe to close
+ *
+ * Preconditions:
+ * - All snapshots and iterators must be released before calling tl_close()
+ * - Background maintenance (if enabled) will be stopped automatically
  */
-void tl_close(tl_timelog_t* tl);
+TL_API void tl_close(tl_timelog_t* tl);
 
 /*===========================================================================
  * Write API (single-writer externally required)
@@ -216,53 +299,53 @@ typedef enum tl_append_flags {
     TL_APPEND_HINT_MOSTLY_ORDER  = TL_APPEND_HINT_MOSTLY_IN_ORDER /* alias */
 } tl_append_flags_t;
 
-tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
+TL_API tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
 
-tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
-                            size_t n, uint32_t flags);
+TL_API tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
+                                   size_t n, uint32_t flags);
 
-tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
+TL_API tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
 
 /* Delete [MIN_TS, cutoff) */
-tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
+TL_API tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
 
 /* Synchronous flush of active + sealed memruns; publishes L0 before return. */
-tl_status_t tl_flush(tl_timelog_t* tl);
+TL_API tl_status_t tl_flush(tl_timelog_t* tl);
 
 /* Request compaction; actual work performed by maintenance. */
-tl_status_t tl_compact(tl_timelog_t* tl);
+TL_API tl_status_t tl_compact(tl_timelog_t* tl);
 
 /*===========================================================================
  * Snapshot API (read isolation)
  *===========================================================================*/
 
-tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out);
+TL_API tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out);
 
 /* Release snapshot; all iterators derived from it must be destroyed first. */
-void tl_snapshot_release(tl_snapshot_t* s);
+TL_API void tl_snapshot_release(tl_snapshot_t* s);
 
 /*===========================================================================
  * Read API (iterators)
  *===========================================================================*/
 
 /* Iterate records in [t1, t2). */
-tl_status_t tl_iter_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
-                          tl_iter_t** out);
+TL_API tl_status_t tl_iter_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
+                                 tl_iter_t** out);
 
 /* Iterate records in [t1, +inf). */
-tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
-                          tl_iter_t** out);
+TL_API tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
+                                 tl_iter_t** out);
 
 /* Iterate records in [MIN_TS, t2). */
-tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
-                          tl_iter_t** out);
+TL_API tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
+                                 tl_iter_t** out);
 
 /*
  * Iterate all records with timestamp == ts (range form with overflow guard).
  * If any tombstone in the snapshot covers ts, the iterator is empty.
  */
-tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
-                          tl_iter_t** out);
+TL_API tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
+                                 tl_iter_t** out);
 
 /**
  * Create an iterator over all records with timestamp == ts.
@@ -270,12 +353,12 @@ tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
  * Duplicates are returned; tie order is unspecified. If any tombstone in the
  * snapshot covers ts, the iterator is empty.
  */
-tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
-                          tl_iter_t** out);
+TL_API tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
+                                 tl_iter_t** out);
 
-tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out);
+TL_API tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out);
 
-void tl_iter_destroy(tl_iter_t* it);
+TL_API void tl_iter_destroy(tl_iter_t* it);
 
 /*===========================================================================
  * Scan API (visitor pattern)
@@ -288,20 +371,20 @@ typedef enum tl_scan_decision {
 
 typedef tl_scan_decision_t (*tl_scan_fn)(void* ctx, const tl_record_t* rec);
 
-tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
-                          tl_scan_fn fn, void* ctx);
+TL_API tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
+                                 tl_scan_fn fn, void* ctx);
 
 /*===========================================================================
  * Timestamp navigation
  *===========================================================================*/
 
-tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out);
+TL_API tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
-tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out);
+TL_API tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
-tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
+TL_API tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
-tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
+TL_API tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
 /*===========================================================================
  * Maintenance control
@@ -323,7 +406,7 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
  * Thread Safety: Safe to call from any thread.
  * Idempotency: If already running, returns TL_OK without action.
  */
-tl_status_t tl_maint_start(tl_timelog_t* tl);
+TL_API tl_status_t tl_maint_start(tl_timelog_t* tl);
 
 /**
  * Stop the background maintenance worker thread.
@@ -343,7 +426,7 @@ tl_status_t tl_maint_start(tl_timelog_t* tl);
  *
  * @warning Do not call from the worker thread itself (deadlock on join).
  */
-tl_status_t tl_maint_stop(tl_timelog_t* tl);
+TL_API tl_status_t tl_maint_stop(tl_timelog_t* tl);
 
 /**
  * Perform one unit of maintenance work (manual mode only).
@@ -359,25 +442,38 @@ tl_status_t tl_maint_stop(tl_timelog_t* tl);
  *
  * Thread Safety: NOT thread-safe. Caller must ensure single-threaded access.
  */
-tl_status_t tl_maint_step(tl_timelog_t* tl);
+TL_API tl_status_t tl_maint_step(tl_timelog_t* tl);
 
 /*===========================================================================
  * Statistics and diagnostics
  *===========================================================================*/
 
 typedef struct tl_stats {
-    uint64_t segments_l0;
-    uint64_t segments_l1;
-    uint64_t pages_total;
-    uint64_t records_estimate;
-    tl_ts_t  min_ts;
-    tl_ts_t  max_ts;
-    uint64_t tombstone_count;
+    /* Storage layer metrics */
+    uint64_t segments_l0;       /* L0 (delta) segments */
+    uint64_t segments_l1;       /* L1 (main) segments */
+    uint64_t pages_total;       /* Total pages across all segments */
+    uint64_t records_estimate;  /* Estimated total records (may include deleted) */
+    tl_ts_t  min_ts;            /* Minimum timestamp (TL_TS_MAX if empty) */
+    tl_ts_t  max_ts;            /* Maximum timestamp (TL_TS_MIN if empty) */
+    uint64_t tombstone_count;   /* Number of tombstone intervals */
+
+    /* Memtable/delta layer metrics (snapshot-time values) */
+    uint64_t memtable_active_records;  /* Records in active run buffer */
+    uint64_t memtable_ooo_records;     /* Records in OOO buffer */
+    uint64_t memtable_sealed_runs;     /* Sealed memruns pending flush */
+
+    /* Operational counters (cumulative since open) */
+    uint64_t seals_total;              /* Total memtable seals performed */
+    uint64_t ooo_budget_hits;          /* Times OOO budget was exceeded */
+    uint64_t backpressure_waits;       /* Times writer blocked on sealed queue */
+    uint64_t flushes_total;            /* Total flush operations completed */
+    uint64_t compactions_total;        /* Total compaction operations completed */
 } tl_stats_t;
 
-tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);
+TL_API tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);
 
-tl_status_t tl_validate(const tl_snapshot_t* snap);
+TL_API tl_status_t tl_validate(const tl_snapshot_t* snap);
 
 #ifdef __cplusplus
 }

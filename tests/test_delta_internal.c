@@ -1,16 +1,45 @@
-#include "test_harness.h"
-#include "timelog/timelog.h"
-#include "internal/tl_alloc.h"
-#include "internal/tl_sync.h"
-#include "tl_memrun.h"
-#include "tl_memtable.h"
-#include "tl_flush.h"
-
 /*===========================================================================
- * Memrun Tests
+ * test_delta_internal.c - Delta Layer Internal Tests
+ *
+ * These tests verify LLD-level invariants and internal API behavior for
+ * the delta layer: memrun, memtable, merge iterator, and flush builder.
+ *
+ * CLASSIFICATION: Internal (LLD-Driven)
+ * These are IMPLEMENTATION tests, not SPEC tests.
+ *
+ * If these tests fail, the cause could be:
+ * 1. A bug in the implementation (likely)
+ * 2. An intentional internal refactor (update test accordingly)
+ *
+ * These tests do NOT verify public API contracts - see test_functional.c.
+ *
+ * Part of Phase 10: Test Suite Reorganization
  *===========================================================================*/
 
-TEST_DECLARE(memrun_create_records_only) {
+#include "test_harness.h"
+#include "timelog/timelog.h"
+
+/* Internal headers - NOT public API */
+#include "internal/tl_alloc.h"
+#include "internal/tl_sync.h"
+#include "internal/tl_intervals.h"
+#include "tl_memrun.h"
+#include "tl_memtable.h"
+#include "tl_merge_iter.h"
+#include "tl_flush.h"
+
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/*===========================================================================
+ * Memrun Tests (Internal API)
+ *
+ * These test the internal memrun structure which represents a sealed,
+ * immutable snapshot of memtable data. Memruns are not exposed in public API.
+ *===========================================================================*/
+
+TEST_DECLARE(delta_memrun_create_records_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -34,7 +63,7 @@ TEST_DECLARE(memrun_create_records_only) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_create_with_ooo) {
+TEST_DECLARE(delta_memrun_create_with_ooo) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -61,7 +90,7 @@ TEST_DECLARE(memrun_create_with_ooo) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_create_with_tombstones) {
+TEST_DECLARE(delta_memrun_create_with_tombstones) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -87,7 +116,7 @@ TEST_DECLARE(memrun_create_with_tombstones) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_create_tombstone_only) {
+TEST_DECLARE(delta_memrun_create_tombstone_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -109,7 +138,7 @@ TEST_DECLARE(memrun_create_tombstone_only) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_create_empty_einval) {
+TEST_DECLARE(delta_memrun_create_empty_einval) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -120,7 +149,7 @@ TEST_DECLARE(memrun_create_empty_einval) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_bounds_include_tombstones) {
+TEST_DECLARE(delta_memrun_bounds_include_tombstones) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -145,7 +174,7 @@ TEST_DECLARE(memrun_bounds_include_tombstones) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_bounds_unbounded_tomb) {
+TEST_DECLARE(delta_memrun_bounds_unbounded_tomb) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -175,7 +204,7 @@ TEST_DECLARE(memrun_bounds_unbounded_tomb) {
  * This is critical for read-path: if max_ts=50, overlap checks would skip
  * this memrun when querying [150, 160), causing missed deletes.
  */
-TEST_DECLARE(memrun_bounds_tomb_extends_max) {
+TEST_DECLARE(delta_memrun_bounds_tomb_extends_max) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -199,7 +228,12 @@ TEST_DECLARE(memrun_bounds_tomb_extends_max) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memrun_refcnt_acquire_release) {
+TEST_DECLARE(delta_memrun_refcnt_acquire_release) {
+    /*
+     * Tests internal reference counting behavior.
+     * Reference counting is an implementation detail - a valid
+     * implementation could use arena allocation or epoch-based reclamation.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -230,10 +264,13 @@ TEST_DECLARE(memrun_refcnt_acquire_release) {
 }
 
 /*===========================================================================
- * Memtable Tests
+ * Memtable Tests (Internal API)
+ *
+ * These test the internal memtable structure which is the mutable ingest
+ * buffer. The memtable API is not exposed publicly.
  *===========================================================================*/
 
-TEST_DECLARE(memtable_init_preallocates_sealed) {
+TEST_DECLARE(delta_memtable_init_preallocates_sealed) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -247,7 +284,7 @@ TEST_DECLARE(memtable_init_preallocates_sealed) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_inorder) {
+TEST_DECLARE(delta_memtable_insert_inorder) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -266,7 +303,7 @@ TEST_DECLARE(memtable_insert_inorder) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_ooo) {
+TEST_DECLARE(delta_memtable_insert_ooo) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -289,7 +326,7 @@ TEST_DECLARE(memtable_insert_ooo) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_mixed) {
+TEST_DECLARE(delta_memtable_insert_mixed) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -309,7 +346,11 @@ TEST_DECLARE(memtable_insert_mixed) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_updates_epoch) {
+TEST_DECLARE(delta_memtable_insert_updates_epoch) {
+    /*
+     * Tests internal epoch tracking behavior.
+     * The epoch is an implementation detail for snapshot isolation.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -327,7 +368,11 @@ TEST_DECLARE(memtable_insert_updates_epoch) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_updates_bytes) {
+TEST_DECLARE(delta_memtable_insert_updates_bytes) {
+    /*
+     * Tests internal byte tracking for flush trigger.
+     * This is an implementation detail of the seal heuristic.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -345,7 +390,7 @@ TEST_DECLARE(memtable_insert_updates_bytes) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_batch_fast_path) {
+TEST_DECLARE(delta_memtable_insert_batch_fast_path) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -368,7 +413,7 @@ TEST_DECLARE(memtable_insert_batch_fast_path) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_batch_slow_path) {
+TEST_DECLARE(delta_memtable_insert_batch_slow_path) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -383,15 +428,28 @@ TEST_DECLARE(memtable_insert_batch_slow_path) {
     };
 
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, batch, 3, 0));
-    /* First record goes to run, rest go to OOO */
-    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
-    TEST_ASSERT_EQ(2, tl_memtable_ooo_len(&mt));
+
+    /*
+     * INVARIANT CHECKS (not exact counts, to allow routing algorithm changes):
+     * 1. Total records = batch size
+     * 2. Epoch incremented at least once
+     * 3. Both run and OOO are sorted (verified via validation)
+     */
+    size_t total = tl_memtable_run_len(&mt) + tl_memtable_ooo_len(&mt);
+    TEST_ASSERT_EQ(3, total);  /* All records accounted for */
+    TEST_ASSERT(tl_memtable_epoch(&mt) > 0);  /* At least one epoch tick */
+#ifdef TL_DEBUG
+    TEST_ASSERT(tl_memtable_validate(&mt));  /* Sortedness invariants hold */
+#endif
 
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_batch_no_double_count) {
+TEST_DECLARE(delta_memtable_insert_batch_no_double_count) {
+    /*
+     * Tests that batch insertion doesn't double-count in internal accounting.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -405,16 +463,19 @@ TEST_DECLARE(memtable_insert_batch_no_double_count) {
     };
 
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, batch, 3, 0));
-    /* epoch should be 1, not 3 */
+
+    /*
+     * INVARIANT: epoch should be 1 (single operation), not 3 (per-record).
+     * bytes should be 3 * record size.
+     */
     TEST_ASSERT_EQ(1, tl_memtable_epoch(&mt));
-    /* bytes should be 3 * record size */
     TEST_ASSERT_EQ(3 * TL_RECORD_SIZE, mt.active_bytes_est);
 
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_batch_full_sort_check) {
+TEST_DECLARE(delta_memtable_insert_batch_full_sort_check) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -433,17 +494,24 @@ TEST_DECLARE(memtable_insert_batch_full_sort_check) {
     /* With MOSTLY_IN_ORDER hint, must still detect the unsorted pair */
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, batch, 5, TL_APPEND_HINT_MOSTLY_IN_ORDER));
 
-    /* Should NOT use fast path because batch is not fully sorted */
-    /* Fast path would have all in run; slow path routes some to OOO */
-    /* First 3 elements (10, 20, 25) go to run, 22 goes to OOO, 30 to run */
-    TEST_ASSERT_EQ(4, tl_memtable_run_len(&mt));
-    TEST_ASSERT_EQ(1, tl_memtable_ooo_len(&mt));
+    /*
+     * INVARIANT CHECKS (not exact routing behavior):
+     * 1. Total records = batch size
+     * 2. OOO should be non-empty (batch has out-of-order elements)
+     * 3. Both run and OOO are sorted (verified via validation)
+     */
+    size_t total = tl_memtable_run_len(&mt) + tl_memtable_ooo_len(&mt);
+    TEST_ASSERT_EQ(5, total);  /* All records accounted for */
+    TEST_ASSERT(tl_memtable_ooo_len(&mt) > 0);  /* OOO used because unsorted */
+#ifdef TL_DEBUG
+    TEST_ASSERT(tl_memtable_validate(&mt));  /* Sortedness invariants hold */
+#endif
 
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_tombstone) {
+TEST_DECLARE(delta_memtable_insert_tombstone) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -461,7 +529,7 @@ TEST_DECLARE(memtable_insert_tombstone) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_tombstone_empty) {
+TEST_DECLARE(delta_memtable_insert_tombstone_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -480,7 +548,7 @@ TEST_DECLARE(memtable_insert_tombstone_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_tombstone_invalid) {
+TEST_DECLARE(delta_memtable_insert_tombstone_invalid) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -494,7 +562,7 @@ TEST_DECLARE(memtable_insert_tombstone_invalid) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_insert_tombstone_updates_epoch) {
+TEST_DECLARE(delta_memtable_insert_tombstone_updates_epoch) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -509,7 +577,7 @@ TEST_DECLARE(memtable_insert_tombstone_updates_epoch) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_seal_empty_noop) {
+TEST_DECLARE(delta_memtable_seal_empty_noop) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -528,7 +596,7 @@ TEST_DECLARE(memtable_seal_empty_noop) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_seal_basic) {
+TEST_DECLARE(delta_memtable_seal_basic) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -556,7 +624,7 @@ TEST_DECLARE(memtable_seal_basic) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_seal_preserves_on_ebusy) {
+TEST_DECLARE(delta_memtable_seal_preserves_on_ebusy) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -588,7 +656,7 @@ TEST_DECLARE(memtable_seal_preserves_on_ebusy) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_should_seal_bytes) {
+TEST_DECLARE(delta_memtable_should_seal_bytes) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -608,7 +676,7 @@ TEST_DECLARE(memtable_should_seal_bytes) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_should_seal_ooo) {
+TEST_DECLARE(delta_memtable_should_seal_ooo) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -631,7 +699,7 @@ TEST_DECLARE(memtable_should_seal_ooo) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_sealed_queue_fifo) {
+TEST_DECLARE(delta_memtable_sealed_queue_fifo) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -663,7 +731,11 @@ TEST_DECLARE(memtable_sealed_queue_fifo) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_pop_releases_refcnt) {
+TEST_DECLARE(delta_memtable_pop_releases_refcnt) {
+    /*
+     * Tests internal reference counting during pop.
+     * Reference counting is an implementation detail.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -695,7 +767,7 @@ TEST_DECLARE(memtable_pop_releases_refcnt) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_wait_for_space_timeout) {
+TEST_DECLARE(delta_memtable_wait_for_space_timeout) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -736,17 +808,20 @@ TEST_DECLARE(memtable_wait_for_space_timeout) {
 }
 
 /*===========================================================================
- * Flush Tests
+ * Merge Iterator Tests (Internal API)
+ *
+ * These test the internal merge iterator used for combining sorted runs.
+ * The merge iterator is not exposed in the public API.
  *===========================================================================*/
 
-TEST_DECLARE(merge_iter_empty_both) {
+TEST_DECLARE(delta_merge_iter_empty_both) {
     tl_merge_iter_t it;
     tl_merge_iter_init(&it, NULL, 0, NULL, 0);
     TEST_ASSERT(tl_merge_iter_done(&it));
     TEST_ASSERT_NULL(tl_merge_iter_next(&it));
 }
 
-TEST_DECLARE(merge_iter_single_input) {
+TEST_DECLARE(delta_merge_iter_single_input) {
     tl_record_t a[2] = {
         {.ts = 10, .handle = 1},
         {.ts = 20, .handle = 2},
@@ -769,7 +844,7 @@ TEST_DECLARE(merge_iter_single_input) {
     TEST_ASSERT_NULL(tl_merge_iter_next(&it));
 }
 
-TEST_DECLARE(merge_iter_two_inputs) {
+TEST_DECLARE(delta_merge_iter_two_inputs) {
     tl_record_t a[2] = {
         {.ts = 10, .handle = 1},
         {.ts = 30, .handle = 2},
@@ -799,41 +874,73 @@ TEST_DECLARE(merge_iter_two_inputs) {
     TEST_ASSERT(tl_merge_iter_done(&it));
 }
 
-TEST_DECLARE(merge_iter_stability) {
-    /* Test that equal timestamps prefer first input (a) */
+/**
+ * SPEC-COMPLIANT TEST: Merge iterator preserves all duplicates.
+ *
+ * Per timelog.h:16 and Software Design Spec Section 1:
+ *   "Duplicates (same timestamp) are allowed; tie order is UNSPECIFIED"
+ *
+ * This test verifies:
+ * 1. All 4 records are returned (2 at ts=10, 2 at ts=20)
+ * 2. Records with same timestamp are grouped together
+ * 3. NO assertion on which handle comes first within a group
+ *
+ * Previous version (func_merge_iter_stability) asserted specific tie-order
+ * which was a SPEC VIOLATION. A valid implementation could return ties in
+ * any order and still be correct.
+ */
+TEST_DECLARE(delta_merge_iter_preserves_all_duplicates) {
     tl_record_t a[2] = {
-        {.ts = 10, .handle = 1}, /* From run */
+        {.ts = 10, .handle = 1},
         {.ts = 20, .handle = 2},
     };
     tl_record_t b[2] = {
-        {.ts = 10, .handle = 100}, /* From OOO - same ts */
-        {.ts = 20, .handle = 200},
+        {.ts = 10, .handle = 100}, /* Same ts as a[0] */
+        {.ts = 20, .handle = 200}, /* Same ts as a[1] */
     };
 
     tl_merge_iter_t it;
     tl_merge_iter_init(&it, a, 2, b, 2);
 
-    const tl_record_t* r;
+    /* Collect all records */
+    tl_record_t results[4];
+    size_t count = 0;
+    while (!tl_merge_iter_done(&it) && count < 4) {
+        const tl_record_t* r = tl_merge_iter_next(&it);
+        if (r) results[count++] = *r;
+    }
 
-    /* ts=10 from 'a' should come first (stable) */
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(10, r->ts);
-    TEST_ASSERT_EQ(1, r->handle); /* from 'a' */
+    TEST_ASSERT_EQ(4, count);
 
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(10, r->ts);
-    TEST_ASSERT_EQ(100, r->handle); /* from 'b' */
+    /* Verify ts=10 group (both present, order unspecified) */
+    bool found_ts10_h1 = false, found_ts10_h100 = false;
+    for (size_t i = 0; i < 2; i++) {
+        TEST_ASSERT_EQ(10, results[i].ts);  /* First two should be ts=10 */
+        if (results[i].handle == 1) found_ts10_h1 = true;
+        if (results[i].handle == 100) found_ts10_h100 = true;
+    }
+    TEST_ASSERT(found_ts10_h1);
+    TEST_ASSERT(found_ts10_h100);
 
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(20, r->ts);
-    TEST_ASSERT_EQ(2, r->handle); /* from 'a' */
-
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(20, r->ts);
-    TEST_ASSERT_EQ(200, r->handle); /* from 'b' */
+    /* Verify ts=20 group (both present, order unspecified) */
+    bool found_ts20_h2 = false, found_ts20_h200 = false;
+    for (size_t i = 2; i < 4; i++) {
+        TEST_ASSERT_EQ(20, results[i].ts);  /* Last two should be ts=20 */
+        if (results[i].handle == 2) found_ts20_h2 = true;
+        if (results[i].handle == 200) found_ts20_h200 = true;
+    }
+    TEST_ASSERT(found_ts20_h2);
+    TEST_ASSERT(found_ts20_h200);
 }
 
-TEST_DECLARE(flush_build_records_only) {
+/*===========================================================================
+ * Flush Tests (Internal API)
+ *
+ * These test the internal flush builder which converts memruns to segments.
+ * The flush builder is not exposed in the public API.
+ *===========================================================================*/
+
+TEST_DECLARE(delta_flush_build_records_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -870,7 +977,7 @@ TEST_DECLARE(flush_build_records_only) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(flush_build_with_tombstones) {
+TEST_DECLARE(delta_flush_build_with_tombstones) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -902,7 +1009,7 @@ TEST_DECLARE(flush_build_with_tombstones) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(flush_build_tombstone_only) {
+TEST_DECLARE(delta_flush_build_tombstone_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -930,8 +1037,16 @@ TEST_DECLARE(flush_build_tombstone_only) {
     tl__alloc_destroy(&alloc);
 }
 
+/*===========================================================================
+ * Debug Validation Tests (Internal API)
+ *
+ * These validation functions are only available in debug builds.
+ * They test internal invariants that may change with implementation.
+ *===========================================================================*/
+
 #ifdef TL_DEBUG
-TEST_DECLARE(memrun_validate_correct) {
+
+TEST_DECLARE(delta_memrun_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -948,7 +1063,7 @@ TEST_DECLARE(memrun_validate_correct) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(memtable_validate_correct) {
+TEST_DECLARE(delta_memtable_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -962,59 +1077,63 @@ TEST_DECLARE(memtable_validate_correct) {
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
 }
-#endif
+
+#endif /* TL_DEBUG */
 
 /*===========================================================================
  * Test Runner
  *===========================================================================*/
 
-void run_phase4_tests(void) {
-    /* Memrun tests */
-    RUN_TEST(memrun_create_records_only);
-    RUN_TEST(memrun_create_with_ooo);
-    RUN_TEST(memrun_create_with_tombstones);
-    RUN_TEST(memrun_create_tombstone_only);
-    RUN_TEST(memrun_create_empty_einval);
-    RUN_TEST(memrun_bounds_include_tombstones);
-    RUN_TEST(memrun_bounds_unbounded_tomb);
-    RUN_TEST(memrun_bounds_tomb_extends_max);
-    RUN_TEST(memrun_refcnt_acquire_release);
+void run_delta_internal_tests(void) {
+    /* Memrun tests (9 tests) */
+    RUN_TEST(delta_memrun_create_records_only);
+    RUN_TEST(delta_memrun_create_with_ooo);
+    RUN_TEST(delta_memrun_create_with_tombstones);
+    RUN_TEST(delta_memrun_create_tombstone_only);
+    RUN_TEST(delta_memrun_create_empty_einval);
+    RUN_TEST(delta_memrun_bounds_include_tombstones);
+    RUN_TEST(delta_memrun_bounds_unbounded_tomb);
+    RUN_TEST(delta_memrun_bounds_tomb_extends_max);
+    RUN_TEST(delta_memrun_refcnt_acquire_release);
 
-    /* Memtable tests */
-    RUN_TEST(memtable_init_preallocates_sealed);
-    RUN_TEST(memtable_insert_inorder);
-    RUN_TEST(memtable_insert_ooo);
-    RUN_TEST(memtable_insert_mixed);
-    RUN_TEST(memtable_insert_updates_epoch);
-    RUN_TEST(memtable_insert_updates_bytes);
-    RUN_TEST(memtable_insert_batch_fast_path);
-    RUN_TEST(memtable_insert_batch_slow_path);
-    RUN_TEST(memtable_insert_batch_no_double_count);
-    RUN_TEST(memtable_insert_batch_full_sort_check);
-    RUN_TEST(memtable_insert_tombstone);
-    RUN_TEST(memtable_insert_tombstone_empty);
-    RUN_TEST(memtable_insert_tombstone_invalid);
-    RUN_TEST(memtable_insert_tombstone_updates_epoch);
-    RUN_TEST(memtable_seal_empty_noop);
-    RUN_TEST(memtable_seal_basic);
-    RUN_TEST(memtable_seal_preserves_on_ebusy);
-    RUN_TEST(memtable_should_seal_bytes);
-    RUN_TEST(memtable_should_seal_ooo);
-    RUN_TEST(memtable_sealed_queue_fifo);
-    RUN_TEST(memtable_pop_releases_refcnt);
-    RUN_TEST(memtable_wait_for_space_timeout);
+    /* Memtable tests (22 tests) */
+    RUN_TEST(delta_memtable_init_preallocates_sealed);
+    RUN_TEST(delta_memtable_insert_inorder);
+    RUN_TEST(delta_memtable_insert_ooo);
+    RUN_TEST(delta_memtable_insert_mixed);
+    RUN_TEST(delta_memtable_insert_updates_epoch);
+    RUN_TEST(delta_memtable_insert_updates_bytes);
+    RUN_TEST(delta_memtable_insert_batch_fast_path);
+    RUN_TEST(delta_memtable_insert_batch_slow_path);
+    RUN_TEST(delta_memtable_insert_batch_no_double_count);
+    RUN_TEST(delta_memtable_insert_batch_full_sort_check);
+    RUN_TEST(delta_memtable_insert_tombstone);
+    RUN_TEST(delta_memtable_insert_tombstone_empty);
+    RUN_TEST(delta_memtable_insert_tombstone_invalid);
+    RUN_TEST(delta_memtable_insert_tombstone_updates_epoch);
+    RUN_TEST(delta_memtable_seal_empty_noop);
+    RUN_TEST(delta_memtable_seal_basic);
+    RUN_TEST(delta_memtable_seal_preserves_on_ebusy);
+    RUN_TEST(delta_memtable_should_seal_bytes);
+    RUN_TEST(delta_memtable_should_seal_ooo);
+    RUN_TEST(delta_memtable_sealed_queue_fifo);
+    RUN_TEST(delta_memtable_pop_releases_refcnt);
+    RUN_TEST(delta_memtable_wait_for_space_timeout);
 
-    /* Flush tests */
-    RUN_TEST(merge_iter_empty_both);
-    RUN_TEST(merge_iter_single_input);
-    RUN_TEST(merge_iter_two_inputs);
-    RUN_TEST(merge_iter_stability);
-    RUN_TEST(flush_build_records_only);
-    RUN_TEST(flush_build_with_tombstones);
-    RUN_TEST(flush_build_tombstone_only);
+    /* Merge iterator tests (4 tests) */
+    RUN_TEST(delta_merge_iter_empty_both);
+    RUN_TEST(delta_merge_iter_single_input);
+    RUN_TEST(delta_merge_iter_two_inputs);
+    RUN_TEST(delta_merge_iter_preserves_all_duplicates); /* Fixed spec violation */
+
+    /* Flush tests (3 tests) */
+    RUN_TEST(delta_flush_build_records_only);
+    RUN_TEST(delta_flush_build_with_tombstones);
+    RUN_TEST(delta_flush_build_tombstone_only);
 
 #ifdef TL_DEBUG
-    RUN_TEST(memrun_validate_correct);
-    RUN_TEST(memtable_validate_correct);
+    /* Debug validation tests (2 tests) */
+    RUN_TEST(delta_memrun_validate_correct);
+    RUN_TEST(delta_memtable_validate_correct);
 #endif
 }

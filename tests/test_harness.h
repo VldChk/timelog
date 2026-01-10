@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include "timelog/timelog.h"
 
 /*===========================================================================
@@ -79,6 +80,40 @@ typedef struct test_entry {
         } \
     } while(0)
 
+/**
+ * Type-safe equality assertions to avoid truncation and format mismatches.
+ * Use these instead of TEST_ASSERT_EQ for specific types.
+ */
+#define TEST_ASSERT_EQ_U64(expected, actual) \
+    do { \
+        uint64_t _exp = (expected); \
+        uint64_t _act = (actual); \
+        if (_exp != _act) { \
+            test_fail_eq_u64(__FILE__, __LINE__, #expected, #actual, _exp, _act); \
+            return; \
+        } \
+    } while(0)
+
+#define TEST_ASSERT_EQ_SIZE(expected, actual) \
+    do { \
+        size_t _exp = (expected); \
+        size_t _act = (actual); \
+        if (_exp != _act) { \
+            test_fail_eq_size(__FILE__, __LINE__, #expected, #actual, _exp, _act); \
+            return; \
+        } \
+    } while(0)
+
+#define TEST_ASSERT_PTR_EQ(expected, actual) \
+    do { \
+        const void* _exp = (expected); \
+        const void* _act = (actual); \
+        if (_exp != _act) { \
+            test_fail_eq_ptr(__FILE__, __LINE__, #expected, #actual, _exp, _act); \
+            return; \
+        } \
+    } while(0)
+
 #define TEST_ASSERT_NE(a, b) \
     do { \
         if ((a) == (b)) { \
@@ -125,6 +160,15 @@ void test_fail(const char* file, int line, const char* msg);
 void test_fail_eq(const char* file, int line,
                   const char* expected_expr, const char* actual_expr,
                   long long expected, long long actual);
+void test_fail_eq_u64(const char* file, int line,
+                      const char* expected_expr, const char* actual_expr,
+                      uint64_t expected, uint64_t actual);
+void test_fail_eq_size(const char* file, int line,
+                       const char* expected_expr, const char* actual_expr,
+                       size_t expected, size_t actual);
+void test_fail_eq_ptr(const char* file, int line,
+                      const char* expected_expr, const char* actual_expr,
+                      const void* expected, const void* actual);
 void test_fail_status(const char* file, int line,
                       tl_status_t expected, tl_status_t actual);
 

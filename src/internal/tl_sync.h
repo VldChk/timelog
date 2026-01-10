@@ -190,6 +190,23 @@ tl_status_t tl_thread_join(tl_thread_t* thread, void** result);
  */
 uint64_t tl_thread_self_id(void);
 
+#ifdef TL_DEBUG
+/**
+ * Set name for the current thread (debug only, for profilers/debuggers).
+ *
+ * Thread names appear in debuggers, profilers, and tools like htop.
+ * This is useful for identifying maintenance worker threads.
+ *
+ * Platform support:
+ * - Windows: SetThreadDescription (Windows 10 1607+, silently fails on older)
+ * - Linux: pthread_setname_np (truncates to 15 chars)
+ * - macOS: pthread_setname_np (truncates to 63 chars)
+ *
+ * @param name Thread name (null-terminated, may be truncated by platform)
+ */
+void tl_thread_set_name(const char* name);
+#endif
+
 /*===========================================================================
  * Yield and Sleep
  *===========================================================================*/

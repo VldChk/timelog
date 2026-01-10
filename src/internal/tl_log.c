@@ -12,12 +12,12 @@
  * Initialization
  *===========================================================================*/
 
-void tl__log_init(tl_log_ctx_t* log, tl_log_fn fn, void* ctx) {
+void tl__log_init(tl_log_ctx_t* log, tl_log_fn fn, void* ctx, tl_log_level_t level) {
     TL_ASSERT(log != NULL);
 
     log->fn = fn;
     log->ctx = ctx;
-    log->max_level = TL_LOG_LEVEL_TRACE; /* Accept all levels by default */
+    log->max_level = level;
 }
 
 /*===========================================================================
@@ -39,7 +39,7 @@ void tl__log_v(tl_log_ctx_t* log, tl_log_level_t level,
     }
 
     /* Validate level bounds before array access to prevent UB */
-    if ((int)level < 0 || (int)level > (int)TL_LOG_LEVEL_TRACE) {
+    if ((int)level < 0 || (int)level > (int)TL_LOG_TRACE) {
         return;
     }
 

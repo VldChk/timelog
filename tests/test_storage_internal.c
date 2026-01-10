@@ -1,23 +1,51 @@
+/*===========================================================================
+ * test_storage_internal.c - Storage Layer Internal Tests
+ *
+ * These tests verify LLD-level invariants and internal API behavior for
+ * the storage layer: windows, pages, catalogs, segments, and manifests.
+ *
+ * CLASSIFICATION: Internal (LLD-Driven)
+ * These are IMPLEMENTATION tests, not SPEC tests.
+ *
+ * If these tests fail, the cause could be:
+ * 1. A bug in the implementation (likely)
+ * 2. An intentional internal refactor (update test accordingly)
+ *
+ * These tests do NOT verify public API contracts - see test_functional.c.
+ *
+ * Part of Phase 10: Test Suite Reorganization
+ *===========================================================================*/
+
 #include "test_harness.h"
 #include "timelog/timelog.h"
+
+/* Internal headers - NOT public API */
 #include "internal/tl_alloc.h"
+#include "internal/tl_intervals.h"
 #include "tl_window.h"
 #include "tl_page.h"
 #include "tl_segment.h"
 #include "tl_manifest.h"
 
+#include <string.h>
+#include <stdint.h>
+
 /*===========================================================================
- * Window Mapping Tests
+ * Window Mapping Tests (Internal API)
+ *
+ * These test the internal window ID calculation and bounds functions.
+ * Window mapping is an implementation detail of how timestamps are
+ * partitioned into L1 segments.
  *===========================================================================*/
 
-TEST_DECLARE(window_default_size) {
+TEST_DECLARE(storage_window_default_size) {
     TEST_ASSERT_EQ(TL_WINDOW_1H_S, tl_window_default_size(TL_TIME_S));
     TEST_ASSERT_EQ(TL_WINDOW_1H_MS, tl_window_default_size(TL_TIME_MS));
     TEST_ASSERT_EQ(TL_WINDOW_1H_US, tl_window_default_size(TL_TIME_US));
     TEST_ASSERT_EQ(TL_WINDOW_1H_NS, tl_window_default_size(TL_TIME_NS));
 }
 
-TEST_DECLARE(window_id_positive) {
+TEST_DECLARE(storage_window_id_positive) {
     /* ts = 25, size = 10, origin = 0 => window_id = 2 */
     int64_t id;
     TEST_ASSERT_STATUS(TL_OK, tl_window_id_for_ts(25, 10, 0, &id));
@@ -28,7 +56,7 @@ TEST_DECLARE(window_id_positive) {
     TEST_ASSERT_EQ(1, id);
 }
 
-TEST_DECLARE(window_id_negative) {
+TEST_DECLARE(storage_window_id_negative) {
     /* Floor division is required for negative timestamps */
     /* ts = -1, size = 10, origin = 0 => floor(-1/10) = -1 */
     int64_t id;
@@ -36,21 +64,21 @@ TEST_DECLARE(window_id_negative) {
     TEST_ASSERT_EQ(-1, id);
 }
 
-TEST_DECLARE(window_id_negative_exact) {
+TEST_DECLARE(storage_window_id_negative_exact) {
     /* ts = -10, size = 10, origin = 0 => floor(-10/10) = -1 */
     int64_t id;
     TEST_ASSERT_STATUS(TL_OK, tl_window_id_for_ts(-10, 10, 0, &id));
     TEST_ASSERT_EQ(-1, id);
 }
 
-TEST_DECLARE(window_id_negative_past) {
+TEST_DECLARE(storage_window_id_negative_past) {
     /* ts = -11, size = 10, origin = 0 => floor(-11/10) = -2 (C would give -1) */
     int64_t id;
     TEST_ASSERT_STATUS(TL_OK, tl_window_id_for_ts(-11, 10, 0, &id));
     TEST_ASSERT_EQ(-2, id);
 }
 
-TEST_DECLARE(window_id_at_origin) {
+TEST_DECLARE(storage_window_id_at_origin) {
     int64_t id;
     TEST_ASSERT_STATUS(TL_OK, tl_window_id_for_ts(0, 10, 0, &id));
     TEST_ASSERT_EQ(0, id);
@@ -58,7 +86,7 @@ TEST_DECLARE(window_id_at_origin) {
     TEST_ASSERT_EQ(0, id);
 }
 
-TEST_DECLARE(window_bounds_basic) {
+TEST_DECLARE(storage_window_bounds_basic) {
     tl_ts_t start, end;
     bool unbounded;
     tl_window_bounds(2, 10, 0, &start, &end, &unbounded);
@@ -67,7 +95,7 @@ TEST_DECLARE(window_bounds_basic) {
     TEST_ASSERT(!unbounded);
 }
 
-TEST_DECLARE(window_bounds_negative_id) {
+TEST_DECLARE(storage_window_bounds_negative_id) {
     tl_ts_t start, end;
     bool unbounded;
     tl_window_bounds(-1, 10, 0, &start, &end, &unbounded);
@@ -76,7 +104,7 @@ TEST_DECLARE(window_bounds_negative_id) {
     TEST_ASSERT(!unbounded);
 }
 
-TEST_DECLARE(window_bounds_for_ts) {
+TEST_DECLARE(storage_window_bounds_for_ts) {
     tl_ts_t start, end;
     bool unbounded;
     TEST_ASSERT_STATUS(TL_OK, tl_window_bounds_for_ts(25, 10, 0, &start, &end, &unbounded));
@@ -85,21 +113,21 @@ TEST_DECLARE(window_bounds_for_ts) {
     TEST_ASSERT(!unbounded);
 }
 
-TEST_DECLARE(window_contains) {
+TEST_DECLARE(storage_window_contains) {
     TEST_ASSERT(tl_window_contains(20, 30, false, 20));
     TEST_ASSERT(tl_window_contains(20, 30, false, 25));
     TEST_ASSERT(!tl_window_contains(20, 30, false, 30)); /* Half-open: end is exclusive */
     TEST_ASSERT(!tl_window_contains(20, 30, false, 19));
 }
 
-TEST_DECLARE(window_contains_unbounded) {
+TEST_DECLARE(storage_window_contains_unbounded) {
     /* Unbounded windows include everything >= start */
     TEST_ASSERT(tl_window_contains(20, TL_TS_MAX, true, 20));
     TEST_ASSERT(tl_window_contains(20, TL_TS_MAX, true, TL_TS_MAX));
     TEST_ASSERT(!tl_window_contains(20, TL_TS_MAX, true, 19));
 }
 
-TEST_DECLARE(window_ts_max_unbounded) {
+TEST_DECLARE(storage_window_ts_max_unbounded) {
     /* Window containing TL_TS_MAX should be unbounded */
     tl_ts_t start, end;
     bool unbounded;
@@ -111,12 +139,7 @@ TEST_DECLARE(window_ts_max_unbounded) {
     TEST_ASSERT(tl_window_contains(start, end, unbounded, TL_TS_MAX));
 }
 
-TEST_DECLARE(window_id_overflow_underflow) {
-    /*
-     * Test TL_EOVERFLOW when ts - window_origin overflows.
-     * Case 1: ts near INT64_MAX, origin negative => would overflow
-     * Case 2: ts near INT64_MIN, origin positive => would underflow
-     */
+TEST_DECLARE(storage_window_id_overflow_underflow) {
     int64_t id;
 
     /* Case 1: ts = INT64_MAX, origin = INT64_MIN => overflow */
@@ -133,10 +156,7 @@ TEST_DECLARE(window_id_overflow_underflow) {
     TEST_ASSERT_STATUS(TL_OK, tl_window_id_for_ts(INT64_MAX, 1000, 0, &id));
 }
 
-TEST_DECLARE(window_bounds_for_ts_overflow) {
-    /*
-     * Test TL_EOVERFLOW propagation through tl_window_bounds_for_ts.
-     */
+TEST_DECLARE(storage_window_bounds_for_ts_overflow) {
     tl_ts_t start, end;
     bool unbounded;
 
@@ -146,10 +166,13 @@ TEST_DECLARE(window_bounds_for_ts_overflow) {
 }
 
 /*===========================================================================
- * Page Tests
+ * Page Tests (Internal API)
+ *
+ * These test the internal page builder and page structure.
+ * Pages are implementation details - the public API exposes iterators.
  *===========================================================================*/
 
-TEST_DECLARE(page_builder_single_page) {
+TEST_DECLARE(storage_page_builder_single_page) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -169,13 +192,17 @@ TEST_DECLARE(page_builder_single_page) {
     TEST_ASSERT_EQ(5, page->count);
     TEST_ASSERT_EQ(0, page->min_ts);
     TEST_ASSERT_EQ(40, page->max_ts);
+    /*
+     * Verify page is marked fully live.
+     * NOTE: TL_PAGE_FULLY_LIVE = 0, so we must use equality (not bitwise AND).
+     */
     TEST_ASSERT_EQ(TL_PAGE_FULLY_LIVE, page->flags);
 
     tl_page_destroy(page, &alloc);
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(page_builder_count_zero) {
+TEST_DECLARE(storage_page_builder_count_zero) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -189,18 +216,18 @@ TEST_DECLARE(page_builder_count_zero) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(page_capacity_tiny_target) {
+TEST_DECLARE(storage_page_capacity_tiny_target) {
     /* target_page_bytes < sizeof(tl_page_t) => returns TL_MIN_PAGE_ROWS */
     size_t cap = tl_page_builder_compute_capacity(1);
     TEST_ASSERT_EQ(TL_MIN_PAGE_ROWS, cap);
 }
 
-TEST_DECLARE(page_capacity_zero_target) {
+TEST_DECLARE(storage_page_capacity_zero_target) {
     size_t cap = tl_page_builder_compute_capacity(0);
     TEST_ASSERT_EQ(TL_MIN_PAGE_ROWS, cap);
 }
 
-TEST_DECLARE(page_lower_bound_found) {
+TEST_DECLARE(storage_page_lower_bound_found) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -212,7 +239,8 @@ TEST_DECLARE(page_lower_bound_found) {
     };
 
     tl_page_t* page = NULL;
-    tl_page_builder_build(&pb, records, 5, &page);
+    TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, records, 5, &page));
+    TEST_ASSERT_NOT_NULL(page);
 
     TEST_ASSERT_EQ(0, tl_page_lower_bound(page, 5));   /* Before all */
     TEST_ASSERT_EQ(0, tl_page_lower_bound(page, 10));  /* Exact match */
@@ -224,7 +252,7 @@ TEST_DECLARE(page_lower_bound_found) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(page_upper_bound) {
+TEST_DECLARE(storage_page_upper_bound) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -237,7 +265,8 @@ TEST_DECLARE(page_upper_bound) {
     };
 
     tl_page_t* page = NULL;
-    tl_page_builder_build(&pb, records, 5, &page);
+    TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, records, 5, &page));
+    TEST_ASSERT_NOT_NULL(page);
 
     TEST_ASSERT_EQ(0, tl_page_upper_bound(page, 5));
     TEST_ASSERT_EQ(1, tl_page_upper_bound(page, 10));
@@ -248,7 +277,7 @@ TEST_DECLARE(page_upper_bound) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(page_get_record) {
+TEST_DECLARE(storage_page_get_record) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -260,7 +289,8 @@ TEST_DECLARE(page_get_record) {
     };
 
     tl_page_t* page = NULL;
-    tl_page_builder_build(&pb, records, 3, &page);
+    TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, records, 3, &page));
+    TEST_ASSERT_NOT_NULL(page);
 
     tl_record_t out;
     tl_page_get_record(page, 1, &out);
@@ -271,7 +301,7 @@ TEST_DECLARE(page_get_record) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(page_destroy_null) {
+TEST_DECLARE(storage_page_destroy_null) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -282,10 +312,13 @@ TEST_DECLARE(page_destroy_null) {
 }
 
 /*===========================================================================
- * Page Catalog Tests
+ * Page Catalog Tests (Internal API)
+ *
+ * These test the internal page catalog used for organizing pages within
+ * a segment. The catalog is not exposed in the public API.
  *===========================================================================*/
 
-TEST_DECLARE(catalog_init_empty) {
+TEST_DECLARE(storage_catalog_init_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -299,7 +332,7 @@ TEST_DECLARE(catalog_init_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(catalog_push_single) {
+TEST_DECLARE(storage_catalog_push_single) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -326,7 +359,7 @@ TEST_DECLARE(catalog_push_single) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(catalog_find_first_ge) {
+TEST_DECLARE(storage_catalog_find_first_ge) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -364,10 +397,13 @@ TEST_DECLARE(catalog_find_first_ge) {
 }
 
 /*===========================================================================
- * Segment Tests
+ * Segment Tests (Internal API)
+ *
+ * These test the internal segment builder and segment structure.
+ * Includes reference counting tests which are implementation details.
  *===========================================================================*/
 
-TEST_DECLARE(segment_build_l0_records_only) {
+TEST_DECLARE(storage_segment_build_l0_records_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -395,7 +431,7 @@ TEST_DECLARE(segment_build_l0_records_only) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_build_l0_with_tombstones) {
+TEST_DECLARE(storage_segment_build_l0_with_tombstones) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -419,7 +455,7 @@ TEST_DECLARE(segment_build_l0_with_tombstones) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_build_l0_tombstone_only) {
+TEST_DECLARE(storage_segment_build_l0_tombstone_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -443,7 +479,7 @@ TEST_DECLARE(segment_build_l0_tombstone_only) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_build_l0_empty_invalid) {
+TEST_DECLARE(storage_segment_build_l0_empty_invalid) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -458,7 +494,7 @@ TEST_DECLARE(segment_build_l0_empty_invalid) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_build_l0_unbounded_tombstone) {
+TEST_DECLARE(storage_segment_build_l0_unbounded_tombstone) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -480,7 +516,7 @@ TEST_DECLARE(segment_build_l0_unbounded_tombstone) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_build_l1) {
+TEST_DECLARE(storage_segment_build_l1) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -491,7 +527,7 @@ TEST_DECLARE(segment_build_l1) {
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, records, 5,
                                                    TL_DEFAULT_TARGET_PAGE_BYTES,
-                                                   100, 200, 1, &seg));
+                                                   100, 200, false, 1, &seg));
     TEST_ASSERT_NOT_NULL(seg);
     TEST_ASSERT(tl_segment_is_l1(seg));
     TEST_ASSERT_EQ(100, seg->window_start);
@@ -502,7 +538,12 @@ TEST_DECLARE(segment_build_l1) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_refcnt_acquire_release) {
+TEST_DECLARE(storage_segment_refcnt_acquire_release) {
+    /*
+     * Tests internal reference counting behavior.
+     * Reference counting is an implementation detail - a valid
+     * implementation could use arena allocation or epoch-based reclamation.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -531,7 +572,7 @@ TEST_DECLARE(segment_refcnt_acquire_release) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_tombstones_imm) {
+TEST_DECLARE(storage_segment_tombstones_imm) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -551,11 +592,69 @@ TEST_DECLARE(segment_tombstones_imm) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(storage_segment_l0_bounds_include_tombstones) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Records in range [100, 200] */
+    tl_record_t records[3] = {{100, 0}, {150, 0}, {200, 0}};
+
+    /* Tombstones in range [50, 80) and [300, 400) - outside records */
+    tl_interval_t tombs[2] = {
+        {50, 80, false},   /* Earlier than records */
+        {300, 400, false}  /* Later than records */
+    };
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 3,
+                                                   tombs, 2,
+                                                   TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                   1, &seg));
+    TEST_ASSERT_NOT_NULL(seg);
+
+    /* Bounds should cover both records AND tombstones */
+    /* min_ts = min(100, 50) = 50 */
+    /* max_ts = max(200, 79, 399) = 399 */
+    TEST_ASSERT_EQ(50, seg->min_ts);
+    TEST_ASSERT_EQ(399, seg->max_ts);
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_segment_l0_bounds_tombstones_extend_max) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Records in range [100, 200] */
+    tl_record_t records[2] = {{100, 0}, {200, 0}};
+
+    /* Unbounded tombstone starting after records */
+    tl_interval_t tombs[1] = {{300, 0, true}};  /* [300, +inf) */
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 2,
+                                                   tombs, 1,
+                                                   TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                   1, &seg));
+    TEST_ASSERT_NOT_NULL(seg);
+
+    /* max_ts should be TL_TS_MAX due to unbounded tombstone */
+    TEST_ASSERT_EQ(100, seg->min_ts);
+    TEST_ASSERT_EQ(TL_TS_MAX, seg->max_ts);
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
 /*===========================================================================
- * Manifest Tests
+ * Manifest Tests (Internal API)
+ *
+ * These test the internal manifest builder and manifest structure.
+ * The manifest builder is not exposed in the public API.
  *===========================================================================*/
 
-TEST_DECLARE(manifest_create_empty) {
+TEST_DECLARE(storage_manifest_create_empty) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -572,7 +671,11 @@ TEST_DECLARE(manifest_create_empty) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_builder_add_l0) {
+TEST_DECLARE(storage_manifest_builder_add_l0) {
+    /*
+     * Tests internal manifest builder and refcount behavior.
+     * These are implementation details not exposed in public API.
+     */
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -605,7 +708,7 @@ TEST_DECLARE(manifest_builder_add_l0) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_builder_add_l1_sorted) {
+TEST_DECLARE(storage_manifest_builder_add_l1_sorted) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -615,9 +718,9 @@ TEST_DECLARE(manifest_builder_add_l1_sorted) {
     tl_record_t r3[2] = {{0, 0}, {50, 0}};
 
     tl_segment_t *s1 = NULL, *s2 = NULL, *s3 = NULL;
-    tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, 1, &s1);
-    tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 200, 300, 1, &s2);
-    tl_segment_build_l1(&alloc, r3, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, 1, &s3);
+    tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, false, 1, &s1);
+    tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 200, 300, false, 1, &s2);
+    tl_segment_build_l1(&alloc, r3, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, false, 1, &s3);
 
     /* Add in reverse window order */
     tl_manifest_builder_t mb;
@@ -643,7 +746,7 @@ TEST_DECLARE(manifest_builder_add_l1_sorted) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_builder_remove_l0) {
+TEST_DECLARE(storage_manifest_builder_remove_l0) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -684,7 +787,7 @@ TEST_DECLARE(manifest_builder_remove_l0) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_l1_find_first_overlap) {
+TEST_DECLARE(storage_manifest_l1_find_first_overlap) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -694,17 +797,18 @@ TEST_DECLARE(manifest_l1_find_first_overlap) {
     tl_record_t r3[2] = {{210, 0}, {290, 0}};
 
     tl_segment_t *s1 = NULL, *s2 = NULL, *s3 = NULL;
-    tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, 1, &s1);
-    tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, 1, &s2);
-    tl_segment_build_l1(&alloc, r3, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 200, 300, 1, &s3);
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, false, 1, &s1));
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, false, 1, &s2));
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, r3, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 200, 300, false, 1, &s3));
 
     tl_manifest_builder_t mb;
     tl_manifest_builder_init(&mb, &alloc, NULL);
-    tl_manifest_builder_add_l1(&mb, s1);
-    tl_manifest_builder_add_l1(&mb, s2);
-    tl_manifest_builder_add_l1(&mb, s3);
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l1(&mb, s1));
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l1(&mb, s2));
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l1(&mb, s3));
     tl_manifest_t* m = NULL;
-    tl_manifest_builder_build(&mb, &m);
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_build(&mb, &m));
+    TEST_ASSERT_NOT_NULL(m);
     tl_manifest_builder_destroy(&mb);
 
     /* Find first segment with max_ts >= ts */
@@ -720,7 +824,65 @@ TEST_DECLARE(manifest_l1_find_first_overlap) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_bounds_cached) {
+/**
+ * Test L1 overlap search behavior with sparse segments.
+ *
+ * IMPORTANT: tl_manifest_l1_find_first_overlap uses RECORD-BASED bounds (max_ts),
+ * NOT window bounds. This is correct behavior because:
+ * - If max_ts < query_ts, segment has no records at or after query_ts
+ * - Window bounds enforce L1 non-overlap invariant, not query routing
+ *
+ * This test documents the actual (correct) behavior.
+ */
+TEST_DECLARE(storage_manifest_l1_find_first_overlap_sparse) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /*
+     * Create sparse L1 segments:
+     * - s1: window [0,100) but only record at ts=0 (max_ts=0)
+     * - s2: window [100,200) with record at ts=150 (max_ts=150)
+     */
+    tl_record_t r1[1] = {{0, 1}};   /* Single record at ts=0 */
+    tl_record_t r2[1] = {{150, 2}}; /* Single record at ts=150 */
+
+    tl_segment_t *s1 = NULL, *s2 = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, r1, 1, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, false, 1, &s1));
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, r2, 1, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, false, 2, &s2));
+
+    tl_manifest_builder_t mb;
+    tl_manifest_builder_init(&mb, &alloc, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l1(&mb, s1));
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l1(&mb, s2));
+    tl_manifest_t* m = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_build(&mb, &m));
+    TEST_ASSERT_NOT_NULL(m);
+    tl_manifest_builder_destroy(&mb);
+
+    /*
+     * Binary search: "first L1 segment where max_ts >= t1"
+     *
+     * ts=0: s1.max_ts=0 >= 0, return index 0
+     * ts=1: s1.max_ts=0 < 1, skip; s2.max_ts=150 >= 1, return index 1
+     * ts=50: s1.max_ts=0 < 50, skip; s2.max_ts=150 >= 50, return index 1
+     * ts=100: s1.max_ts=0 < 100, skip; s2.max_ts=150 >= 100, return index 1
+     * ts=150: s1.max_ts=0 < 150, skip; s2.max_ts=150 >= 150, return index 1
+     * ts=151: s1 and s2 both have max_ts < 151, return n_l1=2 (past end)
+     */
+    TEST_ASSERT_EQ(0, tl_manifest_l1_find_first_overlap(m, 0));   /* s1.max_ts >= 0 */
+    TEST_ASSERT_EQ(1, tl_manifest_l1_find_first_overlap(m, 1));   /* s1.max_ts < 1, s2.max_ts >= 1 */
+    TEST_ASSERT_EQ(1, tl_manifest_l1_find_first_overlap(m, 50));  /* s1.max_ts < 50, s2.max_ts >= 50 */
+    TEST_ASSERT_EQ(1, tl_manifest_l1_find_first_overlap(m, 100)); /* s1.max_ts < 100, s2.max_ts >= 100 */
+    TEST_ASSERT_EQ(1, tl_manifest_l1_find_first_overlap(m, 150)); /* s1.max_ts < 150, s2.max_ts >= 150 */
+    TEST_ASSERT_EQ(2, tl_manifest_l1_find_first_overlap(m, 151)); /* Both max_ts < 151, past end */
+
+    tl_manifest_release(m);
+    tl_segment_release(s1);
+    tl_segment_release(s2);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_manifest_bounds_cached) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -750,10 +912,10 @@ TEST_DECLARE(manifest_bounds_cached) {
 }
 
 /*===========================================================================
- * Edge Case Tests - Manifest Removal Validation
+ * Manifest Edge Case Tests (Internal API)
  *===========================================================================*/
 
-TEST_DECLARE(manifest_builder_remove_nonexistent) {
+TEST_DECLARE(storage_manifest_builder_remove_nonexistent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -787,7 +949,7 @@ TEST_DECLARE(manifest_builder_remove_nonexistent) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_builder_remove_duplicate) {
+TEST_DECLARE(storage_manifest_builder_remove_duplicate) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -824,71 +986,15 @@ TEST_DECLARE(manifest_builder_remove_duplicate) {
 }
 
 /*===========================================================================
- * Edge Case Tests - L0 Bounds Cover Tombstones
- *===========================================================================*/
-
-TEST_DECLARE(segment_l0_bounds_include_tombstones) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-
-    /* Records in range [100, 200] */
-    tl_record_t records[3] = {{100, 0}, {150, 0}, {200, 0}};
-
-    /* Tombstones in range [50, 80) and [300, 400) - outside records */
-    tl_interval_t tombs[2] = {
-        {50, 80, false},   /* Earlier than records */
-        {300, 400, false}  /* Later than records */
-    };
-
-    tl_segment_t* seg = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 3,
-                                                   tombs, 2,
-                                                   TL_DEFAULT_TARGET_PAGE_BYTES,
-                                                   1, &seg));
-    TEST_ASSERT_NOT_NULL(seg);
-
-    /* Bounds should cover both records AND tombstones */
-    /* min_ts = min(100, 50) = 50 */
-    /* max_ts = max(200, 79, 399) = 399 */
-    TEST_ASSERT_EQ(50, seg->min_ts);
-    TEST_ASSERT_EQ(399, seg->max_ts);
-
-    tl_segment_release(seg);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(segment_l0_bounds_tombstones_extend_max) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-
-    /* Records in range [100, 200] */
-    tl_record_t records[2] = {{100, 0}, {200, 0}};
-
-    /* Unbounded tombstone starting after records */
-    tl_interval_t tombs[1] = {{300, 0, true}};  /* [300, +inf) */
-
-    tl_segment_t* seg = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 2,
-                                                   tombs, 1,
-                                                   TL_DEFAULT_TARGET_PAGE_BYTES,
-                                                   1, &seg));
-    TEST_ASSERT_NOT_NULL(seg);
-
-    /* max_ts should be TL_TS_MAX due to unbounded tombstone */
-    TEST_ASSERT_EQ(100, seg->min_ts);
-    TEST_ASSERT_EQ(TL_TS_MAX, seg->max_ts);
-
-    tl_segment_release(seg);
-    tl__alloc_destroy(&alloc);
-}
-
-/*===========================================================================
- * Debug Validation Tests
+ * Debug Validation Tests (Internal API)
+ *
+ * These validation functions are only available in debug builds.
+ * They test internal invariants that may change with implementation.
  *===========================================================================*/
 
 #ifdef TL_DEBUG
 
-TEST_DECLARE(page_validate_correct) {
+TEST_DECLARE(storage_page_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -908,7 +1014,7 @@ TEST_DECLARE(page_validate_correct) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(catalog_validate_correct) {
+TEST_DECLARE(storage_catalog_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -935,7 +1041,7 @@ TEST_DECLARE(catalog_validate_correct) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_validate_l0) {
+TEST_DECLARE(storage_segment_validate_l0) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -950,14 +1056,14 @@ TEST_DECLARE(segment_validate_l0) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(segment_validate_l1) {
+TEST_DECLARE(storage_segment_validate_l1) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
     tl_record_t records[3] = {{100, 0}, {150, 0}, {199, 0}};
     tl_segment_t* seg = NULL;
     tl_segment_build_l1(&alloc, records, 3, TL_DEFAULT_TARGET_PAGE_BYTES,
-                        100, 200, 1, &seg);
+                        100, 200, false, 1, &seg);
 
     TEST_ASSERT(tl_segment_validate(seg));
 
@@ -965,7 +1071,7 @@ TEST_DECLARE(segment_validate_l1) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(manifest_validate_correct) {
+TEST_DECLARE(storage_manifest_validate_correct) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -973,8 +1079,8 @@ TEST_DECLARE(manifest_validate_correct) {
     tl_record_t r2[2] = {{110, 0}, {190, 0}};
 
     tl_segment_t *s1 = NULL, *s2 = NULL;
-    tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, 1, &s1);
-    tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, 1, &s2);
+    tl_segment_build_l1(&alloc, r1, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 0, 100, false, 1, &s1);
+    tl_segment_build_l1(&alloc, r2, 2, TL_DEFAULT_TARGET_PAGE_BYTES, 100, 200, false, 1, &s2);
 
     tl_manifest_builder_t mb;
     tl_manifest_builder_init(&mb, &alloc, NULL);
@@ -998,68 +1104,67 @@ TEST_DECLARE(manifest_validate_correct) {
  * Test Runner
  *===========================================================================*/
 
-void run_phase3_tests(void) {
-    /* Window tests */
-    RUN_TEST(window_default_size);
-    RUN_TEST(window_id_positive);
-    RUN_TEST(window_id_negative);
-    RUN_TEST(window_id_negative_exact);
-    RUN_TEST(window_id_negative_past);
-    RUN_TEST(window_id_at_origin);
-    RUN_TEST(window_bounds_basic);
-    RUN_TEST(window_bounds_negative_id);
-    RUN_TEST(window_bounds_for_ts);
-    RUN_TEST(window_contains);
-    RUN_TEST(window_contains_unbounded);
-    RUN_TEST(window_ts_max_unbounded);
-    RUN_TEST(window_id_overflow_underflow);
-    RUN_TEST(window_bounds_for_ts_overflow);
+void run_storage_internal_tests(void) {
+    /* Window mapping tests (14 tests) */
+    RUN_TEST(storage_window_default_size);
+    RUN_TEST(storage_window_id_positive);
+    RUN_TEST(storage_window_id_negative);
+    RUN_TEST(storage_window_id_negative_exact);
+    RUN_TEST(storage_window_id_negative_past);
+    RUN_TEST(storage_window_id_at_origin);
+    RUN_TEST(storage_window_bounds_basic);
+    RUN_TEST(storage_window_bounds_negative_id);
+    RUN_TEST(storage_window_bounds_for_ts);
+    RUN_TEST(storage_window_contains);
+    RUN_TEST(storage_window_contains_unbounded);
+    RUN_TEST(storage_window_ts_max_unbounded);
+    RUN_TEST(storage_window_id_overflow_underflow);
+    RUN_TEST(storage_window_bounds_for_ts_overflow);
 
-    /* Page tests */
-    RUN_TEST(page_builder_single_page);
-    RUN_TEST(page_builder_count_zero);
-    RUN_TEST(page_capacity_tiny_target);
-    RUN_TEST(page_capacity_zero_target);
-    RUN_TEST(page_lower_bound_found);
-    RUN_TEST(page_upper_bound);
-    RUN_TEST(page_get_record);
-    RUN_TEST(page_destroy_null);
+    /* Page tests (8 tests) */
+    RUN_TEST(storage_page_builder_single_page);
+    RUN_TEST(storage_page_builder_count_zero);
+    RUN_TEST(storage_page_capacity_tiny_target);
+    RUN_TEST(storage_page_capacity_zero_target);
+    RUN_TEST(storage_page_lower_bound_found);
+    RUN_TEST(storage_page_upper_bound);
+    RUN_TEST(storage_page_get_record);
+    RUN_TEST(storage_page_destroy_null);
 
-    /* Catalog tests */
-    RUN_TEST(catalog_init_empty);
-    RUN_TEST(catalog_push_single);
-    RUN_TEST(catalog_find_first_ge);
+    /* Catalog tests (3 tests) */
+    RUN_TEST(storage_catalog_init_empty);
+    RUN_TEST(storage_catalog_push_single);
+    RUN_TEST(storage_catalog_find_first_ge);
 
-    /* Segment tests */
-    RUN_TEST(segment_build_l0_records_only);
-    RUN_TEST(segment_build_l0_with_tombstones);
-    RUN_TEST(segment_build_l0_tombstone_only);
-    RUN_TEST(segment_build_l0_empty_invalid);
-    RUN_TEST(segment_build_l0_unbounded_tombstone);
-    RUN_TEST(segment_build_l1);
-    RUN_TEST(segment_refcnt_acquire_release);
-    RUN_TEST(segment_tombstones_imm);
+    /* Segment tests (10 tests) */
+    RUN_TEST(storage_segment_build_l0_records_only);
+    RUN_TEST(storage_segment_build_l0_with_tombstones);
+    RUN_TEST(storage_segment_build_l0_tombstone_only);
+    RUN_TEST(storage_segment_build_l0_empty_invalid);
+    RUN_TEST(storage_segment_build_l0_unbounded_tombstone);
+    RUN_TEST(storage_segment_build_l1);
+    RUN_TEST(storage_segment_refcnt_acquire_release);
+    RUN_TEST(storage_segment_tombstones_imm);
+    RUN_TEST(storage_segment_l0_bounds_include_tombstones);
+    RUN_TEST(storage_segment_l0_bounds_tombstones_extend_max);
 
-    /* Manifest tests */
-    RUN_TEST(manifest_create_empty);
-    RUN_TEST(manifest_builder_add_l0);
-    RUN_TEST(manifest_builder_add_l1_sorted);
-    RUN_TEST(manifest_builder_remove_l0);
-    RUN_TEST(manifest_l1_find_first_overlap);
-    RUN_TEST(manifest_bounds_cached);
-    RUN_TEST(manifest_builder_remove_nonexistent);
-    RUN_TEST(manifest_builder_remove_duplicate);
-
-    /* L0 bounds edge case tests */
-    RUN_TEST(segment_l0_bounds_include_tombstones);
-    RUN_TEST(segment_l0_bounds_tombstones_extend_max);
+    /* Manifest tests (8 tests) */
+    RUN_TEST(storage_manifest_create_empty);
+    RUN_TEST(storage_manifest_builder_add_l0);
+    RUN_TEST(storage_manifest_builder_add_l1_sorted);
+    RUN_TEST(storage_manifest_builder_remove_l0);
+    RUN_TEST(storage_manifest_l1_find_first_overlap);
+    RUN_TEST(storage_manifest_l1_find_first_overlap_sparse);
+    RUN_TEST(storage_manifest_bounds_cached);
+    RUN_TEST(storage_manifest_builder_remove_nonexistent);
+    RUN_TEST(storage_manifest_builder_remove_duplicate);
 
 #ifdef TL_DEBUG
-    /* Debug validation tests */
-    RUN_TEST(page_validate_correct);
-    RUN_TEST(catalog_validate_correct);
-    RUN_TEST(segment_validate_l0);
-    RUN_TEST(segment_validate_l1);
-    RUN_TEST(manifest_validate_correct);
+    /* Debug validation tests (5 tests) */
+    RUN_TEST(storage_page_validate_correct);
+    RUN_TEST(storage_catalog_validate_correct);
+    RUN_TEST(storage_segment_validate_l0);
+    RUN_TEST(storage_segment_validate_l1);
+    RUN_TEST(storage_manifest_validate_correct);
 #endif
 }
