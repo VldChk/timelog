@@ -47,9 +47,9 @@ struct tl_snapshot {
     tl_manifest_t*  manifest;
 
     /*-----------------------------------------------------------------------
-     * Memview (owned, captured at acquisition time)
+     * Memview (shared, captured at acquisition time)
      *-----------------------------------------------------------------------*/
-    tl_memview_t    memview;
+    tl_memview_shared_t* memview;
 
     /*-----------------------------------------------------------------------
      * Cached Bounds (computed at acquisition time)
@@ -90,7 +90,8 @@ TL_INLINE const tl_manifest_t* tl_snapshot_manifest(const tl_snapshot_t* snap) {
  */
 TL_INLINE const tl_memview_t* tl_snapshot_memview(const tl_snapshot_t* snap) {
     TL_ASSERT(snap != NULL);
-    return &snap->memview;
+    TL_ASSERT(snap->memview != NULL);
+    return tl_memview_shared_view(snap->memview);
 }
 
 /**

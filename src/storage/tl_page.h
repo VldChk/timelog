@@ -33,6 +33,12 @@ typedef enum tl_rowdel_kind {
     TL_ROWDEL_BITSET = 1                /* Bitset: bit i set => row i deleted */
 } tl_rowdel_kind_t;
 
+typedef struct tl_rowbitset {
+    uint32_t nbits;
+    uint32_t nwords;
+    uint64_t words[];  /* bit i set => row i deleted */
+} tl_rowbitset_t;
+
 /*===========================================================================
  * Page Structure
  *
@@ -201,6 +207,45 @@ TL_INLINE void tl_page_get_record(const tl_page_t* page, size_t idx,
     TL_ASSERT(idx < page->count);
     out->ts = page->ts[idx];
     out->handle = page->h[idx];
+}
+
+/**
+ * Check if a row is deleted via row-level metadata.
+ *
+ * Defensive behavior: if metadata is missing or inconsistent for a
+ * PARTIAL_DELETED page, treat the row as deleted to avoid leaks.
+ */
+TL_INLINE bool tl_page_row_is_deleted(const tl_page_t* page, size_t idx) {
+    TL_ASSERT(page != NULL);
+
+    if ((page->flags & TL_PAGE_PARTIAL_DELETED) == 0) {
+        return false;
+    }
+
+    if (page->row_del_kind != TL_ROWDEL_BITSET || page->row_del == NULL) {
+        return true; /* Unknown or missing metadata - conservative skip */
+    }
+
+    const tl_rowbitset_t* bs = (const tl_rowbitset_t*)page->row_del;
+    if (bs->nwords == 0) {
+        return true;
+    }
+
+    if ((uint64_t)bs->nwords * 64u < (uint64_t)bs->nbits) {
+        return true;
+    }
+
+    if (idx >= (size_t)bs->nbits) {
+        return true;
+    }
+
+    size_t word_idx = idx / 64;
+    if (word_idx >= (size_t)bs->nwords) {
+        return true;
+    }
+
+    uint64_t mask = (uint64_t)1u << (idx % 64);
+    return (bs->words[word_idx] & mask) != 0;
 }
 
 /*===========================================================================

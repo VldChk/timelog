@@ -406,6 +406,10 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     }
     tl->next_gen = 1;
 
+    /* Initialize snapshot memview cache (optional) */
+    tl->memview_cache = NULL;
+    tl->memview_cache_epoch = 0;
+
 #ifdef TL_DEBUG
     /* Initialize debug snapshot counter */
     tl_atomic_init_u32(&tl->snapshot_count, 0);
@@ -476,6 +480,12 @@ void tl_close(tl_timelog_t* tl) {
     if (tl->manifest != NULL) {
         tl_manifest_release(tl->manifest);
         tl->manifest = NULL;
+    }
+
+    /* Release cached memview (if any) */
+    if (tl->memview_cache != NULL) {
+        tl_memview_shared_release(tl->memview_cache);
+        tl->memview_cache = NULL;
     }
 
     /* Destroy memtable (Phase 4) */
@@ -2016,9 +2026,9 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
         out->min_ts = tl_snapshot_min_ts(snap);
         out->max_ts = tl_snapshot_max_ts(snap);
     } else {
-        /* No data: bounds are undefined, set to 0 */
-        out->min_ts = 0;
-        out->max_ts = 0;
+        /* No data: use sentinel bounds per public API contract */
+        out->min_ts = TL_TS_MAX;
+        out->max_ts = TL_TS_MIN;
     }
 
     /*

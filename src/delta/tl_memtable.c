@@ -411,6 +411,7 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond)
     /* Step 7: Reset active metadata AFTER successful enqueue */
     mt->last_inorder_ts = TL_TS_MIN;
     mt->active_bytes_est = 0;
+    mt->epoch++;  /* Memtable state changed (active -> sealed) */
 
     /* Signal waiters if provided */
     if (cond != NULL) {
@@ -465,6 +466,9 @@ void tl_memtable_pop_oldest(tl_memtable_t* mt, tl_cond_t* cond) {
 
     /* Release queue's reference */
     tl_memrun_release(mr);
+
+    /* Sealed queue changed (flush removed a memrun) */
+    mt->epoch++;
 
     /* Signal waiters (backpressure) */
     if (cond != NULL) {

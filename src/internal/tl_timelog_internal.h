@@ -22,6 +22,10 @@
 #include "../delta/tl_memtable.h"
 #include "../storage/tl_manifest.h"
 
+/* Forward declaration to avoid heavy include dependencies. */
+struct tl_memview_shared;
+typedef struct tl_memview_shared tl_memview_shared_t;
+
 /*===========================================================================
  * Maintenance Worker State Machine (Phase 7)
  *
@@ -120,6 +124,10 @@ struct tl_timelog {
 
     /* Memtable: mutable write buffer for inserts and tombstones */
     tl_memtable_t   memtable;
+
+    /* Snapshot memview cache (for reuse when memtable epoch unchanged) */
+    tl_memview_shared_t* memview_cache;
+    uint64_t             memview_cache_epoch;
 
     /*-----------------------------------------------------------------------
      * Storage Layer (Phase 5)

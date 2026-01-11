@@ -457,7 +457,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
 
     tl_status_t st;
     const tl_manifest_t* manifest = snapshot->manifest;
-    const tl_memview_t* mv = &snapshot->memview;
+    const tl_memview_t* mv = tl_snapshot_memview(snapshot);
 
     /*
      * Check if range is empty (bounded only).
@@ -490,11 +490,9 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
-        /*
-         * L1 segments are tombstone-free by invariant (tombstones are folded
-         * during compaction). No need to add tombstones from L1.
-         */
-        TL_ASSERT(seg->tombstones == NULL);
+        /* Defensive: include L1 tombstones if present (should be empty in V1). */
+        st = add_segment_tombstones(plan, seg);
+        if (st != TL_OK) goto fail;
     }
 
     /* Count pruned segments from before l1_start */

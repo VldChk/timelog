@@ -319,6 +319,65 @@ void tl_memview_destroy(tl_memview_t* mv) {
 }
 
 /*===========================================================================
+ * Shared Memview (Snapshot Cache)
+ *===========================================================================*/
+
+tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
+                                       tl_memtable_t* mt,
+                                       tl_mutex_t* memtable_mu,
+                                       tl_alloc_ctx_t* alloc,
+                                       uint64_t epoch) {
+    TL_ASSERT(out != NULL);
+    TL_ASSERT(mt != NULL);
+    TL_ASSERT(memtable_mu != NULL);
+    TL_ASSERT(alloc != NULL);
+
+    *out = NULL;
+
+    tl_memview_shared_t* mv = TL_NEW(alloc, tl_memview_shared_t);
+    if (mv == NULL) {
+        return TL_ENOMEM;
+    }
+
+    memset(mv, 0, sizeof(*mv));
+    mv->epoch = epoch;
+    tl_atomic_init_u32(&mv->refcnt, 1);
+
+    tl_status_t st = tl_memview_capture(&mv->view, mt, memtable_mu, alloc);
+    if (st != TL_OK) {
+        tl__free(alloc, mv);
+        return st;
+    }
+
+    *out = mv;
+    return TL_OK;
+}
+
+tl_memview_shared_t* tl_memview_shared_acquire(tl_memview_shared_t* mv) {
+    if (mv == NULL) {
+        return NULL;
+    }
+
+    tl_atomic_fetch_add_u32(&mv->refcnt, 1, TL_MO_RELAXED);
+    return mv;
+}
+
+void tl_memview_shared_release(tl_memview_shared_t* mv) {
+    if (mv == NULL) {
+        return;
+    }
+
+    uint32_t old = tl_atomic_fetch_sub_u32(&mv->refcnt, 1, TL_MO_RELEASE);
+    TL_ASSERT(old >= 1);
+
+    if (old == 1) {
+        tl_atomic_fence(TL_MO_ACQUIRE);
+        tl_memview_destroy(&mv->view);
+        tl__free(mv->view.alloc, mv);
+    }
+}
+
+/*===========================================================================
  * Query Support
  *===========================================================================*/
 

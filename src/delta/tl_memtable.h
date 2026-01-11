@@ -58,7 +58,7 @@ struct tl_memtable {
     /*-----------------------------------------------------------------------
      * Metadata
      *-----------------------------------------------------------------------*/
-    uint64_t        epoch;            /* Monotonic counter, increments on write */
+    uint64_t        epoch;            /* Monotonic counter, increments on memtable changes */
 
     /*-----------------------------------------------------------------------
      * Allocator (borrowed)
@@ -265,6 +265,8 @@ tl_status_t tl_memtable_peek_oldest(tl_memtable_t* mt, tl_memrun_t** out);
  * Caller still holds their pin from peek_oldest and must release it separately.
  *
  * After pop, signals condvar if provided (for backpressure waiters).
+ *
+ * NOTE: Increments epoch because the sealed queue has changed.
  *
  * @param mt   Memtable
  * @param cond Condvar to signal (may be NULL)

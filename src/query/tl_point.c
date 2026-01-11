@@ -128,6 +128,11 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
     /* Collect all matching records */
     tl_record_t rec;
     while (idx < page->count) {
+        if (tl_page_row_is_deleted(page, idx)) {
+            idx++;
+            continue;
+        }
+
         tl_page_get_record(page, idx, &rec);
         if (rec.ts != ts) {
             break;
@@ -270,7 +275,7 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
  */
 static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
     const tl_manifest_t* manifest = snap->manifest;
-    const tl_memview_t* mv = &snap->memview;
+    const tl_memview_t* mv = tl_snapshot_memview(snap);
 
     /* Check memview tombstones */
     tl_intervals_imm_t mv_tombs = tl_memview_tombs_imm(mv);
@@ -296,18 +301,14 @@ static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
         }
     }
 
-    /*
-     * L1 segments are tombstone-free by invariant (tombstones are folded
-     * during compaction). No need to check them.
-     *
-     * Debug assert verifies the invariant holds.
-     */
-#ifdef TL_DEBUG
+    /* Defensive: check L1 tombstones if present (should be empty in V1). */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-        TL_ASSERT(seg->tombstones == NULL);
+        tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
+        if (tl_intervals_imm_contains(seg_tombs, ts)) {
+            return true;
+        }
     }
-#endif
 
     return false;
 }
@@ -340,7 +341,7 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
 
     tl_status_t st;
     const tl_manifest_t* manifest = snap->manifest;
-    const tl_memview_t* mv = &snap->memview;
+    const tl_memview_t* mv = tl_snapshot_memview(snap);
 
     /* Step 2: L1 lookup (non-overlapping windows) */
     size_t l1_start = tl_manifest_l1_find_first_overlap(manifest, ts);

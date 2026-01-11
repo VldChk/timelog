@@ -447,19 +447,87 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
         return TL_ENOMEM;
     }
 
-    /* Select all L0 segments (baseline policy) and compute bounds.
+    /* Select L0 segments with optional caps (inputs/windows/bytes).
      * Bounds cover BOTH records AND tombstones (segment min/max_ts). */
     tl_ts_t min_ts = TL_TS_MAX;
     tl_ts_t max_ts = TL_TS_MIN;
+    size_t est_bytes = 0;
+
+    size_t max_inputs = (size_t)tl->config.max_compaction_inputs; /* 0 = unlimited */
+    uint64_t max_windows = (uint64_t)tl->config.max_compaction_windows; /* 0 = unlimited */
+    size_t target_bytes = tl->config.compaction_target_bytes; /* 0 = unlimited */
 
     for (uint32_t i = 0; i < n_l0; i++) {
-        tl_segment_t* seg = tl_manifest_l0_get(m, i);
-        ctx->input_l0[i] = tl_segment_acquire(seg);
-        ctx->input_l0_len++;
+        if (max_inputs > 0 && ctx->input_l0_len >= max_inputs) {
+            break;
+        }
 
-        /* Update bounds from segment (covers both records AND tombstones) */
-        if (seg->min_ts < min_ts) min_ts = seg->min_ts;
-        if (seg->max_ts > max_ts) max_ts = seg->max_ts;
+        tl_segment_t* seg = tl_manifest_l0_get(m, i);
+
+        /* Candidate bounds if we include this segment */
+        tl_ts_t cand_min = (ctx->input_l0_len == 0) ? seg->min_ts : TL_MIN(min_ts, seg->min_ts);
+        tl_ts_t cand_max = (ctx->input_l0_len == 0) ? seg->max_ts : TL_MAX(max_ts, seg->max_ts);
+
+        int64_t cand_min_wid = 0;
+        int64_t cand_max_wid = 0;
+        st = tl_window_id_for_ts(cand_min, ctx->window_size,
+                                  ctx->window_origin, &cand_min_wid);
+        if (st != TL_OK) {
+            return st;
+        }
+        st = tl_window_id_for_ts(cand_max, ctx->window_size,
+                                  ctx->window_origin, &cand_max_wid);
+        if (st != TL_OK) {
+            return st;
+        }
+
+        bool windows_exceed = false;
+        if (max_windows > 0) {
+            if (cand_max_wid < cand_min_wid) {
+                return TL_EOVERFLOW;
+            }
+            uint64_t span = (uint64_t)(cand_max_wid - cand_min_wid) + 1;
+            windows_exceed = (span > max_windows);
+        }
+
+        size_t seg_bytes = 0;
+        bool bytes_exceed = false;
+        if (target_bytes > 0) {
+            if (seg->record_count > SIZE_MAX / sizeof(tl_record_t)) {
+                seg_bytes = SIZE_MAX;
+            } else {
+                seg_bytes = (size_t)seg->record_count * sizeof(tl_record_t);
+            }
+
+            if (seg_bytes > SIZE_MAX - est_bytes) {
+                bytes_exceed = true;
+            } else if ((est_bytes + seg_bytes) > target_bytes) {
+                bytes_exceed = true;
+            }
+        }
+
+        /* Enforce caps only after we've selected at least one segment.
+         * This guarantees forward progress even if a single segment exceeds caps. */
+        if (ctx->input_l0_len > 0 && (windows_exceed || bytes_exceed)) {
+            break;
+        }
+
+        /* Accept segment */
+        ctx->input_l0[ctx->input_l0_len++] = tl_segment_acquire(seg);
+        min_ts = cand_min;
+        max_ts = cand_max;
+        if (target_bytes > 0) {
+            if (seg_bytes > SIZE_MAX - est_bytes) {
+                est_bytes = SIZE_MAX;
+            } else {
+                est_bytes += seg_bytes;
+            }
+        }
+    }
+
+    /* Safety: ensure at least one L0 segment is selected */
+    if (ctx->input_l0_len == 0) {
+        return TL_EOF;
     }
 
     ctx->output_min_ts = min_ts;

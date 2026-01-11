@@ -147,26 +147,46 @@ tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out) {
         return TL_EOF;
     }
 
-    /* Load current record */
-    load_current_record(it);
-
-    /* Output the record if requested */
-    if (out != NULL) {
-        *out = it->current;
-    }
-
-    /* Advance to next row */
-    it->row_idx++;
-
-    /* Check if we've exhausted the current page */
-    if (it->row_idx >= it->row_end) {
-        /* Try to advance to next page */
-        if (!advance_to_next_page(it)) {
-            it->done = true;
+    for (;;) {
+        /* Ensure current page bounds are valid */
+        if (it->row_idx >= it->row_end) {
+            if (!advance_to_next_page(it)) {
+                it->done = true;
+                return TL_EOF;
+            }
         }
-    }
 
-    return TL_OK;
+        const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
+        const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
+        const tl_page_t* page = meta->page;
+
+        /* Skip deleted rows on PARTIAL_DELETED pages */
+        if (tl_page_row_is_deleted(page, it->row_idx)) {
+            it->row_idx++;
+            continue;
+        }
+
+        /* Load current record */
+        load_current_record(it);
+
+        /* Output the record if requested */
+        if (out != NULL) {
+            *out = it->current;
+        }
+
+        /* Advance to next row */
+        it->row_idx++;
+
+        /* Check if we've exhausted the current page */
+        if (it->row_idx >= it->row_end) {
+            /* Try to advance to next page */
+            if (!advance_to_next_page(it)) {
+                it->done = true;
+            }
+        }
+
+        return TL_OK;
+    }
 }
 
 void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {

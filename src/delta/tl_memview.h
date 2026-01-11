@@ -5,6 +5,7 @@
 #include "../internal/tl_alloc.h"
 #include "../internal/tl_intervals.h"
 #include "../internal/tl_sync.h"
+#include "../internal/tl_atomic.h"
 #include "tl_memtable.h"
 #include "tl_memrun.h"
 
@@ -62,6 +63,20 @@ struct tl_memview {
 };
 
 /*===========================================================================
+ * Shared Memview (Snapshot Cache)
+ *
+ * Shared, refcounted wrapper used to reuse memviews across snapshots when the
+ * memtable epoch has not changed. This avoids repeated deep copies on frequent
+ * snapshot acquisition under read-heavy workloads.
+ *===========================================================================*/
+
+typedef struct tl_memview_shared {
+    tl_memview_t   view;             /* Immutable memview */
+    tl_atomic_u32  refcnt;           /* Reference count */
+    uint64_t       epoch;            /* Memtable epoch at capture time */
+} tl_memview_shared_t;
+
+/*===========================================================================
  * Lifecycle
  *===========================================================================*/
 
@@ -103,6 +118,37 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
 void tl_memview_destroy(tl_memview_t* mv);
 
 /*===========================================================================
+ * Shared Memview Lifecycle (Snapshot Cache)
+ *===========================================================================*/
+
+/**
+ * Capture a shared memview for snapshot caching.
+ *
+ * @param out          Output: new shared memview (refcnt=1)
+ * @param mt           Memtable to capture
+ * @param memtable_mu  Mutex protecting sealed queue
+ * @param alloc        Allocator for memview and shared wrapper
+ * @param epoch        Memtable epoch at capture time
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
+                                       tl_memtable_t* mt,
+                                       tl_mutex_t* memtable_mu,
+                                       tl_alloc_ctx_t* alloc,
+                                       uint64_t epoch);
+
+/**
+ * Acquire a reference to a shared memview.
+ */
+tl_memview_shared_t* tl_memview_shared_acquire(tl_memview_shared_t* mv);
+
+/**
+ * Release a reference to a shared memview.
+ * Destroys the memview and frees the wrapper when refcnt reaches 0.
+ */
+void tl_memview_shared_release(tl_memview_shared_t* mv);
+
+/*===========================================================================
  * Query Support
  *===========================================================================*/
 
@@ -137,6 +183,18 @@ TL_INLINE tl_intervals_imm_t tl_memview_tombs_imm(const tl_memview_t* mv) {
     imm.data = mv->active_tombs;
     imm.len = mv->active_tombs_len;
     return imm;
+}
+
+/*===========================================================================
+ * Shared Memview Accessors
+ *===========================================================================*/
+
+TL_INLINE const tl_memview_t* tl_memview_shared_view(const tl_memview_shared_t* mv) {
+    return mv != NULL ? &mv->view : NULL;
+}
+
+TL_INLINE uint64_t tl_memview_shared_epoch(const tl_memview_shared_t* mv) {
+    return mv != NULL ? mv->epoch : 0;
 }
 
 /**

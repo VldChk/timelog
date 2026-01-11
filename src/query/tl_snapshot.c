@@ -26,17 +26,18 @@ static void snap_compute_bounds(tl_snapshot_t* snap) {
     }
 
     /* Bounds from memview */
-    if (snap->memview.has_data) {
+    const tl_memview_t* mv = tl_memview_shared_view(snap->memview);
+    if (mv != NULL && mv->has_data) {
         if (!snap->has_data) {
-            snap->min_ts = snap->memview.min_ts;
-            snap->max_ts = snap->memview.max_ts;
+            snap->min_ts = mv->min_ts;
+            snap->max_ts = mv->max_ts;
             snap->has_data = true;
         } else {
-            if (snap->memview.min_ts < snap->min_ts) {
-                snap->min_ts = snap->memview.min_ts;
+            if (mv->min_ts < snap->min_ts) {
+                snap->min_ts = mv->min_ts;
             }
-            if (snap->memview.max_ts > snap->max_ts) {
-                snap->max_ts = snap->memview.max_ts;
+            if (mv->max_ts > snap->max_ts) {
+                snap->max_ts = mv->max_ts;
             }
         }
     }
@@ -95,6 +96,10 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
      * 7. If seq1 != seq2 OR seq1 is odd: retry
      */
     for (;;) {
+        tl_manifest_t* manifest = NULL;
+        tl_memview_shared_t* mv = NULL;
+        bool used_cache = false;
+
         TL_LOCK_WRITER(tl);
 
         /* Step 1: Read seqlock (must be even = no publish in progress) */
@@ -106,33 +111,53 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
         }
 
         /* Step 2: Acquire manifest reference */
-        snap->manifest = tl_manifest_acquire(tl->manifest);
+        manifest = tl_manifest_acquire(tl->manifest);
 
-        /* Step 3: Capture memview (locks memtable_mu internally) */
-        tl_status_t st = tl_memview_capture(&snap->memview,
-                                             &tl->memtable,
-                                             &tl->memtable_mu,
-                                             alloc);
-        if (st != TL_OK) {
-            tl_manifest_release(snap->manifest);
-            TL_UNLOCK_WRITER(tl);
-            tl__free(alloc, snap);
-            return st;
+        /* Step 3: Capture or reuse memview (locks memtable_mu internally) */
+        uint64_t epoch = tl_memtable_epoch(&tl->memtable);
+        if (tl->memview_cache != NULL && tl->memview_cache_epoch == epoch) {
+            mv = tl_memview_shared_acquire(tl->memview_cache);
+            used_cache = true;
+        } else {
+            tl_status_t st = tl_memview_shared_capture(&mv,
+                                                        &tl->memtable,
+                                                        &tl->memtable_mu,
+                                                        alloc,
+                                                        epoch);
+            if (st != TL_OK) {
+                tl_manifest_release(manifest);
+                TL_UNLOCK_WRITER(tl);
+                tl__free(alloc, snap);
+                return st;
+            }
         }
 
-        /* Step 4: Read seqlock again */
+        /* Step 4: Read seqlock again and validate */
         uint64_t seq2 = tl_seqlock_read(&tl->view_seq);
+        bool ok = tl_seqlock_validate(seq1, seq2);
 
-        TL_UNLOCK_WRITER(tl);
+        if (ok) {
+            /* Update cache on fresh capture */
+            if (!used_cache) {
+                if (tl->memview_cache != NULL) {
+                    tl_memview_shared_release(tl->memview_cache);
+                }
+                tl->memview_cache = tl_memview_shared_acquire(mv);
+                tl->memview_cache_epoch = epoch;
+            }
 
-        /* Step 5: Validate consistency */
-        if (tl_seqlock_validate(seq1, seq2)) {
+            TL_UNLOCK_WRITER(tl);
+
+            snap->manifest = manifest;
+            snap->memview = mv;
             break;  /* Success - consistent snapshot */
         }
 
+        TL_UNLOCK_WRITER(tl);
+
         /* Inconsistent - release captured state and retry */
-        tl_manifest_release(snap->manifest);
-        tl_memview_destroy(&snap->memview);
+        tl_manifest_release(manifest);
+        tl_memview_shared_release(mv);
     }
 
     /* Compute global bounds from manifest + memview */
@@ -163,8 +188,8 @@ void tl_snapshot_release_internal(tl_snapshot_t* snap) {
     }
 #endif
 
-    /* Release memview (frees copies, releases pinned memruns) */
-    tl_memview_destroy(&snap->memview);
+    /* Release memview (shared, refcounted) */
+    tl_memview_shared_release(snap->memview);
 
     /* Release manifest reference */
     if (snap->manifest != NULL) {
