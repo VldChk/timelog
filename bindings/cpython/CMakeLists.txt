@@ -81,7 +81,8 @@ set(TIMELOG_PY_SOURCES
     src/py_handle.c
     src/py_errors.c
     src/py_timelog.c    # LLD-B2: PyTimelog type implementation
-    src/module.c        # LLD-B2: PyInit__timelog
+    src/py_iter.c       # LLD-B3: PyTimelogIter type implementation
+    src/module.c        # Module initialization
 )
 
 # Create Python extension module
@@ -167,6 +168,7 @@ if(TIMELOG_BUILD_PY_TESTS)
         src/py_handle.c         # LLD-B1 dependency
         src/py_errors.c         # Error translation
         src/py_timelog.c        # LLD-B2 implementation under test
+        src/py_iter.c           # LLD-B3 dependency (used by py_timelog.c)
     )
 
     target_include_directories(test_py_timelog PRIVATE
@@ -195,6 +197,47 @@ if(TIMELOG_BUILD_PY_TESTS)
             -fsanitize=address,undefined
         )
         target_compile_options(test_py_timelog PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
+    # Test: test_py_iter (LLD-B3 unit tests)
+    # =========================================================================
+    add_executable(test_py_iter
+        tests/test_py_iter.c
+        src/py_handle.c         # LLD-B1 dependency
+        src/py_errors.c         # Error translation
+        src/py_timelog.c        # LLD-B2 dependency (factory methods)
+        src/py_iter.c           # LLD-B3 implementation under test
+    )
+
+    target_include_directories(test_py_iter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(test_py_iter PRIVATE
+        timelog
+        ${Python3_LIBRARIES}
+    )
+
+    if(MSVC)
+        target_compile_options(test_py_iter PRIVATE
+            /W4
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_iter PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_iter PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_iter PRIVATE
             -fsanitize=address,undefined
         )
     endif()

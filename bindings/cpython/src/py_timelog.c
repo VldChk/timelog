@@ -19,6 +19,7 @@
 #include <Python.h>
 
 #include "timelogpy/py_timelog.h"
+#include "timelogpy/py_iter.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
 #include "timelog/timelog.h"
@@ -809,6 +810,200 @@ PyTimelog_exit(PyTimelog* self, PyObject* args)
 }
 
 /*===========================================================================
+ * Iterator Factory (LLD-B3)
+ *
+ * Creates PyTimelogIter instances for range queries.
+ * Follows the protocol: pins_enter → snapshot_acquire → iter_create → track
+ *===========================================================================*/
+
+/**
+ * Iterator mode enumeration.
+ */
+typedef enum {
+    ITER_MODE_RANGE,
+    ITER_MODE_SINCE,
+    ITER_MODE_UNTIL,
+    ITER_MODE_EQUAL,
+    ITER_MODE_POINT
+} iter_mode_t;
+
+/**
+ * Internal factory: create a PyTimelogIter for the given mode and timestamps.
+ *
+ * @param self   The PyTimelog instance
+ * @param mode   Iterator mode (range, since, until, equal, point)
+ * @param t1     First timestamp (interpretation depends on mode)
+ * @param t2     Second timestamp (only used by ITER_MODE_RANGE)
+ * @return       New reference to PyTimelogIter, or NULL on error
+ */
+static PyObject* pytimelog_make_iter(PyTimelog* self,
+                                     iter_mode_t mode,
+                                     tl_ts_t t1, tl_ts_t t2)
+{
+    CHECK_CLOSED(self);
+
+    tl_py_handle_ctx_t* ctx = &self->handle_ctx;  /* NOTE: & for embedded */
+
+    /* Enter pins BEFORE acquiring snapshot */
+    tl_py_pins_enter(ctx);
+
+    /* Acquire snapshot */
+    tl_snapshot_t* snap = NULL;
+    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
+    if (st != TL_OK) {
+        tl_py_pins_exit_and_maybe_drain(ctx);
+        return TlPy_RaiseFromStatus(st);
+    }
+
+    /* Create core iterator */
+    tl_iter_t* it = NULL;
+    switch (mode) {
+        case ITER_MODE_RANGE:
+            st = tl_iter_range(snap, t1, t2, &it);
+            break;
+        case ITER_MODE_SINCE:
+            st = tl_iter_since(snap, t1, &it);
+            break;
+        case ITER_MODE_UNTIL:
+            st = tl_iter_until(snap, t2, &it);
+            break;
+        case ITER_MODE_EQUAL:
+            st = tl_iter_equal(snap, t1, &it);
+            break;
+        case ITER_MODE_POINT:
+            st = tl_iter_point(snap, t1, &it);
+            break;
+
+        default:
+            /* Unreachable: enum covers all cases, but satisfy -Wswitch-default */
+            tl_snapshot_release(snap);
+            tl_py_pins_exit_and_maybe_drain(ctx);
+            PyErr_SetString(PyExc_SystemError, "Invalid iterator mode");
+            return NULL;
+    }
+
+    if (st != TL_OK) {
+        tl_snapshot_release(snap);
+        tl_py_pins_exit_and_maybe_drain(ctx);
+        return TlPy_RaiseFromStatus(st);
+    }
+
+    /* Allocate Python iterator object */
+    PyTimelogIter* pyit = PyObject_GC_New(PyTimelogIter, &PyTimelogIter_Type);
+    if (!pyit) {
+        tl_iter_destroy(it);
+        tl_snapshot_release(snap);
+        tl_py_pins_exit_and_maybe_drain(ctx);
+        return PyErr_NoMemory();
+    }
+
+    /* Initialize fields */
+    pyit->owner = Py_NewRef((PyObject*)self);
+    pyit->snapshot = snap;
+    pyit->iter = it;
+    pyit->handle_ctx = ctx;  /* borrowed pointer, safe due to strong owner ref */
+    pyit->closed = 0;
+
+    /* Enable GC tracking */
+    PyObject_GC_Track((PyObject*)pyit);
+
+    return (PyObject*)pyit;
+}
+
+/**
+ * Timelog.range(t1, t2) -> TimelogIter
+ *
+ * Create an iterator for records in [t1, t2).
+ * If t1 >= t2, returns empty iterator (mirrors core behavior).
+ */
+static PyObject* PyTimelog_range(PyTimelog* self, PyObject* args)
+{
+    long long t1, t2;
+
+    if (!PyArg_ParseTuple(args, "LL", &t1, &t2)) {
+        return NULL;
+    }
+
+    return pytimelog_make_iter(self, ITER_MODE_RANGE, (tl_ts_t)t1, (tl_ts_t)t2);
+}
+
+/**
+ * Timelog.since(t) -> TimelogIter
+ *
+ * Create an iterator for records with ts >= t.
+ */
+static PyObject* PyTimelog_since(PyTimelog* self, PyObject* args)
+{
+    long long t;
+
+    if (!PyArg_ParseTuple(args, "L", &t)) {
+        return NULL;
+    }
+
+    return pytimelog_make_iter(self, ITER_MODE_SINCE, (tl_ts_t)t, 0);
+}
+
+/**
+ * Timelog.until(t) -> TimelogIter
+ *
+ * Create an iterator for records with ts < t.
+ */
+static PyObject* PyTimelog_until(PyTimelog* self, PyObject* args)
+{
+    long long t;
+
+    if (!PyArg_ParseTuple(args, "L", &t)) {
+        return NULL;
+    }
+
+    return pytimelog_make_iter(self, ITER_MODE_UNTIL, 0, (tl_ts_t)t);
+}
+
+/**
+ * Timelog.all() -> TimelogIter
+ *
+ * Create an iterator for all records.
+ */
+static PyObject* PyTimelog_all(PyTimelog* self, PyObject* Py_UNUSED(args))
+{
+    /* all() is since(TL_TS_MIN) */
+    return pytimelog_make_iter(self, ITER_MODE_SINCE, TL_TS_MIN, 0);
+}
+
+/**
+ * Timelog.equal(t) -> TimelogIter
+ *
+ * Create an iterator for records with ts == t.
+ */
+static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
+{
+    long long t;
+
+    if (!PyArg_ParseTuple(args, "L", &t)) {
+        return NULL;
+    }
+
+    return pytimelog_make_iter(self, ITER_MODE_EQUAL, (tl_ts_t)t, 0);
+}
+
+/**
+ * Timelog.point(t) -> TimelogIter
+ *
+ * Create an iterator for records at exact timestamp t.
+ * Alias for equal() for semantic clarity in point queries.
+ */
+static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
+{
+    long long t;
+
+    if (!PyArg_ParseTuple(args, "L", &t)) {
+        return NULL;
+    }
+
+    return pytimelog_make_iter(self, ITER_MODE_POINT, (tl_ts_t)t, 0);
+}
+
+/*===========================================================================
  * Property Getters
  *===========================================================================*/
 
@@ -934,6 +1129,33 @@ static PyMethodDef PyTimelog_methods[] = {
      "Close the timelog. Idempotent. Releases all resources.\n\n"
      "WARNING: Records not yet flushed will be lost. In Python-object mode,\n"
      "this also means those objects will leak. Call flush() before close()."},
+
+    /* Iterator factory methods (LLD-B3) */
+    {"range", (PyCFunction)PyTimelog_range, METH_VARARGS,
+     "range(t1, t2) -> TimelogIter\n\n"
+     "Return an iterator over records in [t1, t2).\n"
+     "If t1 >= t2, returns an empty iterator."},
+
+    {"since", (PyCFunction)PyTimelog_since, METH_VARARGS,
+     "since(t) -> TimelogIter\n\n"
+     "Return an iterator over records with ts >= t."},
+
+    {"until", (PyCFunction)PyTimelog_until, METH_VARARGS,
+     "until(t) -> TimelogIter\n\n"
+     "Return an iterator over records with ts < t."},
+
+    {"all", (PyCFunction)PyTimelog_all, METH_NOARGS,
+     "all() -> TimelogIter\n\n"
+     "Return an iterator over all records."},
+
+    {"equal", (PyCFunction)PyTimelog_equal, METH_VARARGS,
+     "equal(t) -> TimelogIter\n\n"
+     "Return an iterator over records with ts == t."},
+
+    {"point", (PyCFunction)PyTimelog_point, METH_VARARGS,
+     "point(t) -> TimelogIter\n\n"
+     "Return an iterator for the exact timestamp t.\n"
+     "Alias for equal() for point query semantics."},
 
     {"__enter__", (PyCFunction)PyTimelog_enter, METH_NOARGS,
      "Context manager entry."},

@@ -2,12 +2,13 @@
  * @file module.c
  * @brief CPython extension module initialization (LLD-B2)
  *
- * This module provides PyInit__timelog() which initializes the _timelog
- * extension module and registers the PyTimelog type.
+ * This module provides PyInit__timelog() which initializes the timelog._timelog
+ * extension module and registers the PyTimelog and PyTimelogIter types.
  *
- * Module name: _timelog
- *   - Leading underscore indicates internal module
- *   - Public Python package (timelog/) imports from _timelog
+ * Module name: timelog._timelog
+ *   - Fully qualified name for correct __module__ attributes
+ *   - Init function remains PyInit__timelog (last component rule)
+ *   - Public Python package imports: from timelog._timelog import Timelog
  *
  * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
  *      docs/engineering_plan_B2_pytimelog.md
@@ -17,6 +18,7 @@
 #include <Python.h>
 
 #include "timelogpy/py_timelog.h"
+#include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
 
 /*===========================================================================
@@ -28,7 +30,7 @@
 
 static struct PyModuleDef timelog_module = {
     PyModuleDef_HEAD_INIT,
-    "_timelog",                           /* m_name */
+    "timelog._timelog",                   /* m_name */
     "Timelog C extension module.\n\n"     /* m_doc */
     "Provides the Timelog type for time-indexed storage.\n\n"
     "Usage:\n"
@@ -94,6 +96,22 @@ PyMODINIT_FUNC PyInit__timelog(void)
     Py_INCREF(&PyTimelog_Type);
     if (PyModule_AddObject(m, "Timelog", (PyObject*)&PyTimelog_Type) < 0) {
         Py_DECREF(&PyTimelog_Type);
+        goto error;
+    }
+
+    /*
+     * Ready and add PyTimelogIter type (LLD-B3).
+     * Exposed as timelog._timelog.TimelogIter in Python.
+     *
+     * Note: TimelogIter cannot be instantiated directly (tp_new raises TypeError).
+     * It is only created via factory methods on Timelog (range, since, etc.).
+     */
+    if (PyType_Ready(&PyTimelogIter_Type) < 0) {
+        goto error;
+    }
+    Py_INCREF(&PyTimelogIter_Type);
+    if (PyModule_AddObject(m, "TimelogIter", (PyObject*)&PyTimelogIter_Type) < 0) {
+        Py_DECREF(&PyTimelogIter_Type);
         goto error;
     }
 
