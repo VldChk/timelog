@@ -307,7 +307,13 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
     }
 
     size_t count = 0;
-    uint32_t batch_limit = ctx->drain_batch_limit;
+
+    /*
+     * Batch limit: 0 = unlimited.
+     * When force=1 (close path), always drain everything regardless of limit.
+     * This prevents leaking objects when ctx is about to be destroyed.
+     */
+    uint32_t batch_limit = force ? 0 : ctx->drain_batch_limit;
 
     while (list != NULL) {
         /* Check batch limit (0 = unlimited) */

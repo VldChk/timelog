@@ -31,12 +31,36 @@ if(NOT TARGET timelog)
 
     # Import timelog as an interface library pointing to built static lib
     add_library(timelog STATIC IMPORTED)
+
+    # Find the library - check multiple locations for Windows/Unix builds
+    if(WIN32)
+        # Windows: Check build_x64/Release, build_x64/Debug, build/Release, build/Debug
+        if(EXISTS "${TIMELOG_ROOT}/build_x64/Release/timelog.lib")
+            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build_x64/Release/timelog.lib")
+        elseif(EXISTS "${TIMELOG_ROOT}/build_x64/Debug/timelog.lib")
+            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build_x64/Debug/timelog.lib")
+        elseif(EXISTS "${TIMELOG_ROOT}/build/Release/timelog.lib")
+            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/Release/timelog.lib")
+        elseif(EXISTS "${TIMELOG_ROOT}/build/Debug/timelog.lib")
+            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/Debug/timelog.lib")
+        else()
+            message(FATAL_ERROR "Cannot find timelog.lib - build core library first")
+        endif()
+    else()
+        # Unix: Check build/libtimelog.a
+        if(EXISTS "${TIMELOG_ROOT}/build/libtimelog.a")
+            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/libtimelog.a")
+        else()
+            message(FATAL_ERROR "Cannot find libtimelog.a - build core library first")
+        endif()
+    endif()
+
     set_target_properties(timelog PROPERTIES
-        IMPORTED_LOCATION "${TIMELOG_ROOT}/build/libtimelog.a"
+        IMPORTED_LOCATION "${TIMELOG_LIB_PATH}"
         INTERFACE_INCLUDE_DIRECTORIES "${TIMELOG_ROOT}/include"
     )
 
-    message(STATUS "Standalone build: linking against ${TIMELOG_ROOT}/build/libtimelog.a")
+    message(STATUS "Standalone build: linking against ${TIMELOG_LIB_PATH}")
 endif()
 
 # =============================================================================
@@ -56,6 +80,8 @@ message(STATUS "Python3 libraries: ${Python3_LIBRARIES}")
 set(TIMELOG_PY_SOURCES
     src/py_handle.c
     src/py_errors.c
+    src/py_timelog.c    # LLD-B2: PyTimelog type implementation
+    src/module.c        # LLD-B2: PyInit__timelog
 )
 
 # Create Python extension module
@@ -75,6 +101,8 @@ if(MSVC)
     target_compile_options(_timelog PRIVATE
         /W4
         /D_CRT_SECURE_NO_WARNINGS
+        /std:c17
+        /experimental:c11atomics
     )
 else()
     target_compile_options(_timelog PRIVATE
@@ -93,8 +121,12 @@ endif()
 option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
 
 if(TIMELOG_BUILD_PY_TESTS)
+    # =========================================================================
+    # Test: test_py_handle (LLD-B1 unit tests)
+    # =========================================================================
     add_executable(test_py_handle
         tests/test_py_handle.c
+        src/py_handle.c         # LLD-B1 implementation under test
     )
 
     target_include_directories(test_py_handle PRIVATE
@@ -111,6 +143,8 @@ if(TIMELOG_BUILD_PY_TESTS)
         target_compile_options(test_py_handle PRIVATE
             /W4
             /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
         )
     else()
         target_compile_options(test_py_handle PRIVATE
@@ -121,6 +155,46 @@ if(TIMELOG_BUILD_PY_TESTS)
             -fsanitize=address,undefined
         )
         target_compile_options(test_py_handle PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
+    # Test: test_py_timelog (LLD-B2 unit tests)
+    # =========================================================================
+    add_executable(test_py_timelog
+        tests/test_py_timelog.c
+        src/py_handle.c         # LLD-B1 dependency
+        src/py_errors.c         # Error translation
+        src/py_timelog.c        # LLD-B2 implementation under test
+    )
+
+    target_include_directories(test_py_timelog PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(test_py_timelog PRIVATE
+        timelog
+        ${Python3_LIBRARIES}
+    )
+
+    if(MSVC)
+        target_compile_options(test_py_timelog PRIVATE
+            /W4
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_timelog PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_timelog PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_timelog PRIVATE
             -fsanitize=address,undefined
         )
     endif()
