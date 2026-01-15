@@ -20,6 +20,7 @@
 
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_iter.h"
+#include "timelogpy/py_span_iter.h"  /* LLD-B4: PageSpan factory */
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
 #include "timelog/timelog.h"
@@ -1004,6 +1005,41 @@ static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
 }
 
 /*===========================================================================
+ * PageSpan Factory Methods (LLD-B4)
+ *===========================================================================*/
+
+/**
+ * Timelog.page_spans(t1, t2, *, kind="segment") -> PageSpanIter
+ *
+ * Create an iterator yielding PageSpan objects for zero-copy timestamp access.
+ *
+ * Each yielded PageSpan exposes a contiguous slice of page memory as a
+ * read-only memoryview via the buffer protocol.
+ *
+ * @param t1   Range start (inclusive)
+ * @param t2   Range end (exclusive)
+ * @param kind "segment" (only supported value in V1)
+ * @return PageSpanIter iterator
+ */
+static PyObject* PyTimelog_page_spans(PyTimelog* self,
+                                       PyObject* args,
+                                       PyObject* kwds)
+{
+    static char* kwlist[] = {"t1", "t2", "kind", NULL};
+    long long t1, t2;
+    const char* kind = "segment";
+
+    CHECK_CLOSED(self);
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "LL|s", kwlist,
+                                     &t1, &t2, &kind)) {
+        return NULL;
+    }
+
+    return PyPageSpanIter_Create((PyObject*)self, (tl_ts_t)t1, (tl_ts_t)t2, kind);
+}
+
+/*===========================================================================
  * Property Getters
  *===========================================================================*/
 
@@ -1156,6 +1192,20 @@ static PyMethodDef PyTimelog_methods[] = {
      "point(t) -> TimelogIter\n\n"
      "Return an iterator for the exact timestamp t.\n"
      "Alias for equal() for point query semantics."},
+
+    /* PageSpan factory methods (LLD-B4) */
+    {"page_spans", (PyCFunction)PyTimelog_page_spans, METH_VARARGS | METH_KEYWORDS,
+     "page_spans(t1, t2, *, kind='segment') -> PageSpanIter\n\n"
+     "Return an iterator yielding PageSpan objects for [t1, t2).\n"
+     "Each PageSpan exposes a contiguous slice of page timestamps\n"
+     "as a read-only memoryview (zero-copy). Use for bulk timestamp\n"
+     "access without per-record Python object allocation.\n\n"
+     "Parameters:\n"
+     "  t1: Range start (inclusive)\n"
+     "  t2: Range end (exclusive)\n"
+     "  kind: 'segment' (only supported value in V1)\n\n"
+     "Returns:\n"
+     "  PageSpanIter yielding PageSpan objects"},
 
     {"__enter__", (PyCFunction)PyTimelog_enter, METH_NOARGS,
      "Context manager entry."},

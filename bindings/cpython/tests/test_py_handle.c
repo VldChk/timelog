@@ -25,6 +25,55 @@
 static int tests_run = 0;
 static int tests_failed = 0;
 
+/*===========================================================================
+ * Python Initialization Helper
+ *===========================================================================*/
+
+static void tlpy_set_pythonhome(void)
+{
+#ifdef TIMELOG_PYTHON_EXECUTABLE
+    const char* existing = getenv("PYTHONHOME");
+    if (existing != NULL && existing[0] != '\0') {
+        return;
+    }
+
+    const char* exe = TIMELOG_PYTHON_EXECUTABLE;
+    size_t len = strlen(exe);
+    char* buf = (char*)malloc(len + 1);
+    if (buf == NULL) {
+        return;
+    }
+    memcpy(buf, exe, len + 1);
+
+    char* last_slash = strrchr(buf, '\\');
+    char* last_fwd = strrchr(buf, '/');
+    char* last = last_slash;
+    if (last_fwd != NULL && (last == NULL || last_fwd > last)) {
+        last = last_fwd;
+    }
+    if (last != NULL) {
+        *last = '\0';
+#ifdef _WIN32
+        _putenv_s("PYTHONHOME", buf);
+#else
+        setenv("PYTHONHOME", buf, 0);
+#endif
+    }
+    free(buf);
+#endif
+}
+
+static void tlpy_init_python(void)
+{
+    tlpy_set_pythonhome();
+    Py_Initialize();
+}
+
+static int tlpy_finalize_python(void)
+{
+    return Py_FinalizeEx();
+}
+
 #define TEST(name) \
     static void test_##name(void); \
     static void run_##name(void) { \
@@ -117,8 +166,13 @@ TEST(on_drop_enqueues)
     tl_py_handle_ctx_t ctx;
     tl_py_handle_ctx_init(&ctx, 0);
 
-    /* Create a test object */
-    PyObject* obj = PyLong_FromLong(42);
+    /*
+     * Create a test object.
+     * IMPORTANT: Use PyDict_New() instead of PyLong_FromLong() because
+     * Python 3.12+ makes small integers "immortal" - their refcount never
+     * changes, making Py_INCREF/Py_DECREF no-ops. Dicts are always new.
+     */
+    PyObject* obj = PyDict_New();
     ASSERT(obj != NULL);
 
     /* Increment refcount (simulating append) */
@@ -151,8 +205,8 @@ TEST(drain_blocked_by_pins)
     tl_py_handle_ctx_t ctx;
     tl_py_handle_ctx_init(&ctx, 0);
 
-    /* Create a test object */
-    PyObject* obj = PyLong_FromLong(123);
+    /* Use dict (non-immortal) - see on_drop_enqueues comment */
+    PyObject* obj = PyDict_New();
     ASSERT(obj != NULL);
     Py_INCREF(obj);  /* Simulating append */
 
@@ -184,7 +238,8 @@ TEST(force_drain_ignores_pins)
     tl_py_handle_ctx_t ctx;
     tl_py_handle_ctx_init(&ctx, 0);
 
-    PyObject* obj = PyLong_FromLong(456);
+    /* Use dict (non-immortal) - see on_drop_enqueues comment */
+    PyObject* obj = PyDict_New();
     ASSERT(obj != NULL);
     Py_INCREF(obj);
 
@@ -211,10 +266,10 @@ TEST(batch_limit)
     tl_py_handle_ctx_t ctx;
     tl_py_handle_ctx_init(&ctx, 2);  /* batch limit = 2 */
 
-    /* Create and enqueue 5 objects */
+    /* Create and enqueue 5 objects (dicts, non-immortal) */
     PyObject* objs[5];
     for (int i = 0; i < 5; i++) {
-        objs[i] = PyLong_FromLong(i);
+        objs[i] = PyDict_New();
         ASSERT(objs[i] != NULL);
         Py_INCREF(objs[i]);
 
@@ -259,8 +314,9 @@ TEST(multiple_on_drop_concurrent_simulation)
     const int count = 100;
     PyObject* objs[100];
 
+    /* Use dicts (non-immortal) - see on_drop_enqueues comment */
     for (int i = 0; i < count; i++) {
-        objs[i] = PyLong_FromLong(i);
+        objs[i] = PyDict_New();
         ASSERT(objs[i] != NULL);
         Py_INCREF(objs[i]);
 
@@ -285,15 +341,15 @@ TEST(multiple_on_drop_concurrent_simulation)
  * Test Runner
  *===========================================================================*/
 
-int main(int argc, char* argv[])
+/**
+ * Run all py_handle tests. Returns number of failures.
+ * Python must already be initialized before calling this.
+ */
+int run_py_handle_tests(void)
 {
-    (void)argc;
-    (void)argv;
-
-    /* Initialize Python */
-    Py_Initialize();
-
-    printf("Running py_handle tests...\n");
+    /* Reset counters for this suite */
+    tests_run = 0;
+    tests_failed = 0;
 
     run_ctx_init_destroy();
     run_ctx_init_null_fails();
@@ -305,10 +361,26 @@ int main(int argc, char* argv[])
     run_batch_limit();
     run_multiple_on_drop_concurrent_simulation();
 
-    printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
+    printf("%d tests run, %d failed\n", tests_run, tests_failed);
+    return tests_failed;
+}
+
+#ifndef TEST_PY_MAIN
+/* Standalone executable entry point */
+int main(int argc, char* argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    /* Initialize Python */
+    tlpy_init_python();
+
+    printf("Running py_handle tests...\n");
+    int failures = run_py_handle_tests();
 
     /* Finalize Python */
-    Py_Finalize();
+    tlpy_finalize_python();
 
-    return tests_failed > 0 ? 1 : 0;
+    return failures > 0 ? 1 : 0;
 }
+#endif /* TEST_PY_MAIN */

@@ -1,9 +1,9 @@
 /**
  * @file module.c
- * @brief CPython extension module initialization (LLD-B2)
+ * @brief CPython extension module initialization (LLD-B2, B3, B4)
  *
  * This module provides PyInit__timelog() which initializes the timelog._timelog
- * extension module and registers the PyTimelog and PyTimelogIter types.
+ * extension module and registers the PyTimelog, PyTimelogIter, and PageSpan types.
  *
  * Module name: timelog._timelog
  *   - Fully qualified name for correct __module__ attributes
@@ -11,7 +11,7 @@
  *   - Public Python package imports: from timelog._timelog import Timelog
  *
  * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
- *      docs/engineering_plan_B2_pytimelog.md
+ *      docs/timelog_v1_lld_B4_pagespan_zero_copy.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -20,6 +20,9 @@
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_span.h"
+#include "timelogpy/py_span_iter.h"
+#include "timelogpy/py_span_objects.h"
 
 /*===========================================================================
  * Module Definition
@@ -112,6 +115,57 @@ PyMODINIT_FUNC PyInit__timelog(void)
     Py_INCREF(&PyTimelogIter_Type);
     if (PyModule_AddObject(m, "TimelogIter", (PyObject*)&PyTimelogIter_Type) < 0) {
         Py_DECREF(&PyTimelogIter_Type);
+        goto error;
+    }
+
+    /*
+     * Ready and add PyPageSpan type (LLD-B4).
+     * Exposed as timelog._timelog.PageSpan in Python.
+     *
+     * Note: PageSpan cannot be instantiated directly (tp_new raises TypeError).
+     * It is only created via Timelog.page_spans() factory method.
+     */
+    if (PyType_Ready(&PyPageSpan_Type) < 0) {
+        goto error;
+    }
+    Py_INCREF(&PyPageSpan_Type);
+    if (PyModule_AddObject(m, "PageSpan", (PyObject*)&PyPageSpan_Type) < 0) {
+        Py_DECREF(&PyPageSpan_Type);
+        goto error;
+    }
+
+    /*
+     * Ready and add PyPageSpanIter type (LLD-B4).
+     * Exposed as timelog._timelog.PageSpanIter in Python.
+     */
+    if (PyType_Ready(&PyPageSpanIter_Type) < 0) {
+        goto error;
+    }
+    Py_INCREF(&PyPageSpanIter_Type);
+    if (PyModule_AddObject(m, "PageSpanIter", (PyObject*)&PyPageSpanIter_Type) < 0) {
+        Py_DECREF(&PyPageSpanIter_Type);
+        goto error;
+    }
+
+    /*
+     * Ready and add PyPageSpanObjectsView type (LLD-B4).
+     * Exposed as timelog._timelog.PageSpanObjectsView in Python.
+     */
+    if (PyType_Ready(&PyPageSpanObjectsView_Type) < 0) {
+        goto error;
+    }
+    Py_INCREF(&PyPageSpanObjectsView_Type);
+    if (PyModule_AddObject(m, "PageSpanObjectsView", (PyObject*)&PyPageSpanObjectsView_Type) < 0) {
+        Py_DECREF(&PyPageSpanObjectsView_Type);
+        goto error;
+    }
+
+    /*
+     * Ready PyPageSpanObjectsViewIter type (internal iterator).
+     * Not exported to module namespace but must be ready before use.
+     * This avoids a race condition in py_span_objects.c.
+     */
+    if (PyType_Ready(&PyPageSpanObjectsViewIter_Type) < 0) {
         goto error;
     }
 

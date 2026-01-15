@@ -28,6 +28,55 @@
 static int tests_run = 0;
 static int tests_failed = 0;
 
+/*===========================================================================
+ * Python Initialization Helper
+ *===========================================================================*/
+
+static void tlpy_set_pythonhome(void)
+{
+#ifdef TIMELOG_PYTHON_EXECUTABLE
+    const char* existing = getenv("PYTHONHOME");
+    if (existing != NULL && existing[0] != '\0') {
+        return;
+    }
+
+    const char* exe = TIMELOG_PYTHON_EXECUTABLE;
+    size_t len = strlen(exe);
+    char* buf = (char*)malloc(len + 1);
+    if (buf == NULL) {
+        return;
+    }
+    memcpy(buf, exe, len + 1);
+
+    char* last_slash = strrchr(buf, '\\');
+    char* last_fwd = strrchr(buf, '/');
+    char* last = last_slash;
+    if (last_fwd != NULL && (last == NULL || last_fwd > last)) {
+        last = last_fwd;
+    }
+    if (last != NULL) {
+        *last = '\0';
+#ifdef _WIN32
+        _putenv_s("PYTHONHOME", buf);
+#else
+        setenv("PYTHONHOME", buf, 0);
+#endif
+    }
+    free(buf);
+#endif
+}
+
+static void tlpy_init_python(void)
+{
+    tlpy_set_pythonhome();
+    Py_Initialize();
+}
+
+static int tlpy_finalize_python(void)
+{
+    return Py_FinalizeEx();
+}
+
 #define TEST(name) \
     static void test_##name(void); \
     static void run_##name(void) { \
@@ -1367,7 +1416,7 @@ int main(int argc, char* argv[])
     (void)argv;
 
     /* Initialize Python */
-    Py_Initialize();
+    tlpy_init_python();
 
     /* Initialize error types first */
     PyObject* module = PyModule_Create(&test_module_def);
@@ -1443,7 +1492,7 @@ int main(int argc, char* argv[])
     Py_DECREF(module);
 
     /* Finalize Python */
-    if (Py_FinalizeEx() < 0) {
+    if (tlpy_finalize_python() < 0) {
         return 2;
     }
 
