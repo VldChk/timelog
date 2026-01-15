@@ -1,25 +1,32 @@
 /**
  * @file py_span.h
- * @brief PyPageSpan CPython extension type declaration (LLD-B4)
+ * @brief PyPageSpan CPython extension type declaration (Core API Integration)
  *
  * This module provides the PyPageSpan type which exposes a contiguous
  * slice of page memory (timestamps) via the CPython buffer protocol.
  *
+ * Architecture (Post-Migration):
+ *   PageSpan now wraps the core tl_pagespan_view_t, storing ts/h/len
+ *   pointers directly instead of page pointer + row indices. The core
+ *   tl_pagespan_owner_t manages snapshot lifetime via hooks.
+ *
  * Zero-Copy Promise:
  *   The .timestamps property returns a memoryview directly backed by
- *   page->ts[] memory. No copying occurs unless explicitly requested
+ *   span->ts memory. No copying occurs unless explicitly requested
  *   via copy_timestamps() or copy().
  *
  * Thread Safety:
  *   A PageSpan instance is NOT thread-safe. Do not access the same
  *   instance from multiple threads without external synchronization.
+ *   All owner refcount operations must be serialized by the GIL.
  *
  * Lifetime:
- *   PageSpan holds a reference to a shared snapshot owner (tl_py_span_owner_t)
- *   which in turn holds a snapshot pin and strong ref to PyTimelog.
- *   Page memory remains valid as long as any span or exported buffer exists.
+ *   PageSpan holds a reference to the core tl_pagespan_owner_t which
+ *   in turn pins the snapshot. The owner's release hook (set during
+ *   iterator creation) handles pins_exit and Py_DECREF of the timelog.
+ *   Page memory remains valid as long as any span holds an owner ref.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #ifndef TL_PY_SPAN_H
@@ -29,6 +36,7 @@
 #include <Python.h>
 
 #include "timelog/timelog.h"
+#include "query/tl_pagespan_iter.h"
 #include "timelogpy/py_handle.h"
 
 #ifdef __cplusplus
@@ -54,41 +62,17 @@ static inline PyObject* TL_Py_NewRef(PyObject* obj) {
 #endif
 
 /*===========================================================================
- * Forward Declarations
- *===========================================================================*/
-
-/* Internal page type from core storage */
-struct tl_page;
-typedef struct tl_page tl_page_t;
-
-/*===========================================================================
- * Shared Snapshot Owner (Internal, C-only)
- *
- * Provides shared snapshot ownership across multiple PageSpan instances.
- * Uses manual refcounting under GIL (no atomics needed).
- *
- * Lifetime chain:
- *   span_owner -> holds ref to PyTimelog (keeps handle_ctx alive)
- *   span_owner -> owns tl_snapshot_t (keeps page memory valid)
- *===========================================================================*/
-
-/* Forward declaration for allocator context */
-struct tl_alloc_ctx;
-typedef struct tl_alloc_ctx tl_alloc_ctx_t;
-
-typedef struct tl_py_span_owner {
-    uint32_t refcnt;                /**< GIL-protected refcount */
-    PyObject* timelog;              /**< Strong ref to PyTimelog */
-    tl_snapshot_t* snapshot;        /**< Owned snapshot */
-    tl_py_handle_ctx_t* handle_ctx; /**< Borrowed from timelog */
-    tl_alloc_ctx_t* alloc;          /**< Allocator (borrowed from snapshot) */
-} tl_py_span_owner_t;
-
-/*===========================================================================
  * PyPageSpan Type
  *
- * Zero-copy view of timestamps from a single page slice.
+ * Zero-copy view of timestamps from a single span slice.
  * Implements the buffer protocol for memoryview exposure.
+ *
+ * Data Layout (Core API Integration):
+ *   The span stores pointers from tl_pagespan_view_t directly:
+ *   - ts: pointer to timestamp array (borrowed from owner's snapshot)
+ *   - h:  pointer to handle array (borrowed from owner's snapshot)
+ *   - len: row count
+ *   - first_ts, last_ts: cached boundary timestamps
  *
  * Cannot be instantiated directly; use Timelog.page_spans() factory.
  *===========================================================================*/
@@ -97,22 +81,50 @@ typedef struct {
     PyObject_HEAD
 
     /**
-     * Shared snapshot owner (refcounted).
+     * Core snapshot owner (refcounted via core API).
+     * Each span holds one reference; decref on close/dealloc.
      * NULL if closed.
      */
-    tl_py_span_owner_t* owner;
+    tl_pagespan_owner_t* owner;
 
     /**
-     * Page pointer (borrowed from snapshot).
+     * Strong reference to PyTimelog for GC visibility.
+     * Required because core owner is opaque and GC cannot traverse it.
      * NULL if closed.
      */
-    const tl_page_t* page;
+    PyObject* timelog;
 
     /**
-     * Slice boundaries within page arrays.
+     * Pointer to timestamp array (borrowed from owner's snapshot).
+     * Points directly to page memory; valid while owner is alive.
+     * NULL if closed.
      */
-    size_t row_start;               /**< Inclusive */
-    size_t row_end;                 /**< Exclusive */
+    const tl_ts_t* ts;
+
+    /**
+     * Pointer to handle array (borrowed from owner's snapshot).
+     * Points directly to page memory; valid while owner is alive.
+     * May be NULL if handles are unavailable (future-proofing).
+     */
+    const tl_handle_t* h;
+
+    /**
+     * Row count (number of elements in ts/h arrays).
+     * Always > 0 for valid spans returned by iter_next.
+     */
+    uint32_t len;
+
+    /**
+     * Cached first timestamp (== ts[0]).
+     * Provides O(1) access for start_ts property.
+     */
+    tl_ts_t first_ts;
+
+    /**
+     * Cached last timestamp (== ts[len-1]).
+     * Provides O(1) access for end_ts property.
+     */
+    tl_ts_t last_ts;
 
     /**
      * Buffer protocol shape/strides.
@@ -152,63 +164,27 @@ extern PyTypeObject PyPageSpan_Type;
 #define PyPageSpan_Check(op) PyObject_TypeCheck(op, &PyPageSpan_Type)
 
 /*===========================================================================
- * Shared Owner API (Internal)
- *
- * Used by py_span_iter.c to create and manage shared owners.
- *===========================================================================*/
-
-/**
- * Create a shared snapshot owner.
- *
- * PRECONDITIONS (caller must ensure):
- *   1. tl_py_pins_enter() already called on handle_ctx
- *   2. tl_snapshot_acquire() already called to get snapshot
- *
- * This function does NOT call pins_enter - caller must do it first.
- * This ensures the correct protocol: pins_enter BEFORE snapshot_acquire.
- *
- * @param timelog    PyTimelog instance (borrows handle_ctx, takes strong ref)
- * @param snapshot   Snapshot to own (takes ownership)
- * @param alloc      Allocator from snapshot (for owner allocation)
- * @return New owner with refcnt=1, or NULL on error
- */
-tl_py_span_owner_t* tl_py_span_owner_create(PyObject* timelog,
-                                             tl_snapshot_t* snapshot,
-                                             tl_alloc_ctx_t* alloc);
-
-/**
- * Increment owner refcount.
- *
- * @param owner Owner to incref
- */
-void tl_py_span_owner_incref(tl_py_span_owner_t* owner);
-
-/**
- * Decrement owner refcount, destroying if zero.
- *
- * @param owner Owner to decref
- */
-void tl_py_span_owner_decref(tl_py_span_owner_t* owner);
-
-/*===========================================================================
  * Span Creation API (Internal)
  *
- * Used by py_span_iter.c to create spans.
+ * Used by py_span_iter.c to create spans from core views.
  *===========================================================================*/
 
 /**
- * Create a PageSpan from a shared owner and page slice.
+ * Create a PageSpan from a core view, CONSUMING the view's owner reference.
  *
- * @param owner     Shared owner (will be incref'd)
- * @param page      Page pointer (borrowed from snapshot)
- * @param row_start Inclusive start index
- * @param row_end   Exclusive end index
- * @return New PageSpan object, or NULL on error
+ * Ownership Transfer Protocol:
+ *   - On success: span owns the reference; view->owner is set to NULL
+ *   - On failure: caller must call tl_pagespan_view_release(&view)
+ *
+ * This function does NOT incref the owner - it transfers ownership from
+ * the view to the span. The caller (iter_next) receives an already-incref'd
+ * owner from tl_pagespan_iter_next() and passes it here.
+ *
+ * @param view      Core view with owner ref (consumed on success)
+ * @param timelog   PyTimelog instance (takes strong ref for GC)
+ * @return New PageSpan object, or NULL on error (view NOT consumed)
  */
-PyObject* PyPageSpan_Create(tl_py_span_owner_t* owner,
-                            const tl_page_t* page,
-                            size_t row_start,
-                            size_t row_end);
+PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog);
 
 #ifdef __cplusplus
 }

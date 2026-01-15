@@ -1,28 +1,21 @@
 /**
  * @file py_span.c
- * @brief PyPageSpan CPython extension type implementation (LLD-B4)
+ * @brief PyPageSpan CPython extension type implementation (Core API Integration)
  *
  * Implements zero-copy timestamp exposure via the CPython buffer protocol.
+ * Delegates ownership management to core tl_pagespan_owner_t.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <string.h>  /* For memset */
 
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_span_objects.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_timelog.h"
-
-/* Internal headers for page access */
-#include "storage/tl_page.h"
-
-/* For tl_snapshot_alloc */
-#include "query/tl_snapshot.h"
-
-/* For tl__malloc/tl__free */
-#include "internal/tl_alloc.h"
 
 /*===========================================================================
  * Forward Declarations
@@ -51,143 +44,89 @@ static PyObject* PyPageSpan_new_error(PyTypeObject* type,
 }
 
 /*===========================================================================
- * Shared Snapshot Owner Implementation
+ * PageSpan Creation from Core View
+ *
+ * This replaces PyPageSpan_Create which took page pointer + row indices.
+ * Now we take a core view and CONSUME its owner reference.
  *===========================================================================*/
 
-tl_py_span_owner_t* tl_py_span_owner_create(PyObject* timelog,
-                                             tl_snapshot_t* snapshot,
-                                             tl_alloc_ctx_t* alloc)
+PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
 {
-    /* Caller must have already called:
-     *   1. tl_py_pins_enter(handle_ctx) -- BEFORE snapshot acquire
-     *   2. tl_snapshot_acquire() to get snapshot
-     * This function assumes pins are already held.
+    /*
+     * Validate inputs.
+     * On any failure, the caller must call tl_pagespan_view_release().
      */
-    if (!timelog || !PyTimelog_Check(timelog)) {
+    if (view == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "view is NULL");
+        return NULL;
+    }
+    if (view->owner == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "view->owner is NULL");
+        return NULL;
+    }
+    if (timelog == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "timelog is NULL");
+        return NULL;
+    }
+    if (!PyTimelog_Check(timelog)) {
         PyErr_SetString(PyExc_TypeError, "expected PyTimelog");
         return NULL;
     }
 
-    if (!snapshot) {
-        PyErr_SetString(PyExc_RuntimeError, "snapshot is NULL");
-        return NULL;
-    }
-
-    if (!alloc) {
-        PyErr_SetString(PyExc_RuntimeError, "allocator is NULL");
-        return NULL;
-    }
-
-    PyTimelog* tl_obj = (PyTimelog*)timelog;
-
-    tl_py_span_owner_t* owner = tl__malloc(alloc, sizeof(tl_py_span_owner_t));
-    if (!owner) {
-        PyErr_NoMemory();
-        return NULL;
-    }
-
-    owner->refcnt = 1;
-    owner->timelog = Py_NewRef(timelog);
-    owner->snapshot = snapshot;
-    owner->handle_ctx = &tl_obj->handle_ctx;
-    owner->alloc = alloc;
-
-    /* NOTE: pins_enter was called by the caller BEFORE snapshot_acquire.
-     * This function does NOT call pins_enter -- it assumes pins are held.
+    /*
+     * Allocate the Python object with GC support.
      */
-
-    return owner;
-}
-
-void tl_py_span_owner_incref(tl_py_span_owner_t* owner)
-{
-    if (owner) {
-        owner->refcnt++;
-    }
-}
-
-static void span_owner_destroy(tl_py_span_owner_t* owner)
-{
-    if (!owner) return;
-
-    /* Move pointers to locals BEFORE Python code (reentrancy safety) */
-    tl_snapshot_t* snap = owner->snapshot;
-    owner->snapshot = NULL;
-
-    tl_py_handle_ctx_t* ctx = owner->handle_ctx;
-    owner->handle_ctx = NULL;
-
-    PyObject* timelog = owner->timelog;
-    owner->timelog = NULL;
-
-    tl_alloc_ctx_t* alloc = owner->alloc;
-    owner->alloc = NULL;
-
-    /* Release order (critical):
-     * 1. Release snapshot (no Python code)
-     * 2. Exit pins and maybe drain (may run Py_DECREF)
-     * 3. DECREF timelog owner (may run Python code)
-     */
-    if (snap) {
-        tl_snapshot_release(snap);
-    }
-
-    /* Free owner BEFORE decref'ing timelog.
-     * The allocator is borrowed from the timelog, so we must use it
-     * before the timelog is potentially destroyed by DECREF.
-     */
-    tl__free(alloc, owner);
-
-    /* Preserve exception state across drain/DECREF */
-    PyObject *exc_type, *exc_value, *exc_tb;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-
-    if (ctx) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
-    }
-
-    Py_XDECREF(timelog);
-
-    PyErr_Restore(exc_type, exc_value, exc_tb);
-}
-
-void tl_py_span_owner_decref(tl_py_span_owner_t* owner)
-{
-    if (owner && --owner->refcnt == 0) {
-        span_owner_destroy(owner);
-    }
-}
-
-/*===========================================================================
- * PageSpan Creation
- *===========================================================================*/
-
-PyObject* PyPageSpan_Create(tl_py_span_owner_t* owner,
-                            const tl_page_t* page,
-                            size_t row_start,
-                            size_t row_end)
-{
     PyPageSpan* self = PyObject_GC_New(PyPageSpan, &PyPageSpan_Type);
-    if (!self) {
+    if (self == NULL) {
+        /* Allocation failed - caller must release view */
         return NULL;
     }
 
-    tl_py_span_owner_incref(owner);
-    self->owner = owner;
-    self->page = page;
-    self->row_start = row_start;
-    self->row_end = row_end;
+    /*
+     * Transfer ownership from view to span.
+     * The view's owner reference is CONSUMED - no incref needed.
+     * We set view->owner = NULL to prevent accidental double-decref.
+     */
+    self->owner = view->owner;
+    view->owner = NULL;
+
+    /*
+     * Store strong reference to timelog for GC visibility.
+     * The core owner is opaque, so GC cannot traverse it.
+     */
+    self->timelog = Py_NewRef(timelog);
+
+    /*
+     * Copy view pointers. These are borrowed from the owner's snapshot
+     * and remain valid as long as the owner is alive.
+     */
+    self->ts = view->ts;
+    self->h = view->h;
+    self->len = view->len;
+    self->first_ts = view->first_ts;
+    self->last_ts = view->last_ts;
+
+    /*
+     * Initialize buffer protocol state.
+     */
     self->shape[0] = 0;
     self->strides[0] = 0;
     self->exports = 0;
     self->closed = 0;
 
+    /*
+     * Track with GC after all fields are initialized.
+     */
     PyObject_GC_Track((PyObject*)self);
     return (PyObject*)self;
 }
 
 /*===========================================================================
  * Cleanup (Single Source of Truth)
+ *
+ * Releases owner reference and clears borrowed pointers.
+ * The core owner's release hook (set during iterator creation) handles
+ * pins_exit and Py_DECREF of the iteration-level timelog reference.
  *===========================================================================*/
 
 static void pagespan_cleanup(PyPageSpan* self)
@@ -197,16 +136,30 @@ static void pagespan_cleanup(PyPageSpan* self)
     }
     self->closed = 1;
 
-    /* Clear borrowed pointers */
-    self->page = NULL;
+    /*
+     * Clear borrowed pointers first (before releasing owner).
+     * After owner is released, snapshot may be freed and pointers invalid.
+     */
+    self->ts = NULL;
+    self->h = NULL;
 
-    /* Release owner reference */
-    tl_py_span_owner_t* owner = self->owner;
+    /*
+     * Release owner reference via core API.
+     * When refcount reaches 0, core calls the release hook which handles
+     * pins_exit and Py_DECREF of the hook context's timelog reference.
+     */
+    tl_pagespan_owner_t* owner = self->owner;
     self->owner = NULL;
 
-    if (owner) {
-        tl_py_span_owner_decref(owner);
+    if (owner != NULL) {
+        tl_pagespan_owner_decref(owner);
     }
+
+    /*
+     * Clear our direct timelog reference (for GC visibility).
+     * This is separate from the hook context's reference.
+     */
+    Py_CLEAR(self->timelog);
 }
 
 /*===========================================================================
@@ -215,19 +168,20 @@ static void pagespan_cleanup(PyPageSpan* self)
 
 static int PyPageSpan_traverse(PyPageSpan* self, visitproc visit, void* arg)
 {
-    /* Visit the timelog held by our owner.
-     * This allows the GC to detect cycles involving PageSpan -> owner -> timelog.
-     * Per CPython docs, tp_traverse must visit every PyObject* the object contains.
+    /*
+     * Visit timelog for GC cycle detection.
+     * The core owner is opaque and cannot be traversed directly.
      */
-    if (self->owner && self->owner->timelog) {
-        Py_VISIT(self->owner->timelog);
-    }
+    Py_VISIT(self->timelog);
     return 0;
 }
 
 static int PyPageSpan_clear(PyPageSpan* self)
 {
-    /* Can't cleanup if buffers exported */
+    /*
+     * GC clear - called to break reference cycles.
+     * Cannot cleanup if buffers are exported.
+     */
     if (self->exports > 0) {
         return 0;
     }
@@ -238,14 +192,19 @@ static int PyPageSpan_clear(PyPageSpan* self)
 static void PyPageSpan_dealloc(PyPageSpan* self)
 {
     PyObject_GC_UnTrack(self);
-    /* Note: if exports > 0 at dealloc, something went very wrong.
-     * We cleanup anyway to avoid leaks. */
+    /*
+     * Note: if exports > 0 at dealloc, something went very wrong.
+     * We cleanup anyway to avoid leaks.
+     */
     pagespan_cleanup(self);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
 /*===========================================================================
  * Buffer Protocol
+ *
+ * Exposes timestamps as a read-only 1D array of int64.
+ * Uses span->ts and span->len instead of page pointer + row indices.
  *===========================================================================*/
 
 /* Static format string - must outlive buffer view */
@@ -255,10 +214,12 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
 {
     PyPageSpan* self = (PyPageSpan*)exporter;
 
-    /* CPython contract: on error, view->obj must be NULL */
+    /*
+     * CPython contract: on error, view->obj must be NULL.
+     */
     view->obj = NULL;
 
-    if (self->closed || self->page == NULL) {
+    if (self->closed || self->ts == NULL) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return -1;
     }
@@ -267,10 +228,21 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
         return -1;
     }
 
-    const Py_ssize_t n = (Py_ssize_t)(self->row_end - self->row_start);
-    void* ptr = (void*)(self->page->ts + self->row_start);
+    const Py_ssize_t n = (Py_ssize_t)self->len;
+    void* ptr = (void*)self->ts;
 
-    /* Request-independent fields (ALWAYS set per CPython docs) */
+    /*
+     * Overflow guard: ensure n * sizeof(tl_ts_t) doesn't overflow Py_ssize_t.
+     * This is defensive - page sizes should never approach this limit.
+     */
+    if (n > PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(tl_ts_t)) {
+        PyErr_SetString(PyExc_OverflowError, "PageSpan too large for buffer");
+        return -1;
+    }
+
+    /*
+     * Request-independent fields (ALWAYS set per CPython docs).
+     */
     view->obj = Py_NewRef(exporter);
     view->buf = ptr;
     view->len = n * (Py_ssize_t)sizeof(tl_ts_t);
@@ -278,7 +250,9 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
     view->itemsize = (Py_ssize_t)sizeof(tl_ts_t);
     view->ndim = 1;  /* ALWAYS 1 - request-independent */
 
-    /* Request-dependent fields */
+    /*
+     * Request-dependent fields.
+     */
     view->format = (flags & PyBUF_FORMAT) ? (char*)PAGESPAN_TS_FORMAT : NULL;
 
     if (flags & PyBUF_ND) {
@@ -346,7 +320,8 @@ static PyObject* PyPageSpan_exit(PyPageSpan* self, PyObject* args)
     (void)args;
 
     if (self->exports > 0) {
-        /* Per Python convention, __exit__ should NOT raise for cleanup
+        /*
+         * Per Python convention, __exit__ should NOT raise for cleanup
          * issues that aren't actual exceptions being propagated.
          * Users who need strict error checking should call close() explicitly,
          * which DOES raise BufferError when exports > 0.
@@ -369,6 +344,17 @@ static PyObject* PyPageSpan_objects(PyPageSpan* self, PyObject* noargs)
         return NULL;
     }
 
+    /*
+     * Fail early if handles are not available.
+     * This gives a clear error at .objects() rather than deferring
+     * to the first access (which would raise RuntimeError).
+     */
+    if (self->h == NULL) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "handles not available in this span");
+        return NULL;
+    }
+
     return PyPageSpanObjectsView_Create((PyObject*)self);
 }
 
@@ -381,16 +367,15 @@ static PyObject* PyPageSpan_copy_timestamps(PyPageSpan* self, PyObject* noargs)
         return NULL;
     }
 
-    Py_ssize_t n = (Py_ssize_t)(self->row_end - self->row_start);
+    const Py_ssize_t n = (Py_ssize_t)self->len;
     PyObject* list = PyList_New(n);
-    if (!list) {
+    if (list == NULL) {
         return NULL;
     }
 
-    const tl_ts_t* ts = self->page->ts + self->row_start;
     for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject* val = PyLong_FromLongLong((long long)ts[i]);
-        if (!val) {
+        PyObject* val = PyLong_FromLongLong((long long)self->ts[i]);
+        if (val == NULL) {
             Py_DECREF(list);
             return NULL;
         }
@@ -415,7 +400,7 @@ static Py_ssize_t PyPageSpan_length(PyPageSpan* self)
     if (self->closed) {
         return 0;
     }
-    return (Py_ssize_t)(self->row_end - self->row_start);
+    return (Py_ssize_t)self->len;
 }
 
 static PySequenceMethods pagespan_as_sequence = {
@@ -424,6 +409,8 @@ static PySequenceMethods pagespan_as_sequence = {
 
 /*===========================================================================
  * Properties
+ *
+ * Use cached first_ts/last_ts instead of page pointer dereference.
  *===========================================================================*/
 
 static PyObject* PyPageSpan_get_timestamps(PyPageSpan* self, void* closure)
@@ -447,12 +434,11 @@ static PyObject* PyPageSpan_get_start_ts(PyPageSpan* self, void* closure)
         return NULL;
     }
 
-    if (self->row_start >= self->row_end) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is empty");
-        return NULL;
-    }
-
-    return PyLong_FromLongLong((long long)self->page->ts[self->row_start]);
+    /*
+     * Use cached first_ts from view - no pointer dereference needed.
+     * For valid spans, len > 0 is guaranteed by core iter_next.
+     */
+    return PyLong_FromLongLong((long long)self->first_ts);
 }
 
 static PyObject* PyPageSpan_get_end_ts(PyPageSpan* self, void* closure)
@@ -464,13 +450,11 @@ static PyObject* PyPageSpan_get_end_ts(PyPageSpan* self, void* closure)
         return NULL;
     }
 
-    if (self->row_start >= self->row_end) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is empty");
-        return NULL;
-    }
-
-    /* end_ts is the LAST timestamp (inclusive), not row_end */
-    return PyLong_FromLongLong((long long)self->page->ts[self->row_end - 1]);
+    /*
+     * Use cached last_ts from view - no pointer dereference needed.
+     * For valid spans, len > 0 is guaranteed by core iter_next.
+     */
+    return PyLong_FromLongLong((long long)self->last_ts);
 }
 
 static PyObject* PyPageSpan_get_closed(PyPageSpan* self, void* closure)

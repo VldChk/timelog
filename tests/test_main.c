@@ -164,6 +164,9 @@ extern void run_delta_internal_tests(void);
 /* Compaction internal tests (LLD-driven) */
 extern void run_compaction_internal_tests(void);
 
+/* PageSpan core API tests (V2 binding support) */
+extern void run_pagespan_iter_tests(void);
+
 /*===========================================================================
  * Main Entry Point
  *===========================================================================*/
@@ -200,6 +203,10 @@ int main(int argc, char* argv[]) {
     printf("\n[Internal] Compaction\n");
     printf("----------------------------------------\n");
     run_compaction_internal_tests();
+
+    printf("\n[Internal] PageSpan Iterator\n");
+    printf("----------------------------------------\n");
+    run_pagespan_iter_tests();
 
     /*-----------------------------------------------------------------------
      * Functional Tests (Public API behavior)

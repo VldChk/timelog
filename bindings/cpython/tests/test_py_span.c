@@ -370,7 +370,7 @@ TEST(page_spans_with_data)
     /* Check span properties */
     PyPageSpan* ps = (PyPageSpan*)span;
     ASSERT(!ps->closed);
-    ASSERT(ps->row_end > ps->row_start);
+    ASSERT(ps->len > 0);
 
     Py_DECREF(span);
     Py_DECREF(iter);
@@ -1337,7 +1337,7 @@ TEST(span_len)
 
     /* Verify internal consistency */
     PyPageSpan* ps = (PyPageSpan*)span;
-    ASSERT_EQ((Py_ssize_t)(ps->row_end - ps->row_start), len);
+    ASSERT_EQ((Py_ssize_t)ps->len, len);
 
     Py_DECREF(span);
     Py_DECREF(iter);

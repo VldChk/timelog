@@ -1,38 +1,112 @@
 /**
  * @file py_span_iter.c
- * @brief PyPageSpanIter CPython extension type implementation (LLD-B4)
+ * @brief PyPageSpanIter CPython extension type implementation (Core API Integration)
  *
- * Implements span collection and iteration over page slices.
+ * Implements streaming iteration over page spans using core tl_pagespan_iter_*.
+ * Delegates span enumeration and ownership management to core.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <string.h>  /* For strcmp, memset */
 
 #include "timelogpy/py_span_iter.h"
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_timelog.h"
+#include "timelogpy/py_errors.h"
 
-/* Internal headers for segment/page access */
-#include "storage/tl_page.h"
-#include "storage/tl_segment.h"
-#include "storage/tl_manifest.h"
-#include "query/tl_snapshot.h"
-
-/* For tl__malloc/tl__free */
-#include "internal/tl_alloc.h"
+/*
+ * Core API for pagespan iteration.
+ * This is the ONLY core dependency needed - no storage internals.
+ */
+#include "query/tl_pagespan_iter.h"
 
 /*===========================================================================
  * Forward Declarations
  *===========================================================================*/
 
 static void pagespaniter_cleanup(PyPageSpanIter* self);
-static int collect_spans(tl_snapshot_t* snap,
-                         tl_ts_t t1,
-                         tl_ts_t t2,
-                         span_desc_t** out_spans,
-                         size_t* out_count);
+
+/*===========================================================================
+ * Release Hook Context
+ *
+ * The core owner calls our hook when refcount reaches 0.
+ * The hook handles:
+ *   1. pins_exit_and_maybe_drain() - allow handle cleanup
+ *   2. Py_DECREF(timelog) - release our strong reference
+ *   3. PyMem_Free(ctx) - free this context struct
+ *
+ * The "armed" flag prevents double cleanup if core calls the hook during
+ * iter_open failure paths before we've completed setup.
+ *===========================================================================*/
+
+typedef struct tl_py_pagespan_hook_ctx {
+    PyObject* timelog;          /**< Strong ref, decref on release */
+    tl_py_handle_ctx_t* ctx;    /**< Borrowed handle context */
+    int armed;                  /**< 0 until iter_open succeeds */
+} tl_py_pagespan_hook_ctx_t;
+
+/**
+ * Release hook called by core when owner refcount reaches 0.
+ *
+ * CRITICAL INVARIANTS:
+ *   1. GIL must be held (all CPython code paths that decref hold GIL)
+ *   2. Exception state must be preserved (may run during GC/unwinding)
+ *   3. Hook runs AFTER owner struct is freed (no UAF)
+ */
+static void tl_py_pagespan_on_release(void* user)
+{
+    tl_py_pagespan_hook_ctx_t* hook_ctx = (tl_py_pagespan_hook_ctx_t*)user;
+    if (hook_ctx == NULL) {
+        return;
+    }
+
+    /*
+     * Check armed flag.
+     * If iter_open failed after creating owner but before we armed,
+     * the hook may be called but should be a no-op. The binding
+     * error path handles cleanup in that case.
+     */
+    if (!hook_ctx->armed) {
+        return;
+    }
+
+    /*
+     * EXCEPTION PRESERVATION:
+     * The hook may run during GC or exception unwinding when an
+     * exception is already set. Py_DECREF can run arbitrary finalizers
+     * that might clobber exception state. Save and restore to avoid
+     * losing the user's exception context.
+     */
+    PyObject *exc_type, *exc_value, *exc_tb;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+
+    /*
+     * Exit pins and drain retired handles.
+     * This may run Py_DECREF on retired objects.
+     */
+    if (hook_ctx->ctx != NULL) {
+        tl_py_pins_exit_and_maybe_drain(hook_ctx->ctx);
+    }
+
+    /*
+     * Release our strong reference to timelog.
+     * This may trigger timelog dealloc if we held the last ref.
+     */
+    Py_XDECREF(hook_ctx->timelog);
+
+    /*
+     * Free the hook context itself.
+     */
+    PyMem_Free(hook_ctx);
+
+    /*
+     * Restore exception state.
+     */
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+}
 
 /*===========================================================================
  * Block Direct Construction
@@ -56,6 +130,9 @@ static PyObject* PyPageSpanIter_new_error(PyTypeObject* type,
 
 /*===========================================================================
  * Factory Function
+ *
+ * Creates a streaming iterator using core tl_pagespan_iter_open().
+ * Sets up release hook to handle pins and timelog ref on cleanup.
  *===========================================================================*/
 
 PyObject* PyPageSpanIter_Create(PyObject* timelog,
@@ -63,233 +140,130 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
                                 tl_ts_t t2,
                                 const char* kind)
 {
-    /* Validate kind parameter */
-    if (strcmp(kind, "segment") != 0) {
+    /*
+     * Step 1: Validate kind parameter.
+     * Only "segment" is supported (B4 constraint).
+     */
+    if (kind == NULL || strcmp(kind, "segment") != 0) {
         PyErr_Format(PyExc_ValueError,
-            "page_spans: kind must be 'segment', got '%s'", kind);
+            "page_spans: kind must be 'segment', got '%s'", kind ? kind : "(null)");
+        return NULL;
+    }
+
+    /*
+     * Step 1b: Validate timelog type.
+     * This is defensive - the public API (PyTimelog.page_spans) guarantees
+     * correct type, but internal C callers could misuse. Fail early.
+     */
+    if (!PyTimelog_Check(timelog)) {
+        PyErr_SetString(PyExc_TypeError,
+            "page_spans: expected Timelog instance");
         return NULL;
     }
 
     PyTimelog* tl_obj = (PyTimelog*)timelog;
 
-    /* Check if timelog is closed */
+    /*
+     * Step 2: Check if timelog is closed.
+     */
     if (tl_obj->closed || tl_obj->tl == NULL) {
-        TlPy_RaiseFromStatus(TL_ESTATE);  /* Use consistent error taxonomy */
+        TlPy_RaiseFromStatus(TL_ESTATE);
         return NULL;
     }
 
-    /* CRITICAL: pins_enter BEFORE snapshot_acquire
+    /*
+     * Step 3: Enter pins BEFORE iter_open.
      * This closes the window where compaction could drain retired handles
      * while we're acquiring the snapshot. See py_handle.h protocol docs.
      */
     tl_py_pins_enter(&tl_obj->handle_ctx);
 
-    /* Acquire snapshot */
-    tl_snapshot_t* snap = NULL;
-    tl_status_t status = tl_snapshot_acquire(tl_obj->tl, &snap);
-    if (status != TL_OK) {
+    /*
+     * Step 4: Allocate hook context.
+     * We store a strong ref to timelog and the handle_ctx pointer.
+     * The armed flag is initially 0 to prevent double cleanup.
+     */
+    tl_py_pagespan_hook_ctx_t* hook_ctx = PyMem_Malloc(sizeof(*hook_ctx));
+    if (hook_ctx == NULL) {
         tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        TlPy_RaiseFromStatus(status);  /* Use consistent error taxonomy */
+        PyErr_NoMemory();
         return NULL;
     }
-    if (!snap) {
+    hook_ctx->timelog = Py_NewRef((PyObject*)tl_obj);
+    hook_ctx->ctx = &tl_obj->handle_ctx;
+    hook_ctx->armed = 0;
+
+    /*
+     * Step 5: Set up hooks for core owner.
+     */
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = hook_ctx,
+        .on_release = tl_py_pagespan_on_release
+    };
+
+    /*
+     * Step 6: Call core iter_open.
+     * This acquires a snapshot, creates owner, and sets up streaming iteration.
+     * The core copies our hooks into the owner struct.
+     */
+    uint32_t flags = TL_PAGESPAN_DEFAULT;
+    tl_pagespan_iter_t* core_iter = NULL;
+
+    tl_status_t st = tl_pagespan_iter_open(tl_obj->tl, t1, t2, flags, &hooks, &core_iter);
+
+    if (st != TL_OK) {
+        /*
+         * CRITICAL: iter_open failed.
+         * The core may or may not have invoked the hook already, but since
+         * armed == 0, the hook is a no-op. We must clean up manually.
+         */
+        Py_DECREF(hook_ctx->timelog);
+        PyMem_Free(hook_ctx);
         tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        PyErr_SetString(PyExc_RuntimeError, "Snapshot is NULL after acquire");
+        TlPy_RaiseFromStatus(st);
         return NULL;
     }
 
-    /* Get allocator from snapshot */
-    tl_alloc_ctx_t* alloc = tl_snapshot_alloc(snap);
-    if (!alloc) {
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        PyErr_SetString(PyExc_RuntimeError, "Snapshot allocator is NULL");
-        return NULL;
-    }
+    /*
+     * Step 7: Arm the hook.
+     * From this point, the core owns the hook context and will call it
+     * when the owner refcount reaches 0.
+     */
+    hook_ctx->armed = 1;
 
-    /* Create shared owner (pins already entered above) */
-    tl_py_span_owner_t* owner = tl_py_span_owner_create(timelog, snap, alloc);
-    if (!owner) {
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        return NULL;
-    }
-
-    /* Collect spans from snapshot */
-    span_desc_t* spans = NULL;
-    size_t count = 0;
-
-    int rc = collect_spans(snap, t1, t2, &spans, &count);
-    if (rc < 0) {
-        tl_py_span_owner_decref(owner);
-        return NULL;
-    }
-
-    /* Allocate iterator */
+    /*
+     * Step 8: Allocate Python iterator object.
+     */
     PyPageSpanIter* self = PyObject_GC_New(PyPageSpanIter, &PyPageSpanIter_Type);
-    if (!self) {
-        if (spans) tl__free(owner->alloc, spans);
-        tl_py_span_owner_decref(owner);
+    if (self == NULL) {
+        /*
+         * Python allocation failed.
+         * Close core iter to trigger cleanup (which will invoke our hook).
+         */
+        tl_pagespan_iter_close(core_iter);
         return NULL;
     }
 
-    self->owner = owner;
-    self->spans = spans;
-    self->count = count;
-    self->index = 0;
+    /*
+     * Step 9: Initialize iterator fields.
+     */
+    self->iter = core_iter;
+    self->timelog = Py_NewRef((PyObject*)tl_obj);
     self->closed = 0;
 
+    /*
+     * Step 10: Track with GC.
+     */
     PyObject_GC_Track((PyObject*)self);
     return (PyObject*)self;
 }
 
 /*===========================================================================
- * Span Collection Algorithm
- *
- * Collects all page slices matching [t1, t2) from L1 and L0 segments.
- * Only emits spans from TL_PAGE_FULLY_LIVE pages.
- *
- * Uses binary search via tl_page_catalog_find_first_ge() to skip pages
- * whose max_ts < t1, and tl_page_catalog_find_start_ge() to stop early
- * when all remaining pages start after t2.
- *===========================================================================*/
-
-/**
- * Helper: count and collect spans from a segment catalog using binary search.
- * If spans is NULL, just counts. If non-NULL, collects into spans[*idx].
- */
-static void process_segment_catalog(const tl_page_catalog_t* cat,
-                                    tl_ts_t t1,
-                                    tl_ts_t t2,
-                                    span_desc_t* spans,
-                                    size_t* idx)
-{
-    if (!cat || cat->n_pages == 0) return;
-
-    /* Binary search: find first page that might contain records >= t1.
-     * This is the first page where max_ts >= t1.
-     */
-    size_t first = tl_page_catalog_find_first_ge(cat, t1);
-    if (first >= cat->n_pages) return;  /* All pages end before t1 */
-
-    /* Binary search: find first page that starts at or after t2.
-     * All pages from [first, last) might overlap [t1, t2).
-     */
-    size_t last = tl_page_catalog_find_start_ge(cat, t2);
-    if (last <= first) {
-        /* Edge case: check if first page still overlaps
-         * (its max_ts >= t1, but need to verify min_ts < t2)
-         */
-        last = first + 1;
-    }
-
-    /* Scan only pages in [first, last) */
-    for (size_t p = first; p < last && p < cat->n_pages; p++) {
-        const tl_page_meta_t* meta = &cat->pages[p];
-        const tl_page_t* page = meta->page;
-
-        if (!page || page->count == 0) continue;
-
-        /* Skip non-live pages (V1 only produces FULLY_LIVE) */
-        if (page->flags != TL_PAGE_FULLY_LIVE) continue;
-
-        /* Double-check overlap (should be guaranteed by binary search) */
-        if (page->max_ts < t1 || page->min_ts >= t2) continue;
-
-        /* Find row bounds within page */
-        size_t row_start = tl_page_lower_bound(page, t1);
-        size_t row_end = tl_page_lower_bound(page, t2);
-
-        if (row_start < row_end) {
-            if (spans) {
-                spans[*idx].page = page;
-                spans[*idx].row_start = row_start;
-                spans[*idx].row_end = row_end;
-            }
-            (*idx)++;
-        }
-    }
-}
-
-static int collect_spans(tl_snapshot_t* snap,
-                         tl_ts_t t1,
-                         tl_ts_t t2,
-                         span_desc_t** out_spans,
-                         size_t* out_count)
-{
-    *out_spans = NULL;
-    *out_count = 0;
-
-    if (!snap || !snap->manifest) {
-        return 0;  /* Empty result is OK */
-    }
-
-    const tl_manifest_t* mf = snap->manifest;
-    tl_alloc_ctx_t* alloc = tl_snapshot_alloc(snap);
-
-    /* First pass: count spans for allocation */
-    size_t total_spans = 0;
-
-    /* Count from L1 segments (using binary search per segment) */
-    for (uint32_t s = 0; s < mf->n_l1; s++) {
-        const tl_segment_t* seg = mf->l1[s];
-        if (!seg || seg->page_count == 0) continue;
-
-        /* Quick segment-level bounds check */
-        if (seg->max_ts < t1 || seg->min_ts >= t2) continue;
-
-        process_segment_catalog(&seg->catalog, t1, t2, NULL, &total_spans);
-    }
-
-    /* Count from L0 segments (using binary search per segment) */
-    for (uint32_t s = 0; s < mf->n_l0; s++) {
-        const tl_segment_t* seg = mf->l0[s];
-        if (!seg || seg->page_count == 0) continue;
-
-        if (seg->max_ts < t1 || seg->min_ts >= t2) continue;
-
-        process_segment_catalog(&seg->catalog, t1, t2, NULL, &total_spans);
-    }
-
-    if (total_spans == 0) {
-        return 0;  /* Empty result */
-    }
-
-    /* Allocate spans array */
-    span_desc_t* spans = tl__malloc(alloc, total_spans * sizeof(span_desc_t));
-    if (!spans) {
-        PyErr_NoMemory();
-        return -1;
-    }
-
-    /* Second pass: collect spans */
-    size_t idx = 0;
-
-    /* Collect from L1 segments */
-    for (uint32_t s = 0; s < mf->n_l1; s++) {
-        const tl_segment_t* seg = mf->l1[s];
-        if (!seg || seg->page_count == 0) continue;
-        if (seg->max_ts < t1 || seg->min_ts >= t2) continue;
-
-        process_segment_catalog(&seg->catalog, t1, t2, spans, &idx);
-    }
-
-    /* Collect from L0 segments */
-    for (uint32_t s = 0; s < mf->n_l0; s++) {
-        const tl_segment_t* seg = mf->l0[s];
-        if (!seg || seg->page_count == 0) continue;
-        if (seg->max_ts < t1 || seg->min_ts >= t2) continue;
-
-        process_segment_catalog(&seg->catalog, t1, t2, spans, &idx);
-    }
-
-    *out_spans = spans;
-    *out_count = idx;
-    return 0;
-}
-
-/*===========================================================================
  * Cleanup (Single Source of Truth)
+ *
+ * Closes core iterator and clears Python references.
+ * The core iter_close releases the iterator's owner ref, which may trigger
+ * the release hook if that was the last ref.
  *===========================================================================*/
 
 static void pagespaniter_cleanup(PyPageSpanIter* self)
@@ -299,21 +273,24 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
     }
     self->closed = 1;
 
-    /* Free spans array (using allocator from owner before releasing it) */
-    tl_py_span_owner_t* owner = self->owner;
-    if (self->spans && owner && owner->alloc) {
-        tl__free(owner->alloc, self->spans);
-    }
-    self->spans = NULL;
-    self->count = 0;
-    self->index = 0;
+    /*
+     * Close core iterator.
+     * This releases the iterator's owner reference. If no spans are holding
+     * refs, the owner is destroyed and our release hook is called.
+     */
+    tl_pagespan_iter_t* iter = self->iter;
+    self->iter = NULL;
 
-    /* Release owner reference */
-    self->owner = NULL;
-
-    if (owner) {
-        tl_py_span_owner_decref(owner);
+    if (iter != NULL) {
+        tl_pagespan_iter_close(iter);
     }
+
+    /*
+     * Clear our timelog reference (for GC visibility).
+     * Note: The hook context also holds a timelog ref which is released
+     * by the hook when the owner is destroyed.
+     */
+    Py_CLEAR(self->timelog);
 }
 
 /*===========================================================================
@@ -322,12 +299,11 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
 
 static int PyPageSpanIter_traverse(PyPageSpanIter* self, visitproc visit, void* arg)
 {
-    /* Visit the timelog held by our owner.
-     * This allows the GC to detect cycles involving PageSpanIter -> owner -> timelog.
+    /*
+     * Visit timelog for GC cycle detection.
+     * The core iterator is opaque and cannot be traversed.
      */
-    if (self->owner && self->owner->timelog) {
-        Py_VISIT(self->owner->timelog);
-    }
+    Py_VISIT(self->timelog);
     return 0;
 }
 
@@ -346,33 +322,58 @@ static void PyPageSpanIter_dealloc(PyPageSpanIter* self)
 
 /*===========================================================================
  * Iterator Protocol
+ *
+ * Each __next__ call invokes core iter_next to get the next span on-demand.
+ * This is streaming - no pre-collection of spans.
  *===========================================================================*/
 
 static PyObject* PyPageSpanIter_iternext(PyPageSpanIter* self)
 {
-    if (self->closed || self->index >= self->count) {
-        /* Exhausted - cleanup and signal StopIteration */
-        if (!self->closed) {
-            pagespaniter_cleanup(self);
-        }
-        return NULL;  /* No exception = StopIteration */
-    }
-
-    /* Get current span descriptor (do NOT increment index yet) */
-    span_desc_t* desc = &self->spans[self->index];
-
-    /* Create the span object */
-    PyObject* span = PyPageSpan_Create(self->owner, desc->page,
-                                        desc->row_start, desc->row_end);
-
-    /* Only advance index if creation succeeded.
-     * This ensures we don't skip elements on allocation failure.
+    /*
+     * Check if closed or exhausted.
      */
-    if (span) {
-        self->index++;
+    if (self->closed || self->iter == NULL) {
+        return NULL;  /* StopIteration */
     }
 
-    return span;
+    /*
+     * Get next span from core iterator.
+     */
+    tl_pagespan_view_t view;
+    memset(&view, 0, sizeof(view));
+
+    tl_status_t st = tl_pagespan_iter_next(self->iter, &view);
+
+    if (st == TL_OK) {
+        /*
+         * Got a span. Create PyPageSpan which CONSUMES the view's owner ref.
+         * On success, PyPageSpan_FromView sets view.owner = NULL.
+         */
+        PyObject* span = PyPageSpan_FromView(&view, self->timelog);
+        if (span == NULL) {
+            /*
+             * Creation failed - release the owner ref we received.
+             */
+            tl_pagespan_view_release(&view);
+            return NULL;
+        }
+        return span;
+    }
+
+    if (st == TL_EOF) {
+        /*
+         * Exhausted - cleanup iterator.
+         */
+        pagespaniter_cleanup(self);
+        return NULL;  /* StopIteration */
+    }
+
+    /*
+     * Error - cleanup and raise.
+     */
+    pagespaniter_cleanup(self);
+    TlPy_RaiseFromStatus(st);
+    return NULL;
 }
 
 /*===========================================================================
@@ -437,7 +438,7 @@ PyTypeObject PyPageSpanIter_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "timelog._timelog.PageSpanIter",
     .tp_doc = PyDoc_STR(
-        "Iterator yielding PageSpan objects for a time range.\n\n"
+        "Streaming iterator yielding PageSpan objects for a time range.\n\n"
         "Cannot be instantiated directly; use Timelog.page_spans()."
     ),
     .tp_basicsize = sizeof(PyPageSpanIter),

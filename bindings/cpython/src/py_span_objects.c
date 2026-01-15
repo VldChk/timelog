@@ -1,10 +1,11 @@
 /**
  * @file py_span_objects.c
- * @brief PyPageSpanObjectsView CPython extension type implementation (LLD-B4)
+ * @brief PyPageSpanObjectsView CPython extension type implementation (Core API Integration)
  *
  * Implements lazy access to decoded Python objects from a PageSpan.
+ * Uses span->h[] pointer directly (borrowed from core owner's snapshot).
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -14,8 +15,9 @@
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_handle.h"
 
-/* Internal headers for page access */
-#include "storage/tl_page.h"
+/*
+ * NO storage headers needed - span->h and span->len provide direct access.
+ */
 
 /*===========================================================================
  * Py_NewRef Compatibility
@@ -97,7 +99,7 @@ static Py_ssize_t PyPageSpanObjectsView_length(PyPageSpanObjectsView* self)
     if (span->closed) {
         return 0;
     }
-    return (Py_ssize_t)(span->row_end - span->row_start);
+    return (Py_ssize_t)span->len;
 }
 
 static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
@@ -110,7 +112,16 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
         return NULL;
     }
 
-    Py_ssize_t len = (Py_ssize_t)(span->row_end - span->row_start);
+    /*
+     * Check handle pointer availability.
+     * span->h may be NULL if handles are unavailable (future-proofing).
+     */
+    if (span->h == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
+        return NULL;
+    }
+
+    const Py_ssize_t len = (Py_ssize_t)span->len;
 
     /* Handle negative indices */
     if (index < 0) {
@@ -122,13 +133,16 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
         return NULL;
     }
 
-    /* Decode handle to PyObject* and return new reference */
-    tl_handle_t h = span->page->h[span->row_start + (size_t)index];
+    /*
+     * Access handle directly via span->h[index].
+     * This is borrowed from the owner's snapshot and valid while span is open.
+     */
+    tl_handle_t h = span->h[index];
     PyObject* obj = tl_py_handle_decode(h);
 
     /* Defensive NULL check (handle could be corrupted) */
     if (!obj) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid handle in page");
+        PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
 
@@ -168,18 +182,31 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
         return NULL;  /* StopIteration */
     }
 
-    Py_ssize_t len = (Py_ssize_t)(span->row_end - span->row_start);
+    /*
+     * Check handle pointer availability.
+     * span->h may be NULL if handles are unavailable (future-proofing).
+     */
+    if (span->h == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
+        return NULL;
+    }
+
+    const Py_ssize_t len = (Py_ssize_t)span->len;
 
     if (self->index >= len) {
         return NULL;  /* StopIteration */
     }
 
-    tl_handle_t h = span->page->h[span->row_start + (size_t)self->index];
+    /*
+     * Access handle directly via span->h[index].
+     * This is borrowed from the owner's snapshot and valid while span is open.
+     */
+    tl_handle_t h = span->h[self->index];
     PyObject* obj = tl_py_handle_decode(h);
 
     /* Defensive NULL check (handle could be corrupted) */
     if (!obj) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid handle in page");
+        PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
 
@@ -232,7 +259,16 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
         return NULL;
     }
 
-    Py_ssize_t len = (Py_ssize_t)(span->row_end - span->row_start);
+    /*
+     * Check handle pointer availability.
+     * span->h may be NULL if handles are unavailable (future-proofing).
+     */
+    if (span->h == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
+        return NULL;
+    }
+
+    const Py_ssize_t len = (Py_ssize_t)span->len;
 
     PyObject* list = PyList_New(len);
     if (!list) {
@@ -240,13 +276,17 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
     }
 
     for (Py_ssize_t i = 0; i < len; i++) {
-        tl_handle_t h = span->page->h[span->row_start + (size_t)i];
+        /*
+         * Access handle directly via span->h[i].
+         * This is borrowed from the owner's snapshot and valid while span is open.
+         */
+        tl_handle_t h = span->h[i];
         PyObject* obj = tl_py_handle_decode(h);
 
         /* Defensive NULL check */
         if (!obj) {
             Py_DECREF(list);
-            PyErr_SetString(PyExc_RuntimeError, "invalid handle in page");
+            PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
             return NULL;
         }
 

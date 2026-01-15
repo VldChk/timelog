@@ -1,13 +1,13 @@
 /**
  * @file py_span_objects.h
- * @brief PyPageSpanObjectsView CPython extension type declaration (LLD-B4)
+ * @brief PyPageSpanObjectsView CPython extension type declaration (Core API Integration)
  *
  * This module provides the PyPageSpanObjectsView type which provides
  * lazy access to decoded Python objects from a PageSpan.
  *
  * No-Copy Access:
  *   The objects view does NOT allocate a list of objects.
- *   It decodes handles lazily on indexing/iteration.
+ *   It decodes handles lazily on indexing/iteration via span->h[].
  *   Use .copy() to materialize a list when needed.
  *
  * Thread Safety:
@@ -18,7 +18,7 @@
  *   The view holds a strong reference to its parent PageSpan.
  *   The PageSpan must remain open for the view to function.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #ifndef TL_PY_SPAN_OBJECTS_H
@@ -45,7 +45,7 @@ typedef struct {
 
     /**
      * Strong reference to parent PageSpan.
-     * The span's page pointer is used for handle decoding.
+     * The span's h[] pointer is used for handle decoding.
      */
     PyObject* span;
 

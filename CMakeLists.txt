@@ -103,6 +103,7 @@ set(TIMELOG_SOURCES
     src/query/tl_merge_iter.c
     src/query/tl_filter.c
     src/query/tl_point.c
+    src/query/tl_pagespan_iter.c
     # Phase 8
     src/maint/tl_compaction.c
 )
@@ -165,6 +166,8 @@ set(TEST_SOURCES
     # Concurrency and stress tests
     tests/test_concurrency.c
     tests/test_stress.c
+    # PageSpan core API tests
+    tests/test_pagespan_iter.c
 )
 
 add_executable(test_timelog ${TEST_SOURCES})

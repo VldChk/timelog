@@ -1,25 +1,30 @@
 /**
  * @file py_span_iter.h
- * @brief PyPageSpanIter CPython extension type declaration (LLD-B4)
+ * @brief PyPageSpanIter CPython extension type declaration (Core API Integration)
  *
- * This module provides the PyPageSpanIter type which iterates over
- * precomputed span descriptors, yielding PyPageSpan instances.
+ * This module provides the PyPageSpanIter type which wraps the core
+ * tl_pagespan_iter_t for streaming iteration over page spans.
  *
- * Span Collection:
- *   On creation, the iterator collects all matching page slices from
- *   the snapshot (L1 segments first, then L0). Each yielded PageSpan
- *   shares the same snapshot owner for efficient lifetime management.
+ * Architecture (Post-Migration):
+ *   The iterator delegates to the core tl_pagespan_iter_* API instead of
+ *   pre-collecting span descriptors. This eliminates algorithm duplication
+ *   and reduces memory usage for large result sets.
+ *
+ * Streaming Behavior:
+ *   Each call to __next__ invokes tl_pagespan_iter_next() which returns
+ *   the next span on-demand. No spans are pre-collected or cached.
  *
  * Thread Safety:
  *   A PageSpanIter instance is NOT thread-safe. Do not access the same
  *   instance from multiple threads without external synchronization.
  *
  * Lifetime:
- *   The iterator holds a reference to the shared snapshot owner.
- *   When the iterator is closed or exhausted, it releases its owner ref.
- *   Individual PageSpan instances each hold their own owner ref.
+ *   The iterator holds the core tl_pagespan_iter_t which holds one owner
+ *   reference. When closed or exhausted, the iterator releases this ref.
+ *   Individual PageSpan instances each hold their own owner ref, remaining
+ *   valid after the iterator is closed.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
  */
 
 #ifndef TL_PY_SPAN_ITER_H
@@ -35,22 +40,9 @@ extern "C" {
 #endif
 
 /*===========================================================================
- * Span Descriptor
- *
- * Describes a single page slice to be exposed as a PageSpan.
- * Collected during iterator creation, consumed during iteration.
- *===========================================================================*/
-
-typedef struct span_desc {
-    const tl_page_t* page;          /**< Borrowed pointer into snapshot */
-    size_t row_start;               /**< Inclusive */
-    size_t row_end;                 /**< Exclusive */
-} span_desc_t;
-
-/*===========================================================================
  * PyPageSpanIter Type
  *
- * Iterator over precomputed span descriptors.
+ * Streaming iterator over page spans using core API.
  * Yields PyPageSpan instances.
  *
  * Cannot be instantiated directly; use Timelog.page_spans() factory.
@@ -60,26 +52,20 @@ typedef struct {
     PyObject_HEAD
 
     /**
-     * Shared snapshot owner (refcounted).
+     * Core iterator (owned).
+     * Wraps snapshot acquisition and span enumeration logic.
+     * The core iterator holds one owner reference which is released on close.
      * NULL if closed.
      */
-    tl_py_span_owner_t* owner;
+    tl_pagespan_iter_t* iter;
 
     /**
-     * Array of span descriptors.
-     * Allocated on creation, freed on close/dealloc.
+     * Strong reference to PyTimelog for GC visibility.
+     * Required because core iterator is opaque and GC cannot traverse it.
+     * Also used to pass timelog reference to created PageSpan instances.
+     * NULL if closed.
      */
-    span_desc_t* spans;
-
-    /**
-     * Total number of spans.
-     */
-    size_t count;
-
-    /**
-     * Current iteration index.
-     */
-    size_t index;
+    PyObject* timelog;
 
     /**
      * State flag.
@@ -115,14 +101,19 @@ extern PyTypeObject PyPageSpanIter_Type;
 /**
  * Create a PageSpanIter for the given time range.
  *
- * Collects all matching page slices from L1 and L0 segments.
- * Only emits spans from TL_PAGE_FULLY_LIVE pages.
+ * Delegates to tl_pagespan_iter_open() which acquires a snapshot and
+ * sets up streaming iteration. Spans are returned on-demand via __next__.
+ *
+ * Lifetime Protocol:
+ *   1. Calls pins_enter() before core iter_open
+ *   2. Sets up release hook to call pins_exit on owner destruction
+ *   3. On failure: cleans up hook context and calls pins_exit
  *
  * @param timelog PyTimelog instance
  * @param t1      Range start (inclusive)
  * @param t2      Range end (exclusive)
- * @param kind    "segment" (only supported value in V1)
- * @return New PageSpanIter object, or NULL on error
+ * @param kind    "segment" (only supported value)
+ * @return New PageSpanIter object, or NULL on error with exception set
  */
 PyObject* PyPageSpanIter_Create(PyObject* timelog,
                                 tl_ts_t t1,
