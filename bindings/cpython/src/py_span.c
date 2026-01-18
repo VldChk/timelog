@@ -158,8 +158,17 @@ static void pagespan_cleanup(PyPageSpan* self)
     /*
      * Clear our direct timelog reference (for GC visibility).
      * This is separate from the hook context's reference.
+     *
+     * Exception preservation: Py_CLEAR may trigger __del__ which can
+     * clobber active exceptions (e.g., when __exit__ calls cleanup).
+     * Per LLD-B6, preserve exception state across cleanup.
      */
-    Py_CLEAR(self->timelog);
+    {
+        PyObject *exc_type, *exc_value, *exc_tb;
+        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+        Py_CLEAR(self->timelog);
+        PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
 }
 
 /*===========================================================================

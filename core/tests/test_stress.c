@@ -37,16 +37,31 @@
  * Configuration
  *===========================================================================*/
 
+/* Read boolean env var safely across platforms */
+static bool env_flag_is_enabled(const char* name) {
+#if defined(_WIN32)
+    char* buf = NULL;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || buf == NULL) {
+        return false;
+    }
+    bool enabled = (buf[0] == '1' || buf[0] == 'y' || buf[0] == 'Y');
+    free(buf);
+    return enabled;
+#else
+    const char* env = getenv(name);
+    return (env != NULL && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y'));
+#endif
+}
+
 /* Check if stress tests should run */
 static bool stress_tests_enabled(void) {
-    const char* env = getenv("TIMELOG_STRESS_TESTS");
-    return (env != NULL && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y'));
+    return env_flag_is_enabled("TIMELOG_STRESS_TESTS");
 }
 
 /* Check if short stress mode is enabled */
 static bool short_stress_mode(void) {
-    const char* env = getenv("TIMELOG_SHORT_STRESS");
-    return (env != NULL && (env[0] == '1' || env[0] == 'y' || env[0] == 'Y'));
+    return env_flag_is_enabled("TIMELOG_SHORT_STRESS");
 }
 
 /* Get iteration count based on mode */

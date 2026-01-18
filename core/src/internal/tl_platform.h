@@ -33,7 +33,11 @@
  *===========================================================================*/
 
 #if defined(TL_COMPILER_MSVC)
-    #define TL_INLINE        static __forceinline
+    #if defined(__clang__)
+        #define TL_INLINE        static inline __attribute__((always_inline))
+    #else
+        #define TL_INLINE        static __forceinline
+    #endif
     #define TL_NOINLINE      __declspec(noinline)
     #define TL_RESTRICT      __restrict
     #define TL_LIKELY(x)     (x)

@@ -74,38 +74,38 @@ endif()
 
 set(TIMELOG_SOURCES
     # Phase 0
-    src/internal/tl_alloc.c
-    src/internal/tl_log.c
-    src/tl_timelog.c
+    core/src/internal/tl_alloc.c
+    core/src/internal/tl_log.c
+    core/src/tl_timelog.c
     # Phase 1
-    src/internal/tl_sync.c
-    src/internal/tl_test_hooks.c
+    core/src/internal/tl_sync.c
+    core/src/internal/tl_test_hooks.c
     # Phase 2
-    src/internal/tl_recvec.c
-    src/internal/tl_intervals.c
-    src/internal/tl_heap.c
+    core/src/internal/tl_recvec.c
+    core/src/internal/tl_intervals.c
+    core/src/internal/tl_heap.c
     # Phase 3
-    src/storage/tl_window.c
-    src/storage/tl_page.c
-    src/storage/tl_segment.c
-    src/storage/tl_manifest.c
+    core/src/storage/tl_window.c
+    core/src/storage/tl_page.c
+    core/src/storage/tl_segment.c
+    core/src/storage/tl_manifest.c
     # Phase 4
-    src/delta/tl_memrun.c
-    src/delta/tl_memtable.c
-    src/delta/tl_flush.c
+    core/src/delta/tl_memrun.c
+    core/src/delta/tl_memtable.c
+    core/src/delta/tl_flush.c
     # Phase 5
-    src/delta/tl_memview.c
-    src/query/tl_snapshot.c
-    src/query/tl_segment_iter.c
-    src/query/tl_memrun_iter.c
-    src/query/tl_active_iter.c
-    src/query/tl_plan.c
-    src/query/tl_merge_iter.c
-    src/query/tl_filter.c
-    src/query/tl_point.c
-    src/query/tl_pagespan_iter.c
+    core/src/delta/tl_memview.c
+    core/src/query/tl_snapshot.c
+    core/src/query/tl_segment_iter.c
+    core/src/query/tl_memrun_iter.c
+    core/src/query/tl_active_iter.c
+    core/src/query/tl_plan.c
+    core/src/query/tl_merge_iter.c
+    core/src/query/tl_filter.c
+    core/src/query/tl_point.c
+    core/src/query/tl_pagespan_iter.c
     # Phase 8
-    src/maint/tl_compaction.c
+    core/src/maint/tl_compaction.c
 )
 
 if(TIMELOG_BUILD_SHARED)
@@ -117,12 +117,12 @@ endif()
 add_library(timelog ${TIMELOG_LIB_TYPE} ${TIMELOG_SOURCES})
 
 target_include_directories(timelog
-    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/delta
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/query
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/maint
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/storage
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/delta
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/query
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
 )
 
 # Enable test hooks for deterministic failpoint testing (Phase 9)
@@ -151,34 +151,42 @@ enable_testing()
 
 # Test files organized by category
 set(TEST_SOURCES
-    tests/test_main.c
+    core/tests/test_main.c
     # Internal implementation tests (LLD-driven)
-    tests/test_internal_sync.c
-    tests/test_internal_data_structures.c
-    tests/test_storage_internal.c
-    tests/test_delta_internal.c
-    tests/test_compaction_internal.c
+    core/tests/test_internal_sync.c
+    core/tests/test_internal_data_structures.c
+    core/tests/test_storage_internal.c
+    core/tests/test_delta_internal.c
+    core/tests/test_compaction_internal.c
     # Functional tests (public API behavior)
-    tests/test_functional.c
-    tests/test_api_semantics.c
-    tests/test_snapshot_lifetime.c
-    tests/test_invariants.c
+    core/tests/test_functional.c
+    core/tests/test_api_semantics.c
+    core/tests/test_snapshot_lifetime.c
+    core/tests/test_invariants.c
     # Concurrency and stress tests
-    tests/test_concurrency.c
-    tests/test_stress.c
+    core/tests/test_concurrency.c
+    core/tests/test_stress.c
     # PageSpan core API tests
-    tests/test_pagespan_iter.c
+    core/tests/test_pagespan_iter.c
 )
 
 add_executable(test_timelog ${TEST_SOURCES})
 target_link_libraries(test_timelog PRIVATE timelog)
 target_include_directories(test_timelog
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/delta
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/query
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/maint
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/storage
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/delta
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/query
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
 )
+
+# Clang on Windows (non-MSVC driver) does not pull CRT libs by default.
+if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+    target_link_libraries(test_timelog PRIVATE
+        $<$<CONFIG:Debug>:msvcrtd.lib vcruntimed.lib ucrtd.lib legacy_stdio_definitions.lib oldnames.lib>
+        $<$<NOT:$<CONFIG:Debug>>:msvcrt.lib vcruntime.lib ucrt.lib legacy_stdio_definitions.lib oldnames.lib>
+    )
+endif()
 
 # Enable test hooks for deterministic failpoint testing (Phase 9)
 target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
@@ -190,6 +198,35 @@ endif()
 
 add_test(NAME timelog_tests COMMAND test_timelog)
 
+# Ensure ASan runtime DLL is discoverable when using Clang on Windows.
+if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+    execute_process(
+        COMMAND ${CMAKE_C_COMPILER} --print-resource-dir
+        OUTPUT_VARIABLE _clang_res_dir
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if (_clang_res_dir)
+        get_filename_component(_clang_ver "${_clang_res_dir}" NAME)
+        get_filename_component(_clang_lib_dir "${_clang_res_dir}" DIRECTORY)
+        get_filename_component(_clang_lib_root "${_clang_lib_dir}" DIRECTORY)
+        get_filename_component(_clang_root "${_clang_lib_root}" DIRECTORY)
+
+        set(_clang_rt_dir "${_clang_res_dir}/lib/windows")
+
+        if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(_clang_rt_dir_alt "${_clang_root}/x64/lib/clang/${_clang_ver}/lib/windows")
+            if (EXISTS "${_clang_rt_dir_alt}/clang_rt.asan_dynamic-x86_64.dll")
+                set(_clang_rt_dir "${_clang_rt_dir_alt}")
+            endif()
+        endif()
+
+        set_tests_properties(timelog_tests PROPERTIES
+            ENVIRONMENT "PATH=${_clang_rt_dir};$ENV{PATH}"
+        )
+    endif()
+endif()
+
 # =============================================================================
 # Installation (optional)
 # =============================================================================
@@ -199,4 +236,4 @@ install(TARGETS timelog
     LIBRARY DESTINATION lib
 )
 
-install(DIRECTORY include/timelog DESTINATION include)
+install(DIRECTORY core/include/timelog DESTINATION include)

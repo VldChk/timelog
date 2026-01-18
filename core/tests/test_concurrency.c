@@ -26,67 +26,13 @@
 #include <stdint.h>
 
 /*===========================================================================
- * Snapshot Isolation Tests
+ * Coverage Notes
  *
- * Tests will be migrated from test_phase5.c, test_phase6.c in Step 2.3
+ * This suite covers snapshot stability (flush/compaction), snapshot acquisition
+ * during publication, concurrent readers with maintenance, writer/reader
+ * interleaving, and view_seq validation. Low-level seqlock correctness is
+ * validated in tests/test_internal_sync.c.
  *===========================================================================*/
-
-/* Placeholder - tests to be migrated:
- * - snapshot_isolation_during_write
- * - snapshot_isolation_during_flush
- * - snapshot_isolation_during_compaction
- * - multiple_snapshots_concurrent
- * - snapshot_acquire_during_publication
- */
-
-/*===========================================================================
- * Publication Protocol Tests
- *
- * Tests will be migrated from test_phase1.c, test_phase5.c in Step 2.3
- *===========================================================================*/
-
-/* Placeholder - tests to be migrated:
- * - seqlock_reader_retry
- * - seqlock_writer_blocks_readers
- * - publication_atomic_visibility
- * - manifest_swap_atomic
- */
-
-/*===========================================================================
- * Concurrent Reader Tests
- *
- * Tests will be migrated from test_phase5.c, test_phase6.c in Step 2.3
- *===========================================================================*/
-
-/* Placeholder - tests to be migrated:
- * - concurrent_readers_no_contention
- * - readers_during_write
- * - readers_during_maintenance
- */
-
-/*===========================================================================
- * Writer Tests
- *
- * Tests will be migrated from test_phase4.c, test_phase9.c in Step 2.3
- *===========================================================================*/
-
-/* Placeholder - tests to be migrated:
- * - writer_serialization
- * - writer_flush_coordination
- * - writer_compaction_coordination
- */
-
-/*===========================================================================
- * Maintenance Concurrency Tests
- *
- * Tests will be migrated from test_phase9.c in Step 2.3
- *===========================================================================*/
-
-/* Placeholder - tests to be migrated:
- * - maint_thread_coordination
- * - maint_flush_compaction_interleaving
- * - maint_shutdown_waits_for_completion
- */
 
 /*===========================================================================
  * Test Helpers (must be defined before tests)
@@ -214,6 +160,43 @@ static void* flush_writer_thread(void* arg) {
     return NULL;
 }
 
+/*---------------------------------------------------------------------------
+ * Snapshot acquisition thread (for publication tests)
+ *---------------------------------------------------------------------------*/
+typedef struct {
+    concurrency_test_ctx_t* ctx;
+    size_t                  iterations;
+    bool                    success;
+} snapshot_acquire_ctx_t;
+
+static void* snapshot_acquire_thread(void* arg) {
+    snapshot_acquire_ctx_t* rctx = (snapshot_acquire_ctx_t*)arg;
+    concurrency_test_ctx_t* ctx = rctx->ctx;
+
+    tl_atomic_fetch_add_u32(&ctx->ready_count, 1, TL_MO_RELEASE);
+    wait_for_start(ctx);
+
+    rctx->success = true;
+    for (size_t i = 0; i < rctx->iterations; i++) {
+        tl_snapshot_t* snap = NULL;
+        if (tl_snapshot_acquire(ctx->tl, &snap) != TL_OK) {
+            tl_atomic_fetch_add_u32(&ctx->error_count, 1, TL_MO_RELAXED);
+            rctx->success = false;
+            continue;
+        }
+
+        if (tl_validate(snap) != TL_OK) {
+            tl_atomic_fetch_add_u32(&ctx->error_count, 1, TL_MO_RELAXED);
+            rctx->success = false;
+        }
+
+        tl_snapshot_release(snap);
+        tl_atomic_fetch_add_u64(&ctx->operations, 1, TL_MO_RELAXED);
+    }
+
+    return NULL;
+}
+
 TEST_DECLARE(conc_snapshot_stability_during_flush) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
@@ -325,6 +308,49 @@ TEST_DECLARE(conc_snapshot_stability_during_compaction) {
 }
 
 /*---------------------------------------------------------------------------
+ * Test: conc_snapshot_acquire_during_publication
+ *
+ * Acquire snapshots while a writer publishes new manifests (flush).
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(conc_snapshot_acquire_during_publication) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert initial data */
+    for (int i = 0; i < 50; i++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, (tl_ts_t)(i * 10), (tl_handle_t)(i + 1)));
+    }
+
+    concurrency_test_ctx_t ctx = {0};
+    ctx.tl = tl;
+    tl_atomic_init_u32(&ctx.ready_count, 0);
+    tl_atomic_init_u32(&ctx.start_flag, 0);
+    tl_atomic_init_u32(&ctx.error_count, 0);
+    tl_atomic_init_u64(&ctx.operations, 0);
+
+    snapshot_acquire_ctx_t reader_ctx = {
+        .ctx = &ctx,
+        .iterations = 200,
+        .success = false
+    };
+
+    tl_thread_t reader, writer;
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&reader, snapshot_acquire_thread, &reader_ctx));
+    TEST_ASSERT_STATUS(TL_OK, tl_thread_create(&writer, flush_writer_thread, &ctx));
+
+    wait_for_threads_ready(&ctx, 2);
+    signal_start(&ctx);
+
+    tl_thread_join(&reader, NULL);
+    tl_thread_join(&writer, NULL);
+
+    TEST_ASSERT_EQ(0, tl_atomic_load_relaxed_u32(&ctx.error_count));
+    TEST_ASSERT(reader_ctx.success);
+
+    tl_close(tl);
+}
+
+/*---------------------------------------------------------------------------
  * Test: conc_multiple_readers_during_maintenance
  *
  * Multiple reader threads with background maintenance.
@@ -356,9 +382,7 @@ static void* multi_reader_thread(void* arg) {
         tl_iter_t* it = NULL;
         if (tl_iter_since(snap, 0, &it) == TL_OK) {
             tl_record_t rec;
-            size_t count = 0;
             while (tl_iter_next(it, &rec) == TL_OK) {
-                count++;
             }
             tl_iter_destroy(it);
             rctx->reads_completed++;
@@ -557,6 +581,7 @@ void run_concurrency_tests(void) {
     /* Phase 10 concurrency tests */
     RUN_TEST(conc_snapshot_stability_during_flush);
     RUN_TEST(conc_snapshot_stability_during_compaction);
+    RUN_TEST(conc_snapshot_acquire_during_publication);
     RUN_TEST(conc_multiple_readers_during_maintenance);
     RUN_TEST(conc_writer_reader_interleave);
     RUN_TEST(conc_view_seq_validation);

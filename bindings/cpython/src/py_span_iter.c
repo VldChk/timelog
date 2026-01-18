@@ -165,9 +165,10 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
 
     /*
      * Step 2: Check if timelog is closed.
+     * Use formatted message for consistency with CHECK_CLOSED macro.
      */
     if (tl_obj->closed || tl_obj->tl == NULL) {
-        TlPy_RaiseFromStatus(TL_ESTATE);
+        TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
         return NULL;
     }
 
@@ -289,8 +290,17 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
      * Clear our timelog reference (for GC visibility).
      * Note: The hook context also holds a timelog ref which is released
      * by the hook when the owner is destroyed.
+     *
+     * Exception preservation: Py_CLEAR may trigger __del__ which can
+     * clobber active exceptions (e.g., when __exit__ calls cleanup).
+     * Per LLD-B6, preserve exception state across cleanup.
      */
-    Py_CLEAR(self->timelog);
+    {
+        PyObject *exc_type, *exc_value, *exc_tb;
+        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+        Py_CLEAR(self->timelog);
+        PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
 }
 
 /*===========================================================================

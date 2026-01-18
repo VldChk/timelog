@@ -1,7 +1,7 @@
 /*===========================================================================
  * test_functional.c - Public API Functional Tests
  *
- * Tests for end-to-end functional correctness using PUBLIC API ONLY:
+ * Tests for end-to-end functional correctness using public API:
  * - Snapshot: tl_snapshot_acquire, tl_snapshot_release
  * - Iterators: tl_iter_range, tl_iter_since, tl_iter_until, tl_iter_equal
  * - Scanning: tl_scan_range with callbacks
@@ -16,16 +16,16 @@
  * - test_compaction_internal.c: selection, merge, publish
  *
  * Part of Phase 10: Integration Testing and Hardening
+ *
+ * Note: test scaffolding uses internal sync primitives for threads/conds,
+ * but core behaviors are exercised through the public API surface.
  *===========================================================================*/
 
 #include "test_harness.h"
 #include "timelog/timelog.h"
 
-/* Internal headers required by some compaction tests that use internal APIs.
- * TODO: Refactor these tests to use public API (tl_compact, tl_maint_step)
- * instead of internal functions (tl_compact_one). */
+/* Internal headers required for test threading scaffolding. */
 #include "internal/tl_sync.h"
-#include "maint/tl_compaction.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -946,82 +946,6 @@ static void func_flush_n_times(tl_timelog_t* tl, int n, tl_ts_t base_ts, int rec
 }
 
 /*---------------------------------------------------------------------------
- * Fault-Injection Allocator (for ENOMEM tests)
- *---------------------------------------------------------------------------*/
-
-typedef struct {
-    bool   fail_next;
-    size_t alloc_calls;
-} func_fail_alloc_ctx_t;
-
-static void* func_fail_malloc(void* ctx, size_t size) {
-    func_fail_alloc_ctx_t* fa = (func_fail_alloc_ctx_t*)ctx;
-    fa->alloc_calls++;
-    if (fa->fail_next) {
-        fa->fail_next = false;
-        return NULL;
-    }
-    return malloc(size);
-}
-
-static void* func_fail_calloc(void* ctx, size_t count, size_t size) {
-    func_fail_alloc_ctx_t* fa = (func_fail_alloc_ctx_t*)ctx;
-    fa->alloc_calls++;
-    if (fa->fail_next) {
-        fa->fail_next = false;
-        return NULL;
-    }
-    return calloc(count, size);
-}
-
-static void* func_fail_realloc(void* ctx, void* ptr, size_t size) {
-    func_fail_alloc_ctx_t* fa = (func_fail_alloc_ctx_t*)ctx;
-    if (fa->fail_next) {
-        fa->fail_next = false;
-        return NULL;
-    }
-    return realloc(ptr, size);
-}
-
-static void func_fail_free(void* ctx, void* ptr) {
-    (void)ctx;
-    free(ptr);
-}
-
-/*---------------------------------------------------------------------------
- * Threaded Helpers (for EBUSY publish test)
- *---------------------------------------------------------------------------*/
-
-typedef struct {
-    tl_timelog_t* tl;
-    tl_mutex_t    mu;
-    tl_cond_t     cond;
-    bool          start;
-    bool          done;
-} func_flush_thread_ctx_t;
-
-static void* func_flush_thread_entry(void* arg) {
-    func_flush_thread_ctx_t* ctx = (func_flush_thread_ctx_t*)arg;
-
-    tl_mutex_lock(&ctx->mu);
-    while (!ctx->start) {
-        tl_cond_wait(&ctx->cond, &ctx->mu);
-    }
-    tl_mutex_unlock(&ctx->mu);
-
-    /* Publish a new L0 to change the manifest */
-    tl_append(ctx->tl, 9999, 42);
-    tl_flush(ctx->tl);
-
-    tl_mutex_lock(&ctx->mu);
-    ctx->done = true;
-    tl_cond_signal(&ctx->cond);
-    tl_mutex_unlock(&ctx->mu);
-
-    return NULL;
-}
-
-/*---------------------------------------------------------------------------
  * Drop handle tracker (for callback tests)
  *---------------------------------------------------------------------------*/
 
@@ -1038,6 +962,22 @@ static void func_track_dropped_handle(void* ctx, tl_ts_t ts, tl_handle_t handle)
         tracker->dropped_handle[tracker->dropped_count] = handle;
         tracker->dropped_count++;
     }
+}
+
+/*---------------------------------------------------------------------------
+ * Helper: request compaction and run maintenance to quiescence (public API)
+ *---------------------------------------------------------------------------*/
+static tl_status_t func_compact_to_quiescence(tl_timelog_t* tl) {
+    tl_status_t st = tl_compact(tl);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    do {
+        st = tl_maint_step(tl);
+    } while (st == TL_OK);
+
+    return st;  /* TL_EOF on success, or error */
 }
 
 /*---------------------------------------------------------------------------
@@ -1070,8 +1010,8 @@ TEST_DECLARE(func_compact_one_basic) {
     /* Create 2 L0 segments */
     func_flush_n_times(tl, 2, 1000, 5);
 
-    /* Run full compaction */
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    /* Run full compaction via public API */
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Verify L0 is cleared, L1 exists */
     tl_snapshot_t* snap = NULL;
@@ -1090,8 +1030,8 @@ TEST_DECLARE(func_compact_one_no_work) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
 
-    /* No L0 segments - should return EOF */
-    TEST_ASSERT_STATUS(TL_EOF, tl_compact_one(tl, 3));
+    /* No L0 segments - maint step should return EOF */
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     tl_close(tl);
 }
@@ -1114,7 +1054,7 @@ TEST_DECLARE(func_compact_preserves_data) {
     tl_flush(tl);
 
     /* Run compaction */
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Query should return all records in order */
     tl_snapshot_t* snap = NULL;
@@ -1171,7 +1111,7 @@ TEST_DECLARE(func_compact_respects_tombstones) {
     tl_flush(tl);
 
     /* Run compaction */
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Query should skip deleted records */
     tl_snapshot_t* snap = NULL;
@@ -1208,7 +1148,7 @@ TEST_DECLARE(func_compact_validate_passes) {
     func_flush_n_times(tl, 3, 1000, 10);
 
     /* Run compaction */
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Validate should pass */
     tl_snapshot_t* snap = NULL;
@@ -1229,15 +1169,15 @@ TEST_DECLARE(func_compact_multiple_rounds) {
 
     /* Round 1: Create 2 L0 segments and compact */
     func_flush_n_times(tl, 2, 1000, 5);
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Round 2: Create 2 more L0 segments and compact */
     func_flush_n_times(tl, 2, 2000, 5);
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Round 3: Create 2 more L0 segments and compact */
     func_flush_n_times(tl, 2, 3000, 5);
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Validate final state */
     tl_snapshot_t* snap = NULL;
@@ -1305,7 +1245,7 @@ TEST_DECLARE(func_compact_record_at_ts_max) {
     tl_flush(tl);
 
     /* Compact - should handle the massive window span via jumping */
-    TEST_ASSERT_STATUS(TL_OK, tl_compact_one(tl, 3));
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
 
     /* Verify all records are queryable after compaction */
     tl_snapshot_t* snap = NULL;
@@ -1676,7 +1616,7 @@ TEST_DECLARE(func_publish_phase_enomem) {
 
     /* Phase 2: Calibrate - count allocations during successful compaction. */
     fail_ctx.alloc_count = 0;
-    (void)tl_compact_one(tl, 3);
+    TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
     size_t compact_allocs = fail_ctx.alloc_count;
 
     tl_status_t st;  /* Declare here for use in Phase 3 */
@@ -1701,7 +1641,7 @@ TEST_DECLARE(func_publish_phase_enomem) {
     fail_ctx.alloc_count = 0;
     fail_ctx.failed = false;
 
-    st = tl_compact_one(tl, 3);
+    st = func_compact_to_quiescence(tl);
 
     /* Either injection triggered (ENOMEM) or missed (compaction succeeded). */
     if (fail_ctx.failed) {
@@ -1718,8 +1658,8 @@ TEST_DECLARE(func_publish_phase_enomem) {
         TEST_ASSERT(stats_after.segments_l0 >= stats_before.segments_l0 ||
                     stats_after.segments_l0 > 0);
     } else {
-        /* Injection missed - compaction should have succeeded or returned EOF */
-        TEST_ASSERT(st == TL_OK || st == TL_EOF);
+        /* Injection missed - compaction should have quiesced */
+        TEST_ASSERT_STATUS(TL_EOF, st);
 
         /* Compaction either succeeded (L1 created) or had no work */
         TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
@@ -1829,6 +1769,39 @@ TEST_DECLARE(func_eoverflow_clears_pending_manual_mode) {
     tl_close(tl);
 }
 
+/*---------------------------------------------------------------------------
+ * Stress Smoke Test (always-on, small scale)
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(func_smoke_high_volume_append_iterate) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    const int count = 5000;
+    for (int i = 0; i < count; i++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, (tl_ts_t)i, (tl_handle_t)(i + 1)));
+    }
+
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, 0, count, &it));
+
+    int seen = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        seen++;
+    }
+    TEST_ASSERT_EQ(count, seen);
+
+    tl_iter_destroy(it);
+    TEST_ASSERT_STATUS(TL_OK, tl_validate(snap));
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Test Runner
  *===========================================================================*/
@@ -1920,6 +1893,9 @@ void run_functional_tests(void) {
     RUN_TEST(func_publish_phase_enomem);
     RUN_TEST(func_transient_errors_are_logged);
     RUN_TEST(func_eoverflow_clears_pending_manual_mode);
+
+    /* Stress smoke test (small scale, always-on) */
+    RUN_TEST(func_smoke_high_volume_append_iterate);
 
     /*
      * Total: ~55 tests (public API only)

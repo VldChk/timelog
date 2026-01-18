@@ -57,7 +57,7 @@ if(NOT TARGET timelog)
 
     set_target_properties(timelog PROPERTIES
         IMPORTED_LOCATION "${TIMELOG_LIB_PATH}"
-        INTERFACE_INCLUDE_DIRECTORIES "${TIMELOG_ROOT}/include"
+        INTERFACE_INCLUDE_DIRECTORIES "${TIMELOG_ROOT}/core/include"
     )
 
     message(STATUS "Standalone build: linking against ${TIMELOG_LIB_PATH}")
@@ -142,11 +142,11 @@ if(NOT DEFINED TIMELOG_ROOT)
 endif()
 
 # Include directories
-# NOTE: B4 requires access to internal headers in ${TIMELOG_ROOT}/src
+# NOTE: B4 requires access to internal headers in core/src
 target_include_directories(_timelog PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${Python3_INCLUDE_DIRS}
-    ${TIMELOG_ROOT}/src  # Internal headers for B4 (tl_page.h, tl_segment.h, etc.)
+    ${TIMELOG_ROOT}/core/src  # Internal headers for B4 (tl_page.h, tl_segment.h, etc.)
 )
 
 # Link against timelog core library
@@ -240,7 +240,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     target_include_directories(test_py_timelog PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/src     # Internal headers for B4
+        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
     )
 
     if(Python3_EXECUTABLE)
@@ -293,7 +293,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     target_include_directories(test_py_iter PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/src     # Internal headers for B4
+        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
     )
 
     if(Python3_EXECUTABLE)
@@ -346,7 +346,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     target_include_directories(test_py_span PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/src     # Internal headers for B4
+        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
     )
 
     if(Python3_EXECUTABLE)
@@ -383,6 +383,112 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
+    # Test: test_py_maint_b5 (LLD-B5 unit tests - Maintenance + Threading)
+    # =========================================================================
+    add_executable(test_py_maint_b5
+        tests/test_py_maint_b5.c
+        src/py_handle.c         # LLD-B1 dependency
+        src/py_errors.c         # Error translation
+        src/py_timelog.c        # LLD-B2 dependency (factory methods)
+        src/py_iter.c           # LLD-B3 dependency
+        src/py_span.c           # LLD-B4 dependency
+        src/py_span_iter.c      # LLD-B4 dependency
+        src/py_span_objects.c   # LLD-B4 dependency
+    )
+
+    target_include_directories(test_py_maint_b5 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
+    )
+
+    if(Python3_EXECUTABLE)
+        target_compile_definitions(test_py_maint_b5 PRIVATE
+            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+        )
+    endif()
+
+    target_link_libraries(test_py_maint_b5 PRIVATE
+        timelog
+        ${Python3_LIBRARIES}
+    )
+
+    timelog_copy_python_runtime(test_py_maint_b5)
+
+    if(MSVC)
+        target_compile_options(test_py_maint_b5 PRIVATE
+            /W4
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_maint_b5 PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_maint_b5 PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_maint_b5 PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
+    # Test: test_py_errors (LLD-B6 unit tests - Error Model Subsystem)
+    # =========================================================================
+    add_executable(test_py_errors
+        tests/test_py_errors.c
+        src/py_handle.c         # LLD-B1 dependency
+        src/py_errors.c         # Error translation (primary target)
+        src/py_timelog.c        # LLD-B2 dependency (integration tests)
+        src/py_iter.c           # LLD-B3 dependency (integration tests)
+        src/py_span.c           # LLD-B4 dependency
+        src/py_span_iter.c      # LLD-B4 dependency
+        src/py_span_objects.c   # LLD-B4 dependency
+    )
+
+    target_include_directories(test_py_errors PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+        ${TIMELOG_ROOT}/core/src     # Internal headers
+    )
+
+    if(Python3_EXECUTABLE)
+        target_compile_definitions(test_py_errors PRIVATE
+            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+        )
+    endif()
+
+    target_link_libraries(test_py_errors PRIVATE
+        timelog
+        ${Python3_LIBRARIES}
+    )
+
+    timelog_copy_python_runtime(test_py_errors)
+
+    if(MSVC)
+        target_compile_options(test_py_errors PRIVATE
+            /W4
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_errors PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_errors PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_errors PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
     # CTest Integration - Run all tests with 'ctest' command
     # =========================================================================
     enable_testing()
@@ -407,11 +513,21 @@ if(TIMELOG_BUILD_PY_TESTS)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
+    add_test(NAME py_maint_b5_tests
+        COMMAND test_py_maint_b5
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+
+    add_test(NAME py_errors_tests
+        COMMAND test_py_errors
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+
     # Custom target to run all tests (alternative to ctest)
     # Note: -C $<CONFIG> is required for multi-config generators (MSVC)
     add_custom_target(run_all_tests
         COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG> --output-on-failure
-        DEPENDS test_py_handle test_py_timelog test_py_iter test_py_span
+        DEPENDS test_py_handle test_py_timelog test_py_iter test_py_span test_py_maint_b5 test_py_errors
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMENT "Running all CPython binding tests..."
     )

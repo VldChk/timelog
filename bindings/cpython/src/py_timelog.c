@@ -312,8 +312,20 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
     /* Clear pointer */
     self->tl = NULL;
 
-    /* Drain retired objects (force=1) */
-    tl_py_drain_retired(&self->handle_ctx, 1);
+    /*
+     * Drain retired objects (force=1).
+     * Preserve exception state: drain executes Py_DECREF which can
+     * trigger __del__ methods that may clobber active exceptions
+     * (e.g., when close() is called from __exit__).
+     */
+    {
+        PyObject *exc_type, *exc_value, *exc_tb;
+        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+
+        tl_py_drain_retired(&self->handle_ctx, 1);
+
+        PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
 
     /* Destroy handle context */
     tl_py_handle_ctx_destroy(&self->handle_ctx);
@@ -343,7 +355,19 @@ PyTimelog_dealloc(PyTimelog* self)
             tl_maint_stop(self->tl);
             tl_close(self->tl);
             Py_END_ALLOW_THREADS
-            tl_py_drain_retired(&self->handle_ctx, 1);
+
+            /*
+             * Drain retired objects with exception preservation.
+             * Per LLD-B6: Py_DECREF in drain can trigger __del__ that
+             * may clobber active exceptions during finalization.
+             */
+            {
+                PyObject *exc_type, *exc_value, *exc_tb;
+                PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+                tl_py_drain_retired(&self->handle_ctx, 1);
+                PyErr_Restore(exc_type, exc_value, exc_tb);
+            }
+
             tl_py_handle_ctx_destroy(&self->handle_ctx);
         } else {
             /* WARNING: leaking resources (pins active) */
@@ -767,6 +791,28 @@ PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
     if (self->closed) {
         return TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
     }
+
+    /*
+     * Auto-start maintenance worker when in background mode.
+     *
+     * When users create a Timelog with maintenance="background" and use the
+     * context manager, they expect background maintenance to run automatically.
+     * Without this, writes that trigger backpressure would wait on a condvar
+     * that never gets signaled (because the worker isn't running), causing
+     * writes to take 100ms each (the sealed_wait_ms timeout).
+     *
+     * Note: close() (called by __exit__) already calls tl_maint_stop().
+     */
+    if (self->maint_mode == TL_MAINT_BACKGROUND) {
+        tl_status_t st = tl_maint_start(self->tl);
+        if (st != TL_OK && st != TL_EBUSY) {
+            /* TL_EBUSY means stop in progress - shouldn't happen on fresh open.
+             * Any other error is a real problem. */
+            return TlPy_RaiseFromStatus(st);
+        }
+        /* TL_OK = started (or already running - idempotent) */
+    }
+
     Py_INCREF(self);
     return (PyObject*)self;
 }

@@ -367,10 +367,9 @@ TEST(page_spans_with_data)
     ASSERT_NOT_NULL(span);
     ASSERT(PyPageSpan_Check(span));
 
-    /* Check span properties */
-    PyPageSpan* ps = (PyPageSpan*)span;
-    ASSERT(!ps->closed);
-    ASSERT(ps->len > 0);
+    /* Check span properties via public protocol */
+    Py_ssize_t len = PyObject_Length(span);
+    ASSERT(len > 0);
 
     Py_DECREF(span);
     Py_DECREF(iter);
@@ -1095,21 +1094,20 @@ TEST(multiple_spans_share_owner)
     }
     ASSERT(span_count >= 1);
 
-    /* Verify all spans have same owner (internal check) */
-    if (span_count > 1) {
-        PyPageSpan* ps0 = (PyPageSpan*)spans[0];
-        for (int i = 1; i < span_count; i++) {
-            PyPageSpan* ps = (PyPageSpan*)spans[i];
-            ASSERT(ps->owner == ps0->owner);
-        }
+    /* Verify spans remain valid after iterator is closed */
+    Py_DECREF(iter);
+    for (int i = 0; i < span_count; i++) {
+        Py_buffer view;
+        int rc_view = PyObject_GetBuffer(spans[i], &view, PyBUF_SIMPLE);
+        ASSERT_EQ(rc_view, 0);
+        ASSERT(view.len > 0);
+        PyBuffer_Release(&view);
     }
 
     /* Clean up spans */
     for (int i = 0; i < span_count; i++) {
         Py_DECREF(spans[i]);
     }
-    Py_DECREF(iter);
-
     /* For remaining refs from iteration */
     for (int i = 0; i < 100; i++) {
         Py_DECREF(obj);
@@ -1335,9 +1333,12 @@ TEST(span_len)
     Py_ssize_t len = PyObject_Length(span);
     ASSERT_EQ(len, 4);
 
-    /* Verify internal consistency */
-    PyPageSpan* ps = (PyPageSpan*)span;
-    ASSERT_EQ((Py_ssize_t)ps->len, len);
+    /* Verify buffer length matches __len__ */
+    Py_buffer view;
+    int rc_view = PyObject_GetBuffer(span, &view, PyBUF_SIMPLE);
+    ASSERT_EQ(rc_view, 0);
+    ASSERT_EQ(view.len, len * (Py_ssize_t)sizeof(tl_ts_t));
+    PyBuffer_Release(&view);
 
     Py_DECREF(span);
     Py_DECREF(iter);
