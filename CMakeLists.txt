@@ -106,6 +106,8 @@ set(TIMELOG_SOURCES
     core/src/query/tl_pagespan_iter.c
     # Phase 8
     core/src/maint/tl_compaction.c
+    # Adaptive Segmentation (V-Next)
+    core/src/maint/tl_adaptive.c
 )
 
 if(TIMELOG_BUILD_SHARED)
@@ -168,6 +170,8 @@ set(TEST_SOURCES
     core/tests/test_stress.c
     # PageSpan core API tests
     core/tests/test_pagespan_iter.c
+    # Adaptive Segmentation tests
+    core/tests/test_adaptive_internal.c
 )
 
 add_executable(test_timelog ${TEST_SOURCES})
@@ -190,6 +194,9 @@ endif()
 
 # Enable test hooks for deterministic failpoint testing (Phase 9)
 target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
+
+# Enable adaptive module internal test helpers
+target_compile_definitions(test_timelog PRIVATE TL_ADAPTIVE_INTERNAL_TEST)
 
 # Link pthread on POSIX systems
 if(NOT WIN32)

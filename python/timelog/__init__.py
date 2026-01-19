@@ -30,8 +30,8 @@ Resource Management:
     Call close() or use the context manager to release resources.
     Note: close() may leave unflushed objects in sealed memruns
     unreachable unless flush() or background maintenance ran first.
-    For guaranteed cleanup, use maintenance="background" or call
-    flush() before close().
+    For guaranteed cleanup, keep maintenance="background" (default)
+    or call flush() before close().
 """
 
 from __future__ import annotations
@@ -90,8 +90,8 @@ class Timelog(_CTimelog):
 
     Warning:
         close() may leave unflushed objects unreachable if sealed memruns
-        exist. Call flush() before close(), or use maintenance="background"
-        to ensure all objects are properly released.
+        exist. Call flush() before close(), or keep maintenance="background"
+        (default) to ensure all objects are properly released.
 
     Example:
         >>> with Timelog(time_unit="ms") as log:
@@ -106,7 +106,7 @@ class Timelog(_CTimelog):
         time_unit: Timestamp resolution. One of "s", "ms", "us", "ns".
             Default: "ms" (milliseconds).
         maintenance: Background maintenance mode. "disabled" for manual
-            control, "background" for automatic. Default: "disabled".
+            control, "background" for automatic. Default: "background".
         memtable_max_bytes: Maximum bytes before memtable seals (default ~1MB).
         target_page_bytes: Target size for storage pages (default ~64KB).
         sealed_max_runs: Max sealed memruns before backpressure (default 4).

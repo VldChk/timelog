@@ -167,6 +167,9 @@ extern void run_compaction_internal_tests(void);
 /* PageSpan core API tests (V2 binding support) */
 extern void run_pagespan_iter_tests(void);
 
+/* Adaptive Segmentation internal tests (V-Next) */
+extern void run_adaptive_internal_tests(void);
+
 /*===========================================================================
  * Main Entry Point
  *===========================================================================*/
@@ -207,6 +210,10 @@ int main(int argc, char* argv[]) {
     printf("\n[Internal] PageSpan Iterator\n");
     printf("----------------------------------------\n");
     run_pagespan_iter_tests();
+
+    printf("\n[Internal] Adaptive Segmentation\n");
+    printf("----------------------------------------\n");
+    run_adaptive_internal_tests();
 
     /*-----------------------------------------------------------------------
      * Functional Tests (Public API behavior)

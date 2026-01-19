@@ -17,6 +17,7 @@
 #include "query/tl_filter.h"
 #include "query/tl_point.h"
 #include "maint/tl_compaction.h"
+#include "maint/tl_adaptive.h"
 
 #include <string.h>
 
@@ -121,6 +122,16 @@ tl_status_t tl_config_init_defaults(tl_config_t* cfg) {
     cfg->sealed_max_runs = TL_DEFAULT_SEALED_MAX_RUNS;
     cfg->sealed_wait_ms  = TL_DEFAULT_SEALED_WAIT_MS;
 
+    /* Watermark scheduling: ENABLED by default for better OOO handling.
+     * Zero values here mean "auto-derive" in normalize_config.
+     * Watermarks will be derived as: hi_wm = 75%, lo_wm = 25% of sealed_max_runs.
+     * User can explicitly set values to override. */
+    cfg->sealed_hi_wm = 0;  /* 0 = auto-derive in normalize_config */
+    cfg->sealed_lo_wm = 0;  /* 0 = auto-derive in normalize_config */
+
+    /* Maintenance timing: 0 means use default (100ms) in normalize */
+    cfg->maintenance_wakeup_ms = 0;
+
     /* Compaction */
     cfg->max_delta_segments     = TL_DEFAULT_MAX_DELTA_SEGMENTS;
     cfg->window_size            = 0; /* Will use default based on time_unit */
@@ -128,10 +139,17 @@ tl_status_t tl_config_init_defaults(tl_config_t* cfg) {
     cfg->delete_debt_threshold  = 0.0; /* Disabled */
     cfg->compaction_target_bytes = 0;  /* Unlimited */
     cfg->max_compaction_inputs   = 0;  /* Unlimited */
-    cfg->max_compaction_windows  = 0;  /* Unlimited */
+    cfg->max_compaction_windows  = TL_DEFAULT_MAX_COMPACTION_WINDOWS;
 
-    /* Maintenance */
-    cfg->maintenance_mode = TL_MAINT_DISABLED;
+    /* Phase 2 OOO Scaling: Reshape compaction tuning */
+    cfg->compaction_strategy    = TL_COMPACT_AUTO;
+    cfg->reshape_l0_threshold   = TL_DEFAULT_RESHAPE_L0_THRESHOLD;
+    cfg->reshape_max_inputs     = TL_DEFAULT_RESHAPE_MAX_INPUTS;
+    cfg->reshape_cooldown_max   = TL_DEFAULT_RESHAPE_COOLDOWN_MAX;
+
+    /* Maintenance: Background by default for automatic segment management.
+     * Users doing bulk OOO ingestion should set to TL_MAINT_DISABLED. */
+    cfg->maintenance_mode = TL_MAINT_BACKGROUND;
 
     /* Allocator: NULL means use libc defaults */
     cfg->allocator.ctx        = NULL;
@@ -205,6 +223,32 @@ static tl_status_t validate_config(const tl_config_t* cfg) {
         return TL_EINVAL;
     }
 
+    /* Validate adaptive segmentation config.
+     * tl_adaptive_config_validate() returns TL_OK if disabled (target_records == 0).
+     * Otherwise, it validates min/max guardrails, alpha, and other parameters. */
+    tl_status_t adapt_st = tl_adaptive_config_validate(&cfg->adaptive);
+    if (adapt_st != TL_OK) {
+        return adapt_st;
+    }
+
+    /* Watermark validation (OOO Scaling Phase 1):
+     *
+     * Case 1: hi_wm=0 AND lo_wm=0 → Auto-derive (valid, default: 75%/25%)
+     * Case 2: hi_wm>0 AND lo_wm=0 → Valid (drain to empty before compaction)
+     * Case 3: hi_wm=0 AND lo_wm>0 → INVALID (hi_wm must be set if lo_wm is set)
+     * Case 4: hi_wm>0 AND lo_wm>=hi_wm → INVALID (must have lo_wm < hi_wm)
+     * Case 5: hi_wm>0 AND lo_wm<hi_wm → Valid watermark pair
+     */
+    if (cfg->sealed_hi_wm == 0 && cfg->sealed_lo_wm > 0) {
+        /* Case 3: lo_wm set without hi_wm */
+        return TL_EINVAL;
+    }
+
+    if (cfg->sealed_hi_wm > 0 && cfg->sealed_lo_wm >= cfg->sealed_hi_wm) {
+        /* Case 4: lo_wm must be strictly less than hi_wm */
+        return TL_EINVAL;
+    }
+
     return TL_OK;
 }
 
@@ -254,6 +298,61 @@ static void normalize_config(tl_timelog_t* tl) {
         tl->effective_ooo_budget = cfg->memtable_max_bytes / 10;
     } else {
         tl->effective_ooo_budget = cfg->ooo_budget_bytes;
+    }
+
+    /* =======================================================================
+     * Step 3: Watermark normalization (OOO Scaling Phase 1)
+     *
+     * Watermarks are ENABLED by default for better OOO handling.
+     * - If hi_wm=0 AND lo_wm=0: auto-derive from sealed_max_runs (75%/25%)
+     * - If hi_wm>0: use explicit values (clamp/adjust as needed)
+     * ======================================================================= */
+    if (cfg->sealed_hi_wm == 0 && cfg->sealed_lo_wm == 0) {
+        /* Auto-derive watermarks from sealed_max_runs (default behavior).
+         *
+         * Formula (overflow-safe):
+         *   lo_wm = floor(25% * n) = n / 4
+         *   hi_wm = ceil(75% * n) = n - lo_wm
+         *
+         * This is mathematically equivalent to (3n+3)/4 but avoids overflow
+         * for large n. The hysteresis band is intuitive: hi + lo ≈ n.
+         *
+         * Examples:
+         *   n=4 → lo=1, hi=3 (default config)
+         *   n=8 → lo=2, hi=6 (recommended for OOO workloads)
+         *   n=1 → lo=0, hi=1 (degenerate but valid) */
+        tl->effective_sealed_lo_wm = cfg->sealed_max_runs / 4;
+        tl->effective_sealed_hi_wm = cfg->sealed_max_runs - tl->effective_sealed_lo_wm;
+        tl->watermarks_enabled = true;
+    } else if (cfg->sealed_hi_wm > 0) {
+        /* User provided explicit watermarks - clamp and validate */
+        if (cfg->sealed_hi_wm > cfg->sealed_max_runs) {
+            cfg->sealed_hi_wm = cfg->sealed_max_runs;
+        }
+
+        /* Ensure lo_wm < hi_wm after clamping */
+        if (cfg->sealed_lo_wm >= cfg->sealed_hi_wm) {
+            cfg->sealed_lo_wm = (cfg->sealed_hi_wm > 1) ? cfg->sealed_hi_wm - 1 : 0;
+        }
+
+        tl->effective_sealed_hi_wm = cfg->sealed_hi_wm;
+        tl->effective_sealed_lo_wm = cfg->sealed_lo_wm;
+        tl->watermarks_enabled = true;
+    } else {
+        /* UNREACHABLE: hi_wm=0 with lo_wm>0 is rejected by validate_config().
+         * This assertion documents the invariant - if we ever reach here,
+         * validation logic has a bug. */
+        TL_ASSERT(0 && "unreachable: validate_config should reject hi_wm=0 with lo_wm>0");
+        tl->effective_sealed_hi_wm = 0;
+        tl->effective_sealed_lo_wm = 0;
+        tl->watermarks_enabled = false;
+    }
+
+    /* =======================================================================
+     * Step 4: Maintenance timing
+     * ======================================================================= */
+    if (cfg->maintenance_wakeup_ms == 0) {
+        cfg->maintenance_wakeup_ms = TL_DEFAULT_MAINTENANCE_WAKEUP_MS;
     }
 }
 
@@ -422,16 +521,42 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl_atomic_init_u64(&tl->flushes_total, 0);
     tl_atomic_init_u64(&tl->compactions_total, 0);
 
+    /* Initialize OOO Scaling counters (Phase 1) */
+    tl_atomic_init_u64(&tl->flush_first_cycles, 0);
+    tl_atomic_init_u64(&tl->compaction_deferred, 0);
+    tl_atomic_init_u64(&tl->compaction_forced, 0);
+
     /* Initialize lifecycle state */
     tl->is_open = true;
 
     /* Initialize maintenance state (Phase 7).
      * All fields are plain bools/enum protected by maint_mu.
-     * Worker is NOT started here - caller must invoke tl_maint_start(). */
+     * Worker is auto-started below when mode is TL_MAINT_BACKGROUND. */
     tl->maint_state = TL_WORKER_STOPPED;
     tl->maint_shutdown = false;
     tl->flush_pending = false;
     tl->compact_pending = false;
+
+    /* Initialize adaptive segmentation state (V-Next).
+     * All zeros = disabled behavior; state tracks EWMA and counters only. */
+    tl_adaptive_state_init(&tl->adaptive);
+
+    /* Auto-start background maintenance worker when mode is BACKGROUND.
+     * This is the default mode - automatic segment management without
+     * explicit tl_maint_start() call. Users doing bulk OOO ingestion
+     * should set mode to TL_MAINT_DISABLED for better performance. */
+    if (tl->config.maintenance_mode == TL_MAINT_BACKGROUND) {
+        status = tl_maint_start(tl);
+        if (status != TL_OK) {
+            /* Failed to start worker - clean up and fail open */
+            tl_manifest_release(tl->manifest);
+            tl_memtable_destroy(&tl->memtable);
+            destroy_locks(tl);
+            tl__alloc_destroy(&tl->alloc);
+            temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
+            return status;
+        }
+    }
 
     /* Log successful open */
     tl_log_ctx_t* log = &tl->log;
@@ -872,8 +997,18 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
  * This is a wrapper around flush_one_memrun that handles:
  * 1. Acquire flush_mu (serializes flush operations)
  * 2. Peek + pin memrun from sealed queue
- * 3. Call flush_one_memrun
- * 4. Handle errors with proper cleanup
+ * 3. Capture flush metrics for adaptive density (record-only bounds)
+ * 4. Call flush_one_memrun
+ * 5. Handle errors with proper cleanup
+ * 6. Update adaptive density if enabled (under maint_mu)
+ *
+ * ADAPTIVE INTEGRATION (Phase 6):
+ * Only this function (maintenance thread path) updates density.
+ * Manual tl_flush() does NOT update density - acceptable because
+ * manual mode users don't use adaptive segmentation anyway.
+ *
+ * Lock ordering note: maint_mu is acquired AFTER flush_mu is released
+ * to respect the lock hierarchy (maint_mu -> flush_mu).
  *
  * @return TL_OK     - One memrun flushed successfully
  *         TL_EOF    - No sealed memruns to flush
@@ -897,6 +1032,36 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
         return TL_EOF;  /* No work */
     }
 
+    /*-----------------------------------------------------------------------
+     * Capture flush metrics BEFORE flush (memrun will be released on success).
+     * Record-only bounds - excludes tombstones per LLD.
+     *-----------------------------------------------------------------------*/
+    tl_flush_metrics_t metrics = { 0 };
+    if (tl->config.adaptive.target_records > 0) {
+        size_t run_len = tl_memrun_run_len(mr);
+        size_t ooo_len = tl_memrun_ooo_len(mr);
+        metrics.record_count = (uint64_t)(run_len + ooo_len);
+        metrics.has_records = (metrics.record_count > 0);
+
+        if (metrics.has_records) {
+            const tl_record_t* run = tl_memrun_run_data(mr);
+            const tl_record_t* ooo = tl_memrun_ooo_data(mr);
+
+            /* Compute record-only min/max.
+             * Both run and ooo are sorted, so min is first, max is last. */
+            if (run_len > 0 && ooo_len > 0) {
+                metrics.min_ts = TL_MIN(run[0].ts, ooo[0].ts);
+                metrics.max_ts = TL_MAX(run[run_len - 1].ts, ooo[ooo_len - 1].ts);
+            } else if (run_len > 0) {
+                metrics.min_ts = run[0].ts;
+                metrics.max_ts = run[run_len - 1].ts;
+            } else {  /* ooo_len > 0 */
+                metrics.min_ts = ooo[0].ts;
+                metrics.max_ts = ooo[ooo_len - 1].ts;
+            }
+        }
+    }
+
     /* Build and publish (releases our reference on success) */
     st = flush_one_memrun(tl, mr);
 
@@ -906,6 +1071,21 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
     }
 
     TL_UNLOCK_FLUSH(tl);
+
+    /*-----------------------------------------------------------------------
+     * Update adaptive density AFTER releasing flush_mu (lock ordering).
+     * Call on ALL successful flushes (even tombstone-only) so flush_count
+     * increments properly for stale_flushes detection. The function will
+     * skip density update if no records present.
+     *-----------------------------------------------------------------------*/
+    if (st == TL_OK && tl->config.adaptive.target_records > 0) {
+        TL_LOCK_MAINT(tl);
+        tl_adaptive_update_density(&tl->adaptive,
+                                   &tl->config.adaptive,
+                                   &metrics);
+        TL_UNLOCK_MAINT(tl);
+    }
+
     return st;
 }
 
@@ -1550,12 +1730,18 @@ static void* tl__maint_worker_entry(void* arg) {
          *-------------------------------------------------------------------*/
         TL_LOCK_MAINT(tl);
 
-        /* Predicate loop handles spurious wakeups.
+        /* Predicate loop handles spurious wakeups AND missed signals.
+         *
+         * Using timed wait (periodic wake) ensures the worker checks for
+         * pressure even if a signal was missed due to race conditions.
+         * Default interval: 100ms (from config.maintenance_wakeup_ms).
+         *
          * All fields are plain bools, read under maint_mu. */
         while (!tl->maint_shutdown &&
                !tl->flush_pending &&
                !tl->compact_pending) {
-            tl_cond_wait(&tl->maint_cond, &tl->maint_mu);
+            tl_cond_timedwait(&tl->maint_cond, &tl->maint_mu,
+                              tl->config.maintenance_wakeup_ms);
         }
 
         /* Check shutdown first (takes priority) */
@@ -1575,19 +1761,86 @@ static void* tl__maint_worker_entry(void* arg) {
         TL_UNLOCK_MAINT(tl);
 
         /*-------------------------------------------------------------------
-         * Phase 2: Execute flush work (outside maint_mu)
+         * Phase 2a: Read sealed queue length (OOO Scaling Phase 1)
          *
-         * Flush loop with fairness: after each flush batch, if compaction
-         * is needed, run one compaction step to prevent L0 growth.
+         * Check sealed queue to detect missed signals and enter flush-first
+         * mode when watermarks are enabled and pressure is high.
+         *-------------------------------------------------------------------*/
+        TL_LOCK_MEMTABLE(tl);
+        size_t sealed_len = tl_memtable_sealed_len(&tl->memtable);
+        TL_UNLOCK_MEMTABLE(tl);
+
+        /* Override missed signals: if work exists, do it */
+        if (sealed_len > 0) {
+            do_flush = true;
+        }
+
+        /* Check compaction heuristic only if there's pending flush work.
+         *
+         * Rationale: tl__compaction_needed() acquires writer_mu and may compute
+         * delete-debt (expensive segment scan). On idle periodic wakes with no
+         * pending work, this is wasted effort. We only check heuristics when:
+         * - do_compact is not already set (explicit request already handled)
+         * - do_flush is true (flush will create new L0 segments)
+         *
+         * CORRECTNESS: This gating is safe because compaction triggers (L0 count
+         * and delete-debt) can only change when new segments are created via flush.
+         * Tombstones from tl_delete_range() go into the memtable and don't affect
+         * segment-level delete-debt until flushed. Therefore, if there's no flush
+         * work pending, compaction triggers haven't changed since the last check.
+         *
+         * BEHAVIOR CHANGE: This means delete-debt compaction won't be checked on
+         * pure idle periodic wakes (no sealed runs). Users who require prompt
+         * delete-debt cleanup should ensure write activity continues or use
+         * tl_compact() for explicit compaction requests. */
+        if (!do_compact && do_flush) {
+            if (tl__compaction_needed(tl)) {
+                do_compact = true;
+            }
+        }
+
+        /*-------------------------------------------------------------------
+         * Phase 2b: Execute flush work (outside maint_mu)
+         *
+         * When watermarks are enabled and sealed_len >= hi_wm, enter
+         * flush-first mode: drain aggressively until <= lo_wm before
+         * allowing compaction. This breaks the "sealed-queue → writer stall"
+         * feedback loop under OOO workloads.
+         *
+         * Legacy behavior (watermarks disabled): flush one, check compaction.
          *-------------------------------------------------------------------*/
         if (do_flush) {
+            bool flush_first_mode = false;
+
+            /* Watermark check: if >= hi_wm, enter flush-first mode */
+            if (tl->watermarks_enabled && sealed_len >= tl->effective_sealed_hi_wm) {
+                flush_first_mode = true;
+                tl_atomic_inc_u64(&tl->flush_first_cycles);
+            }
+
             tl_status_t st;
             while ((st = tl__flush_one(tl)) == TL_OK) {
-                /* After successful flush, check if compaction needed.
-                 * If so, break to allow one compaction step (fairness). */
-                if (tl__compaction_needed(tl)) {
-                    do_compact = true;
-                    break;
+                /* Re-read sealed_len after each flush */
+                TL_LOCK_MEMTABLE(tl);
+                sealed_len = tl_memtable_sealed_len(&tl->memtable);
+                TL_UNLOCK_MEMTABLE(tl);
+
+                if (flush_first_mode) {
+                    /* Flush-first: drain until <= lo_wm */
+                    if (sealed_len <= tl->effective_sealed_lo_wm) {
+                        /* Pressure relieved, allow compaction */
+                        if (tl__compaction_needed(tl)) {
+                            do_compact = true;
+                        }
+                        break;
+                    }
+                    /* Continue flushing (no fairness check in flush-first mode) */
+                } else {
+                    /* Legacy fairness: flush one, check compaction */
+                    if (tl__compaction_needed(tl)) {
+                        do_compact = true;
+                        break;
+                    }
                 }
             }
 
@@ -1642,11 +1895,83 @@ static void* tl__maint_worker_entry(void* arg) {
          * - Explicit request (compact_pending was set)
          * - Automatic heuristic (tl__compaction_needed returned true during flush)
          *
+         * OOO Scaling Phase 1: Watermark-based deferral with safety valve.
+         * - Defer compaction if sealed > lo_wm (flush pressure high)
+         * - UNLESS L0 >= max_delta_segments (safety valve: force compaction)
+         *
          * Error handling mirrors flush: backoff on transient errors,
          * re-set compact_pending to ensure retry.
          *-------------------------------------------------------------------*/
         if (do_compact) {
-            tl_status_t st = tl__compact_one_step(tl);
+            tl_status_t st;
+
+            /* Re-read sealed_len for watermark check */
+            TL_LOCK_MEMTABLE(tl);
+            sealed_len = tl_memtable_sealed_len(&tl->memtable);
+            TL_UNLOCK_MEMTABLE(tl);
+
+            /* Get L0 count for safety valve.
+             *
+             * CRITICAL: Must use pin/read/release pattern to prevent UAF.
+             * Per tl_compact_needed() documentation: "reading manifest without
+             * writer_mu risks UAF since manifest is a plain pointer that can
+             * be freed after swap." The seqlock protects readers DURING a swap,
+             * but the manifest pointer itself can become dangling afterward. */
+            TL_LOCK_WRITER(tl);
+            tl_manifest_t* m_pinned = tl_manifest_acquire(tl->manifest);
+            TL_UNLOCK_WRITER(tl);
+
+            uint32_t l0_count = tl_manifest_l0_count(m_pinned);
+            tl_manifest_release(m_pinned);
+
+            /* Watermark check with HARD SAFETY VALVE:
+             * - Defer compaction if sealed > lo_wm (soft rule)
+             * - UNLESS L0 debt >= max_delta_segments (hard rule - MUST compact)
+             *
+             * SEMANTIC NOTE (delete-debt deferral):
+             * When watermark pressure is high (sealed > lo_wm) but L0 is below
+             * the safety cap, ALL compaction is deferred - including delete-debt
+             * triggered compaction. This means tombstones may remain in segments
+             * longer than delete_debt_threshold would normally allow.
+             *
+             * This is an intentional trade-off: we prioritize reducing writer
+             * stalls (via aggressive flush) over prompt tombstone cleanup. The
+             * safety valve ensures compaction eventually runs when L0 debt
+             * becomes critical. For workloads where delete-debt cleanup is
+             * time-sensitive, consider increasing max_delta_segments to trigger
+             * the safety valve earlier, or reducing watermark pressure by
+             * increasing sealed_max_runs. */
+            bool pressure_high = tl->watermarks_enabled &&
+                                 sealed_len > tl->effective_sealed_lo_wm;
+            bool l0_debt_critical = (l0_count >= tl->config.max_delta_segments);
+
+            if (pressure_high && !l0_debt_critical) {
+                /* Defer compaction: flush pressure too high, L0 debt acceptable */
+                tl_atomic_inc_u64(&tl->compaction_deferred);
+
+                /* Prevent busy-spin: set flush_pending if work exists,
+                 * remember to compact later via compact_pending */
+                TL_LOCK_MAINT(tl);
+                if (sealed_len > 0) {
+                    tl->flush_pending = true;  /* Try flushing instead */
+                }
+                tl->compact_pending = true;    /* Remember to compact later */
+                TL_UNLOCK_MAINT(tl);
+
+                /* Reset backoff since deferral is expected behavior, not an error.
+                 * Without this, a previous transient error's backoff would persist. */
+                backoff_ms = TL_MAINT_BACKOFF_INIT_MS;
+
+                /* Skip compaction this cycle - continue to next iteration */
+                continue;
+            }
+
+            /* Compact: either pressure is low OR L0 debt is critical */
+            if (l0_debt_critical && pressure_high) {
+                tl_atomic_inc_u64(&tl->compaction_forced);
+            }
+
+            st = tl__compact_one_step(tl);
 
             /* Handle transient errors with backoff */
             if (st == TL_ENOMEM || st == TL_EBUSY || st == TL_EINTERNAL) {
@@ -2079,13 +2404,42 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
      * Read from parent timelog instance with relaxed ordering.
      * These are monotonically increasing counters.
      */
-    const tl_timelog_t* tl = snap->parent;
+    tl_timelog_t* tl = (tl_timelog_t*)snap->parent;  /* Cast for lock macros */
     if (tl != NULL) {
-        out->seals_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->seals_total);
-        out->ooo_budget_hits = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->ooo_budget_hits);
-        out->backpressure_waits = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->backpressure_waits);
-        out->flushes_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->flushes_total);
-        out->compactions_total = tl_atomic_load_relaxed_u64(&((tl_timelog_t*)tl)->compactions_total);
+        out->seals_total = tl_atomic_load_relaxed_u64(&tl->seals_total);
+        out->ooo_budget_hits = tl_atomic_load_relaxed_u64(&tl->ooo_budget_hits);
+        out->backpressure_waits = tl_atomic_load_relaxed_u64(&tl->backpressure_waits);
+        out->flushes_total = tl_atomic_load_relaxed_u64(&tl->flushes_total);
+        out->compactions_total = tl_atomic_load_relaxed_u64(&tl->compactions_total);
+
+        /* OOO Scaling metrics (Phase 1) */
+        out->flush_first_cycles = tl_atomic_load_relaxed_u64(&tl->flush_first_cycles);
+        out->compaction_deferred_cycles = tl_atomic_load_relaxed_u64(&tl->compaction_deferred);
+        out->compaction_forced_cycles = tl_atomic_load_relaxed_u64(&tl->compaction_forced);
+
+        /* OOO Scaling metrics (Phase 2) */
+        out->reshape_compactions_total = tl_atomic_load_relaxed_u64(&tl->reshape_compactions_total);
+        out->rebase_publish_success = tl_atomic_load_relaxed_u64(&tl->rebase_publish_success);
+        out->rebase_publish_fallback = tl_atomic_load_relaxed_u64(&tl->rebase_publish_fallback);
+        out->window_bound_exceeded = tl_atomic_load_relaxed_u64(&tl->window_bound_exceeded);
+        out->rebase_l1_conflict = tl_atomic_load_relaxed_u64(&tl->rebase_l1_conflict);
+
+        /*
+         * Adaptive segmentation metrics (V-Next).
+         * Read under maint_mu for safe access to adaptive state.
+         *
+         * These are only populated when adaptive is enabled.
+         * When disabled (target_records == 0), values remain zero
+         * from the memset at the start.
+         */
+        if (tl->config.adaptive.target_records > 0) {
+            TL_LOCK_MAINT(tl);
+            out->adaptive_window = tl->effective_window_size;
+            out->adaptive_ewma_density = tl->adaptive.ewma_density;
+            out->adaptive_flush_count = tl->adaptive.flush_count;
+            out->adaptive_failures = tl->adaptive.consecutive_failures;
+            TL_UNLOCK_MAINT(tl);
+        }
     }
 
     return TL_OK;

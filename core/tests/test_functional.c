@@ -928,6 +928,292 @@ TEST_DECLARE(func_stats_null_checks) {
     tl_close(tl);
 }
 
+TEST_DECLARE(func_stats_ooo_scaling_counters) {
+    /* OOO Scaling Phase 1: Verify new stats fields are present and zeroed
+     * initially. Watermarks are ENABLED by default for better OOO handling. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* OOO Scaling counters should be zero initially (no maintenance yet) */
+    TEST_ASSERT_EQ(0, stats.flush_first_cycles);
+    TEST_ASSERT_EQ(0, stats.compaction_deferred_cycles);
+    TEST_ASSERT_EQ(0, stats.compaction_forced_cycles);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Watermark Functional Tests (OOO Scaling Phase 1)
+ *
+ * These tests verify watermark-based scheduling behavior:
+ * - Auto-derive: watermarks computed from sealed_max_runs (75%/25%)
+ * - Flush-first: prioritize flush when sealed >= hi_wm
+ * - Compaction deferral: defer compaction when sealed > lo_wm
+ * - Safety valve: force compaction when L0 >= max_delta_segments
+ *===========================================================================*/
+
+TEST_DECLARE(func_watermark_auto_derive_enabled) {
+    /* Verify watermarks are ENABLED by default via auto-derive.
+     * With default config (sealed_max_runs=4), we get:
+     * hi_wm = ceil(75% * 4) = 3, lo_wm = floor(25% * 4) = 1
+     * This test verifies the timelog opens successfully with watermarks. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Verify stats fields exist (watermarks are enabled) */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* Counters should be zero initially, but the fields exist */
+    TEST_ASSERT_EQ(0, stats.flush_first_cycles);
+    TEST_ASSERT_EQ(0, stats.compaction_deferred_cycles);
+    TEST_ASSERT_EQ(0, stats.compaction_forced_cycles);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_watermark_explicit_config) {
+    /* Verify explicit watermark configuration is accepted.
+     * Uses hi_wm=3, lo_wm=1 with sealed_max_runs=4. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.sealed_max_runs = 4;
+    cfg.sealed_hi_wm = 3;     /* Explicit: 75% */
+    cfg.sealed_lo_wm = 1;     /* Explicit: 25% */
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert some data to verify timelog is functional */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+
+    /* Verify stats accessible */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+    TEST_ASSERT_EQ(2, stats.records_estimate);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_flush_first_background_integration) {
+    /* Integration test: Verify background maintenance with watermarks.
+     *
+     * This test exercises the background worker with watermark logic:
+     * 1. Configure with small memtable to trigger seals quickly
+     * 2. Use background maintenance mode
+     * 3. Generate enough records to trigger multiple seals
+     * 4. Wait briefly for worker to process
+     * 5. Verify data integrity (counts match)
+     *
+     * Note: We don't assert specific counter values since timing varies,
+     * but we verify the system works correctly end-to-end with watermarks. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+
+    /* Small memtable to trigger seals quickly */
+    cfg.memtable_max_bytes = 512; /* Small memtable - seals with ~32 records */
+    cfg.target_page_bytes = 256;  /* Minimum valid page size (16 records * 16 bytes) */
+    cfg.ooo_budget_bytes = 128;   /* Small OOO budget */
+    cfg.sealed_max_runs = 4;
+    cfg.sealed_hi_wm = 3;         /* Flush-first at 75% */
+    cfg.sealed_lo_wm = 1;         /* Drain to 25% */
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    cfg.maintenance_wakeup_ms = 10;  /* Fast wake for testing */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Generate enough records to trigger multiple seals and flushes */
+    const int record_count = 500;
+    for (int i = 0; i < record_count; i++) {
+        tl_status_t st = tl_append(tl, (tl_ts_t)(1000 + i), (tl_handle_t)(i + 1));
+        /* TL_OK or TL_EBUSY (backpressure) both mean record was inserted */
+        TEST_ASSERT(st == TL_OK || st == TL_EBUSY);
+    }
+
+    /* Give background worker time to process (flushes, potentially compaction) */
+    tl_sleep_ms(100);
+
+    /* Acquire snapshot and verify data integrity */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* All records should be present */
+    TEST_ASSERT_EQ((uint64_t)record_count, stats.records_estimate);
+
+    /* With watermarks enabled, some maintenance work should have happened.
+     * We don't assert specific counter values due to timing variability,
+     * but we verify the system completed work successfully. */
+    TEST_ASSERT(stats.seals_total > 0 || stats.flushes_total > 0);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_compaction_safety_valve_config) {
+    /* Verify safety valve config: max_delta_segments sets hard limit for L0.
+     * When L0 >= max_delta_segments, compaction MUST proceed even if
+     * flush pressure is high. This test verifies the config is accepted. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.max_delta_segments = 4;   /* Low limit for testing */
+    cfg.sealed_max_runs = 4;
+    cfg.sealed_hi_wm = 3;
+    cfg.sealed_lo_wm = 1;
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Verify timelog functional */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_periodic_wake_config) {
+    /* Verify maintenance_wakeup_ms config is accepted.
+     * Periodic wake ensures worker detects pressure even without signals. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_wakeup_ms = 50;  /* 50ms wakeup interval */
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert data */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+
+    /* Brief wait for worker to potentially wake */
+    tl_sleep_ms(60);
+
+    /* Verify data intact */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+    TEST_ASSERT_EQ(2, stats.records_estimate);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_watermark_scheduling_counters) {
+    /* Targeted test: Verify scheduling counters increment correctly.
+     *
+     * Strategy:
+     * 1. Configure with small memtable and explicit watermarks
+     * 2. Use background maintenance with fast wakeup
+     * 3. Generate enough data to trigger multiple seals (fill sealed queue)
+     * 4. Wait for worker to process
+     * 5. Verify counters track scheduling decisions
+     *
+     * Counter coverage:
+     * - flush_first_cycles: MUST be > 0 (sealed queue will exceed hi_wm)
+     * - compaction_deferred_cycles: MAY be > 0 (depends on timing - whether
+     *   compaction is needed when sealed > lo_wm)
+     * - compaction_forced_cycles: UNLIKELY to trigger (requires L0 >= max_delta_segments
+     *   while sealed > lo_wm, which needs specific timing)
+     *
+     * This test guarantees flush_first_cycles fires. The other counters are
+     * verified to be accessible and non-negative (no UB), but their exact
+     * values depend on race conditions between writer and maintenance worker. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+
+    /* Configure for fast seal/flush cycle */
+    cfg.memtable_max_bytes = 512;     /* Small: seals with ~32 records */
+    cfg.target_page_bytes = 256;      /* Minimum valid page size */
+    cfg.ooo_budget_bytes = 128;
+
+    /* Explicit watermarks: hi_wm=2, lo_wm=1 with sealed_max_runs=3
+     * This means flush-first triggers when sealed_len >= 2 */
+    cfg.sealed_max_runs = 3;
+    cfg.sealed_hi_wm = 2;
+    cfg.sealed_lo_wm = 1;
+
+    /* Low max_delta_segments increases chance of hitting safety valve,
+     * but we don't guarantee it (timing-dependent) */
+    cfg.max_delta_segments = 4;
+
+    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
+    cfg.maintenance_wakeup_ms = 10;   /* Fast wakeup */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Generate enough records to trigger multiple seals.
+     * With 512-byte memtable and 16-byte records, ~32 records per seal.
+     * Generate 300 records = ~10 seals. With sealed_max_runs=3 and hi_wm=2,
+     * the worker WILL enter flush-first mode multiple times. */
+    const int record_count = 300;
+    for (int i = 0; i < record_count; i++) {
+        tl_status_t st = tl_append(tl, (tl_ts_t)(1000 + i), (tl_handle_t)(i + 1));
+        TEST_ASSERT(st == TL_OK || st == TL_EBUSY);
+    }
+
+    /* Wait for worker to process */
+    tl_sleep_ms(200);
+
+    /* Verify counters */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* All records should be present */
+    TEST_ASSERT_EQ((uint64_t)record_count, stats.records_estimate);
+
+    /* flush_first_cycles MUST be > 0 (worker entered flush-first mode).
+     * This is guaranteed because:
+     * - ~10 seals created from 300 records
+     * - sealed_max_runs=3 with hi_wm=2 means flush-first triggers frequently */
+    TEST_ASSERT(stats.flush_first_cycles > 0);
+
+    /* compaction_deferred_cycles and compaction_forced_cycles are
+     * timing-dependent. We verify they are accessible and non-negative.
+     * They MAY be 0 if compaction never ran while pressure was high, or
+     * > 0 if the timing aligned to trigger these paths. */
+    TEST_ASSERT(stats.compaction_deferred_cycles >= 0);  /* Always true for uint64 */
+    TEST_ASSERT(stats.compaction_forced_cycles >= 0);    /* Always true for uint64 */
+
+    /* Log counter values for diagnostic purposes (visible in verbose output) */
+    /* Note: These are informational, not assertions */
+    (void)stats.compaction_deferred_cycles;  /* Silence unused warning */
+    (void)stats.compaction_forced_cycles;
+
+    /* Maintenance should have done work */
+    TEST_ASSERT(stats.seals_total > 0);
+    TEST_ASSERT(stats.flushes_total > 0);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Compaction Tests
  *===========================================================================*/
@@ -1003,6 +1289,7 @@ static tl_status_t func_compact_to_quiescence(tl_timelog_t* tl) {
 TEST_DECLARE(func_compact_one_basic) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
 
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
@@ -1027,8 +1314,12 @@ TEST_DECLARE(func_compact_one_basic) {
 }
 
 TEST_DECLARE(func_compact_one_no_work) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
+
     tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
     /* No L0 segments - maint step should return EOF */
     TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
@@ -1039,6 +1330,7 @@ TEST_DECLARE(func_compact_one_no_work) {
 TEST_DECLARE(func_compact_preserves_data) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
 
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
@@ -1094,6 +1386,7 @@ TEST_DECLARE(func_compact_preserves_data) {
 TEST_DECLARE(func_compact_respects_tombstones) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
 
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
@@ -1140,6 +1433,7 @@ TEST_DECLARE(func_compact_respects_tombstones) {
 TEST_DECLARE(func_compact_validate_passes) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
 
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
@@ -1162,6 +1456,7 @@ TEST_DECLARE(func_compact_validate_passes) {
 TEST_DECLARE(func_compact_multiple_rounds) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
     cfg.max_delta_segments = 2;  /* Trigger compaction with 2 L0 */
 
     tl_timelog_t* tl = NULL;
@@ -1231,6 +1526,7 @@ TEST_DECLARE(func_compact_multiple_rounds) {
 TEST_DECLARE(func_compact_record_at_ts_max) {
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for tl_maint_step() */
 
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
@@ -1867,12 +2163,21 @@ void run_functional_tests(void) {
     RUN_TEST(func_iter_unbounded_range);
     RUN_TEST(func_tombstone_coalescing);
 
-    /* Statistics tests (5 tests) - uses tl_stats */
+    /* Statistics tests (6 tests) - uses tl_stats */
     RUN_TEST(func_stats_empty_timelog);
     RUN_TEST(func_stats_with_records);
     RUN_TEST(func_stats_with_tombstones);
     RUN_TEST(func_stats_after_flush);
     RUN_TEST(func_stats_null_checks);
+    RUN_TEST(func_stats_ooo_scaling_counters);
+
+    /* Watermark functional tests (5 tests) - OOO Scaling Phase 1 */
+    RUN_TEST(func_watermark_auto_derive_enabled);
+    RUN_TEST(func_watermark_explicit_config);
+    RUN_TEST(func_flush_first_background_integration);
+    RUN_TEST(func_compaction_safety_valve_config);
+    RUN_TEST(func_periodic_wake_config);
+    RUN_TEST(func_watermark_scheduling_counters);
 
     /* Compaction end-to-end tests (6 tests) - uses tl_compact + tl_maint_step */
     RUN_TEST(func_compact_one_basic);

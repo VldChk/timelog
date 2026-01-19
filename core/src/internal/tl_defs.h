@@ -25,7 +25,14 @@
 #define TL_DEFAULT_MEMTABLE_MAX_BYTES     ((size_t)1024 * 1024) /* 1 MiB */
 #define TL_DEFAULT_SEALED_MAX_RUNS        4
 #define TL_DEFAULT_SEALED_WAIT_MS         100
+#define TL_DEFAULT_MAINTENANCE_WAKEUP_MS  100   /* Periodic wake interval */
 #define TL_DEFAULT_MAX_DELTA_SEGMENTS     8
+
+/* Phase 2 OOO Scaling defaults */
+#define TL_DEFAULT_MAX_COMPACTION_WINDOWS   4    /* Bound compaction scope (was 0/unlimited) */
+#define TL_DEFAULT_RESHAPE_L0_THRESHOLD     12   /* L0 count to trigger reshape */
+#define TL_DEFAULT_RESHAPE_MAX_INPUTS       4    /* Max L0 inputs per reshape */
+#define TL_DEFAULT_RESHAPE_COOLDOWN_MAX     3    /* Max consecutive reshapes */
 
 /* Minimum page rows to prevent degenerate pages */
 #define TL_MIN_PAGE_ROWS                  16

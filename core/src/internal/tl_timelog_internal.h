@@ -21,6 +21,7 @@
 #include "tl_seqlock.h"
 #include "../delta/tl_memtable.h"
 #include "../storage/tl_manifest.h"
+#include "../maint/tl_adaptive.h"
 
 /* Forward declaration to avoid heavy include dependencies. */
 struct tl_memview_shared;
@@ -119,6 +120,15 @@ struct tl_timelog {
     tl_thread_t       maint_thread;     /* Worker thread handle (valid when RUNNING) */
 
     /*-----------------------------------------------------------------------
+     * Adaptive Segmentation State (V-Next)
+     *
+     * Protected by maint_mu. Single writer: maintenance thread only.
+     * Tracks EWMA density and failure counters for window adaptation.
+     * The authoritative window is `effective_window_size` (above).
+     *-----------------------------------------------------------------------*/
+    tl_adaptive_state_t adaptive;
+
+    /*-----------------------------------------------------------------------
      * Delta Layer (Phase 4)
      *-----------------------------------------------------------------------*/
 
@@ -150,6 +160,46 @@ struct tl_timelog {
     tl_atomic_u64   backpressure_waits; /* Writer blocked on sealed queue */
     tl_atomic_u64   flushes_total;      /* Flush operations completed */
     tl_atomic_u64   compactions_total;  /* Compaction operations completed */
+
+    /*-----------------------------------------------------------------------
+     * OOO Scaling Counters (Phase 1)
+     *
+     * Atomic counters for watermark-based scheduling metrics.
+     * Incremented by maintenance thread, read by stats queries.
+     *-----------------------------------------------------------------------*/
+    tl_atomic_u64   flush_first_cycles;   /* Times watermark triggered flush-first */
+    tl_atomic_u64   compaction_deferred;  /* Times compaction deferred (sealed > lo_wm) */
+    tl_atomic_u64   compaction_forced;    /* Times compaction forced (L0 debt cap) */
+
+    /*-----------------------------------------------------------------------
+     * OOO Scaling Counters (Phase 2)
+     *
+     * Atomic counters for reshape and rebase publish metrics.
+     * Incremented by maintenance thread, read by stats queries.
+     *-----------------------------------------------------------------------*/
+    tl_atomic_u64   reshape_compactions_total;  /* L0->L0 reshape operations */
+    tl_atomic_u64   rebase_publish_success;     /* Successful rebase publishes */
+    tl_atomic_u64   rebase_publish_fallback;    /* Rebase fell back to retry */
+    tl_atomic_u64   window_bound_exceeded;      /* Wide L0 exceeded cap (observability) */
+    tl_atomic_u64   rebase_l1_conflict;         /* Rebase rejected due to L1 conflict */
+
+    /*-----------------------------------------------------------------------
+     * Reshape Cooldown (protected by maint_mu)
+     *
+     * Tracks consecutive reshape operations to prevent infinite loops when
+     * workload is inherently wide. Reset to 0 after any L0→L1 compaction.
+     *-----------------------------------------------------------------------*/
+    uint32_t        consecutive_reshapes;
+
+    /*-----------------------------------------------------------------------
+     * Effective Watermarks (computed at init, immutable after)
+     *
+     * These are computed from config during normalize_config() and are
+     * read-only thereafter. No synchronization needed for reads.
+     *-----------------------------------------------------------------------*/
+    size_t          effective_sealed_hi_wm;
+    size_t          effective_sealed_lo_wm;
+    bool            watermarks_enabled;
 
 #ifdef TL_DEBUG
     /*-----------------------------------------------------------------------

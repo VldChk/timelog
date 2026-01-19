@@ -70,7 +70,11 @@ static int parse_time_unit(const char* s, tl_time_unit_t* out, int* was_set)
  */
 static int parse_maint_mode(const char* s, tl_maint_mode_t* out)
 {
-    if (s == NULL || strcmp(s, "disabled") == 0) {
+    if (s == NULL) {
+        *out = TL_MAINT_BACKGROUND;
+        return 0;
+    }
+    if (strcmp(s, "disabled") == 0) {
         *out = TL_MAINT_DISABLED;
         return 0;
     }
@@ -256,6 +260,20 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     self->closed = 0;
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
+
+    /* Auto-start maintenance when in background mode. */
+    if (self->maint_mode == TL_MAINT_BACKGROUND) {
+        st = tl_maint_start(self->tl);
+        if (st != TL_OK) {
+            tl_maint_stop(self->tl);
+            tl_close(self->tl);
+            self->tl = NULL;
+            self->closed = 1;
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            TlPy_RaiseFromStatus(st);
+            return -1;
+        }
+    }
 
     return 0;
 }

@@ -420,23 +420,28 @@ python/timelog/                   # Pure Python facade
 
 Where: K = component count, P = pages/component, M = result size, T = tombstones, S = segment records
 
-### Background Maintenance Trade-offs
+### Background Maintenance (Default)
 
-Background maintenance keeps segment count bounded but holds locks during merge.
-For bulk ingestion of **out-of-order data**, this causes significant contention.
+Background maintenance is **enabled by default** (`TL_MAINT_BACKGROUND`). The worker
+auto-starts in `tl_open()` and handles flush/compaction asynchronously. This is the
+right default for most use cases (streaming writes, typical workloads).
+
+For **bulk ingestion of out-of-order data**, background maintenance causes contention
+because compaction holds locks during merge.
 
 **OOO Profiling Results** (5M records, ~17% OOO rate):
 
 | Mode | Throughput | Slow Batches |
 |------|------------|--------------|
-| Background maintenance | 96K/s | 42% |
-| Sync-flush mode | 289K/s | 0% |
+| Background maintenance (default) | 96K/s | 42% |
+| Manual mode | 289K/s | 0% |
 
-**Recommendation for bulk OOO ingestion**:
+**Override for bulk OOO ingestion**:
 ```python
 Timelog(maintenance="disabled", busy_policy="flush")
 ```
 This is 3x faster because compaction of overlapping segments is expensive.
+After bulk ingestion, switch back to background maintenance for ongoing writes.
 
 ---
 
