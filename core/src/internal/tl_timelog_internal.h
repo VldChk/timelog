@@ -184,10 +184,15 @@ struct tl_timelog {
     tl_atomic_u64   rebase_l1_conflict;         /* Rebase rejected due to L1 conflict */
 
     /*-----------------------------------------------------------------------
-     * Reshape Cooldown (protected by maint_mu)
+     * Reshape Cooldown (maintenance thread only)
      *
      * Tracks consecutive reshape operations to prevent infinite loops when
      * workload is inherently wide. Reset to 0 after any L0→L1 compaction.
+     *
+     * CONCURRENCY: Read in tl__should_reshape and written in tl_compact_publish.
+     * Both are called only from the maintenance thread (maint_mu serialization)
+     * or from tl_maint_step which is documented as single-threaded. No locks
+     * are held during access; callers must ensure single-threaded usage.
      *-----------------------------------------------------------------------*/
     uint32_t        consecutive_reshapes;
 

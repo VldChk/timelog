@@ -21,14 +21,21 @@
  *
  * Phases:
  * 1. Trigger check (tl_compact_needed)
- * 2. Selection (tl_compact_select)
- * 3. Merge (tl_compact_merge)
- * 4. Publication (tl_compact_publish)
+ * 2. Selection (tl_compact_select) - window-bounded or greedy
+ * 3. Merge (tl_compact_merge) - k-way merge with tombstone filtering
+ * 4. Publication (tl_compact_publish) - with rebase support
+ *
+ * Phase 2 OOO Scaling Enhancements:
+ * - Window-bounded selection: anchor on oldest backlog, limit to max_compaction_windows
+ * - Reshape compaction (L0→L0): split wide L0s into window-contained pieces
+ * - Rebase publish: if manifest changed but inputs still exist, rebuild and publish
+ *   without full retry (tracks rebase_publish_success/fallback/l1_conflict stats)
  *
  * Thread Safety:
  * - Compaction is serialized externally by maint_mu (one compaction at a time)
  * - writer_mu held only during short publication phase
  * - Long-running merge happens without locks
+ * - consecutive_reshapes accessed only by maintenance thread (single-threaded)
  *
  * Handle Drop Callback Semantics:
  * - Callbacks are DEFERRED until AFTER successful publication
@@ -40,7 +47,7 @@
  * - User must implement their own epoch/RCU/hazard-pointer scheme if they
  *   need safe payload reclamation (see tl_on_drop_fn docs in timelog.h)
  *
- * Reference: timelog_v1_lld_compaction_policy.md
+ * Reference: timelog_v1_lld_compaction_policy.md, timelog_vnext_ooo_scaling_lld_c17.md
  *===========================================================================*/
 
 /* Forward declaration - actual struct in tl_timelog_internal.h */
@@ -117,6 +124,11 @@ typedef struct tl_compact_ctx {
      * When is_reshape is true, compaction produces L0 segments (not L1).
      * Reshape splits wide L0 segments into window-contained pieces without
      * merging with L1. This reduces fan-in for subsequent L0→L1 compaction.
+     *
+     * Tombstone handling: Records-only L0 segments are produced per window,
+     * plus ONE tombstone-only L0 segment containing the full tombstone union.
+     * This "Option B" approach avoids tombstone loss in gap windows (windows
+     * that have tombstones but no records).
      *-----------------------------------------------------------------------*/
     bool                is_reshape;      /* True if L0->L0 reshape mode */
     tl_segment_t**      output_l0;       /* Output L0 segments (reshape only) */

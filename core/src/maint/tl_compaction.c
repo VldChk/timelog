@@ -571,11 +571,17 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
 
         bool windows_exceed = false;
         if (max_windows > 0) {
-            if (cand_max_wid < cand_min_wid) {
-                return TL_EOVERFLOW;
+            /* Use overflow-safe subtraction.
+             * On overflow or inverted range (diff < 0): treat as exceeding window cap.
+             * This ensures we don't fail compaction - we just enforce the cap. */
+            int64_t diff;
+            if (tl_sub_overflow_i64(cand_max_wid, cand_min_wid, &diff) || diff < 0) {
+                windows_exceed = true;
+            } else {
+                /* Safe: diff >= 0 and fits in int64_t. (uint64_t)diff + 1 fits in uint64_t. */
+                uint64_t span = (uint64_t)diff + 1;
+                windows_exceed = (span > max_windows);
             }
-            uint64_t span = (uint64_t)(cand_max_wid - cand_min_wid) + 1;
-            windows_exceed = (span > max_windows);
         }
 
         size_t seg_bytes = 0;
@@ -744,10 +750,19 @@ static tl_status_t tl__compact_select_window_bounded(tl_compact_ctx_t* ctx,
             continue;
         }
 
-        /* Track if this single L0 exceeds window cap (observability) */
-        int64_t seg_span = seg_wid_max - seg_wid_min + 1;
-        if (seg_span > (int64_t)max_windows) {
+        /* Track if this single L0 exceeds window cap (observability).
+         * Use overflow-safe arithmetic to avoid UB. */
+        int64_t diff;
+        if (tl_sub_overflow_i64(seg_wid_max, seg_wid_min, &diff)) {
+            /* Overflow in subtraction means astronomical span - definitely exceeds */
             tl_atomic_inc_u64(&tl->window_bound_exceeded);
+        } else {
+            /* Safe: diff >= 0 since seg_wid_max >= seg_wid_min for overlapping segs.
+             * Add 1 for inclusive count, with overflow check. */
+            int64_t seg_span = (diff <= INT64_MAX - 1) ? diff + 1 : INT64_MAX;
+            if (seg_span > (int64_t)max_windows) {
+                tl_atomic_inc_u64(&tl->window_bound_exceeded);
+            }
         }
 
         /* Accept segment */
@@ -830,7 +845,7 @@ static bool tl__should_reshape(tl_timelog_t* tl, tl_manifest_t** out_manifest) {
         return false;
     }
 
-    /* Cooldown check (protected by caller holding maint_mu).
+    /* Cooldown check (single-threaded access via maintenance serialization).
      * Prevents infinite reshape loops when workload is inherently wide. */
     if (tl->consecutive_reshapes >= tl->config.reshape_cooldown_max) {
         return false;
@@ -844,13 +859,19 @@ static bool tl__should_reshape(tl_timelog_t* tl, tl_manifest_t** out_manifest) {
 
     /* Condition 2: Wide span triggers reshape (only if max_windows > 0).
      * When window-bounded compaction is enabled, reshape helps split wide
-     * L0s into manageable pieces before L0→L1 merge. */
+     * L0s into manageable pieces before L0→L1 merge.
+     *
+     * LIMITATION: This uses global L0 span (min/max across ALL L0 segments),
+     * not the span of the candidate window-bounded compaction. This can trigger
+     * reshape unnecessarily when a stale far-past segment exists while current
+     * backlog is narrow. A future optimization could compute span on the actual
+     * compaction candidate to focus reshape where it matters most. */
     uint64_t max_windows = (uint64_t)tl->config.max_compaction_windows;
     if (max_windows == 0) {
         return false;  /* Unlimited mode: no span-based trigger */
     }
 
-    /* Compute L0 span */
+    /* Compute global L0 span (see LIMITATION above) */
     tl_ts_t min_ts = TL_TS_MAX, max_ts = TL_TS_MIN;
     for (uint32_t i = 0; i < l0_count; i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(m, i);
@@ -868,8 +889,15 @@ static bool tl__should_reshape(tl_timelog_t* tl, tl_manifest_t** out_manifest) {
         return false;
     }
 
-    /* Calculate span (handle underflow defensively) */
-    uint64_t span = (max_wid >= min_wid) ? (uint64_t)(max_wid - min_wid) + 1 : 1;
+    /* Calculate span using overflow-safe arithmetic.
+     * If overflow occurs, span is astronomical - definitely exceeds. */
+    int64_t diff;
+    if (tl_sub_overflow_i64(max_wid, min_wid, &diff) || diff < 0) {
+        return true;  /* Overflow or inverted range - trigger reshape */
+    }
+    /* Safe: diff >= 0 and fits in int64_t (otherwise subtraction would overflow).
+     * Since diff <= INT64_MAX, (uint64_t)diff + 1 <= INT64_MAX + 1 which fits in uint64_t. */
+    uint64_t span = (uint64_t)diff + 1;
     return span > max_windows;
 }
 
@@ -1504,17 +1532,18 @@ cleanup:
  * Reshape merge differs from regular merge:
  * - Outputs L0 segments (not L1)
  * - Does NOT filter records by tombstones (all records preserved)
- * - Clips tombstones to each window and includes them in output L0
- * - Handles residual tombstones extending beyond output range
+ * - Emits records-only L0 segments per window (Option B approach)
+ * - Emits ONE tombstone-only L0 segment containing full tombstone union
+ * - This avoids tombstone loss in gap windows (windows with no records)
  *===========================================================================*/
 
 /**
- * Flush accumulated records AND clipped tombstones into an L0 segment.
+ * Flush accumulated records into an L0 segment (records only, no tombstones).
  * Used by reshape merge to produce window-contained L0 segments.
  *
  * @param ctx           Compaction context
  * @param records       Record accumulator to flush
- * @param all_tombs     Full tombstone set (will be clipped to window)
+ * @param all_tombs     Tombstone set to clip to window, or NULL for records-only
  * @param window_start  Window start bound (inclusive)
  * @param window_end    Window end bound (exclusive), or TL_TS_MAX if unbounded
  * @param end_unbounded True if this is the unbounded final window
@@ -1527,29 +1556,31 @@ static tl_status_t tl__flush_reshape_window(tl_compact_ctx_t* ctx,
                                              bool end_unbounded) {
     tl_status_t st;
 
-    /* Clip tombstones to this window */
+    /* Clip tombstones to this window (if provided) */
     tl_intervals_t window_tombs;
     tl_intervals_init(&window_tombs, ctx->alloc);
 
-    /* Copy all tombstones to window_tombs */
-    for (size_t i = 0; i < tl_intervals_len(all_tombs); i++) {
-        const tl_interval_t* t = tl_intervals_get(all_tombs, i);
-        if (t->end_unbounded) {
-            st = tl_intervals_insert_unbounded(&window_tombs, t->start);
-        } else {
-            st = tl_intervals_insert(&window_tombs, t->start, t->end);
+    /* Copy all tombstones to window_tombs (skip if NULL - records only mode) */
+    if (all_tombs != NULL) {
+        for (size_t i = 0; i < tl_intervals_len(all_tombs); i++) {
+            const tl_interval_t* t = tl_intervals_get(all_tombs, i);
+            if (t->end_unbounded) {
+                st = tl_intervals_insert_unbounded(&window_tombs, t->start);
+            } else {
+                st = tl_intervals_insert(&window_tombs, t->start, t->end);
+            }
+            if (st != TL_OK) {
+                tl_intervals_destroy(&window_tombs);
+                return st;
+            }
         }
-        if (st != TL_OK) {
-            tl_intervals_destroy(&window_tombs);
-            return st;
-        }
-    }
 
-    /* Clip to window bounds */
-    if (end_unbounded) {
-        tl_intervals_clip_lower(&window_tombs, window_start);
-    } else {
-        tl_intervals_clip(&window_tombs, window_start, window_end);
+        /* Clip to window bounds */
+        if (end_unbounded) {
+            tl_intervals_clip_lower(&window_tombs, window_start);
+        } else {
+            tl_intervals_clip(&window_tombs, window_start, window_end);
+        }
     }
 
     /* Skip if no records AND no tombstones (empty window) */
@@ -1610,75 +1641,51 @@ static tl_status_t tl__flush_reshape_window(tl_compact_ctx_t* ctx,
 }
 
 /**
- * Build residual tombstone L0 segment for reshape.
+ * Emit a tombstone-only L0 segment containing the full tombstone union.
  *
- * Residual tombstones are portions that extend beyond the output windows.
- * This is similar to tl__build_residual_tombstones but outputs to output_l0
- * instead of residual_tomb.
+ * CRITICAL FOR CORRECTNESS: This function ensures ALL tombstones from
+ * reshape inputs are preserved in a single segment. This is the safe
+ * approach (Option B from LLD) that avoids the complexity of per-window
+ * tombstone splitting which can drop tombstones in gap windows.
  *
- * @param ctx       Compaction context with tombs already computed
- * @param max_wid   Last window ID that was processed
+ * @param ctx  Compaction context with tombs already collected
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
  */
-static tl_status_t tl__build_reshape_residual_tombs(tl_compact_ctx_t* ctx,
-                                                      int64_t max_wid) {
+static tl_status_t tl__emit_full_tombstone_segment(tl_compact_ctx_t* ctx) {
     tl_status_t st;
 
-    /* Get bounds of last processed window */
-    tl_ts_t last_w_start, last_w_end;
-    bool last_unbounded;
-    tl_window_bounds(max_wid, ctx->window_size, ctx->window_origin,
-                     &last_w_start, &last_w_end, &last_unbounded);
-
-    /* If last window is unbounded, no residual possible */
-    if (last_unbounded) {
+    /* Skip if no tombstones */
+    if (tl_intervals_is_empty(&ctx->tombs)) {
         return TL_OK;
     }
 
-    /* Find tombstones extending beyond last_w_end */
-    tl_intervals_t residual;
-    tl_intervals_init(&residual, ctx->alloc);
-
-    for (size_t i = 0; i < tl_intervals_len(&ctx->tombs); i++) {
-        const tl_interval_t* t = tl_intervals_get(&ctx->tombs, i);
-
-        if (t->end_unbounded) {
-            /* Unbounded tombstone: residual starts at max(t->start, last_w_end) */
-            tl_ts_t res_start = TL_MAX(t->start, last_w_end);
-            st = tl_intervals_insert_unbounded(&residual, res_start);
-            if (st != TL_OK) {
-                tl_intervals_destroy(&residual);
-                return st;
-            }
-            break;  /* Unbounded covers everything after */
-        } else if (t->end > last_w_end) {
-            /* Bounded but extends past last window */
-            tl_ts_t res_start = TL_MAX(t->start, last_w_end);
-            if (res_start < t->end) {
-                st = tl_intervals_insert(&residual, res_start, t->end);
-                if (st != TL_OK) {
-                    tl_intervals_destroy(&residual);
-                    return st;
-                }
-            }
-        }
-    }
-
-    /* If no residual tombstones, nothing to do */
-    if (tl_intervals_is_empty(&residual)) {
-        tl_intervals_destroy(&residual);
-        return TL_OK;
-    }
-
-    /* Build tombstone-only L0 segment */
+    /* Ensure output L0 array capacity */
     st = tl__ensure_output_l0_capacity(ctx);
     if (st != TL_OK) {
-        tl_intervals_destroy(&residual);
         return st;
     }
 
-    size_t tomb_len = 0;
-    tl_interval_t* tomb_arr = tl_intervals_take(&residual, &tomb_len);
+    /* Extract tombstone array (makes a copy).
+     * Check for overflow before allocation - tl_segment_build_l0 requires
+     * tombstones_len to fit in uint32_t, and we must avoid size_t overflow. */
+    size_t tomb_len = tl_intervals_len(&ctx->tombs);
+    if (tomb_len > UINT32_MAX) {
+        return TL_EOVERFLOW;
+    }
+    if (tomb_len > SIZE_MAX / sizeof(tl_interval_t)) {
+        return TL_EOVERFLOW;
+    }
+    tl_interval_t* tomb_arr = tl__malloc(ctx->alloc, tomb_len * sizeof(tl_interval_t));
+    if (tomb_arr == NULL) {
+        return TL_ENOMEM;
+    }
 
+    for (size_t i = 0; i < tomb_len; i++) {
+        const tl_interval_t* t = tl_intervals_get(&ctx->tombs, i);
+        tomb_arr[i] = *t;
+    }
+
+    /* Build tombstone-only L0 segment */
     tl_segment_t* seg = NULL;
     st = tl_segment_build_l0(
         ctx->alloc,
@@ -1690,7 +1697,6 @@ static tl_status_t tl__build_reshape_residual_tombs(tl_compact_ctx_t* ctx,
     );
 
     tl__free(ctx->alloc, tomb_arr);
-    tl_intervals_destroy(&residual);
 
     if (st != TL_OK) {
         return st;
@@ -1707,9 +1713,15 @@ static tl_status_t tl__build_reshape_residual_tombs(tl_compact_ctx_t* ctx,
  *
  * Unlike regular merge:
  * - Does NOT filter records by tombstones (all records preserved)
- * - Outputs L0 segments partitioned by window
- * - Includes clipped tombstones in each output L0
- * - Handles residual tombstones extending beyond output range
+ * - Outputs L0 segments partitioned by window (records only)
+ * - Emits ONE tombstone-only segment containing the FULL tombstone union
+ *
+ * TOMBSTONE PRESERVATION (CRITICAL):
+ * This implementation uses the "Option B" approach from the LLD review:
+ * - Record segments are window-contained (one per window with records)
+ * - ALL tombstones are emitted in a single tombstone-only segment
+ * This is simpler and avoids the bug where per-window clipping drops
+ * tombstones in windows that have no records (gap windows).
  *
  * @param ctx  Context with selected reshape inputs (is_reshape must be true)
  * @return TL_OK on success, error code on failure
@@ -1793,9 +1805,6 @@ static tl_status_t tl__compact_merge_reshape(tl_compact_ctx_t* ctx) {
                       &current_window_start, &current_window_end,
                       &current_end_unbounded);
 
-    /* Track actual max window processed (for residual tombs) */
-    int64_t max_processed_wid = current_wid;
-
     /* Current window accumulator */
     tl_recvec_t window_records;
     tl_recvec_init(&window_records, ctx->alloc);
@@ -1835,8 +1844,10 @@ static tl_status_t tl__compact_merge_reshape(tl_compact_ctx_t* ctx) {
 
         /* If we've moved to a new window, flush the current window and jump */
         if (current_wid < rec_wid) {
-            /* Flush current window as L0 with clipped tombstones */
-            st = tl__flush_reshape_window(ctx, &window_records, &ctx->tombs,
+            /* Flush current window as L0 (records only - no tombstones).
+             * Tombstones are emitted separately in a single segment at the end
+             * to ensure none are lost in gap windows. */
+            st = tl__flush_reshape_window(ctx, &window_records, NULL,
                                            current_window_start, current_window_end,
                                            current_end_unbounded);
             if (st != TL_OK) {
@@ -1850,11 +1861,6 @@ static tl_status_t tl__compact_merge_reshape(tl_compact_ctx_t* ctx) {
                               &current_end_unbounded);
         }
 
-        /* Track max window seen */
-        if (rec_wid > max_processed_wid) {
-            max_processed_wid = rec_wid;
-        }
-
         /* Add record to current window accumulator */
         st = tl_recvec_push(&window_records, min_entry.ts, min_entry.handle);
         if (st != TL_OK) {
@@ -1862,8 +1868,8 @@ static tl_status_t tl__compact_merge_reshape(tl_compact_ctx_t* ctx) {
         }
     }
 
-    /* Flush final window */
-    st = tl__flush_reshape_window(ctx, &window_records, &ctx->tombs,
+    /* Flush final window (records only) */
+    st = tl__flush_reshape_window(ctx, &window_records, NULL,
                                    current_window_start, current_window_end,
                                    current_end_unbounded);
     if (st != TL_OK) {
@@ -1871,12 +1877,14 @@ static tl_status_t tl__compact_merge_reshape(tl_compact_ctx_t* ctx) {
     }
 
     /* ===================================================================
-     * Step 4: Handle residual tombstones
+     * Step 4: Emit ALL tombstones as a single tombstone-only segment
      *
-     * Tombstones extending beyond the last processed window need to be
-     * preserved in a separate tombstone-only L0 segment.
+     * CRITICAL CORRECTNESS FIX (Option B from LLD review):
+     * Instead of per-window tombstone clipping (which drops tombstones in
+     * gap windows), we emit the FULL tombstone union in a single segment.
+     * This ensures no tombstones are ever lost during reshape.
      * =================================================================== */
-    st = tl__build_reshape_residual_tombs(ctx, max_processed_wid);
+    st = tl__emit_full_tombstone_segment(ctx);
     if (st != TL_OK) {
         goto cleanup;
     }
@@ -2153,7 +2161,8 @@ do_swap:
 
     tl_seqlock_write_end(&tl->view_seq);
 
-    /* Update reshape cooldown counter (protected by writer_mu) */
+    /* Update reshape cooldown counter.
+     * Safe: maintenance is single-threaded (maint_mu serialization). */
     if (ctx->is_reshape) {
         tl->consecutive_reshapes++;
     } else {

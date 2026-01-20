@@ -282,7 +282,15 @@ typedef struct tl_config {
 
     double          delete_debt_threshold;  /* 0.0 => disabled */
     size_t          compaction_target_bytes;/* optional cap */
-    uint32_t        max_compaction_inputs;  /* optional cap */
+
+    /* Max L0 inputs per compaction (0 = unlimited, default).
+     *
+     * WARNING: Setting > 0 with tombstones may produce unexpected results.
+     * Partial overlap selection can remove tombstones from some inputs without
+     * applying them to all surviving segments in the window range. Recommended
+     * to keep at 0 unless tombstone semantics are not required. */
+    uint32_t        max_compaction_inputs;
+
     uint32_t        max_compaction_windows; /* default: 4 (0 = unlimited) */
 
     /* Phase 2 OOO Scaling: Reshape compaction tuning
@@ -295,11 +303,14 @@ typedef struct tl_config {
      * - L0 span exceeds max_compaction_windows (if max_compaction_windows > 0)
      *
      * Cooldown prevents infinite reshape loops when workload is inherently wide.
+     *
+     * Note: All reshape parameters follow "0 = use default" pattern, allowing
+     * zero-initialized configs to work correctly without calling init_defaults.
      */
     tl_compaction_strategy_t compaction_strategy;  /* default: AUTO */
-    uint32_t        reshape_l0_threshold;   /* L0 count to trigger reshape (default: 12) */
-    uint32_t        reshape_max_inputs;     /* Max L0 inputs for reshape (default: 4) */
-    uint32_t        reshape_cooldown_max;   /* Max consecutive reshapes before L0→L1 (default: 3) */
+    uint32_t        reshape_l0_threshold;   /* 0 or threshold (default: 12) */
+    uint32_t        reshape_max_inputs;     /* 0 or max inputs (default: 4) */
+    uint32_t        reshape_cooldown_max;   /* 0 or max reshapes (default: 3) */
 
     tl_adaptive_config_t adaptive;          /* Adaptive segmentation (zeros = disabled) */
 
@@ -563,7 +574,7 @@ typedef struct tl_stats {
      * Reshape and rebase publish metrics for OOO workload handling:
      * - reshape_compactions_total: L0→L0 reshape operations completed
      * - rebase_publish_success: Successful rebase publishes (manifest changed but inputs valid)
-     * - rebase_publish_fallback: Rebase fell back to full retry (inputs removed or L1 conflict)
+     * - rebase_publish_fallback: Rebase fell back to full retry (inputs removed from manifest)
      * - window_bound_exceeded: Single L0 span exceeded max_compaction_windows (observability)
      * - rebase_l1_conflict: Rebase rejected due to new L1 overlap conflict
      */

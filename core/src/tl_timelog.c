@@ -249,6 +249,12 @@ static tl_status_t validate_config(const tl_config_t* cfg) {
         return TL_EINVAL;
     }
 
+    /* Phase 2 OOO Scaling: compaction_strategy must be valid enum value */
+    if ((int)cfg->compaction_strategy < (int)TL_COMPACT_AUTO ||
+        (int)cfg->compaction_strategy > (int)TL_COMPACT_RESHAPE) {
+        return TL_EINVAL;
+    }
+
     return TL_OK;
 }
 
@@ -353,6 +359,22 @@ static void normalize_config(tl_timelog_t* tl) {
      * ======================================================================= */
     if (cfg->maintenance_wakeup_ms == 0) {
         cfg->maintenance_wakeup_ms = TL_DEFAULT_MAINTENANCE_WAKEUP_MS;
+    }
+
+    /* =======================================================================
+     * Step 5: Phase 2 OOO Scaling reshape parameters
+     *
+     * These follow the "0 = use default" pattern for consistency with other
+     * config values. This allows zero-initialized configs to work correctly.
+     * ======================================================================= */
+    if (cfg->reshape_l0_threshold == 0) {
+        cfg->reshape_l0_threshold = TL_DEFAULT_RESHAPE_L0_THRESHOLD;
+    }
+    if (cfg->reshape_max_inputs == 0) {
+        cfg->reshape_max_inputs = TL_DEFAULT_RESHAPE_MAX_INPUTS;
+    }
+    if (cfg->reshape_cooldown_max == 0) {
+        cfg->reshape_cooldown_max = TL_DEFAULT_RESHAPE_COOLDOWN_MAX;
     }
 }
 
@@ -525,6 +547,16 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl_atomic_init_u64(&tl->flush_first_cycles, 0);
     tl_atomic_init_u64(&tl->compaction_deferred, 0);
     tl_atomic_init_u64(&tl->compaction_forced, 0);
+
+    /* Initialize OOO Scaling counters (Phase 2) */
+    tl_atomic_init_u64(&tl->reshape_compactions_total, 0);
+    tl_atomic_init_u64(&tl->rebase_publish_success, 0);
+    tl_atomic_init_u64(&tl->rebase_publish_fallback, 0);
+    tl_atomic_init_u64(&tl->window_bound_exceeded, 0);
+    tl_atomic_init_u64(&tl->rebase_l1_conflict, 0);
+
+    /* Initialize reshape cooldown counter (protected by maint_mu) */
+    tl->consecutive_reshapes = 0;
 
     /* Initialize lifecycle state */
     tl->is_open = true;
