@@ -155,20 +155,6 @@ typedef enum tl_maint_mode {
 } tl_maint_mode_t;
 
 /**
- * Compaction strategy (Phase 2 OOO Scaling).
- *
- * Controls how compaction chooses between L0→L1 merge and L0→L0 reshape.
- * - AUTO: System chooses based on L0 span and count (recommended)
- * - L0_L1: Force standard compaction only (merge L0 into L1)
- * - RESHAPE: Force reshape only (split wide L0s into window-contained L0s)
- */
-typedef enum tl_compaction_strategy {
-    TL_COMPACT_AUTO    = 0,  /* Default: system chooses based on overlap */
-    TL_COMPACT_L0_L1   = 1,  /* Force L0->L1 merge only */
-    TL_COMPACT_RESHAPE = 2   /* Force L0->L0 reshape only */
-} tl_compaction_strategy_t;
-
-/**
  * Log verbosity levels (passed to log_fn callback).
  * Use TL_LOG_NONE in config to disable all logging.
  */
@@ -262,16 +248,6 @@ typedef struct tl_config {
     size_t          sealed_max_runs;        /* default: 4 */
     uint32_t        sealed_wait_ms;         /* default: 100 */
 
-    /* Watermark-based scheduling (OOO Scaling Phase 1)
-     * ENABLED by default for better out-of-order handling.
-     * Default (0,0): auto-derive as 75%/25% of sealed_max_runs.
-     * User can set explicit values to override.
-     * When enabled: lo_wm < hi_wm <= sealed_max_runs
-     * - hi_wm: High watermark - enter flush-first mode when sealed >= hi_wm
-     * - lo_wm: Low watermark - allow compaction when sealed <= lo_wm */
-    size_t          sealed_hi_wm;           /* default: 0 (auto: 75% of sealed_max_runs) */
-    size_t          sealed_lo_wm;           /* default: 0 (auto: 25% of sealed_max_runs) */
-
     /* Maintenance timing */
     uint32_t        maintenance_wakeup_ms;  /* default: 100 (periodic wake) */
 
@@ -283,23 +259,7 @@ typedef struct tl_config {
     double          delete_debt_threshold;  /* 0.0 => disabled */
     size_t          compaction_target_bytes;/* optional cap */
     uint32_t        max_compaction_inputs;  /* optional cap */
-    uint32_t        max_compaction_windows; /* default: 4 (0 = unlimited) */
-
-    /* Phase 2 OOO Scaling: Reshape compaction tuning
-     *
-     * Reshape (L0→L0) splits wide L0 segments into window-contained pieces.
-     * This reduces merge fan-in for subsequent L0→L1 compaction.
-     *
-     * Trigger conditions (OR logic):
-     * - L0 count >= reshape_l0_threshold, OR
-     * - L0 span exceeds max_compaction_windows (if max_compaction_windows > 0)
-     *
-     * Cooldown prevents infinite reshape loops when workload is inherently wide.
-     */
-    tl_compaction_strategy_t compaction_strategy;  /* default: AUTO */
-    uint32_t        reshape_l0_threshold;   /* L0 count to trigger reshape (default: 12) */
-    uint32_t        reshape_max_inputs;     /* Max L0 inputs for reshape (default: 4) */
-    uint32_t        reshape_cooldown_max;   /* Max consecutive reshapes before L0→L1 (default: 3) */
+    uint32_t        max_compaction_windows; /* default: 0 (unlimited) */
 
     tl_adaptive_config_t adaptive;          /* Adaptive segmentation (zeros = disabled) */
 
@@ -545,33 +505,6 @@ typedef struct tl_stats {
     double   adaptive_ewma_density;    /* EWMA density (records per time unit) */
     uint64_t adaptive_flush_count;     /* Flush count for density tracking */
     uint32_t adaptive_failures;        /* Consecutive compaction failures */
-
-    /* OOO Scaling metrics (Phase 1)
-     *
-     * Watermarks are ENABLED by default via auto-derive (when both sealed_hi_wm
-     * and sealed_lo_wm are 0 in config). These counters track scheduling decisions:
-     * - flush_first_cycles: High pressure triggered aggressive flush drain
-     * - compaction_deferred_cycles: Compaction postponed due to flush pressure
-     * - compaction_forced_cycles: Compaction forced despite pressure (L0 debt critical)
-     */
-    uint64_t flush_first_cycles;       /* Times watermark triggered flush-first mode */
-    uint64_t compaction_deferred_cycles; /* Times compaction deferred (sealed > lo_wm) */
-    uint64_t compaction_forced_cycles; /* Times compaction forced (L0 >= max_delta_segments) */
-
-    /* OOO Scaling metrics (Phase 2)
-     *
-     * Reshape and rebase publish metrics for OOO workload handling:
-     * - reshape_compactions_total: L0→L0 reshape operations completed
-     * - rebase_publish_success: Successful rebase publishes (manifest changed but inputs valid)
-     * - rebase_publish_fallback: Rebase fell back to full retry (inputs removed or L1 conflict)
-     * - window_bound_exceeded: Single L0 span exceeded max_compaction_windows (observability)
-     * - rebase_l1_conflict: Rebase rejected due to new L1 overlap conflict
-     */
-    uint64_t reshape_compactions_total;  /* L0->L0 reshape operations completed */
-    uint64_t rebase_publish_success;     /* Successful rebase publishes */
-    uint64_t rebase_publish_fallback;    /* Rebase fell back to full retry */
-    uint64_t window_bound_exceeded;      /* Wide L0 exceeded window cap (observability) */
-    uint64_t rebase_l1_conflict;         /* Rebase rejected due to L1 conflict */
 } tl_stats_t;
 
 TL_API tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);

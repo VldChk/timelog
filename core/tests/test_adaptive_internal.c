@@ -951,6 +951,94 @@ TEST_DECLARE(adapt_e2e_stats_enabled_window) {
     tl_close(tl);
 }
 
+TEST_DECLARE(adapt_e2e_compaction_commits_window) {
+    /*
+     * E2E test: Verify adaptive window is committed after successful compaction.
+     *
+     * This test exercises the flow:
+     * 1. Configure adaptive with known parameters
+     * 2. Append enough records to trigger multiple seals and flushes
+     * 3. Run flush/compaction cycle
+     * 4. Verify adaptive_window in stats reflects a computed window
+     *
+     * The key invariant: after compaction with adaptive enabled,
+     * effective_window_size is committed and visible in stats.
+     */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+
+    /* Configure adaptive with specific parameters for predictable behavior */
+    cfg.adaptive.target_records = 100;     /* Low target for quick test */
+    cfg.adaptive.min_window = 1000;        /* 1000 time units minimum */
+    cfg.adaptive.max_window = 1000000;     /* 1M time units maximum */
+    cfg.adaptive.alpha = 0.5;              /* Fast EWMA adaptation */
+    cfg.adaptive.warmup_flushes = 1;       /* Minimal warmup for test */
+    cfg.adaptive.hysteresis_pct = 0;       /* No hysteresis (accept all changes) */
+    cfg.adaptive.window_quantum = 100;     /* Snap to 100-unit boundaries */
+    cfg.adaptive.stale_flushes = 100;      /* Don't go stale during test */
+
+    /* Set base window_size within guardrails (fallback uses this).
+     * Default is 1 hour in ns which exceeds max_window. */
+    cfg.window_size = 50000;               /* Within [min_window, max_window] */
+
+    /* Small memtable to trigger seals quickly */
+    cfg.memtable_max_bytes = 512;
+    cfg.max_delta_segments = 2;            /* Trigger compaction at 2 L0 segments */
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Manual mode for control */
+
+    tl_timelog_t* tl = NULL;
+    tl_status_t st = tl_open(&cfg, &tl);
+    TEST_ASSERT_STATUS(TL_OK, st);
+
+    /* Append many records to ensure multiple seals.
+     * ~500 records at 16 bytes each = 8000 bytes >> 512 byte memtable.
+     * Spread across time range [0, 50000) for density calculation. */
+    for (int i = 0; i < 500; i++) {
+        tl_ts_t ts = i * 100;  /* 0, 100, 200, ... 49900 */
+        st = tl_append(tl, ts, (tl_handle_t)(uintptr_t)(i + 1));
+        TEST_ASSERT(st == TL_OK || st == TL_EBUSY);
+    }
+
+    /* Flush until all sealed runs are flushed */
+    for (int flush = 0; flush < 20; flush++) {
+        st = tl_flush(tl);
+        if (st == TL_EOF) break;
+        TEST_ASSERT_STATUS(TL_OK, st);
+    }
+
+    /* Run compaction to trigger adaptive window commit.
+     * Use tl_compact() (public API) followed by tl_maint_step() for manual mode. */
+    st = tl_compact(tl);  /* Sets pending flag */
+    TEST_ASSERT_STATUS(TL_OK, st);
+
+    /* Run maintenance step to execute the compaction */
+    st = tl_maint_step(tl);
+    /* TL_EOF is acceptable (no work needed), TL_OK means compaction ran */
+    TEST_ASSERT(st == TL_OK || st == TL_EOF);
+
+    /* Get stats and verify adaptive window was set */
+    tl_snapshot_t* snap = NULL;
+    st = tl_snapshot_acquire(tl, &snap);
+    TEST_ASSERT_STATUS(TL_OK, st);
+
+    tl_stats_t stats;
+    st = tl_stats(snap, &stats);
+    TEST_ASSERT_STATUS(TL_OK, st);
+
+    /* Verify adaptive is tracking:
+     * - adaptive_window should be positive (effective window was set)
+     * - Window should be within configured guardrails */
+    TEST_ASSERT(stats.adaptive_window > 0);
+    TEST_ASSERT(stats.adaptive_window >= cfg.adaptive.min_window);
+    TEST_ASSERT(stats.adaptive_window <= cfg.adaptive.max_window);
+
+    /* Verify window is snapped to quantum */
+    TEST_ASSERT(stats.adaptive_window % cfg.adaptive.window_quantum == 0);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Test Runner
  *===========================================================================*/
@@ -1065,4 +1153,5 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_e2e_open_valid_accepted);
     RUN_TEST(adapt_e2e_stats_disabled_zeros);
     RUN_TEST(adapt_e2e_stats_enabled_window);
+    RUN_TEST(adapt_e2e_compaction_commits_window);
 }

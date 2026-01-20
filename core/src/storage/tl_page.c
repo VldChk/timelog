@@ -278,24 +278,16 @@ bool tl_page_validate(const tl_page_t* page) {
      *
      * In V1, we do not emit FULLY_DELETED or PARTIAL_DELETED pages.
      * Any page with flags != FULLY_LIVE indicates corruption or bug.
+     *
+     * Invariant 4 (row_del consistency) is implicitly satisfied:
+     * FULLY_LIVE requires row_del == NULL, which is enforced at build time.
      */
     if (page->flags != TL_PAGE_FULLY_LIVE) {
         return false;
     }
 
-    /*
-     * Invariant 4: row_del consistency
-     *
-     * row_del non-NULL IFF flags == PARTIAL_DELETED
-     * Since V1 requires FULLY_LIVE (checked above), this is academic for V1,
-     * but we check it for forward compatibility with V2.
-     */
-    if (page->flags == TL_PAGE_PARTIAL_DELETED && page->row_del == NULL) {
-        /* PARTIAL_DELETED requires row_del to be set */
-        return false;
-    }
-    if (page->flags != TL_PAGE_PARTIAL_DELETED && page->row_del != NULL) {
-        /* row_del should only be set for PARTIAL_DELETED */
+    /* row_del must be NULL for FULLY_LIVE pages */
+    if (page->row_del != NULL) {
         return false;
     }
 

@@ -205,6 +205,13 @@ endif()
 
 add_test(NAME timelog_tests COMMAND test_timelog)
 
+# =============================================================================
+# Demo Targets
+# =============================================================================
+
+add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
+target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
+
 # Ensure ASan runtime DLL is discoverable when using Clang on Windows.
 if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
     execute_process(

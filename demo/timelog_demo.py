@@ -29,6 +29,8 @@ Options:
     --ingest-mode=MODE      Ingest measurement mode: end_to_end, parse_only, timelog_only
     --reuse-obj             Reuse a single Order object (isolates handle overhead)
     --no-tracemalloc        Disable tracemalloc (reduce measurement overhead)
+    --repeat-min-seconds=S  Repeat fast read-only features until >=S seconds (0 disables)
+    --repeat-max-runs=N     Max repeats for fast read-only features
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import sys
 import time
 import tracemalloc
@@ -61,6 +64,12 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     np = None
 
+# Optional psutil import for RSS memory and system resources.
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
+
 # =============================================================================
 # Performance Profiling Infrastructure
 # =============================================================================
@@ -76,6 +85,9 @@ class PerfMetrics:
     records: int = 0
     memory_peak_mb: float = 0.0
     memory_allocated_mb: float = 0.0
+    rss_start_mb: float = 0.0
+    rss_end_mb: float = 0.0
+    rss_delta_mb: float = 0.0
     gc_collections: tuple[int, int, int] = (0, 0, 0)  # gen0, gen1, gen2
 
     @property
@@ -117,6 +129,8 @@ class PerfProfiler:
         self._start_cpu: int = 0
         self._start_gc: tuple[int, int, int] = (0, 0, 0)
         self._mem_tracking: bool = False
+        self._rss_start_mb: float = 0.0
+        self._rss_end_mb: float = 0.0
         self.metrics: Optional[PerfMetrics] = None
         self.records: int = 0
 
@@ -140,6 +154,9 @@ class PerfProfiler:
             tracemalloc.start()
             self._mem_tracking = True
 
+        # Capture RSS after GC to reduce noise (if psutil available).
+        self._rss_start_mb = get_process_rss_mb()
+
         # Start timing (order matters - do timing last)
         self._start_cpu = time.process_time_ns()
         self._start_wall = time.perf_counter_ns()
@@ -158,6 +175,9 @@ class PerfProfiler:
             self._mem_tracking = False
         else:
             current = peak = 0
+
+        # Capture RSS at end (if psutil available).
+        self._rss_end_mb = get_process_rss_mb()
 
         # Get GC stats after
         if self.track_gc:
@@ -182,6 +202,9 @@ class PerfProfiler:
             records=self.records,
             memory_peak_mb=peak / (1024 * 1024),
             memory_allocated_mb=current / (1024 * 1024),
+            rss_start_mb=self._rss_start_mb,
+            rss_end_mb=self._rss_end_mb,
+            rss_delta_mb=self._rss_end_mb - self._rss_start_mb,
             gc_collections=gc_delta,
         )
 
@@ -207,6 +230,9 @@ class PerfProfiler:
             "ns_per_record": m.ns_per_record,
             "memory_peak_mb": m.memory_peak_mb,
             "memory_allocated_mb": m.memory_allocated_mb,
+            "rss_start_mb": m.rss_start_mb,
+            "rss_end_mb": m.rss_end_mb,
+            "rss_delta_mb": m.rss_delta_mb,
             "gc_gen0": m.gc_collections[0],
             "gc_gen1": m.gc_collections[1],
             "gc_gen2": m.gc_collections[2],
@@ -251,15 +277,59 @@ class PerfProfiler:
         return result
 
 
+def get_process_rss_mb() -> float:
+    """Get current process RSS memory in MB (0 if psutil unavailable)."""
+    if psutil is None:
+        return 0.0
+    try:
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _get_system_memory_info() -> dict:
+    """Best-effort system memory stats (requires psutil)."""
+    if psutil is None:
+        return {}
+    try:
+        vm = psutil.virtual_memory()
+        return {
+            "mem_total_gb": round(vm.total / (1024 ** 3), 2),
+            "mem_available_gb": round(vm.available / (1024 ** 3), 2),
+            "mem_percent": vm.percent,
+        }
+    except Exception:
+        return {}
+
+
+def _get_disk_usage_info(path: str) -> dict:
+    """Best-effort disk usage stats for the drive containing path."""
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "disk_total_gb": round(usage.total / (1024 ** 3), 2),
+            "disk_free_gb": round(usage.free / (1024 ** 3), 2),
+            "disk_used_gb": round(usage.used / (1024 ** 3), 2),
+        }
+    except Exception:
+        return {}
+
+
 def get_system_info() -> dict:
     """Capture system information for benchmark context."""
-    return {
+    info = {
         "python_version": sys.version,
         "platform": platform.platform(),
         "processor": platform.processor(),
         "cpu_count": os.cpu_count(),
         "machine": platform.machine(),
+        "psutil_available": psutil is not None,
     }
+    if psutil is not None:
+        info["psutil_version"] = getattr(psutil, "__version__", "unknown")
+    info.update(_get_system_memory_info())
+    info.update(_get_disk_usage_info(os.getcwd()))
+    return info
 
 
 class LatencyStats:
@@ -609,35 +679,41 @@ def load_orders(
     """
     count = 0
     skipped = 0
-    with _open_csv_source(data_path) as f:
-        if CSV_MODE == "trusted":
-            reader = csv.reader(f)
-            header = next(reader, None)
-            if header is None:
-                return
-            index_map = {}
-            for name in CSV_COLUMNS:
-                if name not in header:
-                    raise ValueError(f"missing column in trusted CSV: {name}")
-                index_map[name] = header.index(name)
+    try:
+        with _open_csv_source(data_path) as f:
+            if CSV_MODE == "trusted":
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    return
+                index_map = {}
+                for name in CSV_COLUMNS:
+                    if name not in header:
+                        raise ValueError(f"missing column in trusted CSV: {name}")
+                    index_map[name] = header.index(name)
 
-            for row in reader:
-                result = parse_order_trusted(row, index_map)
-                yield result
-                count += 1
-                if limit > 0 and count >= limit:
-                    break
-        else:
-            reader = csv.DictReader(f)
-            for row in reader:
-                result = parse_order(row)
-                if result is None:
-                    skipped += 1
-                    continue
-                yield result
-                count += 1
-                if limit > 0 and count >= limit:
-                    break
+                for row in reader:
+                    result = parse_order_trusted(row, index_map)
+                    yield result
+                    count += 1
+                    if limit > 0 and count >= limit:
+                        break
+            else:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    result = parse_order(row)
+                    if result is None:
+                        skipped += 1
+                        continue
+                    yield result
+                    count += 1
+                    if limit > 0 and count >= limit:
+                        break
+    except MemoryError as exc:
+        rss_mb = get_process_rss_mb()
+        raise MemoryError(
+            f"MemoryError while reading {data_path} (rss_mb={rss_mb:.1f})"
+        ) from exc
     if skipped > 0:
         print(f"  (Skipped {skipped:,} malformed rows)")
 
@@ -704,6 +780,9 @@ def _alternate_dataset_path(data_path: str) -> str | None:
 FEATURES: dict[str, dict] = {}
 SHARED_LOG_CATEGORIES = "BCFGHI"  # Categories that reuse a shared Timelog instance
 SELF_CONTAINED_CATEGORIES = "ADEJK"  # Categories that create their own Timelog instances
+REPEATABLE_CATEGORIES = SHARED_LOG_CATEGORIES  # Read-only categories safe to repeat
+DEFAULT_REPEAT_MIN_SECONDS = 0.25
+DEFAULT_REPEAT_MAX_RUNS = 10
 
 
 def feature(code: str, name: str, category: str):
@@ -738,6 +817,8 @@ class DemoRunner:
         reuse_obj: bool = False,
         track_memory: bool = True,
         track_gc: bool = True,
+        repeat_min_seconds: float = DEFAULT_REPEAT_MIN_SECONDS,
+        repeat_max_runs: int = DEFAULT_REPEAT_MAX_RUNS,
     ):
         self.data_path = data_path
         self.limit = 100_000 if quick else 0
@@ -749,6 +830,8 @@ class DemoRunner:
         self.reuse_obj = reuse_obj
         self.track_memory = track_memory
         self.track_gc = track_gc
+        self.repeat_min_seconds = repeat_min_seconds
+        self.repeat_max_runs = repeat_max_runs
         self.results: dict[str, dict] = {}
         self.log: Optional[Timelog] = None
         self._data_loaded = False
@@ -783,6 +866,35 @@ class DemoRunner:
 
         print(f"  Loaded {total:,} records total")
         self._data_loaded = True
+
+    def _run_feature_with_repeats(
+        self,
+        func: Callable[["DemoRunner"], dict],
+        repeatable: bool,
+    ) -> tuple[dict, int, int]:
+        """Run a feature, repeating if it is fast and safe to retry."""
+        iterations = 0
+        total_records = 0
+        result: dict = {}
+        start = time.perf_counter()
+
+        while True:
+            result = func(self)
+            iterations += 1
+            records = result.get("records", 0)
+            if isinstance(records, (int, float)):
+                total_records += int(records)
+
+            if "error" in result:
+                break
+            if not repeatable:
+                break
+            if iterations >= self.repeat_max_runs:
+                break
+            if time.perf_counter() - start >= self.repeat_min_seconds:
+                break
+
+        return result, iterations, total_records
 
     def run_feature(self, code: str) -> dict:
         """Run a single feature and collect results."""
@@ -823,16 +935,31 @@ class DemoRunner:
                 result = f["func"](self)
                 result["expected"] = f["expected"]
             else:
+                repeatable = (
+                    self.repeat_min_seconds > 0
+                    and self.repeat_max_runs > 1
+                    and f["category"] in REPEATABLE_CATEGORIES
+                )
                 with PerfProfiler(
                     code,
                     f["expected"],
                     track_memory=self.track_memory,
                     track_gc=self.track_gc,
                 ) as profiler:
-                    result = f["func"](self)
-                    profiler.records = result.get("records", 0)
+                    result, iterations, total_records = self._run_feature_with_repeats(
+                        f["func"],
+                        repeatable,
+                    )
+                    profiler.records = total_records
                 perf_result = profiler.report()
                 result.update(perf_result)
+                if repeatable and iterations > 1 and "error" not in result:
+                    result["iterations"] = iterations
+                    result["records_per_run"] = (
+                        total_records / iterations if iterations else 0
+                    )
+                    result["repeat_min_seconds"] = self.repeat_min_seconds
+                    result["repeat_max_runs"] = self.repeat_max_runs
 
             self.results[code] = result
 
@@ -889,6 +1016,19 @@ class DemoRunner:
         print("  | MEMORY" + " " * 53 + "|")
         print(f"  |   Peak:           {result.get('memory_peak_mb', 0):>10.1f} MB" + " " * 27 + "|")
         print(f"  |   Allocated:      {result.get('memory_allocated_mb', 0):>10.1f} MB" + " " * 27 + "|")
+        rss_start = result.get("rss_start_mb", 0)
+        rss_end = result.get("rss_end_mb", 0)
+        rss_delta = result.get("rss_delta_mb", 0)
+        print(
+            f"  |   RSS start/end:  {rss_start:>10.1f}/{rss_end:>10.1f} MB"
+            + " " * 14
+            + "|"
+        )
+        print(
+            f"  |   RSS delta:      {rss_delta:>10.1f} MB"
+            + " " * 25
+            + "|"
+        )
         gc0 = result.get("gc_gen0", 0)
         gc1 = result.get("gc_gen1", 0)
         gc2 = result.get("gc_gen2", 0)
@@ -998,6 +1138,9 @@ def export_results_csv(results: dict, path: Path) -> None:
         "records_per_sec",
         "ns_per_record",
         "memory_peak_mb",
+        "rss_start_mb",
+        "rss_end_mb",
+        "rss_delta_mb",
         "gc_gen0",
         "expected_rps",
         "ratio",
@@ -1028,6 +1171,9 @@ def export_results_csv(results: dict, path: Path) -> None:
                 "records_per_sec": rps,
                 "ns_per_record": r.get("ns_per_record", 0),
                 "memory_peak_mb": r.get("memory_peak_mb", 0),
+                "rss_start_mb": r.get("rss_start_mb", 0),
+                "rss_end_mb": r.get("rss_end_mb", 0),
+                "rss_delta_mb": r.get("rss_delta_mb", 0),
                 "gc_gen0": r.get("gc_gen0", 0),
                 "expected_rps": exp_rps,
                 "ratio": rps / exp_rps if exp_rps > 0 else 0,
@@ -1046,6 +1192,18 @@ def print_system_info(info: dict, config: Optional[dict] = None) -> None:
     print(f"  Platform:  {info.get('platform', 'unknown')}")
     print(f"  Processor: {info.get('processor', 'unknown')}")
     print(f"  CPU Count: {info.get('cpu_count', 'unknown')}")
+    if info.get("psutil_available"):
+        print(f"  psutil:    {info.get('psutil_version', 'unknown')}")
+    if "mem_total_gb" in info:
+        print(
+            f"  Memory:    {info.get('mem_available_gb')} GB free / "
+            f"{info.get('mem_total_gb')} GB total ({info.get('mem_percent')}%)"
+        )
+    if "disk_free_gb" in info:
+        print(
+            f"  Disk:      {info.get('disk_free_gb')} GB free / "
+            f"{info.get('disk_total_gb')} GB total"
+        )
     if config:
         print("-" * 80)
         print("RUN CONFIG")
@@ -2935,6 +3093,18 @@ def main():
         action="store_true",
         help="Disable tracemalloc to reduce measurement overhead",
     )
+    parser.add_argument(
+        "--repeat-min-seconds",
+        type=float,
+        default=DEFAULT_REPEAT_MIN_SECONDS,
+        help="Repeat fast read-only features until this duration (0 disables)",
+    )
+    parser.add_argument(
+        "--repeat-max-runs",
+        type=int,
+        default=DEFAULT_REPEAT_MAX_RUNS,
+        help="Max repeats for fast read-only features",
+    )
 
     args = parser.parse_args()
 
@@ -2962,6 +3132,8 @@ def main():
         "ingest_mode": args.ingest_mode,
         "reuse_obj": args.reuse_obj,
         "tracemalloc": not args.no_tracemalloc,
+        "repeat_min_seconds": args.repeat_min_seconds,
+        "repeat_max_runs": args.repeat_max_runs,
     }
     print_system_info(system_info, run_config)
 
@@ -2983,6 +3155,8 @@ def main():
         reuse_obj=args.reuse_obj,
         track_memory=not args.no_tracemalloc,
         track_gc=not args.no_tracemalloc,
+        repeat_min_seconds=args.repeat_min_seconds,
+        repeat_max_runs=args.repeat_max_runs,
     )
 
     print()

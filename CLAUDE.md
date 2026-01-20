@@ -522,3 +522,178 @@ py -3.14 -m pytest python/tests/ -v
 4. Prefer immutability
 5. Test boundary conditions
 6. Remember: **NO DISK I/O** — everything is in memory
+
+---
+
+## Windows Tooling (CRITICAL - Read This First!)
+
+**STOP! This project runs on Windows.** Tools are NOT in PATH. You MUST use full paths.
+
+### Tool Locations (Verified January 2026)
+
+| Tool | Full Path | Version |
+|------|-----------|---------|
+| Python | `py -V:3.13` (launcher) | 3.13.9 |
+| clang | `/c/Program Files/LLVM/bin/clang.exe` | 21.1.8 |
+| clang-tidy | `/c/Program Files/LLVM/bin/clang-tidy.exe` | 21.1.8 |
+| cppcheck | `/c/Program Files/Cppcheck/cppcheck.exe` | 2.19.0 |
+
+---
+
+### Python - ALWAYS Use `py -V:3.13`
+
+```bash
+# ✅ CORRECT - Windows py launcher with version
+py -V:3.13 script.py
+py -V:3.13 -m pytest python/tests/ -v
+py -V:3.13 -m pip install -e .
+py -V:3.13 combine_sources.py
+
+# ❌ WRONG - These DO NOT work on this system
+python script.py        # "not found"
+python3 script.py       # "not found"
+py -3 script.py         # May pick wrong version
+py script.py            # May pick wrong version
+```
+
+**Why `-V:3.13`?** Multiple Python versions installed. The `-V:` flag is the ONLY reliable way to get the right one.
+
+---
+
+### CMake Builds
+
+```bash
+# Configure (once per build dir)
+cmake -B build-test -G "Visual Studio 17 2022" -A x64
+
+# Build
+cmake --build build-test --config Debug
+
+# Run tests - MUST have "-C Debug" on Windows!
+ctest --test-dir build-test -C Debug --output-on-failure
+
+# Run test exe directly (see detailed output)
+U:/Projects/timelog/build-test/Debug/test_timelog.exe 2>&1 | tail -20
+```
+
+**Critical:** Without `-C Debug`, ctest on Windows finds no tests!
+
+---
+
+### cppcheck - Full Path Required
+
+```bash
+# ✅ WORKING COMMAND (tested)
+"/c/Program Files/Cppcheck/cppcheck.exe" \
+    --enable=warning,style \
+    --std=c17 \
+    --suppress=missingIncludeSystem \
+    -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src \
+    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
+
+# Scan entire core/src directory
+"/c/Program Files/Cppcheck/cppcheck.exe" \
+    --enable=warning,style \
+    --std=c17 \
+    --suppress=missingIncludeSystem \
+    -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src \
+    U:/Projects/timelog/core/src/ 2>&1 | head -100
+```
+
+**Note:** Use `-I` with FULL paths. Relative paths often fail in bash on Windows.
+
+---
+
+### clang-tidy - Full Path + Specific Flags
+
+```bash
+# ✅ WORKING COMMAND (tested) - bugprone + analyzer checks
+"/c/Program Files/LLVM/bin/clang-tidy.exe" \
+    U:/Projects/timelog/core/src/maint/tl_compaction.c \
+    --checks='-*,bugprone-*,clang-analyzer-*' \
+    -- -std=c17 \
+    -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src \
+    -D_CRT_SECURE_NO_WARNINGS 2>&1 | head -50
+
+# Useful check sets:
+#   bugprone-*           - Common bugs (NULL deref, use-after-move, etc.)
+#   clang-analyzer-*     - Deep static analysis
+#   performance-*        - Performance issues
+#   readability-*        - Code style (noisy, skip usually)
+#   modernize-*          - C++ only, skip for C
+
+# ❌ AVOID these noisy checks:
+#   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling  # memset/memcpy spam
+#   -bugprone-easily-swappable-parameters  # Too noisy for allocator callbacks
+```
+
+**Critical flags:**
+- `-D_CRT_SECURE_NO_WARNINGS` - Silences MSVC secure function warnings
+- `-- -std=c17` - The `--` separates clang-tidy flags from compiler flags
+
+---
+
+### clang Static Analyzer
+
+```bash
+# Direct analysis on single file
+"/c/Program Files/LLVM/bin/clang.exe" \
+    --analyze \
+    -Xanalyzer -analyzer-output=text \
+    -std=c17 \
+    -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src \
+    -D_CRT_SECURE_NO_WARNINGS \
+    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
+
+# scan-build (wraps full build) - less reliable on Windows
+"/c/Program Files/LLVM/bin/scan-build.bat" \
+    cmake --build build-test --config Debug
+```
+
+---
+
+### Common Pitfalls (Save Yourself Time!)
+
+| Problem | Wrong | Right |
+|---------|-------|-------|
+| Python not found | `python script.py` | `py -V:3.13 script.py` |
+| clang not found | `clang-tidy file.c` | `"/c/Program Files/LLVM/bin/clang-tidy.exe" file.c` |
+| cppcheck not found | `cppcheck file.c` | `"/c/Program Files/Cppcheck/cppcheck.exe" file.c` |
+| Relative includes fail | `-I core/include` | `-I U:/Projects/timelog/core/include` |
+| ctest finds no tests | `ctest --test-dir build` | `ctest --test-dir build -C Debug` |
+| Path with spaces | `cd C:\Program Files\...` | `cd "/c/Program Files/..."` |
+| Backslashes in bash | `U:\Projects\timelog` | `U:/Projects/timelog` |
+
+---
+
+### Copy-Paste Quick Reference
+
+```bash
+# Build and test (the daily workflow)
+cmake --build U:/Projects/timelog/build-test --config Debug && \
+ctest --test-dir U:/Projects/timelog/build-test -C Debug --output-on-failure
+
+# Quick test count
+U:/Projects/timelog/build-test/Debug/test_timelog.exe 2>&1 | grep "Test Results"
+
+# Run Python tests
+py -V:3.13 -m pytest U:/Projects/timelog/python/tests/ -v
+
+# cppcheck quick scan
+"/c/Program Files/Cppcheck/cppcheck.exe" --enable=warning --std=c17 \
+    --suppress=missingIncludeSystem \
+    -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src \
+    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
+
+# clang-tidy quick scan
+"/c/Program Files/LLVM/bin/clang-tidy.exe" \
+    U:/Projects/timelog/core/src/maint/tl_compaction.c \
+    --checks='-*,bugprone-*,clang-analyzer-*' \
+    -- -std=c17 -I U:/Projects/timelog/core/include \
+    -I U:/Projects/timelog/core/src -D_CRT_SECURE_NO_WARNINGS 2>&1 | head -50
+```

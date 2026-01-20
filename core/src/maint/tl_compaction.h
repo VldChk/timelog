@@ -110,18 +110,6 @@ typedef struct tl_compact_ctx {
     tl_ts_t             output_max_ts;
     int64_t             output_min_wid;  /* First output window ID */
     int64_t             output_max_wid;  /* Last output window ID (inclusive) */
-
-    /*-----------------------------------------------------------------------
-     * Phase 2 OOO Scaling: Reshape support
-     *
-     * When is_reshape is true, compaction produces L0 segments (not L1).
-     * Reshape splits wide L0 segments into window-contained pieces without
-     * merging with L1. This reduces fan-in for subsequent L0→L1 compaction.
-     *-----------------------------------------------------------------------*/
-    bool                is_reshape;      /* True if L0->L0 reshape mode */
-    tl_segment_t**      output_l0;       /* Output L0 segments (reshape only) */
-    size_t              output_l0_len;
-    size_t              output_l0_cap;
 } tl_compact_ctx_t;
 
 /*===========================================================================
@@ -226,15 +214,6 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
  *
  * Convenience function that runs select -> merge -> publish.
  * On TL_EBUSY from publish, retries up to max_retries times.
- *
- * Phase 2 OOO Scaling: Supports AUTO/RESHAPE/L0_L1 strategies.
- * In AUTO mode, may trigger reshape (L0→L0) or L0→L1 based on
- * segment count, window span, and cooldown counter.
- *
- * CONCURRENCY: This function accesses tl->consecutive_reshapes
- * without holding writer_mu, relying on external serialization.
- * When called from the maintenance worker (normal case), maint_mu
- * provides serialization. Direct calls must be externally serialized.
  *
  * @param tl          Timelog instance
  * @param max_retries Max publish retries (default 3)
