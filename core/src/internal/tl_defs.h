@@ -11,10 +11,10 @@
 
 /*===========================================================================
  * Timestamp Bounds
+ *
+ * TL_TS_MIN and TL_TS_MAX are defined in the public header (timelog.h)
+ * which is already included above. No redefinition here to avoid warnings.
  *===========================================================================*/
-
-#define TL_TS_MIN  INT64_MIN
-#define TL_TS_MAX  INT64_MAX
 
 /*===========================================================================
  * Size Constants
@@ -93,7 +93,21 @@ typedef struct tl_maint_state   tl_maint_state_t;
  * Internal Helper Macros
  *===========================================================================*/
 
-/* Safe minimum/maximum */
+/**
+ * Minimum/Maximum macros.
+ *
+ * WARNING: Arguments are evaluated multiple times!
+ * NEVER pass expressions with side effects (e.g., i++, function calls).
+ * Only pass simple values or variables.
+ *
+ * Safe:   TL_MIN(a, b)           TL_MAX(arr[i], limit)
+ * UNSAFE: TL_MIN(i++, j)         TL_MAX(get_value(), 0)
+ *
+ * Rationale: C17 lacks typeof/generics for safe type-generic inline functions.
+ * These macros work for any ordered type (int64_t, size_t, etc.) which is
+ * essential for this codebase. The double-evaluation is acceptable given
+ * the constraint above.
+ */
 #define TL_MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define TL_MAX(a, b) (((a) > (b)) ? (a) : (b))
 

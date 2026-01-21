@@ -30,6 +30,11 @@
  * - writer_mu held only during short publication phase
  * - Long-running merge happens without locks
  *
+ * Trigger Coupling with Flush (Background Mode):
+ * - tl_compact_needed() is only called when flush work is pending
+ * - This is safe because compaction triggers depend on segment state
+ * - See tl_compact_needed() documentation for full details
+ *
  * Handle Drop Callback Semantics:
  * - Callbacks are DEFERRED until AFTER successful publication
  * - During merge, dropped records are collected but NOT fired
@@ -144,6 +149,40 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  *
  * Briefly acquires writer_mu to pin manifest (prevents UAF).
  * This is an advisory check; selection re-validates.
+ *
+ * Flush/Compaction Trigger Coupling (Background Mode):
+ * =====================================================
+ * In background mode, the worker loop only calls this function when:
+ *   - do_flush is true (flush work pending), AND
+ *   - do_compact is false (compact_pending was NOT already set)
+ *
+ * See tl_timelog.c:1749: `if (!do_compact && do_flush)`
+ *
+ * This is an optimization based on the invariant:
+ *
+ *   "Compaction triggers can only change when segments change"
+ *
+ * Segment state changes only via:
+ * - Flush: creates new L0 segments (increases L0 count, adds tombstones)
+ * - Compaction: removes L0/L1, creates L1 (decreases L0 count)
+ *
+ * On idle periodic wakes with no pending work, calling this is wasteful
+ * because triggers are unchanged from the previous check.
+ *
+ * When compact_pending is already set (explicit tl_compact() request), this
+ * function is SKIPPED because we already know compaction should run.
+ *
+ * IMPORTANT: This coupling means delete-debt compaction won't be triggered
+ * on pure idle wakes without write activity. Users wanting prompt delete-debt
+ * response should either:
+ * - Use tl_compact() for explicit compaction requests
+ * - Ensure continued write activity
+ *
+ * This coupling does NOT affect:
+ * - Explicit requests via compact_pending flag (bypasses this check entirely)
+ * - Manual mode (tl_maint_step always checks triggers unconditionally)
+ *
+ * Reference: tl_timelog.c worker loop (tl__maint_worker_entry)
  */
 bool tl_compact_needed(const tl_timelog_t* tl);
 

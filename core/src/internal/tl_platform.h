@@ -139,6 +139,28 @@
 #endif
 
 /*===========================================================================
+ * TL_VERIFY: Runtime verification for OS primitives
+ *
+ * Unlike TL_ASSERT (which becomes TL_ASSUME in release, potentially causing UB),
+ * TL_VERIFY always performs the check and aborts on failure.
+ *
+ * Use TL_VERIFY for:
+ * - OS primitive return values (pthread_mutex_lock, etc.)
+ * - Conditions where failure indicates system corruption
+ * - Situations where TL_ASSUME would cause UB if violated
+ *
+ * In debug: Uses TL_ASSERT for file/line info in error messages
+ * In release: Explicit abort() - deterministic crash, no UB
+ *===========================================================================*/
+
+#ifdef TL_DEBUG
+    #define TL_VERIFY(cond) TL_ASSERT(cond)
+#else
+    #include <stdlib.h>
+    #define TL_VERIFY(cond) do { if (!(cond)) abort(); } while(0)
+#endif
+
+/*===========================================================================
  * Prefetch Hints
  *===========================================================================*/
 

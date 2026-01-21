@@ -123,7 +123,15 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
  * Frees dynamically allocated memory (sources, tombstones).
  * Does NOT release the snapshot - caller is responsible for that.
  *
- * @param plan  Plan to destroy
+ * Idempotent: Safe to call on:
+ * - NULL plan pointer (no-op)
+ * - Zeroed plan (e.g., from memset(0)) - all NULL checks pass
+ * - Already-destroyed plan (pointers set to NULL after free)
+ *
+ * This enables simpler cleanup paths: callers can unconditionally call
+ * destroy() without checking initialization state.
+ *
+ * @param plan  Plan to destroy (may be NULL or zeroed)
  */
 void tl_plan_destroy(tl_plan_t* plan);
 

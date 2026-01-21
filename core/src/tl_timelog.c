@@ -210,12 +210,32 @@ static tl_status_t validate_config(const tl_config_t* cfg) {
         return TL_EINVAL;
     }
 
+    /* Log level must be valid (TL_LOG_NONE = -1 is special "disable" value).
+     * TL_LOG_ERROR = 0 to TL_LOG_TRACE = 4 are valid levels. */
+    if (cfg->log_level != TL_LOG_NONE &&
+        ((int)cfg->log_level < (int)TL_LOG_ERROR ||
+         (int)cfg->log_level > (int)TL_LOG_TRACE)) {
+        return TL_EINVAL;
+    }
+
     /* Validate adaptive segmentation config.
      * tl_adaptive_config_validate() returns TL_OK if disabled (target_records == 0).
      * Otherwise, it validates min/max guardrails, alpha, and other parameters. */
     tl_status_t adapt_st = tl_adaptive_config_validate(&cfg->adaptive);
     if (adapt_st != TL_OK) {
         return adapt_st;
+    }
+
+    /* Validate allocator: if custom allocator is provided, realloc_fn is required.
+     *
+     * Rationale: Many internal structures (heap, recvec, intervals) use realloc
+     * for growth. If realloc_fn is NULL, tl__realloc() returns NULL which causes
+     * TL_ENOMEM errors - misleading since it's a configuration error, not OOM.
+     *
+     * We detect "custom allocator" by checking if malloc_fn is non-NULL.
+     * If malloc_fn is provided without realloc_fn, reject early with clear error. */
+    if (cfg->allocator.malloc_fn != NULL && cfg->allocator.realloc_fn == NULL) {
+        return TL_EINVAL;
     }
 
     return TL_OK;
@@ -317,12 +337,23 @@ static tl_status_t init_locks(tl_timelog_t* tl) {
         return s;
     }
 
+    s = tl_cond_init(&tl->memtable_cond);
+    if (s != TL_OK) {
+        tl_mutex_destroy(&tl->memtable_mu);
+        tl_cond_destroy(&tl->maint_cond);
+        tl_mutex_destroy(&tl->maint_mu);
+        tl_mutex_destroy(&tl->flush_mu);
+        tl_mutex_destroy(&tl->writer_mu);
+        return s;
+    }
+
     tl_seqlock_init(&tl->view_seq);
 
     return TL_OK;
 }
 
 static void destroy_locks(tl_timelog_t* tl) {
+    tl_cond_destroy(&tl->memtable_cond);
     tl_mutex_destroy(&tl->memtable_mu);
     tl_cond_destroy(&tl->maint_cond);
     tl_mutex_destroy(&tl->maint_mu);
@@ -500,8 +531,18 @@ void tl_close(tl_timelog_t* tl) {
     /* Stop maintenance worker before closing (Phase 7).
      * tl_maint_stop() is idempotent and works for any mode.
      * We do this BEFORE setting is_open = false because tl_maint_stop
-     * doesn't check is_open (allowing cleanup flexibility). */
-    tl_maint_stop(tl);
+     * doesn't check is_open (allowing cleanup flexibility).
+     *
+     * CRITICAL: If join fails (TL_EINTERNAL), worker thread may still be
+     * running. Proceeding to destroy locks would cause memory corruption.
+     * Fail-fast is the safest option. */
+    tl_status_t stop_st = tl_maint_stop(tl);
+    if (stop_st == TL_EINTERNAL) {
+        TL_LOG_ERROR("tl_close: worker join failed, aborting to prevent corruption");
+        TL_ASSERT_MSG(false, "tl_maint_stop() join failed during tl_close()");
+        /* If assertions disabled in release, abort anyway */
+        abort();
+    }
 
     /* Mark as closed (prevents further operations) */
     tl->is_open = false;
@@ -565,7 +606,7 @@ static void tl__maint_request_flush(tl_timelog_t* tl);
  * @param tl          Timelog instance
  * @param need_signal Output: true if caller should signal maintenance worker
  * @return TL_OK if seal succeeded or not needed,
- *         TL_EBUSY if caller should trigger flush (manual mode only)
+ *         TL_EBUSY if backpressure occurred (write succeeded, do not retry)
  */
 static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
                                                   bool* need_signal) {
@@ -583,10 +624,10 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         tl_atomic_inc_u64(&tl->ooo_budget_hits);
     }
 
-    /* Try to seal */
+    /* Try to seal (no signal: seal GROWS queue, not frees space) */
     tl_status_t seal_st = tl_memtable_seal(&tl->memtable,
                                             &tl->memtable_mu,
-                                            &tl->maint_cond);
+                                            NULL);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
@@ -595,8 +636,11 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     }
 
     if (seal_st != TL_EBUSY) {
-        /* Unexpected error */
-        return seal_st;
+        /* Seal failed with error other than queue-full (e.g., TL_ENOMEM).
+         * Write already succeeded (this function is called post-insert),
+         * so return TL_EBUSY to prevent caller from retrying → duplicates.
+         * Waiting for queue space won't help - this isn't a capacity issue. */
+        return TL_EBUSY;
     }
 
     /* TL_EBUSY: sealed queue is full */
@@ -614,7 +658,7 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     TL_LOCK_MEMTABLE(tl);
     bool have_space = tl_memtable_wait_for_space(&tl->memtable,
                                                    &tl->memtable_mu,
-                                                   &tl->maint_cond,
+                                                   &tl->memtable_cond,
                                                    tl->config.sealed_wait_ms);
     TL_UNLOCK_MEMTABLE(tl);
 
@@ -622,24 +666,39 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     TL_LOCK_WRITER(tl);
 
     if (!have_space) {
-        /* Timeout waiting for space - still return TL_OK since write succeeded.
-         * The next write will also try to seal/wait. */
-        return TL_OK;
+        /* Timeout waiting for space. Write succeeded, but backpressure exceeded.
+         * Return TL_EBUSY to signal caller (consistent with manual mode).
+         * Caller should NOT retry - record is already in memtable. */
+        return TL_EBUSY;
     }
 
-    /* Retry seal now that we have space */
+    /* Retry seal now that we have space (no signal: seal GROWS queue) */
     seal_st = tl_memtable_seal(&tl->memtable,
                                 &tl->memtable_mu,
-                                &tl->maint_cond);
+                                NULL);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
         *need_signal = true;
+        return TL_OK;
     }
-    /* Ignore any error - write succeeded, this is best-effort */
-    return TL_OK;
+
+    /* Seal failed after write succeeded. Return TL_EBUSY to signal backpressure.
+     * We don't propagate TL_ENOMEM because:
+     * 1. The write DID succeed (record is in memtable)
+     * 2. Returning ENOMEM might cause caller to retry, creating duplicates
+     * 3. Seal failure is just a form of backpressure - maintenance will handle it */
+    return TL_EBUSY;
 }
 
+/*
+ * API Guard Pattern:
+ * All public write/query APIs that require an open timelog validate:
+ *   - tl != NULL     -> TL_EINVAL
+ *   - tl->is_open    -> TL_ESTATE
+ * This pattern is intentionally kept explicit (not factored into a helper)
+ * for debuggability and clarity. See Section 8.2 of internal_review_task_list.md.
+ */
 tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     if (tl == NULL) {
         return TL_EINVAL;
@@ -699,6 +758,13 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     st = tl_memtable_insert_batch(&tl->memtable, records, n, flags);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
+        /* Partial insert may have occurred before failure (slow path can fail
+         * mid-batch). Return TL_EBUSY instead of raw error to prevent caller
+         * from retrying entire batch and creating duplicates.
+         * TL_EINVAL is a true pre-insert failure (bad input), so pass through. */
+        if (st == TL_ENOMEM || st == TL_EOVERFLOW) {
+            return TL_EBUSY;
+        }
         return st;
     }
 
@@ -724,8 +790,11 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     }
 
     /* Validate range: half-open interval [t1, t2) must not be negative.
-     * - t1 == t2: Empty range, allowed as no-op (no work, returns TL_OK)
+     * - t1 == t2: Empty range, early return as no-op (no work, avoids lock)
      * - t1 > t2:  Invalid negative range, rejected as TL_EINVAL */
+    if (t1 == t2) {
+        return TL_OK;  /* Empty range is no-op */
+    }
     if (t1 > t2) {
         return TL_EINVAL;
     }
@@ -816,21 +885,120 @@ static tl_status_t tl__compact_one_step(tl_timelog_t* tl) {
 
 /*===========================================================================
  * Flush Implementation
+ *
+ * Uses "rebase publish" pattern (same as compaction) to minimize writer_mu
+ * critical section. All allocations happen OFF-LOCK; under lock we only do
+ * pointer comparison and swap.
  *===========================================================================*/
+
+/**
+ * Attempt to publish a pre-built L0 segment to manifest.
+ *
+ * Uses "rebase publish" pattern from compaction (tl_compaction.c:1206-1277):
+ * 1. Capture base manifest (brief writer_mu lock to acquire ref)
+ * 2. Build new manifest OFF-LOCK (all allocations here)
+ * 3. Validate and swap under writer_mu (NO ALLOCATION)
+ *
+ * @param tl   Timelog instance
+ * @param mr   Pinned memrun (caller holds reference)
+ * @param seg  Pre-built L0 segment (caller holds reference)
+ * @return TL_OK     Success, seg ref released (manifest owns it), mr released
+ *         TL_EBUSY  Manifest changed (concurrent compaction), retry needed
+ *                   seg NOT released (caller retries or releases)
+ *                   mr NOT released (caller handles)
+ *         Other     Error, seg released here, mr NOT released
+ */
+static tl_status_t flush_publish(tl_timelog_t* tl, tl_memrun_t* mr, tl_segment_t* seg) {
+    tl_status_t st;
+
+    /* Step 1: Capture base manifest (brief lock, acquire ref).
+     * Per Codex review: must pin under writer_mu to prevent ABA/UAF. */
+    TL_LOCK_WRITER(tl);
+    tl_manifest_t* base = tl->manifest;
+    tl_manifest_acquire(base);
+    TL_UNLOCK_WRITER(tl);
+
+    /* Step 2: Build new manifest OFF-LOCK (all allocations here).
+     * Per engineering rule: "keep writer_mu short; never do expensive work." */
+    tl_manifest_builder_t builder;
+    tl_manifest_builder_init(&builder, &tl->alloc, base);
+    st = tl_manifest_builder_add_l0(&builder, seg);
+    if (st != TL_OK) {
+        tl_manifest_builder_destroy(&builder);
+        tl_manifest_release(base);
+        tl_segment_release(seg);
+        return st;
+    }
+
+    tl_manifest_t* new_manifest = NULL;
+    st = tl_manifest_builder_build(&builder, &new_manifest);
+    tl_manifest_builder_destroy(&builder);
+    if (st != TL_OK) {
+        tl_manifest_release(base);
+        tl_segment_release(seg);
+        return st;
+    }
+
+    /* Step 3: Validate and swap under lock (NO ALLOCATION beyond this point). */
+    TL_LOCK_WRITER(tl);
+
+    if (tl->manifest != base) {
+        /* Concurrent compaction changed manifest - retry needed.
+         * This is rare but possible when compaction publishes between
+         * our base capture (step 1) and this validation. */
+        TL_UNLOCK_WRITER(tl);
+        tl_manifest_release(new_manifest);
+        tl_manifest_release(base);
+        /* NOTE: seg NOT released - caller will retry with it */
+        return TL_EBUSY;
+    }
+
+    /* Swap manifest under seqlock */
+    tl_seqlock_write_begin(&tl->view_seq);
+    tl_manifest_t* old = tl->manifest;
+    tl->manifest = new_manifest;
+
+    /* Remove memrun from sealed queue INSIDE seqlock critical section.
+     * This ensures atomicity: no snapshot sees BOTH segment AND memrun.
+     * Lock ordering (writer_mu -> memtable_mu) is respected per hierarchy. */
+    TL_LOCK_MEMTABLE(tl);
+    tl_memtable_pop_oldest(&tl->memtable, &tl->memtable_cond);
+    TL_UNLOCK_MEMTABLE(tl);
+
+    tl_seqlock_write_end(&tl->view_seq);
+    TL_UNLOCK_WRITER(tl);
+
+    /* Release old references (safe after unlock).
+     * Note: old == base at this point (we verified tl->manifest == base above). */
+    tl_manifest_release(base);  /* Our captured reference */
+    tl_manifest_release(old);   /* The swapped-out manifest */
+    tl_memrun_release(mr);      /* Caller's pin - successful publish consumes it */
+
+    /* Release caller's segment ref. The manifest builder acquired its own ref
+     * when we called tl_manifest_builder_add_l0(), so the segment is now owned
+     * by the new manifest. Without this release, each flush leaks one segment. */
+    tl_segment_release(seg);
+
+    tl_atomic_inc_u64(&tl->flushes_total);
+    return TL_OK;
+}
 
 /**
  * Flush a single memrun to L0 segment and publish to manifest.
  *
- * Algorithm (from plan_phase5.md Section 3.2):
- * 1. Build L0 segment OFF-LOCK (expensive)
- * 2. Under writer_mu + seqlock:
- *    - Swap manifest to include new L0
- *    - Pop memrun from sealed queue (INSIDE seqlock for atomicity)
- * 3. Release old references (after unlock)
+ * Algorithm (revised for "rebase publish" pattern):
+ * 1. Acquire generation under writer_mu (brief)
+ * 2. Build L0 segment OFF-LOCK (expensive, only once)
+ * 3. Publish with retry loop (manifest may become stale)
+ *
+ * Retry rationale: Concurrent compaction can change manifest between our
+ * base capture and publish. We use same retry limit (3) as compaction.
  *
  * @param tl  Timelog instance
- * @param mr  Pinned memrun (caller holds reference, we release it on success)
- * @return TL_OK on success, error otherwise
+ * @param mr  Pinned memrun (caller holds reference)
+ * @return TL_OK     Success (mr released)
+ *         TL_EBUSY  Retries exhausted (mr NOT released - caller handles)
+ *         TL_ENOMEM Build failed (mr NOT released)
  */
 static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     TL_ASSERT(tl != NULL);
@@ -839,12 +1007,14 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     tl_status_t st;
 
     /* Step 1: Acquire generation under writer_mu to prevent races.
-     * We only need the lock briefly to get a unique generation. */
+     * We only need the lock briefly to get a unique generation.
+     * Note: flush_mu is held by caller, serializing generation assignment
+     * per Codex review (prevents generation ordering issues on retry). */
     TL_LOCK_WRITER(tl);
     uint32_t gen = tl->next_gen++;
     TL_UNLOCK_WRITER(tl);
 
-    /* Step 2: Build L0 segment OFF-LOCK (expensive operation) */
+    /* Step 2: Build L0 segment OFF-LOCK (expensive, only once) */
     tl_flush_ctx_t ctx = {
         .alloc = &tl->alloc,
         .target_page_bytes = tl->config.target_page_bytes,
@@ -854,58 +1024,28 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     tl_segment_t* seg = NULL;
     st = tl_flush_build(&ctx, mr, &seg);
     if (st != TL_OK) {
-        return st;
+        return st;  /* mr NOT released - caller handles */
     }
 
-    /* Step 3: Publication under writer_mu + seqlock */
-    TL_LOCK_WRITER(tl);
-    tl_seqlock_write_begin(&tl->view_seq);
-
-    /* Build new manifest with L0 segment added */
-    tl_manifest_builder_t builder;
-    tl_manifest_builder_init(&builder, &tl->alloc, tl->manifest);
-    st = tl_manifest_builder_add_l0(&builder, seg);
-    if (st != TL_OK) {
-        tl_manifest_builder_destroy(&builder);
-        tl_seqlock_write_end(&tl->view_seq);
-        TL_UNLOCK_WRITER(tl);
-        tl_segment_release(seg);
-        return st;
+    /* Step 3: Publish with retry (manifest may become stale during build).
+     * Use same retry limit (3) as compaction for consistency.
+     * flush_mu is held by caller, serializing this entire operation. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        st = flush_publish(tl, mr, seg);
+        if (st != TL_EBUSY) {
+            /* Success or hard error - either way, we're done.
+             * On success: flush_publish released mr and transferred seg.
+             * On error: flush_publish released seg, we return error. */
+            return st;
+        }
+        /* TL_EBUSY: manifest changed by concurrent compaction.
+         * seg is still valid (not released on EBUSY) - retry with it. */
     }
 
-    tl_manifest_t* new_manifest = NULL;
-    st = tl_manifest_builder_build(&builder, &new_manifest);
-    tl_manifest_builder_destroy(&builder);
-    if (st != TL_OK) {
-        tl_seqlock_write_end(&tl->view_seq);
-        TL_UNLOCK_WRITER(tl);
-        tl_segment_release(seg);
-        return st;
-    }
-
-    /* Swap manifest */
-    tl_manifest_t* old_manifest = tl->manifest;
-    tl->manifest = new_manifest;
-
-    /* Remove memrun from sealed queue INSIDE seqlock critical section.
-     * This ensures atomicity: no snapshot sees BOTH segment AND memrun.
-     * Lock ordering (writer_mu -> memtable_mu) is respected per hierarchy.
-     */
-    TL_LOCK_MEMTABLE(tl);
-    tl_memtable_pop_oldest(&tl->memtable, &tl->maint_cond);
-    TL_UNLOCK_MEMTABLE(tl);
-
-    tl_seqlock_write_end(&tl->view_seq);
-    TL_UNLOCK_WRITER(tl);
-
-    /* Step 3: Release old references (safe after unlock) */
-    tl_manifest_release(old_manifest);
-    tl_memrun_release(mr);  /* Release our pin from peek_oldest */
-
-    /* Increment flush counter */
-    tl_atomic_inc_u64(&tl->flushes_total);
-
-    return TL_OK;
+    /* Exhausted retries (rare: concurrent compaction storm).
+     * Release segment, but NOT mr - caller must release it. */
+    tl_segment_release(seg);
+    return TL_EBUSY;
 }
 
 /*===========================================================================
@@ -930,7 +1070,8 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
  * @return TL_OK     - One memrun flushed successfully
  *         TL_EOF    - No sealed memruns to flush
  *         TL_ENOMEM - Build failed (memrun preserved for retry)
- *         TL_EINTERNAL - Publication failed
+ *         TL_EBUSY  - Publish retries exhausted (rare: concurrent compaction
+ *                     storm; memrun preserved for retry on next cycle)
  *===========================================================================*/
 static tl_status_t tl__flush_one(tl_timelog_t* tl) {
     TL_ASSERT(tl != NULL);
@@ -1027,9 +1168,10 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
         TL_LOCK_WRITER(tl);
         bool need_seal = !tl_memtable_is_active_empty(&tl->memtable);
         if (need_seal) {
+            /* No signal: seal GROWS queue, manual mode has no backpressure waiters */
             st = tl_memtable_seal(&tl->memtable,
                                    &tl->memtable_mu,
-                                   &tl->maint_cond);
+                                   NULL);
             if (st != TL_OK && st != TL_EBUSY) {
                 TL_UNLOCK_WRITER(tl);
                 TL_UNLOCK_FLUSH(tl);
@@ -1150,7 +1292,6 @@ tl_status_t tl_compact(tl_timelog_t* tl) {
     if (tl == NULL) {
         return TL_EINVAL;
     }
-
     if (!tl->is_open) {
         return TL_ESTATE;
     }
@@ -1731,9 +1872,10 @@ static void* tl__maint_worker_entry(void* arg) {
             }
 
             /* Handle transient errors: backoff sleep to prevent CPU spin.
-             * Both ENOMEM (memory pressure) and EINTERNAL (publication failure)
-             * may be transient and benefit from backoff before retry. */
-            if (st == TL_ENOMEM || st == TL_EINTERNAL) {
+             * ENOMEM (memory pressure), EBUSY (publish retries exhausted due to
+             * concurrent compaction storm), and EINTERNAL (publication failure)
+             * may all be transient and benefit from backoff before retry. */
+            if (st == TL_ENOMEM || st == TL_EBUSY || st == TL_EINTERNAL) {
                 tl_sleep_ms(backoff_ms);
                 backoff_ms = (backoff_ms * 2 > TL_MAINT_BACKOFF_MAX_MS)
                            ? TL_MAINT_BACKOFF_MAX_MS : backoff_ms * 2;
@@ -1753,6 +1895,7 @@ static void* tl__maint_worker_entry(void* arg) {
             /* Re-signal if more work remains.
              * This handles:
              * - ENOMEM: retry after backoff (memory may free up)
+             * - EBUSY: retry after backoff (compaction storm may subside)
              * - EINTERNAL: retry after backoff (transient issue may resolve)
              * - TL_OK: broke for compaction fairness, more memruns may exist
              *
@@ -2327,48 +2470,19 @@ tl_status_t tl_validate(const tl_snapshot_t* snap) {
 }
 
 /*===========================================================================
- * Publication Protocol Helpers (Phase 1)
+ * Publication Protocol Note
  *
- * These functions implement the atomic publication pattern used by both
- * flush and compaction. The actual publish work is done between
- * tl__publish_begin() and tl__publish_end().
+ * Both flush and compaction publish paths use direct seqlock calls rather
+ * than combined helpers. This is intentional because validation must occur
+ * BETWEEN acquiring writer_mu and entering the seqlock critical section:
  *
- * From timelog_v1_c_software_design_spec.md Section 4.3:
+ *   TL_LOCK_WRITER(tl);
+ *   if (manifest changed) { UNLOCK + return TL_EBUSY; }  // Validation here!
+ *   tl_seqlock_write_begin(&tl->view_seq);
+ *   ... swap manifest ...
+ *   tl_seqlock_write_end(&tl->view_seq);
+ *   TL_UNLOCK_WRITER(tl);
  *
- * 1. Lock writer_mu
- * 2. view_seq++ (odd = publish in progress)
- * 3. Swap manifest pointer + update state
- * 4. view_seq++ (even = publish complete)
- * 5. Unlock writer_mu
+ * A combined tl__publish_begin() that does LOCK+seqlock_begin atomically
+ * cannot accommodate this validation step. See Section 8.6 of review notes.
  *===========================================================================*/
-
-/**
- * Begin publication phase.
- * Acquires writer_mu and increments seqlock to odd.
- *
- * @param tl Timelog instance
- */
-void tl__publish_begin(tl_timelog_t* tl) {
-    TL_ASSERT(tl != NULL);
-    TL_ASSERT(tl->is_open);
-
-    TL_LOCK_WRITER(tl);
-    tl_seqlock_write_begin(&tl->view_seq);
-
-    /* Now seq is odd - no snapshot can proceed */
-}
-
-/**
- * End publication phase.
- * Increments seqlock to even and releases writer_mu.
- *
- * @param tl Timelog instance
- */
-void tl__publish_end(tl_timelog_t* tl) {
-    TL_ASSERT(tl != NULL);
-
-    tl_seqlock_write_end(&tl->view_seq);
-    TL_UNLOCK_WRITER(tl);
-
-    /* Now seq is even - snapshots can proceed */
-}

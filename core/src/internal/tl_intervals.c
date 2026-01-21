@@ -5,30 +5,8 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Check if allocation size would overflow.
- */
-TL_INLINE bool alloc_would_overflow_iv(size_t count, size_t elem_size) {
-    return elem_size != 0 && count > SIZE_MAX / elem_size;
-}
-
-/**
- * Compute next capacity >= required using 2x growth.
- */
-static size_t next_capacity_iv(size_t current, size_t required) {
-    static const size_t MIN_CAPACITY = 8;
-
-    size_t new_cap = (current == 0) ? MIN_CAPACITY : current;
-
-    while (new_cap < required) {
-        if (new_cap > SIZE_MAX / 2) {
-            return SIZE_MAX;
-        }
-        new_cap *= 2;
-    }
-
-    return new_cap;
-}
+/** Minimum initial capacity for interval set (small - tombstones are usually few) */
+static const size_t INTERVALS_MIN_CAPACITY = 8;
 
 /**
  * Reserve capacity for interval set.
@@ -38,9 +16,8 @@ static tl_status_t intervals_reserve(tl_intervals_t* iv, size_t min_cap) {
         return TL_OK;
     }
 
-    size_t new_cap = next_capacity_iv(iv->cap, min_cap);
-
-    if (alloc_would_overflow_iv(new_cap, sizeof(tl_interval_t))) {
+    size_t new_cap = tl__grow_capacity(iv->cap, min_cap, INTERVALS_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_interval_t))) {
         return TL_ENOMEM;
     }
 

@@ -5,41 +5,8 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Check if allocation size would overflow.
- * @param count Number of elements
- * @param elem_size Size of each element
- * @return true if count * elem_size would overflow size_t
- */
-TL_INLINE bool alloc_would_overflow(size_t count, size_t elem_size) {
-    return elem_size != 0 && count > SIZE_MAX / elem_size;
-}
-
-/**
- * Compute next capacity >= required using 2x growth.
- * Returns SIZE_MAX on overflow (will fail allocation).
- *
- * Overflow handling:
- * - Check before multiply to avoid UB
- * - SIZE_MAX / 2 is the largest value that can safely double
- */
-static size_t next_capacity(size_t current, size_t required) {
-    /* Minimum initial capacity */
-    static const size_t MIN_CAPACITY = 16;
-
-    /* Start with minimum capacity or current */
-    size_t new_cap = (current == 0) ? MIN_CAPACITY : current;
-
-    while (new_cap < required) {
-        /* Check for overflow BEFORE multiplying */
-        if (new_cap > SIZE_MAX / 2) {
-            return SIZE_MAX; /* Overflow sentinel - will fail allocation */
-        }
-        new_cap *= 2;
-    }
-
-    return new_cap;
-}
+/** Minimum initial capacity for record vector (larger - batches can be big) */
+static const size_t RECVEC_MIN_CAPACITY = 16;
 
 /*===========================================================================
  * Lifecycle
@@ -87,10 +54,8 @@ tl_status_t tl_recvec_reserve(tl_recvec_t* rv, size_t min_cap) {
         return TL_OK; /* Already have enough capacity */
     }
 
-    size_t new_cap = next_capacity(rv->cap, min_cap);
-
-    /* Check for byte-size overflow */
-    if (alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+    size_t new_cap = tl__grow_capacity(rv->cap, min_cap, RECVEC_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
         return TL_ENOMEM;
     }
 

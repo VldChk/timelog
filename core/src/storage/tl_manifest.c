@@ -188,6 +188,9 @@ void tl_manifest_builder_destroy(tl_manifest_builder_t* mb) {
  * Builder: Internal Helpers
  *===========================================================================*/
 
+/** Minimum initial capacity for manifest builder arrays (small - few segments) */
+static const size_t MANIFEST_MIN_CAPACITY = 8;
+
 static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
                                     tl_segment_t*** arr,
                                     size_t* len,
@@ -196,7 +199,12 @@ static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
         return TL_OK;
     }
 
-    size_t new_cap = (*cap == 0) ? 8 : *cap * 2;
+    /* Use shared growth helper with overflow check (fixes latent bug) */
+    size_t new_cap = tl__grow_capacity(*cap, *len + 1, MANIFEST_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_segment_t*))) {
+        return TL_ENOMEM;
+    }
+
     tl_segment_t** new_arr = tl__realloc(alloc, *arr,
                                           new_cap * sizeof(tl_segment_t*));
     if (new_arr == NULL) {

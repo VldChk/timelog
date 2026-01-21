@@ -338,7 +338,7 @@ void tl_mutex_destroy(tl_mutex_t* mu) {
 void tl_mutex_lock(tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
     int rc = pthread_mutex_lock(&mu->lock);
-    TL_ASSERT(rc == 0);
+    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
     (void)rc;
 #ifdef TL_DEBUG
     mu->owner = pthread_self();
@@ -356,7 +356,7 @@ void tl_mutex_unlock(tl_mutex_t* mu) {
     /* Note: We don't clear owner since pthread_t is opaque */
 #endif
     int rc = pthread_mutex_unlock(&mu->lock);
-    TL_ASSERT(rc == 0);
+    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
     (void)rc;
 }
 
@@ -433,7 +433,7 @@ void tl_cond_wait(tl_cond_t* cv, tl_mutex_t* mu) {
     mu->locked = 0;
 #endif
     int rc = pthread_cond_wait(&cv->cond, &mu->lock);
-    TL_ASSERT(rc == 0);
+    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
     (void)rc;
 #ifdef TL_DEBUG
     /* Mutex is reacquired after wait */
@@ -491,7 +491,7 @@ bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms) {
     if (rc == ETIMEDOUT) {
         return false; /* Timed out */
     }
-    TL_ASSERT(0); /* Unexpected error */
+    TL_VERIFY(0);  /* Unexpected OS error - abort, not UB */
     return false;
 }
 

@@ -96,6 +96,57 @@ void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size);
 void tl__free(tl_alloc_ctx_t* ctx, void* ptr);
 
 /*===========================================================================
+ * Allocation Safety Helpers
+ *===========================================================================*/
+
+/**
+ * Check if allocation size would overflow size_t.
+ *
+ * Use this before multiplying count * elem_size for allocation.
+ *
+ * @param count     Number of elements
+ * @param elem_size Size of each element in bytes
+ * @return true if count * elem_size would overflow size_t
+ */
+TL_INLINE bool tl__alloc_would_overflow(size_t count, size_t elem_size) {
+    return elem_size != 0 && count > SIZE_MAX / elem_size;
+}
+
+/**
+ * Compute next capacity >= required using 2x growth.
+ *
+ * Growth strategy:
+ * - If current == 0, start with min_cap
+ * - Double until capacity >= required
+ * - Return 0 on overflow (cannot satisfy request)
+ *
+ * @param current  Current capacity (may be 0 for first allocation)
+ * @param required Minimum capacity needed (typically len + additional)
+ * @param min_cap  Minimum initial capacity (e.g., 8 for heap, 16 for recvec)
+ * @return New capacity >= required, or 0 if overflow would occur
+ *
+ * Usage:
+ *   size_t new_cap = tl__grow_capacity(vec->cap, vec->len + 1, 16);
+ *   if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(elem_t))) {
+ *       return TL_ENOMEM;
+ *   }
+ */
+TL_INLINE size_t tl__grow_capacity(size_t current, size_t required, size_t min_cap) {
+    TL_ASSERT(min_cap > 0);  /* Initial capacity must be positive */
+
+    size_t new_cap = (current == 0) ? min_cap : current;
+
+    while (new_cap < required) {
+        if (new_cap > SIZE_MAX / 2) {
+            return 0;  /* Cannot double without overflow */
+        }
+        new_cap *= 2;
+    }
+
+    return new_cap;
+}
+
+/*===========================================================================
  * Convenience Macros
  *===========================================================================*/
 

@@ -493,7 +493,7 @@ bool tl_memtable_wait_for_space(tl_memtable_t* mt, tl_mutex_t* mu,
 
     /*
      * Loop to handle spurious wakeups properly.
-     * maint_cond is shared and may be signaled for other reasons.
+     * memtable_cond is dedicated to sealed queue space signaling.
      * Use monotonic time to track actual elapsed time across wakeups.
      */
     uint64_t start_ms = tl_monotonic_ms();

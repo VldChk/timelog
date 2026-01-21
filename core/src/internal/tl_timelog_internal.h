@@ -59,7 +59,17 @@ struct tl_timelog {
      *-----------------------------------------------------------------------*/
     tl_config_t     config;
 
-    /* Computed/normalized config values */
+    /*-----------------------------------------------------------------------
+     * Effective Values (initialized from config at open)
+     *
+     * effective_ooo_budget: Derived once at init, immutable thereafter.
+     *                       Computed from config.ooo_budget_bytes or default.
+     *
+     * effective_window_size: Runtime state. Initial value from config,
+     *                        but MUTATED by adaptive segmentation during
+     *                        compaction. See tl_adaptive.h for details.
+     *                        Protected by maint_mu during updates.
+     *-----------------------------------------------------------------------*/
     tl_ts_t         effective_window_size;
     size_t          effective_ooo_budget;
 
@@ -88,6 +98,7 @@ struct tl_timelog {
 
     /* Memtable mutex: protects sealed memrun queue. */
     tl_mutex_t      memtable_mu;
+    tl_cond_t       memtable_cond;  /* Backpressure: sealed queue has space */
 
     /* Seqlock for snapshot consistency. Even = idle, odd = publish in progress. */
     tl_seqlock_t    view_seq;

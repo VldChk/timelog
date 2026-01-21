@@ -20,7 +20,9 @@ PyObject* TlPy_TimelogError = NULL;
 
 /**
  * TimelogBusyError exception for TL_EBUSY.
- * Inherits from TimelogError. Indicates a transient condition.
+ * Inherits from TimelogError.
+ * IMPORTANT: For write operations, this means the write succeeded but
+ * backpressure occurred - DO NOT RETRY (would create duplicates).
  */
 PyObject* TlPy_TimelogBusyError = NULL;
 
@@ -108,7 +110,7 @@ void TlPy_FiniErrors(void)
  * Mapping rationale:
  * - TL_EINVAL   -> ValueError (bad arguments from user)
  * - TL_ESTATE   -> TimelogError (API usage error)
- * - TL_EBUSY    -> TimelogBusyError (transient, caller should retry)
+ * - TL_EBUSY    -> TimelogBusyError (backpressure - see header for context)
  * - TL_ENOMEM   -> MemoryError (system resource)
  * - TL_EOVERFLOW-> OverflowError (arithmetic)
  * - TL_EINTERNAL-> SystemError (bug in timelog)

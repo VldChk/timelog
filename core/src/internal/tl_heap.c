@@ -5,30 +5,8 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Check if allocation size would overflow.
- */
-TL_INLINE bool alloc_would_overflow_heap(size_t count, size_t elem_size) {
-    return elem_size != 0 && count > SIZE_MAX / elem_size;
-}
-
-/**
- * Compute next capacity >= required using 2x growth.
- */
-static size_t next_capacity_heap(size_t current, size_t required) {
-    static const size_t MIN_CAPACITY = 8;
-
-    size_t new_cap = (current == 0) ? MIN_CAPACITY : current;
-
-    while (new_cap < required) {
-        if (new_cap > SIZE_MAX / 2) {
-            return SIZE_MAX;
-        }
-        new_cap *= 2;
-    }
-
-    return new_cap;
-}
+/** Minimum initial capacity for heap (small - heap is usually K sources) */
+static const size_t HEAP_MIN_CAPACITY = 8;
 
 /**
  * Compare two heap entries.
@@ -143,9 +121,8 @@ tl_status_t tl_heap_reserve(tl_heap_t* h, size_t min_cap) {
         return TL_OK;
     }
 
-    size_t new_cap = next_capacity_heap(h->cap, min_cap);
-
-    if (alloc_would_overflow_heap(new_cap, sizeof(tl_heap_entry_t))) {
+    size_t new_cap = tl__grow_capacity(h->cap, min_cap, HEAP_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_heap_entry_t))) {
         return TL_ENOMEM;
     }
 

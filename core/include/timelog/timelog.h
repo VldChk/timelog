@@ -54,6 +54,10 @@ extern "C" {
  * - Maintenance (tl_maint_start, tl_maint_stop):
  *   Thread-safe. See function docs for mode constraints and idempotency.
  *   tl_maint_step is NOT thread-safe (manual mode only).
+ *
+ * - Lifecycle (tl_close):
+ *   NOT thread-safe. tl_close() must not race with any other API call on
+ *   the same instance. Caller must ensure exclusive access during close.
  *===========================================================================*/
 
 /*===========================================================================
@@ -110,16 +114,25 @@ typedef struct tl_record {
  * - TL_EINVAL:    Invalid argument (NULL pointer, invalid range t1>=t2,
  *                 invalid config value, out-of-bounds index)
  * - TL_ESTATE:    Invalid state (e.g., instance not open, wrong maint mode)
- * - TL_EBUSY:     Resource temporarily busy (e.g., backpressure from sealed
- *                 memruns, compaction manifest conflict - retryable)
+ * - TL_EBUSY:     Resource temporarily busy. Context-dependent:
+ *                 - Write APIs (tl_append*, tl_delete*): Write WAS accepted,
+ *                   but a seal/maintenance issue occurred:
+ *                   (a) Sealed queue full (backpressure), OR
+ *                   (b) Seal allocation failed (rare TL_ENOMEM remapped), OR
+ *                   (c) Batch partial failure (tl_append_batch only).
+ *                   DO NOT RETRY - would cause duplicates. In manual mode
+ *                   call flush(); in background mode worker handles it.
+ *                 - tl_maint_start(): Stop in progress - retry later.
  * - TL_ENOMEM:    Memory allocation failed (often retryable after wait)
  * - TL_EOVERFLOW: Arithmetic overflow (extreme timestamp calculations,
  *                 array size overflow - usually non-retryable)
  * - TL_EINTERNAL: Internal error (thread creation failed, invariant violation
  *                 - should not occur in normal operation)
  *
- * Retryability:
- * - TL_EBUSY, TL_ENOMEM: Typically retryable after short delay
+ * Retryability guide:
+ * - TL_EBUSY for writes: NOT retryable (data is already in log)
+ * - TL_EBUSY for tl_maint_start: Retryable after short delay
+ * - TL_ENOMEM: Often retryable after wait or reducing load
  * - TL_EINVAL, TL_ESTATE, TL_EOVERFLOW: Not retryable without caller fix
  * - TL_EINTERNAL: Usually indicates a bug; may or may not be retryable
  *===========================================================================*/
@@ -129,7 +142,7 @@ typedef enum tl_status {
     TL_EOF       = 1,   /* End of iteration / no work */
     TL_EINVAL    = 10,  /* Invalid argument */
     TL_ESTATE    = 20,  /* Invalid state */
-    TL_EBUSY     = 21,  /* Resource busy (retryable) */
+    TL_EBUSY     = 21,  /* Resource busy - see status code docs for context */
     TL_ENOMEM    = 30,  /* Out of memory (often retryable) */
     TL_EOVERFLOW = 31,  /* Arithmetic overflow */
     TL_EINTERNAL = 90   /* Internal error (bug or system failure) */
@@ -241,17 +254,19 @@ typedef struct tl_adaptive_config {
 typedef struct tl_config {
     tl_time_unit_t  time_unit;
 
-    size_t          target_page_bytes;
-    size_t          memtable_max_bytes;
+    size_t          target_page_bytes;      /* 0 => default (64 KiB) */
+    size_t          memtable_max_bytes;     /* 0 => default (1 MiB) */
     size_t          ooo_budget_bytes;       /* 0 => memtable_max_bytes / 10 */
 
-    size_t          sealed_max_runs;        /* default: 4 */
-    uint32_t        sealed_wait_ms;         /* default: 100 */
+    size_t          sealed_max_runs;        /* 0 => default (4) */
+    uint32_t        sealed_wait_ms;         /* default: 100ms. Backpressure wait timeout.
+                                             * NOTE: 0 = no waiting (immediate TL_EBUSY).
+                                             * Unlike other fields, 0 is NOT "use default". */
 
     /* Maintenance timing */
-    uint32_t        maintenance_wakeup_ms;  /* default: 100 (periodic wake) */
+    uint32_t        maintenance_wakeup_ms;  /* 0 => default (100ms). Periodic wake interval. */
 
-    size_t          max_delta_segments;     /* L0 bound */
+    size_t          max_delta_segments;     /* 0 => default (8). L0 segment bound. */
 
     tl_ts_t         window_size;            /* 0 => default window (1 hour) */
     tl_ts_t         window_origin;          /* default: 0 */
@@ -286,7 +301,14 @@ TL_API tl_status_t tl_config_init_defaults(tl_config_t* cfg);
  *            The config is copied; it need not persist after this call.
  * @param out Output pointer for new instance (must not be NULL)
  * @return TL_OK on success; TL_EINVAL if out is NULL or config is invalid;
- *         TL_ENOMEM on allocation failure
+ *         TL_ENOMEM on allocation failure; TL_EINTERNAL if worker thread fails
+ *
+ * Maintenance:
+ * - When maintenance_mode == TL_MAINT_BACKGROUND (the default), the background
+ *   maintenance worker is automatically started during tl_open(). No separate
+ *   call to tl_maint_start() is needed for normal operation.
+ * - When maintenance_mode == TL_MAINT_DISABLED, no worker is started and the
+ *   caller must call tl_flush() and tl_maint_step() manually.
  *
  * If a log_fn callback is configured, informational messages may be logged
  * during open (and close) operations.
@@ -308,6 +330,16 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  * Preconditions:
  * - All snapshots and iterators must be released before calling tl_close()
  * - Background maintenance (if enabled) will be stopped automatically
+ *
+ * Thread Safety:
+ * - tl_close() must NOT race with any other API call on the same instance.
+ *   The caller must ensure no other thread is calling tl_append, tl_flush,
+ *   tl_snapshot_acquire, tl_maint_start, tl_maint_stop, or any other API
+ *   while tl_close() is executing.
+ * - This is consistent with the single-writer model: external coordination
+ *   is required for lifecycle transitions.
+ * - If worker join fails (TL_EINTERNAL from internal tl_maint_stop), close
+ *   will abort in debug builds to prevent memory corruption.
  */
 TL_API void tl_close(tl_timelog_t* tl);
 
@@ -316,9 +348,17 @@ TL_API void tl_close(tl_timelog_t* tl);
  *===========================================================================*/
 
 /*
- * Backpressure:
- * - Write calls may return TL_EBUSY if sealed_max_runs is reached and
- *   maintenance cannot make progress within sealed_wait_ms.
+ * Backpressure and Partial Failure:
+ * - Write calls may return TL_EBUSY in the following cases:
+ *   (a) Sealed queue full (sealed_max_runs reached, maintenance can't keep up)
+ *   (b) Seal allocation failed (rare - memrun struct allocation failed)
+ *   (c) Batch partial failure (tl_append_batch only - allocation failed mid-batch)
+ * - CRITICAL: TL_EBUSY means SOME OR ALL data WAS accepted. DO NOT RETRY.
+ *   Retrying would create duplicate records. In manual mode, call tl_flush()
+ *   to relieve pressure. In background mode, wait for maintenance to catch up.
+ * - For tl_append_batch: TL_EBUSY may indicate partial success (some records
+ *   inserted before failure). The caller cannot determine which records
+ *   succeeded. If precise tracking is needed, use single tl_append calls.
  */
 
 /** Append flags */
@@ -405,14 +445,90 @@ TL_API tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t 
 
 /*===========================================================================
  * Timestamp navigation
+ *
+ * Convenience functions for finding min/max timestamps and navigating between
+ * adjacent timestamps. These are intended for diagnostic/debugging use cases.
+ *
+ * **Performance note**: Forward navigation (tl_min_ts, tl_next_ts) is efficient
+ * at O(K log P), but backward navigation (tl_max_ts, tl_prev_ts) requires full
+ * dataset scan at O(N) due to LSM architecture. For performance-critical paths,
+ * use iterators directly or maintain your own bounds tracking.
+ *
+ * Where: K = component count, P = pages/component, N = total visible records.
  *===========================================================================*/
 
+/**
+ * Get the minimum timestamp in the snapshot (first visible record).
+ *
+ * @param snap Snapshot to query
+ * @param out  Output parameter for minimum timestamp
+ * @return TL_OK   Success, *out contains minimum timestamp
+ *         TL_EOF  No visible records (empty or all deleted)
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * Complexity: O(K log P) typical - creates iterator and fetches first record.
+ * However, if tombstones delete early records, the function must scan past
+ * them to find the first VISIBLE record, degrading to O(N) in tombstone-heavy
+ * edge cases. For truly performance-critical paths with heavy deletes,
+ * consider maintaining your own min tracker.
+ */
 TL_API tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
+/**
+ * Get the maximum timestamp in the snapshot (last visible record).
+ *
+ * @param snap Snapshot to query
+ * @param out  Output parameter for maximum timestamp
+ * @return TL_OK   Success, *out contains maximum timestamp
+ *         TL_EOF  No visible records (empty or all deleted)
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * **WARNING: O(N) COMPLEXITY** - This function scans ALL visible records
+ * because LSM iterators only support forward traversal. For large datasets,
+ * consider maintaining your own max tracker during append operations.
+ */
 TL_API tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
+/**
+ * Find the next timestamp strictly greater than the given timestamp.
+ *
+ * @param snap Snapshot to query
+ * @param ts   Reference timestamp
+ * @param out  Output parameter for next timestamp
+ * @return TL_OK   Success, *out contains next timestamp after ts
+ *         TL_EOF  No visible records after ts
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * Complexity: O(K log P) typical - creates iterator at ts+1 and fetches first.
+ * However, if tombstones delete records after ts, the function must scan past
+ * them to find the first VISIBLE record, degrading to O(N) in tombstone-heavy
+ * edge cases.
+ *
+ * Note: If ts == TL_TS_MAX, returns TL_EOF (no overflow).
+ */
 TL_API tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
+/**
+ * Find the previous timestamp strictly less than the given timestamp.
+ *
+ * @param snap Snapshot to query
+ * @param ts   Reference timestamp
+ * @param out  Output parameter for previous timestamp
+ * @return TL_OK   Success, *out contains previous timestamp before ts
+ *         TL_EOF  No visible records before ts
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * **WARNING: O(N) COMPLEXITY** - This function scans ALL visible records
+ * in [TL_TS_MIN, ts) to find the last one, because LSM iterators only
+ * support forward traversal. For large datasets, consider using iterators
+ * directly or implementing reverse navigation in your application layer.
+ *
+ * Note: If ts == TL_TS_MIN, returns TL_EOF (no underflow).
+ */
 TL_API tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
 /*===========================================================================
@@ -422,8 +538,9 @@ TL_API tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* ou
 /**
  * Start the background maintenance worker thread.
  *
- * Must be called after tl_open() to enable background flush and compaction.
- * tl_open() does NOT start the worker automatically.
+ * In TL_MAINT_BACKGROUND mode, the worker is automatically started by
+ * tl_open(), so this function is typically only needed to restart the
+ * worker after calling tl_maint_stop().
  *
  * @param tl Timelog instance
  * @return TL_OK       Worker started successfully (or already running)
