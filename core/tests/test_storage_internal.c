@@ -165,6 +165,61 @@ TEST_DECLARE(storage_window_bounds_for_ts_overflow) {
         tl_window_bounds_for_ts(INT64_MAX, 1000, INT64_MIN, &start, &end, &unbounded));
 }
 
+/* C-06 fix tests: window_size <= 0 should return TL_EINVAL or safe values */
+TEST_DECLARE(storage_window_id_zero_size_invalid) {
+    int64_t id;
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_window_id_for_ts(100, 0, 0, &id));
+}
+
+TEST_DECLARE(storage_window_id_negative_size_invalid) {
+    int64_t id;
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_window_id_for_ts(100, -10, 0, &id));
+}
+
+TEST_DECLARE(storage_window_bounds_zero_size_degenerate) {
+    tl_ts_t start, end;
+    bool unbounded;
+
+    /* window_size = 0 should return degenerate window [origin, origin) */
+    tl_window_bounds(5, 0, 100, &start, &end, &unbounded);
+    TEST_ASSERT_EQ(100, start);
+    TEST_ASSERT_EQ(100, end);
+    TEST_ASSERT(!unbounded);
+}
+
+TEST_DECLARE(storage_window_bounds_negative_size_degenerate) {
+    tl_ts_t start, end;
+    bool unbounded;
+
+    /* window_size < 0 should return degenerate window [origin, origin) */
+    tl_window_bounds(5, -10, 50, &start, &end, &unbounded);
+    TEST_ASSERT_EQ(50, start);
+    TEST_ASSERT_EQ(50, end);
+    TEST_ASSERT(!unbounded);
+}
+
+TEST_DECLARE(storage_window_bounds_for_ts_zero_size_invalid) {
+    tl_ts_t start, end;
+    bool unbounded;
+
+    /* window_size = 0 should return TL_EINVAL */
+    TEST_ASSERT_STATUS(TL_EINVAL,
+        tl_window_bounds_for_ts(100, 0, 0, &start, &end, &unbounded));
+}
+
+TEST_DECLARE(storage_floor_div_zero_divisor_safe) {
+    /* Division by zero should return 0 as safe fallback */
+    TEST_ASSERT_EQ(0, tl_floor_div_i64(100, 0));
+    TEST_ASSERT_EQ(0, tl_floor_div_i64(-100, 0));
+    TEST_ASSERT_EQ(0, tl_floor_div_i64(0, 0));
+}
+
+TEST_DECLARE(storage_floor_div_negative_divisor_safe) {
+    /* Negative divisor should return 0 as safe fallback */
+    TEST_ASSERT_EQ(0, tl_floor_div_i64(100, -10));
+    TEST_ASSERT_EQ(0, tl_floor_div_i64(-100, -10));
+}
+
 /*===========================================================================
  * Page Tests (Internal API)
  *
@@ -494,6 +549,70 @@ TEST_DECLARE(storage_segment_build_l0_empty_invalid) {
     tl__alloc_destroy(&alloc);
 }
 
+/*
+ * C-04 fix: tombstones_len > 0 with NULL pointer must return TL_EINVAL.
+ * Before fix, this would cause memcpy with NULL src (undefined behavior).
+ */
+TEST_DECLARE(storage_segment_build_l0_null_tombstones_invalid) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Some records but NULL tombstones with non-zero len */
+    tl_record_t records[2] = {{100, 1}, {200, 2}};
+
+    tl_segment_t* seg = NULL;
+    /* tombstones_len=2 but tombstones=NULL => TL_EINVAL (C-04 fix) */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 2,
+                                                       NULL, 2,  /* NULL with len > 0 */
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
+/*
+ * C-04 fix: record_count > 0 with NULL pointer must return TL_EINVAL.
+ * Before fix, TL_ASSERT would catch this in debug, but release builds had UB.
+ * This variant has tombstones present (records-only validation still works).
+ */
+TEST_DECLARE(storage_segment_build_l0_null_records_invalid) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Some tombstones but NULL records with non-zero count */
+    tl_interval_t tombs[1] = {{100, 200, false}};
+
+    tl_segment_t* seg = NULL;
+    /* record_count=3 but records=NULL => TL_EINVAL (C-04 fix) */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, NULL, 3,
+                                                       tombs, 1,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
+/*
+ * C-04 fix: record_count > 0 with NULL pointer, no tombstones.
+ * Covers the case where records validation is the ONLY thing preventing UB.
+ */
+TEST_DECLARE(storage_segment_build_l0_null_records_no_tombstones_invalid) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_segment_t* seg = NULL;
+    /* record_count=5 but records=NULL, no tombstones => TL_EINVAL */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, NULL, 5,
+                                                       NULL, 0,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
 TEST_DECLARE(storage_segment_build_l0_unbounded_tombstone) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -533,6 +652,44 @@ TEST_DECLARE(storage_segment_build_l1) {
     TEST_ASSERT_EQ(100, seg->window_start);
     TEST_ASSERT_EQ(200, seg->window_end);
     TEST_ASSERT_NULL(seg->tombstones);
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
+/* C-05 fix test: unbounded mismatch should return TL_EINVAL */
+TEST_DECLARE(storage_segment_build_l1_unbounded_mismatch_invalid) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[2] = {{100, 1}, {200, 2}};
+
+    tl_segment_t* seg = NULL;
+    /* window_end_unbounded=true but window_end=500 (not TL_TS_MAX) => TL_EINVAL */
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l1(&alloc, records, 2,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       0, 500, true, 1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
+/* C-05 fix test: valid unbounded config should succeed */
+TEST_DECLARE(storage_segment_build_l1_unbounded_valid) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[2] = {{100, 1}, {200, 2}};
+
+    tl_segment_t* seg = NULL;
+    /* window_end_unbounded=true and window_end=TL_TS_MAX => TL_OK */
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l1(&alloc, records, 2,
+                                                    TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                    0, TL_TS_MAX, true, 1, &seg));
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT(tl_segment_is_l1(seg));
+    TEST_ASSERT(seg->window_end_unbounded);
+    TEST_ASSERT_EQ(TL_TS_MAX, seg->window_end);
 
     tl_segment_release(seg);
     tl__alloc_destroy(&alloc);
@@ -1120,6 +1277,13 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_window_ts_max_unbounded);
     RUN_TEST(storage_window_id_overflow_underflow);
     RUN_TEST(storage_window_bounds_for_ts_overflow);
+    RUN_TEST(storage_window_id_zero_size_invalid);
+    RUN_TEST(storage_window_id_negative_size_invalid);
+    RUN_TEST(storage_window_bounds_zero_size_degenerate);
+    RUN_TEST(storage_window_bounds_negative_size_degenerate);
+    RUN_TEST(storage_window_bounds_for_ts_zero_size_invalid);
+    RUN_TEST(storage_floor_div_zero_divisor_safe);
+    RUN_TEST(storage_floor_div_negative_divisor_safe);
 
     /* Page tests (8 tests) */
     RUN_TEST(storage_page_builder_single_page);
@@ -1141,8 +1305,13 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_segment_build_l0_with_tombstones);
     RUN_TEST(storage_segment_build_l0_tombstone_only);
     RUN_TEST(storage_segment_build_l0_empty_invalid);
+    RUN_TEST(storage_segment_build_l0_null_tombstones_invalid);
+    RUN_TEST(storage_segment_build_l0_null_records_invalid);
+    RUN_TEST(storage_segment_build_l0_null_records_no_tombstones_invalid);
     RUN_TEST(storage_segment_build_l0_unbounded_tombstone);
     RUN_TEST(storage_segment_build_l1);
+    RUN_TEST(storage_segment_build_l1_unbounded_mismatch_invalid);
+    RUN_TEST(storage_segment_build_l1_unbounded_valid);
     RUN_TEST(storage_segment_refcnt_acquire_release);
     RUN_TEST(storage_segment_tombstones_imm);
     RUN_TEST(storage_segment_l0_bounds_include_tombstones);

@@ -69,11 +69,16 @@ TL_INLINE bool tl_sub_overflow_i64(int64_t a, int64_t b, int64_t* out) {
  *   tl_floor_div_i64(9, 10)   = 0    (C gives 0, same)
  *   tl_floor_div_i64(10, 10)  = 1    (C gives 1, same)
  *
- * Precondition: b > 0 (divisor must be positive)
+ * If b <= 0, returns 0 as defensive fallback to prevent UB.
+ * Callers should validate b > 0 before calling.
  *---------------------------------------------------------------------------*/
 
 TL_INLINE int64_t tl_floor_div_i64(int64_t a, int64_t b) {
-    TL_ASSERT(b > 0);
+    /* C-06 fix: Runtime guard against division by zero.
+     * TL_ASSERT becomes UB in release builds. Return 0 as safe fallback. */
+    if (b <= 0) {
+        return 0;
+    }
     int64_t q = a / b;
     int64_t r = a % b;
     /* Adjust if remainder is non-zero and numerator is negative */
@@ -102,9 +107,9 @@ tl_ts_t tl_window_default_size(tl_time_unit_t unit);
  * @param window_size   Window width (must be > 0)
  * @param window_origin Origin for window alignment
  * @param out_id        Output: window ID (may be negative)
- * @return TL_OK on success, TL_EOVERFLOW if ts - origin overflows
- *
- * Precondition: window_size > 0
+ * @return TL_OK on success,
+ *         TL_EINVAL if window_size <= 0,
+ *         TL_EOVERFLOW if ts - origin overflows
  *---------------------------------------------------------------------------*/
 
 tl_status_t tl_window_id_for_ts(tl_ts_t ts, tl_ts_t window_size,
@@ -120,14 +125,16 @@ tl_status_t tl_window_id_for_ts(tl_ts_t ts, tl_ts_t window_size,
  * and out_end is set to TL_TS_MAX. Callers must check end_unbounded
  * when comparing timestamps against window_end.
  *
+ * If window_size <= 0, returns degenerate empty window [origin, origin)
+ * with end_unbounded = false. Callers should validate window_size > 0
+ * before calling; this defensive behavior prevents UB on bad input.
+ *
  * @param window_id      Window ID
- * @param window_size    Window width (must be > 0)
+ * @param window_size    Window width (must be > 0; returns degenerate if not)
  * @param window_origin  Origin for window alignment
  * @param out_start      Output: window start (inclusive)
  * @param out_end        Output: window end (exclusive), or TL_TS_MAX if unbounded
  * @param end_unbounded  Output: true if end extends to +infinity
- *
- * Precondition: window_size > 0
  *---------------------------------------------------------------------------*/
 
 void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_origin,
@@ -145,9 +152,9 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
  * @param out_start      Output: window start (inclusive)
  * @param out_end        Output: window end (exclusive), or TL_TS_MAX if unbounded
  * @param end_unbounded  Output: true if end extends to +infinity
- * @return TL_OK on success, TL_EOVERFLOW if computation overflows
- *
- * Precondition: window_size > 0
+ * @return TL_OK on success,
+ *         TL_EINVAL if window_size <= 0,
+ *         TL_EOVERFLOW if computation overflows
  *---------------------------------------------------------------------------*/
 
 tl_status_t tl_window_bounds_for_ts(tl_ts_t ts, tl_ts_t window_size,

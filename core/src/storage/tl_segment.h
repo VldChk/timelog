@@ -114,7 +114,9 @@ typedef struct tl_segment {
  * @return TL_OK on success,
  *         TL_ENOMEM on allocation failure,
  *         TL_EINVAL if both record_count == 0 and tombstones_len == 0,
- *         TL_EINVAL if tombstones_len > UINT32_MAX
+ *         TL_EINVAL if tombstones_len > UINT32_MAX,
+ *         TL_EINVAL if tombstones_len > 0 but tombstones == NULL,
+ *         TL_EINVAL if record_count > 0 but records == NULL
  *
  * Segment bounds for tombstone-only segments:
  * - min_ts = min(tombstones[i].start)
@@ -142,12 +144,16 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
  * @param window_end          Window end (exclusive); TL_TS_MAX when unbounded
  * @param window_end_unbounded True if window extends to +infinity
  * @param generation          Generation counter
- * @param out                 Output segment pointer
- * @return TL_OK on success, TL_ENOMEM on failure, TL_EINVAL if records empty
+ * @param out                 Output segment pointer (set to NULL on error)
+ * @return TL_OK on success,
+ *         TL_ENOMEM on allocation failure,
+ *         TL_EINVAL if records empty or NULL,
+ *         TL_EINVAL if window_end_unbounded is true but window_end != TL_TS_MAX
  *
  * Precondition: All records satisfy window_start <= ts < window_end
  *               (or ts >= window_start if window_end_unbounded).
  * Invariant: window_end_unbounded implies window_end == TL_TS_MAX.
+ *            This is enforced at runtime (returns TL_EINVAL on violation).
  *
  * Returned segment has refcnt = 1 (caller owns reference).
  */

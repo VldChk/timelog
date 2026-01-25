@@ -229,13 +229,17 @@ static tl_status_t collect_from_memrun(tl_point_result_t* result,
         return st;
     }
 
-    /* Collect from ooo (sorted) */
-    st = collect_from_sorted(result,
-                             tl_memrun_ooo_data(mr),
-                             tl_memrun_ooo_len(mr),
-                             ts);
-    if (st != TL_OK) {
-        return st;
+    /* Collect from OOO runs (sorted) */
+    size_t run_count = tl_memrun_ooo_run_count(mr);
+    for (size_t i = 0; i < run_count; i++) {
+        const tl_ooorun_t* run = tl_memrun_ooo_run_at(mr, i);
+        if (run == NULL || run->len == 0) {
+            continue;
+        }
+        st = collect_from_sorted(result, run->records, run->len, ts);
+        if (st != TL_OK) {
+            return st;
+        }
     }
 
     return TL_OK;
@@ -258,13 +262,28 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
         return st;
     }
 
-    /* Collect from active_ooo (sorted) */
+    /* Collect from active OOO head (sorted) */
     st = collect_from_sorted(result,
-                             tl_memview_ooo_data(mv),
-                             tl_memview_ooo_len(mv),
+                             tl_memview_ooo_head_data(mv),
+                             tl_memview_ooo_head_len(mv),
                              ts);
     if (st != TL_OK) {
         return st;
+    }
+
+    /* Collect from active OOO runs (sorted) */
+    const tl_ooorunset_t* runs = tl_memview_ooo_runs(mv);
+    if (runs != NULL) {
+        for (size_t i = 0; i < runs->count; i++) {
+            const tl_ooorun_t* run = runs->runs[i];
+            if (run == NULL || run->len == 0) {
+                continue;
+            }
+            st = collect_from_sorted(result, run->records, run->len, ts);
+            if (st != TL_OK) {
+                return st;
+            }
+        }
     }
 
     return TL_OK;

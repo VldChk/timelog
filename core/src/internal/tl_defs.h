@@ -27,6 +27,12 @@
 #define TL_DEFAULT_SEALED_WAIT_MS         100
 #define TL_DEFAULT_MAINTENANCE_WAKEUP_MS  100   /* Periodic wake interval */
 #define TL_DEFAULT_MAX_DELTA_SEGMENTS     8
+#define TL_DEFAULT_OOO_RUN_LIMIT          32
+
+/* OOO run sizing (internal defaults) */
+#define TL_OOO_TARGET_RUNS                16
+#define TL_OOO_CHUNK_MIN_RECORDS          1024
+#define TL_OOO_CHUNK_MAX_RECORDS          16384
 
 /* Minimum page rows to prevent degenerate pages */
 #define TL_MIN_PAGE_ROWS                  16

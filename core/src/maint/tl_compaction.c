@@ -268,11 +268,21 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
     }
 
     /* Cap window iteration to prevent DoS from adversarial inputs.
-     * If span is huge, assume max debt - this is a heuristic anyway. */
+     * If span is huge, assume max debt - this is a heuristic anyway.
+     *
+     * C-12 fix: Use overflow-safe subtraction for window span.
+     * Direct subtraction can overflow if window IDs have opposite signs
+     * (e.g., min_wid = -INT64_MAX/2, max_wid = INT64_MAX/2). */
     const int64_t MAX_DEBT_WINDOWS = 1000;
-    if (max_wid - min_wid > MAX_DEBT_WINDOWS) {
+    int64_t debt_span;
+    if (tl_sub_overflow_i64(max_wid, min_wid, &debt_span)) {
+        /* Overflow - conservatively assume high debt */
         tl_intervals_destroy(&tombs);
-        return 1.0;  /* Assume high debt for large spans */
+        return 1.0;
+    }
+    if (debt_span < 0 || debt_span > MAX_DEBT_WINDOWS) {
+        tl_intervals_destroy(&tombs);
+        return 1.0;  /* Assume high debt for large or invalid spans */
     }
 
     for (int64_t wid = min_wid; wid <= max_wid; wid++) {
@@ -1234,7 +1244,16 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
      */
     TL_LOCK_WRITER(tl);
 
-    /* Check if manifest changed during merge */
+    /* C-09: Strict publish validation.
+     *
+     * Check if manifest changed during merge (concurrent flush or compaction).
+     * If changed, return TL_EBUSY to force retry from fresh selection.
+     *
+     * This is the "strict publish" protocol (V1):
+     * - Discards merge result if manifest diverged
+     * - Caller retries with new selection or fails after max_retries
+     *
+     * See tl__compact_one_step() for retry logic and Phase-2 deferred notes. */
     if (tl->manifest != ctx->base_manifest) {
         /* Manifest changed - caller must retry with fresh selection */
         TL_UNLOCK_WRITER(tl);
@@ -1251,16 +1270,35 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
 
     tl_seqlock_write_end(&tl->view_seq);
 
+#ifndef NDEBUG
+    /* C-13 fix: Pin the exact manifest we just published for validation.
+     * MUST happen before unlock - a concurrent flush could otherwise
+     * replace and release new_manifest before we validate it.
+     *
+     * Race condition prevented:
+     * Without this pin, a concurrent flush could:
+     * 1. Acquire writer_mu after we release it
+     * 2. Replace tl->manifest with flush_manifest
+     * 3. Release old = new_manifest (refcnt goes to 0)
+     * 4. Free new_manifest
+     * Then our validation call below would be UAF.
+     *
+     * By acquiring before unlock, we ensure refcnt >= 2 while we hold it,
+     * so even if flush replaces and releases, our copy survives. */
+    tl_manifest_t* validate_m = tl_manifest_acquire(new_manifest);
+#endif
+
     TL_UNLOCK_WRITER(tl);
 
     /* Release old manifest (safe after unlock) */
     tl_manifest_release(old_manifest);
 
 #ifndef NDEBUG
-    /* Validate critical L1 non-overlap invariant after compaction.
-     * new_manifest is what we just published - safe to read since we built it
-     * and it's now referenced by tl->manifest (won't be freed). */
-    tl__validate_l1_non_overlap(new_manifest);
+    /* Validate the exact manifest we published (not current tl->manifest).
+     * Using validate_m ensures we check what we built, not what a concurrent
+     * flush might have replaced it with. */
+    tl__validate_l1_non_overlap(validate_m);
+    tl_manifest_release(validate_m);
 #endif
 
     /* NOTE: We do NOT clear output_l1_len or residual_tomb here.
@@ -1303,7 +1341,10 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     original_window = tl->effective_window_size;
     candidate_window = original_window;
 
-    if (tl->config.adaptive.target_records > 0) {
+    /* C-10: Only compute adaptive candidate if grid is NOT frozen.
+     * Once L1 segments exist, the window grid is frozen to prevent
+     * L1 overlap violations from window size changes. */
+    if (!tl->window_grid_frozen && tl->config.adaptive.target_records > 0) {
         /* Compute candidate under maint_mu (reads adaptive state) */
         candidate_window = tl_adaptive_compute_candidate(
             &tl->adaptive,
@@ -1348,7 +1389,35 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
         return st;
     }
 
-    /* Phase 3: Publish with retries */
+    /* Phase 3: Publish with retries
+     *
+     * C-09 Documentation: STRICT PUBLISH vs REBASE
+     *
+     * Current behavior (V1): Strict publish with bounded retries.
+     * If the manifest changed during merge (concurrent flush), we:
+     * 1. Discard the merge result (return TL_EBUSY)
+     * 2. Retry from fresh selection (up to max_retries attempts)
+     * 3. If retries exhausted, compaction fails and returns TL_EBUSY
+     *
+     * Alternative (Phase-2 deferred): Rebase strategy.
+     * Instead of discarding, rebuild manifest incorporating the concurrent
+     * change while preserving our merge result. This avoids wasted work
+     * under high flush rates but adds complexity.
+     *
+     * V1 rationale:
+     * - Simplicity: Strict publish is straightforward to implement correctly
+     * - Correctness: No risk of ordering bugs in rebase logic
+     * - Acceptable for typical workloads: Concurrent flush during compaction
+     *   is rare unless flush rate exceeds compaction rate significantly
+     *
+     * Livelock risk:
+     * - Under extreme flush rates, compaction may repeatedly fail to publish
+     * - max_retries (3) bounds wasted CPU, but L0 segments accumulate
+     * - Mitigation: Increase flush_interval or reduce memtable size to lower
+     *   flush rate relative to compaction time
+     *
+     * Reference: Compaction LLD Section 8.2 (Publication Protocol)
+     */
     tl_status_t publish_st = TL_EBUSY;
     for (int attempt = 0; attempt < max_retries; attempt++) {
         publish_st = tl_compact_publish(&ctx);
@@ -1376,12 +1445,31 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
                 /* Increment compaction counter */
                 tl_atomic_inc_u64(&tl->compactions_total);
 
-                /* Adaptive: commit window and record success.
-                 * THIS is when we commit effective_window_size (LLD-strict). */
-                if (tl->config.adaptive.target_records > 0) {
+                /* Post-publish maint_mu block: C-10 grid freeze + adaptive updates.
+                 *
+                 * C-10: Freeze window grid after first L1 creation.
+                 * Once frozen, adaptive segmentation cannot change window size.
+                 *
+                 * Adaptive: Commit window and record success.
+                 * THIS is when we commit effective_window_size (LLD-strict).
+                 *
+                 * Both checks in one lock acquisition for efficiency. */
+                if (ctx.output_l1_len > 0 || tl->config.adaptive.target_records > 0) {
                     TL_LOCK_MAINT(tl);
-                    tl->effective_window_size = candidate_window;
-                    tl_adaptive_record_success(&tl->adaptive);
+
+                    /* C-10: Freeze grid after first L1 creation.
+                     * This prevents future adaptive changes from breaking
+                     * L1 non-overlap invariant with existing segments. */
+                    if (ctx.output_l1_len > 0) {
+                        tl->window_grid_frozen = true;
+                    }
+
+                    /* Adaptive: commit window and record success */
+                    if (tl->config.adaptive.target_records > 0) {
+                        tl->effective_window_size = candidate_window;
+                        tl_adaptive_record_success(&tl->adaptive);
+                    }
+
                     TL_UNLOCK_MAINT(tl);
                 }
             } else {

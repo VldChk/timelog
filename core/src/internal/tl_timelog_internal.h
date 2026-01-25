@@ -140,6 +140,22 @@ struct tl_timelog {
     tl_adaptive_state_t adaptive;
 
     /*-----------------------------------------------------------------------
+     * Window Grid Freeze Flag (C-10)
+     *
+     * Protected by maint_mu. Once L1 segments exist, the window grid is
+     * frozen and adaptive segmentation cannot change effective_window_size.
+     * This prevents L1 overlap violations from window size changes.
+     *
+     * Set to true:
+     * - During tl_open() if manifest already has L1 segments
+     * - After first successful L1 creation in tl_compact_one()
+     *
+     * Checked in tl_compact_one() before computing adaptive candidate.
+     * Once frozen, remains frozen for the lifetime of the instance.
+     *-----------------------------------------------------------------------*/
+    bool window_grid_frozen;
+
+    /*-----------------------------------------------------------------------
      * Delta Layer (Phase 4)
      *-----------------------------------------------------------------------*/
 

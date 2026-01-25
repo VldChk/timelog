@@ -119,21 +119,24 @@ typedef struct tl_record {
  *                   but a seal/maintenance issue occurred:
  *                   (a) Sealed queue full (backpressure), OR
  *                   (b) Seal allocation failed (rare TL_ENOMEM remapped), OR
- *                   (c) Batch partial failure (tl_append_batch only).
+ *                   (c) OOO head flush failed after insert (runset allocation/backpressure).
  *                   DO NOT RETRY - would cause duplicates. In manual mode
  *                   call flush(); in background mode worker handles it.
  *                 - tl_maint_start(): Stop in progress - retry later.
- * - TL_ENOMEM:    Memory allocation failed (often retryable after wait)
+ * - TL_ENOMEM:    Memory allocation failed. For write APIs (tl_append*),
+ *                 this means NO data was inserted - caller can rollback
+ *                 (e.g., DECREF handles) and retry later.
  * - TL_EOVERFLOW: Arithmetic overflow (extreme timestamp calculations,
- *                 array size overflow - usually non-retryable)
+ *                 array size overflow). For write APIs, this means NO
+ *                 data was inserted - caller can rollback and retry.
  * - TL_EINTERNAL: Internal error (thread creation failed, invariant violation
  *                 - should not occur in normal operation)
  *
  * Retryability guide:
  * - TL_EBUSY for writes: NOT retryable (data is already in log)
  * - TL_EBUSY for tl_maint_start: Retryable after short delay
- * - TL_ENOMEM: Often retryable after wait or reducing load
- * - TL_EINVAL, TL_ESTATE, TL_EOVERFLOW: Not retryable without caller fix
+ * - TL_ENOMEM/TL_EOVERFLOW for writes: Retryable (no data was inserted)
+ * - TL_EINVAL, TL_ESTATE: Not retryable without caller fix
  * - TL_EINTERNAL: Usually indicates a bug; may or may not be retryable
  *===========================================================================*/
 
@@ -348,17 +351,23 @@ TL_API void tl_close(tl_timelog_t* tl);
  *===========================================================================*/
 
 /*
- * Backpressure and Partial Failure:
- * - Write calls may return TL_EBUSY in the following cases:
+ * Backpressure and Error Semantics:
+ *
+ * TL_EBUSY (backpressure):
+ * - Write calls may return TL_EBUSY when:
  *   (a) Sealed queue full (sealed_max_runs reached, maintenance can't keep up)
  *   (b) Seal allocation failed (rare - memrun struct allocation failed)
- *   (c) Batch partial failure (tl_append_batch only - allocation failed mid-batch)
- * - CRITICAL: TL_EBUSY means SOME OR ALL data WAS accepted. DO NOT RETRY.
+ *   (c) OOO head flush failed after insert (runset allocation/backpressure)
+ * - CRITICAL: TL_EBUSY means ALL data WAS accepted. DO NOT RETRY.
  *   Retrying would create duplicate records. In manual mode, call tl_flush()
  *   to relieve pressure. In background mode, wait for maintenance to catch up.
- * - For tl_append_batch: TL_EBUSY may indicate partial success (some records
- *   inserted before failure). The caller cannot determine which records
- *   succeeded. If precise tracking is needed, use single tl_append calls.
+ *
+ * TL_ENOMEM / TL_EOVERFLOW (true failures):
+ * - These mean NO data was inserted - operation has all-or-nothing semantics.
+ * - For tl_append_batch: either ALL records were inserted, or NONE were.
+ * - Caller can safely rollback (e.g., DECREF all handles) and retry later.
+ *
+ * Summary: TL_EBUSY = data accepted (don't retry), other errors = no data (can retry).
  */
 
 /** Append flags */

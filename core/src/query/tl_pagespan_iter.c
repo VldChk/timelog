@@ -493,15 +493,29 @@ void tl_pagespan_iter_close(tl_pagespan_iter_t* it) {
 
     it->closed = true;
 
-    /* Cache allocator before releasing owner (owner may be destroyed) */
+    /*
+     * CRITICAL: Free iterator BEFORE releasing owner reference (C-03 fix).
+     *
+     * The owner's release hook may Py_DECREF the timelog, which owns the
+     * allocator. If owner decref triggers destroy -> hook -> allocator freed,
+     * then calling tl__free(alloc, it) would be use-after-free.
+     *
+     * Correct order:
+     * 1. Cache owner pointer
+     * 2. Free iterator using allocator (while allocator is still valid)
+     * 3. Release owner reference (may trigger destroy and hook)
+     *
+     * This mirrors the pattern in owner_destroy() which frees the owner
+     * struct before calling the release hook.
+     */
+    tl_pagespan_owner_t* owner = it->owner;
     tl_alloc_ctx_t* alloc = it->alloc;
 
-    /* Release our owner reference */
-    if (it->owner != NULL) {
-        tl_pagespan_owner_decref(it->owner);
-        it->owner = NULL;
-    }
-
-    /* Free iterator using cached allocator */
+    /* Step 1: Free iterator struct while allocator is valid */
     tl__free(alloc, it);
+
+    /* Step 2: Release owner reference (may trigger destroy and hook) */
+    if (owner != NULL) {
+        tl_pagespan_owner_decref(owner);
+    }
 }

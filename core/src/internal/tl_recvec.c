@@ -1,4 +1,5 @@
 #include "tl_recvec.h"
+#include <stdlib.h>  /* qsort */
 #include <string.h>
 
 /*===========================================================================
@@ -174,6 +175,38 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
     rv->data[idx].handle = handle;
     rv->len++;
     return TL_OK;
+}
+
+/*===========================================================================
+ * Sorting
+ *===========================================================================*/
+
+/**
+ * Comparison function for qsort.
+ * Sorts records by (ts, handle) in non-decreasing order.
+ */
+static int cmp_record_ts(const void* a, const void* b) {
+    const tl_record_t* ra = (const tl_record_t*)a;
+    const tl_record_t* rb = (const tl_record_t*)b;
+
+    /* Use explicit comparison to avoid integer overflow in subtraction.
+     * For signed int64_t, (ra->ts - rb->ts) could overflow if the values
+     * span a large range. Explicit comparison is safe. */
+    if (ra->ts < rb->ts) return -1;
+    if (ra->ts > rb->ts) return 1;
+    if (ra->handle < rb->handle) return -1;
+    if (ra->handle > rb->handle) return 1;
+    return 0;
+}
+
+void tl_recvec_sort(tl_recvec_t* rv) {
+    TL_ASSERT(rv != NULL);
+
+    if (rv->len <= 1) {
+        return;  /* Already sorted */
+    }
+
+    qsort(rv->data, rv->len, sizeof(tl_record_t), cmp_record_ts);
 }
 
 /*===========================================================================

@@ -1455,6 +1455,93 @@ TEST_DECLARE(func_compact_on_drop_handle_invoked) {
 }
 
 /*===========================================================================
+ * C-10: Window Grid Freeze Test
+ *
+ * Verifies that after L1 segments are created, subsequent compactions
+ * maintain L1 non-overlap invariant (which C-10 protects by freezing the
+ * window grid once L1 exists).
+ *===========================================================================*/
+
+TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
+    /*
+     * C-10 TEST: Verify L1 non-overlap is maintained across multiple compactions.
+     *
+     * The C-10 fix freezes the window grid after first L1 creation, preventing
+     * adaptive segmentation from changing window boundaries mid-stream. This
+     * test verifies the invariant is preserved by:
+     * 1. Creating L1 segments through compaction
+     * 2. Adding more data and compacting again
+     * 3. Verifying all data is still queryable (L1 non-overlap maintained)
+     */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 2;  /* Trigger compaction with 2 L0 segments */
+    cfg.window_size = 100;       /* Small window for easy L1 creation */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Phase 1: Create first L1 segment */
+    /* Insert records in window 0 [0, 100) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Insert more in same window */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact - should create L1 segment for window 0 */
+    /* After this, window_grid_frozen should be true (C-10) */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    /* Phase 2: Add more data in different window and compact again */
+    /* Insert records in window 1 [100, 200) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 110, 110));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 120, 120));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 130, 130));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 140, 140));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact again - should create L1 segment for window 1 */
+    /* C-10 ensures window boundaries don't change, maintaining non-overlap */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    /* Phase 3: Verify all data is queryable (L1 non-overlap maintained) */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    tl_ts_t expected_ts[] = {10, 20, 30, 40, 110, 120, 130, 140};
+    tl_handle_t expected_h[] = {10, 20, 30, 40, 110, 120, 130, 140};
+    size_t n_expected = sizeof(expected_ts) / sizeof(expected_ts[0]);
+
+    for (size_t i = 0; i < n_expected; i++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+        TEST_ASSERT_EQ(expected_ts[i], rec.ts);
+        TEST_ASSERT_EQ(expected_h[i], rec.handle);
+    }
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    /* Phase 4: Verify validation passes (L1 non-overlap invariant) */
+#ifdef TL_DEBUG
+    TEST_ASSERT_STATUS(TL_OK, tl_validate(snap));
+#endif
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Failure Handling Tests (migrated from test_phase9.c)
  *===========================================================================*/
 
@@ -1866,6 +1953,239 @@ TEST_DECLARE(func_smoke_high_volume_append_iterate) {
 }
 
 /*===========================================================================
+ * Skip-Ahead Seek Tests (C-02 Fix Verification)
+ *
+ * These tests verify that tl_kmerge_iter_seek() correctly preserves buffered
+ * records >= target timestamp. The bug (C-02 / QUERY-1.1) was that seek()
+ * cleared the entire heap, losing prefetched records that should be preserved.
+ *===========================================================================*/
+
+/**
+ * Test: seek during tombstone filtering preserves buffered records >= target.
+ *
+ * Bug scenario: With multiple sources (L0 segment + memtable), the merge heap
+ * contains prefetched records from each. When a tombstone triggers skip-ahead,
+ * seek() must preserve heap entries with ts >= target.
+ *
+ * Setup:
+ * - L0 segment: [100, 300] (from flush)
+ * - Active memtable: [150, 350]
+ * - Tombstone: [0, 200)  <- triggers skip-ahead past 150, 100
+ *
+ * After merge init, heap has: {ts=100, L0}, {ts=150, memtable}
+ * Tombstone skip-ahead seeks to ts=200:
+ * - Entry {100} < 200: pop, seek L0 to 200, re-prime with 300
+ * - Entry {150} < 200: pop, seek memtable to 200, re-prime with 350
+ *
+ * Expected output: ts=300, ts=350 (both records visible after tombstone)
+ *
+ * The bug would lose ts=300 if seek() incorrectly cleared and re-sought L0.
+ */
+TEST_DECLARE(func_seek_preserves_buffered_records_multi_source) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create L0 segment with records at ts=100, ts=300 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add records to active memtable at ts=150, ts=350 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 350, 4));
+
+    /* Add tombstone [0, 200) - triggers skip-ahead past 100 and 150 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 200));
+
+    /* Query all records */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Should see ts=300 and ts=350 (records after tombstone) */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+    TEST_ASSERT_EQ(3, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(350, rec.ts);
+    TEST_ASSERT_EQ(4, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek preserves heap entry exactly at target timestamp.
+ *
+ * If heap has entry {ts=200} and we seek to target=200, the entry should
+ * be preserved (200 >= 200), not popped and re-fetched.
+ */
+TEST_DECLARE(func_seek_preserves_entry_at_exact_target) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create records: 100, 200, 300 in L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add tombstone [50, 200) - seek target is exactly 200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 200));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* ts=100 is deleted by tombstone.
+     * After skip-ahead to 200, heap should have entry for ts=200.
+     * ts=200 is NOT deleted (tombstone is [50, 200), half-open). */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(200, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek preserves some entries while popping others (MIXED case).
+ *
+ * This is the CORE BUG scenario - one source has entry >= target that must
+ * be preserved while another source has entry < target that must be popped.
+ *
+ * Setup:
+ * - L0 segment: [100, 400]
+ * - Active memtable: [250, 500]
+ *
+ * After merge init, heap has: {ts=100, L0}, {ts=250, memtable}
+ * Tombstone [0, 200) triggers seek to 200:
+ * - Entry {100} < 200: pop, seek L0 to 200, re-prime with 400
+ * - Entry {250} >= 200: PRESERVE (this is the key case!)
+ *
+ * Expected: 250, 400, 500 (250 preserved, not lost)
+ *
+ * The OLD buggy code would lose 250 because it cleared the entire heap.
+ */
+TEST_DECLARE(func_seek_mixed_preserve_and_pop) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create L0 segment with records at ts=100, ts=400 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add records to active memtable at ts=250, ts=500 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 250, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 500, 5));
+
+    /* Tombstone [0, 200) - triggers seek.
+     * Entry {100} < 200: pop and re-seek
+     * Entry {250} >= 200: PRESERVE */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 200));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Key assertion: ts=250 MUST be returned first (preserved, not lost) */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(250, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(400, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(500, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek with interleaved records from multiple sources.
+ *
+ * Three sources with interleaved timestamps:
+ * - L0-a: [100, 400]
+ * - L0-b: [200, 500]
+ * - Active: [300, 600]
+ *
+ * Tombstone [0, 350) triggers seek to 350.
+ * After init, heap has {100, 200, 300}.
+ * All three entries are < 350, so all sources should be re-seeked.
+ *
+ * Expected: 400, 500, 600 (sorted order from all sources)
+ */
+TEST_DECLARE(func_seek_multiple_sources_all_below_target) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create first L0 segment */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Create second L0 segment */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 500, 5));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Active memtable */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 600, 6));
+
+    /* Tombstone [0, 350) */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 350));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Should see 400, 500, 600 in sorted order */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(400, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(500, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(600, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -1955,6 +2275,9 @@ void run_functional_tests(void) {
     /* Compaction callback tests (1 test) - uses on_drop callback */
     RUN_TEST(func_compact_on_drop_handle_invoked);
 
+    /* C-10: Window grid freeze test (1 test) - verifies L1 non-overlap invariant */
+    RUN_TEST(func_compact_c10_l1_nonoverlap_preserved);
+
     /* Failure handling tests (4 tests) - uses allocator/log hooks */
     RUN_TEST(func_flush_build_survives_enomem);
     RUN_TEST(func_publish_phase_enomem);
@@ -1964,8 +2287,14 @@ void run_functional_tests(void) {
     /* Stress smoke test (small scale, always-on) */
     RUN_TEST(func_smoke_high_volume_append_iterate);
 
+    /* Skip-ahead seek tests (4 tests) - C-02 fix verification */
+    RUN_TEST(func_seek_preserves_buffered_records_multi_source);
+    RUN_TEST(func_seek_preserves_entry_at_exact_target);
+    RUN_TEST(func_seek_mixed_preserve_and_pop);  /* Core bug scenario */
+    RUN_TEST(func_seek_multiple_sources_all_below_target);
+
     /*
-     * Total: ~55 tests (public API only)
+     * Total: ~58 tests (public API only)
      *
      * Internal tests moved to:
      * - test_storage_internal.c (~43 tests): window, page, catalog, segment, manifest

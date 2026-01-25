@@ -3,12 +3,12 @@
 
 #include "../internal/tl_defs.h"
 #include "../delta/tl_memrun.h"
+#include "tl_submerge.h"
 
 /*===========================================================================
  * Memrun Iterator
  *
- * Two-way merge over run[] and ooo[] arrays within a memrun.
- * Produces records in timestamp order (run preferred on ties for stability).
+ * Internal K-way merge over run[] and OOO runs within a memrun.
  *
  * UNBOUNDED QUERY DESIGN:
  * - If t2_unbounded == true, the query is [t1, +inf)
@@ -29,13 +29,10 @@ typedef struct tl_memrun_iter {
     tl_ts_t         t2;              /* ONLY valid if !t2_unbounded */
     bool            t2_unbounded;
 
-    /* Positions in run and ooo */
-    size_t          run_pos;
-    size_t          run_end;
-    size_t          ooo_pos;
-    size_t          ooo_end;
+    /* Internal merge state */
+    tl_submerge_t   merge;
 
-    /* State */
+    /* Output state */
     bool            done;
     bool            has_current;
     tl_record_t     current;
@@ -55,11 +52,19 @@ typedef struct tl_memrun_iter {
  * @param t1           Range start (inclusive)
  * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
  * @param t2_unbounded True => [t1, +inf), t2 is ignored
+ * @param alloc        Allocator for internal merge state
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on allocation failure
  */
-void tl_memrun_iter_init(tl_memrun_iter_t* it,
-                          const tl_memrun_t* mr,
-                          tl_ts_t t1, tl_ts_t t2,
-                          bool t2_unbounded);
+tl_status_t tl_memrun_iter_init(tl_memrun_iter_t* it,
+                                 const tl_memrun_t* mr,
+                                 tl_ts_t t1, tl_ts_t t2,
+                                 bool t2_unbounded,
+                                 tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy memrun iterator and free internal resources.
+ */
+void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
 
 /*===========================================================================
  * Iteration

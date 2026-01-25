@@ -205,6 +205,17 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
+    /*
+     * Validate pointers when counts are non-zero (C-04 fix).
+     * memcpy with NULL src is undefined behavior per C17 §7.1.4.
+     */
+    if (tombstones_len > 0 && tombstones == NULL) {
+        return TL_EINVAL;
+    }
+    if (record_count > 0 && records == NULL) {
+        return TL_EINVAL;
+    }
+
     /* Allocate segment */
     tl_segment_t* seg = TL_NEW(alloc, tl_segment_t);
     if (seg == NULL) {
@@ -297,8 +308,15 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  tl_segment_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
-    /* Invariant: unbounded implies window_end == TL_TS_MAX */
-    TL_ASSERT(!window_end_unbounded || window_end == TL_TS_MAX);
+    *out = NULL;  /* Defensive initialization per C-05 fix */
+
+    /* C-05 fix: Runtime check for L1 unbounded invariant.
+     * TL_ASSERT becomes UB in release builds, so this defensive check
+     * ensures future callers cannot create invalid L1 segments.
+     * Invariant: window_end_unbounded implies window_end == TL_TS_MAX */
+    if (window_end_unbounded && window_end != TL_TS_MAX) {
+        return TL_EINVAL;
+    }
 
     /* L1 must have records */
     if (record_count == 0 || records == NULL) {

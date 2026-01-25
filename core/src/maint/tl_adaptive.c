@@ -198,7 +198,14 @@ tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
     int64_t q = (int64_t)window_quantum;
     int64_t qid = tl_floor_div_i64(wi, q);
 
-    /* Step 3: Compute snapped value */
+    /* C-11 fix: Defensive overflow check for qid * q.
+     * Mathematically, qid * q <= wi < INT64_MAX, so overflow is impossible.
+     * This check is defensive programming per LLD Section 12.1. */
+    if (qid > 0 && q > INT64_MAX / qid) {
+        return current_window;  /* Overflow - should never happen */
+    }
+
+    /* Step 3: Compute snapped value (overflow-safe after C-11 check) */
     int64_t snapped = qid * q;
 
     /* Step 4: Compute remainder */

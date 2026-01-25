@@ -91,6 +91,7 @@ set(TIMELOG_SOURCES
     core/src/storage/tl_manifest.c
     # Phase 4
     core/src/delta/tl_memrun.c
+    core/src/delta/tl_ooorun.c
     core/src/delta/tl_memtable.c
     core/src/delta/tl_flush.c
     # Phase 5
@@ -99,6 +100,7 @@ set(TIMELOG_SOURCES
     core/src/query/tl_segment_iter.c
     core/src/query/tl_memrun_iter.c
     core/src/query/tl_active_iter.c
+    core/src/query/tl_submerge.c
     core/src/query/tl_plan.c
     core/src/query/tl_merge_iter.c
     core/src/query/tl_filter.c

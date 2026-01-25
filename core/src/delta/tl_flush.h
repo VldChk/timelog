@@ -12,7 +12,7 @@
  * Builds L0 segments from sealed memruns. Serialized by flush_mu in tl_timelog.
  *
  * The flush builder:
- * 1. Merges run + ooo arrays into a single sorted stream (two-way merge)
+ * 1. Merges run + OOO runs into a single sorted stream (K-way merge)
  * 2. Passes merged records + tombstones to tl_segment_build_l0
  * 3. Returns the built L0 segment
  *
@@ -35,7 +35,7 @@ typedef struct tl_flush_ctx {
  * Two-Way Merge Iterator
  *
  * Produces records in timestamp order from two sorted inputs.
- * Stable merge: if timestamps are equal, prefers first input (run over ooo).
+ * Stable merge: if timestamps are equal, prefers first input.
  *
  * Usage:
  *   tl_merge_iter_t it;
@@ -108,11 +108,11 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  * Build an L0 segment from a memrun.
  *
  * Algorithm:
- * 1. Check for addition overflow: run_len + ooo_len
- * 2. If both run and ooo empty but tombs non-empty: build tombstone-only segment
+ * 1. Check for addition overflow: run_len + ooo_total_len
+ * 2. If both run and OOO empty but tombs non-empty: build tombstone-only segment
  * 3. Check for multiplication overflow: total_records * sizeof(tl_record_t)
  * 4. Allocate merged[] buffer
- * 5. Merge run + ooo into merged[] using two-way merge iterator
+ * 5. Merge run + OOO runs into merged[] using K-way merge
  * 6. Call tl_segment_build_l0(merged, tombstones)
  * 7. Free merged[] buffer
  *

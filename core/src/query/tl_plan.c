@@ -147,12 +147,19 @@ static tl_status_t add_memrun_source(tl_plan_t* plan,
     src->kind = TL_ITER_MEMRUN;
     src->priority = priority;
 
-    tl_memrun_iter_init(&src->iter.memrun, mr,
-                        plan->t1, plan->t2, plan->t2_unbounded);
+    tl_status_t init_st = tl_memrun_iter_init(&src->iter.memrun, mr,
+                                              plan->t1, plan->t2, plan->t2_unbounded,
+                                              plan->alloc);
+    if (init_st != TL_OK) {
+        tl_memrun_iter_destroy(&src->iter.memrun);
+        return init_st;
+    }
 
     /* Only add if not immediately exhausted */
     if (!tl_memrun_iter_done(&src->iter.memrun)) {
         plan->source_count++;
+    } else {
+        tl_memrun_iter_destroy(&src->iter.memrun);
     }
 
     return TL_OK;
@@ -172,12 +179,19 @@ static tl_status_t add_active_source(tl_plan_t* plan,
     src->kind = TL_ITER_ACTIVE;
     src->priority = UINT32_MAX;  /* Active is always highest priority */
 
-    tl_active_iter_init(&src->iter.active, mv,
-                        plan->t1, plan->t2, plan->t2_unbounded);
+    tl_status_t init_st = tl_active_iter_init(&src->iter.active, mv,
+                                              plan->t1, plan->t2, plan->t2_unbounded,
+                                              plan->alloc);
+    if (init_st != TL_OK) {
+        tl_active_iter_destroy(&src->iter.active);
+        return init_st;
+    }
 
     /* Only add if not immediately exhausted */
     if (!tl_active_iter_done(&src->iter.active)) {
         plan->source_count++;
+    } else {
+        tl_active_iter_destroy(&src->iter.active);
     }
 
     return TL_OK;
@@ -562,7 +576,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
      */
     if (mv->has_data && tl_memview_overlaps(mv, t1, t2, t2_unbounded)) {
         size_t active_run_len = tl_memview_run_len(mv);
-        size_t active_ooo_len = tl_memview_ooo_len(mv);
+        size_t active_ooo_len = tl_memview_ooo_total_len(mv);
 
         if (active_run_len > 0 || active_ooo_len > 0) {
             st = add_active_source(plan, mv);
@@ -597,6 +611,14 @@ void tl_plan_destroy(tl_plan_t* plan) {
     }
 
     if (plan->sources != NULL) {
+        for (size_t i = 0; i < plan->source_count; i++) {
+            tl_iter_source_t* src = &plan->sources[i];
+            if (src->kind == TL_ITER_ACTIVE) {
+                tl_active_iter_destroy(&src->iter.active);
+            } else if (src->kind == TL_ITER_MEMRUN) {
+                tl_memrun_iter_destroy(&src->iter.memrun);
+            }
+        }
         tl__free(plan->alloc, plan->sources);
         plan->sources = NULL;
     }

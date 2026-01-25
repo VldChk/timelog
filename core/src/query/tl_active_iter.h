@@ -3,12 +3,13 @@
 
 #include "../internal/tl_defs.h"
 #include "../delta/tl_memview.h"
+#include "tl_submerge.h"
 
 /*===========================================================================
  * Active Memview Iterator
  *
- * Two-way merge over active_run and active_ooo from a memview.
- * Follows the same pattern as tl_memrun_iter but operates on memview buffers.
+ * Internal K-way merge over active_run, OOO runs, and OOO head
+ * from a memview. Uses tl_submerge for shared heap logic.
  *
  * UNBOUNDED QUERY DESIGN:
  * - If t2_unbounded == true, the query is [t1, +inf)
@@ -29,13 +30,10 @@ typedef struct tl_active_iter {
     tl_ts_t         t2;              /* ONLY valid if !t2_unbounded */
     bool            t2_unbounded;
 
-    /* Positions in run and ooo */
-    size_t          run_pos;
-    size_t          run_end;
-    size_t          ooo_pos;
-    size_t          ooo_end;
+    /* Internal merge state */
+    tl_submerge_t   merge;
 
-    /* State */
+    /* Output state */
     bool            done;
     bool            has_current;
     tl_record_t     current;
@@ -55,11 +53,19 @@ typedef struct tl_active_iter {
  * @param t1           Range start (inclusive)
  * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
  * @param t2_unbounded True => [t1, +inf), t2 is ignored
+ * @param alloc        Allocator for internal merge state
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on allocation failure
  */
-void tl_active_iter_init(tl_active_iter_t* it,
-                          const tl_memview_t* mv,
-                          tl_ts_t t1, tl_ts_t t2,
-                          bool t2_unbounded);
+tl_status_t tl_active_iter_init(tl_active_iter_t* it,
+                                 const tl_memview_t* mv,
+                                 tl_ts_t t1, tl_ts_t t2,
+                                 bool t2_unbounded,
+                                 tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy active iterator and free internal resources.
+ */
+void tl_active_iter_destroy(tl_active_iter_t* it);
 
 /*===========================================================================
  * Iteration

@@ -137,16 +137,26 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
         bool ok = tl_seqlock_validate(seq1, seq2);
 
         if (ok) {
-            /* Update cache on fresh capture */
-            if (!used_cache) {
-                if (tl->memview_cache != NULL) {
-                    tl_memview_shared_release(tl->memview_cache);
-                }
-                tl->memview_cache = tl_memview_shared_acquire(mv);
-                tl->memview_cache_epoch = epoch;
-            }
-
             TL_UNLOCK_WRITER(tl);
+
+            /* Sort OOO head off writer_mu for fresh captures. */
+            if (!used_cache) {
+                tl_memview_sort_head(&mv->view);
+
+                /* Update cache if epoch unchanged (two-phase capture). */
+                TL_LOCK_WRITER(tl);
+                if (tl_memtable_epoch(&tl->memtable) == epoch) {
+                    if (tl->memview_cache == NULL ||
+                        tl->memview_cache_epoch != epoch) {
+                        if (tl->memview_cache != NULL) {
+                            tl_memview_shared_release(tl->memview_cache);
+                        }
+                        tl->memview_cache = tl_memview_shared_acquire(mv);
+                        tl->memview_cache_epoch = epoch;
+                    }
+                }
+                TL_UNLOCK_WRITER(tl);
+            }
 
             snap->manifest = manifest;
             snap->memview = mv;

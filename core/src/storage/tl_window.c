@@ -117,8 +117,14 @@ static bool add_overflow_i64(int64_t a, int64_t b, int64_t* out) {
 
 tl_status_t tl_window_id_for_ts(tl_ts_t ts, tl_ts_t window_size,
                                  tl_ts_t window_origin, int64_t* out_id) {
-    TL_ASSERT(window_size > 0);
     TL_ASSERT(out_id != NULL);
+
+    /* C-06 fix: Runtime check for window_size.
+     * TL_ASSERT becomes UB in release builds. This defensive check
+     * prevents division by zero on invalid config or overflow corruption. */
+    if (window_size <= 0) {
+        return TL_EINVAL;
+    }
 
     /*
      * Use floor division for correct behavior with negative numerators.
@@ -147,10 +153,20 @@ tl_status_t tl_window_id_for_ts(tl_ts_t ts, tl_ts_t window_size,
 
 void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_origin,
                       tl_ts_t* out_start, tl_ts_t* out_end, bool* end_unbounded) {
-    TL_ASSERT(window_size > 0);
     TL_ASSERT(out_start != NULL);
     TL_ASSERT(out_end != NULL);
     TL_ASSERT(end_unbounded != NULL);
+
+    /* C-06 fix: Runtime guard for window_size.
+     * TL_ASSERT becomes UB in release builds. This defensive check
+     * prevents UB on invalid config or overflow corruption.
+     * Returns degenerate empty window [origin, origin) on invalid input. */
+    if (window_size <= 0) {
+        *out_start = window_origin;
+        *out_end = window_origin;
+        *end_unbounded = false;
+        return;
+    }
 
     /*
      * window_start = window_origin + window_id * window_size

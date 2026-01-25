@@ -10,7 +10,7 @@
  * - Owner reference counting
  * - Release hooks
  *
- * Total: 19 tests organized in 8 phases per the implementation plan.
+ * Total: 20 tests organized in 8 phases per the implementation plan.
  *
  * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
  *===========================================================================*/
@@ -78,6 +78,24 @@ static void test_release_hook(void* user) {
     hook_tracker_t* tracker = (hook_tracker_t*)user;
     if (tracker != NULL) {
         tracker->call_count++;
+    }
+}
+
+typedef struct {
+    tl_timelog_t* tl;
+    int call_count;
+} hook_close_ctx_t;
+
+static void test_release_hook_close_timelog(void* user) {
+    hook_close_ctx_t* ctx = (hook_close_ctx_t*)user;
+    if (ctx == NULL) {
+        return;
+    }
+
+    ctx->call_count++;
+    if (ctx->tl != NULL) {
+        tl_close(ctx->tl);
+        ctx->tl = NULL;
     }
 }
 
@@ -543,7 +561,7 @@ TEST_DECLARE(pagespan_views_valid_after_iter_close) {
 }
 
 /*===========================================================================
- * Phase 7: Release Hooks (2 tests)
+ * Phase 7: Release Hooks (3 tests)
  *===========================================================================*/
 
 /**
@@ -583,6 +601,45 @@ TEST_DECLARE(pagespan_release_hook_called_on_owner_destruction) {
     TEST_ASSERT_EQ(1, tracker.call_count);
 
     tl_close(tl);
+}
+
+/**
+ * Test: Release hook may close the timelog (allocator lifetime safety).
+ *
+ * This simulates a binding that decrefs the timelog in the release hook.
+ * The iterator must be freed before the hook runs to avoid allocator UAF.
+ */
+TEST_DECLARE(pagespan_release_hook_can_close_timelog) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, create_timelog_with_flushed_data(&tl, 100, 10));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_close_ctx_t ctx = { .tl = tl, .call_count = 0 };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &ctx,
+        .on_release = test_release_hook_close_timelog
+    };
+
+    tl_pagespan_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_pagespan_iter_open(tl, 0, 1000, 0, &hooks, &it));
+    TEST_ASSERT_NOT_NULL(it);
+
+    /* Get and release a view to exercise owner refs */
+    tl_pagespan_view_t view;
+    memset(&view, 0, sizeof(view));
+    TEST_ASSERT_STATUS(TL_OK, tl_pagespan_iter_next(it, &view));
+    tl_pagespan_view_release(&view);
+
+    /* Close iterator - hook will close timelog */
+    tl_pagespan_iter_close(it);
+
+    TEST_ASSERT_EQ(1, ctx.call_count);
+
+    /* Cleanup if hook did not close (should not happen) */
+    if (ctx.tl != NULL) {
+        tl_close(ctx.tl);
+        ctx.tl = NULL;
+    }
 }
 
 /**
@@ -758,6 +815,7 @@ void run_pagespan_iter_tests(void) {
 
     /* Phase 7: Release Hooks */
     RUN_TEST(pagespan_release_hook_called_on_owner_destruction);
+    RUN_TEST(pagespan_release_hook_can_close_timelog);
     RUN_TEST(pagespan_release_hook_null_is_safe);
     RUN_TEST(pagespan_release_hook_called_even_with_no_spans);
 

@@ -19,10 +19,10 @@ static void compute_bounds(tl_memrun_t* mr) {
         max_ts = TL_MAX(max_ts, mr->run[mr->run_len - 1].ts);
     }
 
-    /* Record bounds from ooo (sorted, so first/last are min/max) */
-    if (mr->ooo_len > 0) {
-        min_ts = TL_MIN(min_ts, mr->ooo[0].ts);
-        max_ts = TL_MAX(max_ts, mr->ooo[mr->ooo_len - 1].ts);
+    /* Record bounds from OOO runs (precomputed min/max) */
+    if (mr->ooo_total_len > 0) {
+        min_ts = TL_MIN(min_ts, mr->ooo_min_ts);
+        max_ts = TL_MAX(max_ts, mr->ooo_max_ts);
     }
 
     /* Tombstone bounds (CRITICAL for read-path correctness) */
@@ -57,22 +57,27 @@ static void compute_bounds(tl_memrun_t* mr) {
 static void memrun_init_inplace(tl_memrun_t* mr,
                                  tl_alloc_ctx_t* alloc,
                                  tl_record_t* run, size_t run_len,
-                                 tl_record_t* ooo, size_t ooo_len,
+                                 tl_ooorunset_t* ooo_runs,
                                  tl_interval_t* tombs, size_t tombs_len) {
     TL_ASSERT(mr != NULL);
     TL_ASSERT(alloc != NULL);
-    TL_ASSERT(run_len > 0 || ooo_len > 0 || tombs_len > 0);
+    TL_ASSERT(run_len > 0 ||
+              (ooo_runs != NULL && ooo_runs->count > 0) ||
+              tombs_len > 0);
 
     /* Null-check arrays when length is non-zero */
     TL_ASSERT(run_len == 0 || run != NULL);
-    TL_ASSERT(ooo_len == 0 || ooo != NULL);
+    TL_ASSERT(ooo_runs == NULL || ooo_runs->count > 0);
     TL_ASSERT(tombs_len == 0 || tombs != NULL);
 
     /* Take ownership of arrays */
     mr->run = run;
     mr->run_len = run_len;
-    mr->ooo = ooo;
-    mr->ooo_len = ooo_len;
+    mr->ooo_runs = ooo_runs;
+    mr->ooo_total_len = (ooo_runs == NULL) ? 0 : ooo_runs->total_len;
+    mr->ooo_run_count = (ooo_runs == NULL) ? 0 : ooo_runs->count;
+    mr->ooo_min_ts = TL_TS_MAX;
+    mr->ooo_max_ts = TL_TS_MIN;
     mr->tombs = tombs;
     mr->tombs_len = tombs_len;
 
@@ -82,13 +87,21 @@ static void memrun_init_inplace(tl_memrun_t* mr,
     /* Initialize reference count to 1 (caller owns) */
     tl_atomic_init_u32(&mr->refcnt, 1);
 
+    if (mr->ooo_total_len > 0) {
+        for (size_t i = 0; i < mr->ooo_run_count; i++) {
+            const tl_ooorun_t* run_ptr = mr->ooo_runs->runs[i];
+            mr->ooo_min_ts = TL_MIN(mr->ooo_min_ts, run_ptr->min_ts);
+            mr->ooo_max_ts = TL_MAX(mr->ooo_max_ts, run_ptr->max_ts);
+        }
+    }
+
     /* Compute bounds (includes tombstones) */
     compute_bounds(mr);
 }
 
 tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
                               tl_record_t* run, size_t run_len,
-                              tl_record_t* ooo, size_t ooo_len,
+                              tl_ooorunset_t* ooo_runs,
                               tl_interval_t* tombs, size_t tombs_len,
                               tl_memrun_t** out) {
     TL_ASSERT(alloc != NULL);
@@ -97,7 +110,10 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
     *out = NULL;
 
     /* All empty is invalid */
-    if (run_len == 0 && ooo_len == 0 && tombs_len == 0) {
+    if (run_len == 0 && ooo_runs == NULL && tombs_len == 0) {
+        return TL_EINVAL;
+    }
+    if (ooo_runs != NULL && ooo_runs->count == 0) {
         return TL_EINVAL;
     }
 
@@ -109,7 +125,7 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
     }
 
     /* Initialize in-place */
-    memrun_init_inplace(mr, alloc, run, run_len, ooo, ooo_len, tombs, tombs_len);
+    memrun_init_inplace(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len);
 
     *out = mr;
     return TL_OK;
@@ -145,8 +161,8 @@ void tl_memrun_release(tl_memrun_t* mr) {
         if (mr->run != NULL) {
             tl__free(mr->alloc, mr->run);
         }
-        if (mr->ooo != NULL) {
-            tl__free(mr->alloc, mr->ooo);
+        if (mr->ooo_runs != NULL) {
+            tl_ooorunset_release(mr->ooo_runs);
         }
         if (mr->tombs != NULL) {
             tl__free(mr->alloc, mr->tombs);
@@ -166,12 +182,28 @@ void tl_memrun_release(tl_memrun_t* mr) {
 /**
  * Check if record array is sorted by timestamp (non-decreasing).
  */
-static bool is_records_sorted(const tl_record_t* arr, size_t len) {
+static bool is_records_sorted_ts(const tl_record_t* arr, size_t len) {
     if (len <= 1) {
         return true;
     }
     for (size_t i = 0; i < len - 1; i++) {
         if (arr[i].ts > arr[i + 1].ts) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_records_sorted_ts_handle(const tl_record_t* arr, size_t len) {
+    if (len <= 1) {
+        return true;
+    }
+    for (size_t i = 0; i < len - 1; i++) {
+        if (arr[i].ts > arr[i + 1].ts) {
+            return false;
+        }
+        if (arr[i].ts == arr[i + 1].ts &&
+            arr[i].handle > arr[i + 1].handle) {
             return false;
         }
     }
@@ -223,17 +255,59 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
     }
 
     /* At least one component must be non-empty */
-    if (mr->run_len == 0 && mr->ooo_len == 0 && mr->tombs_len == 0) {
+    if (mr->run_len == 0 && mr->ooo_total_len == 0 && mr->tombs_len == 0) {
         return false;
     }
 
-    /* Check run sorted */
-    if (!is_records_sorted(mr->run, mr->run_len)) {
+    /* Check run sorted by ts (handle order is unspecified for in-order path) */
+    if (!is_records_sorted_ts(mr->run, mr->run_len)) {
         return false;
     }
 
-    /* Check ooo sorted */
-    if (!is_records_sorted(mr->ooo, mr->ooo_len)) {
+    /* Check OOO runset */
+    if (mr->ooo_total_len > 0) {
+        if (mr->ooo_runs == NULL || mr->ooo_run_count == 0) {
+            return false;
+        }
+        if (mr->ooo_run_count != mr->ooo_runs->count) {
+            return false;
+        }
+        size_t total = 0;
+        uint64_t last_gen = 0;
+        bool have_gen = false;
+        tl_ts_t min_ts = TL_TS_MAX;
+        tl_ts_t max_ts = TL_TS_MIN;
+
+        for (size_t i = 0; i < mr->ooo_run_count; i++) {
+            const tl_ooorun_t* run = mr->ooo_runs->runs[i];
+            if (run == NULL) {
+                return false;
+            }
+            if (!is_records_sorted_ts_handle(run->records, run->len)) {
+                return false;
+            }
+            if (have_gen && run->gen < last_gen) {
+                return false;
+            }
+            have_gen = true;
+            last_gen = run->gen;
+
+            if (run->len > SIZE_MAX - total) {
+                return false;
+            }
+            total += run->len;
+
+            min_ts = TL_MIN(min_ts, run->min_ts);
+            max_ts = TL_MAX(max_ts, run->max_ts);
+        }
+
+        if (total != mr->ooo_total_len) {
+            return false;
+        }
+        if (min_ts != mr->ooo_min_ts || max_ts != mr->ooo_max_ts) {
+            return false;
+        }
+    } else if (mr->ooo_runs != NULL || mr->ooo_run_count != 0) {
         return false;
     }
 
@@ -247,8 +321,8 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
     if (mr->run_len > 0) {
         expected_min = TL_MIN(expected_min, mr->run[0].ts);
     }
-    if (mr->ooo_len > 0) {
-        expected_min = TL_MIN(expected_min, mr->ooo[0].ts);
+    if (mr->ooo_total_len > 0) {
+        expected_min = TL_MIN(expected_min, mr->ooo_min_ts);
     }
     for (size_t i = 0; i < mr->tombs_len; i++) {
         expected_min = TL_MIN(expected_min, mr->tombs[i].start);
@@ -262,8 +336,8 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
     if (mr->run_len > 0) {
         expected_max = TL_MAX(expected_max, mr->run[mr->run_len - 1].ts);
     }
-    if (mr->ooo_len > 0) {
-        expected_max = TL_MAX(expected_max, mr->ooo[mr->ooo_len - 1].ts);
+    if (mr->ooo_total_len > 0) {
+        expected_max = TL_MAX(expected_max, mr->ooo_max_ts);
     }
     for (size_t i = 0; i < mr->tombs_len; i++) {
         const tl_interval_t* tomb = &mr->tombs[i];

@@ -102,8 +102,13 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
  *
  * Semantics:
  * - Forward-only: if target <= current position, this is a no-op
- * - After seek, the heap is rebuilt with new positions from all sources
+ * - Entries in the heap with ts >= target are preserved (not re-fetched)
+ * - Only sources with buffered ts < target are re-sought
  * - If all sources are exhausted after seek, iterator becomes done
+ *
+ * Implementation note: The heap contains prefetched records. Source iterators
+ * use forward-only seek and cannot recover records they've already returned.
+ * Therefore, heap entries with ts >= target must be preserved in place.
  *
  * @param it     Iterator
  * @param target Target timestamp to seek to

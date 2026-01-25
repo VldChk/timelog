@@ -488,6 +488,12 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
      * All zeros = disabled behavior; state tracks EWMA and counters only. */
     tl_adaptive_state_init(&tl->adaptive);
 
+    /* C-10: Initialize window grid freeze flag.
+     * Check if manifest already has L1 segments (future-proofing for persistence).
+     * If L1 exists, freeze the grid to prevent window size changes.
+     * Single-threaded context - no lock needed. */
+    tl->window_grid_frozen = (tl_manifest_l1_count(tl->manifest) > 0);
+
     /* Auto-start background maintenance worker when mode is BACKGROUND.
      * This is the default mode - automatic segment management without
      * explicit tl_maint_start() call. Users doing bulk OOO ingestion
@@ -638,7 +644,7 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     if (seal_st != TL_EBUSY) {
         /* Seal failed with error other than queue-full (e.g., TL_ENOMEM).
          * Write already succeeded (this function is called post-insert),
-         * so return TL_EBUSY to prevent caller from retrying → duplicates.
+         * so return TL_EBUSY to prevent caller from retrying (duplicates).
          * Waiting for queue space won't help - this isn't a capacity issue. */
         return TL_EBUSY;
     }
@@ -707,21 +713,20 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
         return TL_ESTATE;
     }
 
-    tl_status_t st;
     bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
     /* Insert into memtable */
-    st = tl_memtable_insert(&tl->memtable, ts, handle);
-    if (st != TL_OK) {
+    tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle);
+    if (insert_st != TL_OK && insert_st != TL_EBUSY) {
         TL_UNLOCK_WRITER(tl);
-        return st;
+        return insert_st;
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    st = handle_seal_with_backpressure(tl, &need_signal);
+    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -730,7 +735,11 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
         tl__maint_request_flush(tl);
     }
 
-    return st;
+    if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
+        return TL_EBUSY;
+    }
+
+    return seal_st;
 }
 
 tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
@@ -748,28 +757,27 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
         return TL_EINVAL;
     }
 
-    tl_status_t st;
     bool need_signal = false;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
     /* Insert batch into memtable */
-    st = tl_memtable_insert_batch(&tl->memtable, records, n, flags);
-    if (st != TL_OK) {
+    tl_status_t insert_st = tl_memtable_insert_batch(&tl->memtable, records, n, flags);
+    if (insert_st != TL_OK && insert_st != TL_EBUSY) {
         TL_UNLOCK_WRITER(tl);
-        /* Partial insert may have occurred before failure (slow path can fail
-         * mid-batch). Return TL_EBUSY instead of raw error to prevent caller
-         * from retrying entire batch and creating duplicates.
-         * TL_EINVAL is a true pre-insert failure (bad input), so pass through. */
-        if (st == TL_ENOMEM || st == TL_EOVERFLOW) {
-            return TL_EBUSY;
-        }
-        return st;
+        /* C-08 fix: With all-or-nothing semantics (pre-reserve in slow path),
+         * failure means NO records were inserted. Return the actual error code
+         * so callers can distinguish true failures from backpressure.
+         *
+         * TL_ENOMEM/TL_EOVERFLOW = true failure, caller can rollback all INCREFs
+         * TL_EBUSY is returned only when writes succeeded but backpressure
+         * occurred (seal queue full or OOO head flush failure). */
+        return insert_st;
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    st = handle_seal_with_backpressure(tl, &need_signal);
+    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -778,7 +786,11 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
         tl__maint_request_flush(tl);
     }
 
-    return st;
+    if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
+        return TL_EBUSY;
+    }
+
+    return seal_st;
 }
 
 tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
@@ -1103,19 +1115,20 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
 
         if (metrics.has_records) {
             const tl_record_t* run = tl_memrun_run_data(mr);
-            const tl_record_t* ooo = tl_memrun_ooo_data(mr);
+            tl_ts_t ooo_min = mr->ooo_min_ts;
+            tl_ts_t ooo_max = mr->ooo_max_ts;
 
             /* Compute record-only min/max.
-             * Both run and ooo are sorted, so min is first, max is last. */
+             * run is sorted; OOO runs expose precomputed min/max. */
             if (run_len > 0 && ooo_len > 0) {
-                metrics.min_ts = TL_MIN(run[0].ts, ooo[0].ts);
-                metrics.max_ts = TL_MAX(run[run_len - 1].ts, ooo[ooo_len - 1].ts);
+                metrics.min_ts = TL_MIN(run[0].ts, ooo_min);
+                metrics.max_ts = TL_MAX(run[run_len - 1].ts, ooo_max);
             } else if (run_len > 0) {
                 metrics.min_ts = run[0].ts;
                 metrics.max_ts = run[run_len - 1].ts;
             } else {  /* ooo_len > 0 */
-                metrics.min_ts = ooo[0].ts;
-                metrics.max_ts = ooo[ooo_len - 1].ts;
+                metrics.min_ts = ooo_min;
+                metrics.max_ts = ooo_max;
             }
         }
     }
@@ -2286,7 +2299,7 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
      * This is RAW data before tombstone filtering.
      */
     total_records += tl_memview_run_len(memview);
-    total_records += tl_memview_ooo_len(memview);
+    total_records += tl_memview_ooo_total_len(memview);
 
     /* Add records from sealed memruns */
     for (size_t i = 0; i < tl_memview_sealed_len(memview); i++) {
@@ -2353,7 +2366,7 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
      * - sealed_runs: memruns queued for flush
      */
     out->memtable_active_records = (uint64_t)tl_memview_run_len(memview);
-    out->memtable_ooo_records = (uint64_t)tl_memview_ooo_len(memview);
+    out->memtable_ooo_records = (uint64_t)tl_memview_ooo_total_len(memview);
     out->memtable_sealed_runs = (uint64_t)tl_memview_sealed_len(memview);
 
     /*
@@ -2443,7 +2456,8 @@ tl_status_t tl_validate(const tl_snapshot_t* snap) {
      *
      * tl_memview_validate() checks:
      * - active_run sorted
-     * - active_ooo sorted
+     * - active_ooo_head sorted (ts, handle)
+     * - active_ooo_runs valid and gen-ordered
      * - active_tombs valid via tl_intervals_arr_validate
      * - sealed memrun pointers non-NULL
      * - has_data consistency

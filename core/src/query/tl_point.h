@@ -16,7 +16,7 @@
  * 1. Tombstone check: if any tombstone covers ts, return empty immediately
  * 2. L1 lookup: binary search window, catalog, page for ts
  * 3. L0 lookup: scan overlapping segments with binary search
- * 4. Memview lookup: binary search active_run, active_ooo, sealed memruns
+ * 4. Memview lookup: binary search active_run, OOO head, OOO runs, sealed memruns
  * 5. Concatenate results (duplicates preserved, order unspecified)
  *
  * Complexity:

@@ -14,8 +14,9 @@
  *
  * Used by:
  * - tl_memtable_t.active_run (append-only sorted records)
- * - tl_memtable_t.active_ooo (sorted out-of-order records)
- * - tl_memrun_t.run and tl_memrun_t.ooo (sealed arrays)
+ * - tl_memtable_t.ooo_head (append-only OOO head; may be unsorted)
+ * - tl_memrun_t.run (sealed array, always sorted)
+ * - OOO runs (sorted arrays created from head flush)
  * - Page builder (sorted record stream)
  *
  * Thread Safety:
@@ -104,6 +105,22 @@ tl_status_t tl_recvec_push_n(tl_recvec_t* rv, const tl_record_t* records, size_t
  * @return TL_OK on success, TL_ENOMEM on allocation failure, TL_EINVAL if idx > len
  */
 tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_t handle);
+
+/*---------------------------------------------------------------------------
+ * Sorting
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Sort the record vector by (ts, handle) (non-decreasing).
+ * Uses stdlib qsort. O(n log n) complexity.
+ *
+ * C-14 fix: Supports deferred sort strategy where OOO records are
+ * appended unsorted during insertion and sorted once at seal/capture time.
+ * This gives O(n) + O(n log n) total vs O(n^2) for sorted insert.
+ *
+ * @param rv Vector to sort (modified in place)
+ */
+void tl_recvec_sort(tl_recvec_t* rv);
 
 /*---------------------------------------------------------------------------
  * Binary Search (for sorted vectors)
