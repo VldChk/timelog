@@ -153,6 +153,14 @@ static tl_status_t build_pages(tl_segment_t* seg,
             chunk = cap;
         }
 
+        /* Cross-page ordering check: last of previous page <= first of next */
+        if (offset > 0) {
+            if (records[offset - 1].ts > records[offset].ts) {
+                st = TL_EINVAL;
+                goto rollback;
+            }
+        }
+
         tl_page_t* page = NULL;
         st = tl_page_builder_build(&pb, &records[offset], chunk, &page);
         if (st != TL_OK) {
@@ -356,6 +364,13 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     /* Bounds from pages */
     seg->min_ts = seg->catalog.pages[0].min_ts;
     seg->max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
+
+    /* H-12: Enforce records within window in release builds */
+    if (seg->min_ts < window_start ||
+        (!window_end_unbounded && seg->max_ts >= window_end)) {
+        segment_destroy(seg);
+        return TL_EINVAL;
+    }
 
     *out = seg;
     return TL_OK;

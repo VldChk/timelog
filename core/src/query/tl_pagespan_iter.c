@@ -26,6 +26,11 @@
 
 #include <string.h>
 
+/* Test hook: force iter allocation failure after owner creation */
+#ifdef TL_TEST_HOOKS
+volatile int tl_test_pagespan_fail_iter_alloc = 0;
+#endif
+
 /*===========================================================================
  * Internal Types
  *===========================================================================*/
@@ -42,6 +47,7 @@ struct tl_pagespan_owner {
     tl_snapshot_t*              snapshot;   /* Owned reference */
     tl_alloc_ctx_t*             alloc;      /* Borrowed from timelog */
     tl_pagespan_owner_hooks_t   hooks;      /* Copied from iter_open */
+    bool                        hook_armed; /* Hook runs only after successful open */
 };
 
 /**
@@ -101,6 +107,7 @@ static tl_status_t owner_create(
     owner->refcnt = 1;
     owner->snapshot = snapshot;
     owner->alloc = alloc;
+    owner->hook_armed = false;
 
     /* Copy hooks (NULL-safe) */
     if (hooks != NULL) {
@@ -133,6 +140,7 @@ static void owner_destroy(tl_pagespan_owner_t* owner) {
     tl_snapshot_t* snap = owner->snapshot;
     tl_alloc_ctx_t* alloc = owner->alloc;
     tl_pagespan_owner_hooks_t hooks = owner->hooks;
+    bool hook_armed = owner->hook_armed;
 
     /* Step 2: Release snapshot (no binding code runs here) */
     if (snap != NULL) {
@@ -143,7 +151,7 @@ static void owner_destroy(tl_pagespan_owner_t* owner) {
     tl__free(alloc, owner);
 
     /* Step 4: Call release hook (may run binding code, e.g., Py_DECREF) */
-    if (hooks.on_release != NULL) {
+    if (hook_armed && hooks.on_release != NULL) {
         hooks.on_release(hooks.user);
     }
 }
@@ -359,6 +367,15 @@ tl_status_t tl_pagespan_iter_open(
         return st;
     }
 
+    /* Test hook: force iterator allocation failure after owner creation */
+#ifdef TL_TEST_HOOKS
+    if (tl_test_pagespan_fail_iter_alloc > 0) {
+        tl_test_pagespan_fail_iter_alloc--;
+        tl_pagespan_owner_decref(owner);
+        return TL_ENOMEM;
+    }
+#endif
+
     /* Step 7: Create iterator */
     tl_pagespan_iter_t* it = tl__malloc(alloc, sizeof(tl_pagespan_iter_t));
     if (it == NULL) {
@@ -392,6 +409,9 @@ tl_status_t tl_pagespan_iter_open(
     }
     it->seg_idx = 0;
     it->current_seg = NULL;
+
+    /* Arm release hook only after successful open */
+    owner->hook_armed = true;
 
     *out = it;
     return TL_OK;

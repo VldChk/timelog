@@ -187,6 +187,8 @@ struct tl_timelog {
     tl_atomic_u64   backpressure_waits; /* Writer blocked on sealed queue */
     tl_atomic_u64   flushes_total;      /* Flush operations completed */
     tl_atomic_u64   compactions_total;  /* Compaction operations completed */
+    tl_atomic_u64   compaction_retries;       /* Compaction publish retries */
+    tl_atomic_u64   compaction_publish_ebusy; /* Publish EBUSY returns */
 
 #ifdef TL_DEBUG
     /*-----------------------------------------------------------------------

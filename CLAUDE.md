@@ -51,12 +51,43 @@ merge across ALL levels simultaneously. This is the essence of LSM.
 
 | Structure | Mutability | Contains | Purpose |
 |-----------|------------|----------|---------|
-| **Memtable** | Mutable | Sorted run + OOO vector | Ingest buffer |
-| **Memrun** | Immutable | Sealed memtable snapshot | Flush queue |
+| **Memtable** | Mutable | Sorted run + OOO head + sealed queue | Ingest buffer |
+| **OOORunset** | Immutable | Refcounted array of sorted OOO runs | OOO run collection |
+| **Memrun** | Immutable | Sealed memtable snapshot | Flush queue (ring buffer) |
+| **Memview** | Immutable | Deep copy of active + pinned sealed | Snapshot delta state |
 | **Page** | Immutable | `ts[]` + `h[]` arrays | ~4KB memory unit |
 | **Segment** | Immutable | Page array + fence pointers | In-memory container |
 | **Manifest** | Immutable | L0 + L1 segment catalogs + tombstones | Current state |
 | **Snapshot** | Immutable | Manifest ref + memview | Consistent read view |
+
+### OOO Mini-LSM Architecture (Option B)
+
+Out-of-order records use a mini-LSM within the memtable for O(1) ingestion:
+
+```
+append(ts, handle)
+       │
+       ▼
+┌──────────────────┐
+│   active_run     │  ← In-order records (sorted)
+├──────────────────┤
+│   ooo_head       │  ← OOO append buffer (unsorted, O(1) insert)
+├──────────────────┤
+│   ooo_runs       │  ← Immutable sorted runs (refcounted runset)
+└──────────────────┘
+       │ seal when full
+       ▼
+┌──────────────────┐
+│   Sealed Queue   │  ← Ring buffer of memruns (FIFO)
+└──────────────────┘
+```
+
+**Key design decisions:**
+- `ooo_head`: Mutable append-only buffer, O(1) ingestion, sorted only at seal
+- `ooo_runs`: Immutable sorted runs stored in refcounted `tl_ooorunset_t`
+- Queries use `tl_submerge` for internal k-way merge of delta components
+- Tie-break ordering: `active_run` before `ooo_head` before oldest `ooo_run`
+- Generation numbers (`gen`) ensure deterministic ordering for equal timestamps
 
 **Handles**: The C core stores `tl_handle_t` (uint64_t). For CPython bindings,
 `tl_py_handle_encode(PyObject*)` casts the pointer to handle, and
@@ -107,6 +138,44 @@ If seq1 != seq2 OR seq1 is odd: retry
 `view_seq` is even when idle, odd during publication.
 Writers: `view_seq++` before update, `view_seq++` after update.
 
+### 7. Sealed Queue Ring Buffer (H-07)
+
+The sealed memrun queue uses a fixed-capacity ring buffer with overflow-safe arithmetic:
+```c
+// CORRECT: subtraction-based index (handles wraparound)
+size_t idx = (sealed_head - sealed_len + offset + cap) % cap;
+
+// WRONG: addition-based (can overflow)
+size_t idx = (sealed_head + offset) % cap;  // DON'T USE
+```
+FIFO order is maintained during memview capture by iterating `offset` from 0 to `sealed_len-1`.
+
+### 8. Two-Phase Copy for Memview (H-09)
+
+Memview capture uses epoch-based change detection with bounded retries:
+```
+Phase 1: Read sealed queue state (under memtable_mu)
+Phase 2: Acquire memruns and validate epoch unchanged
+If epoch changed: retry (max 3 times)
+If still changing: fallback to locked allocation
+```
+This minimizes lock contention while ensuring consistency.
+
+### 9. Window Grid Freeze (C-10)
+
+Once any L1 segment exists, the adaptive window grid is **frozen**:
+- `window_grid_frozen` flag set on first L1 creation
+- Prevents window resizing that would invalidate L1 partitioning
+- Checked in `tl_compact_one()` before applying new window size
+
+### 10. L1 Validation in Release Mode (H-12, H-14)
+
+L1 invariants are checked in **release builds**, not just debug:
+- **H-12**: Records within window bounds (`min_ts >= window_start`, `max_ts < window_end`)
+- **H-14**: Non-overlap validation after manifest sort
+
+These checks prevent data corruption from reaching production.
+
 ---
 
 ## Lock Ordering
@@ -137,6 +206,12 @@ Build segments OFF-LOCK, then briefly acquire to swap manifest.
 
 Queries merge K sorted sources (memview + L0 segments + L1 segments).
 Uses a min-heap of iterators, each yielding records in timestamp order.
+
+**Two-level merge architecture:**
+1. **Outer merge** (`tl_merge_iter`): Merges segment iterators + memview iterators
+2. **Inner merge** (`tl_submerge`): Merges delta components within memview
+   - Active run + OOO head + OOO runs → single sorted stream
+   - Tie-break by `tie_id` (lower wins): run=0, head=1, ooo_runs=2+
 
 Complexity: O(N log K) where N = total records, K = source count
 Memory: O(K) heap entries
@@ -177,6 +252,22 @@ Trigger check → Selection (window-based) → K-way merge (OFF-LOCK) → Public
 ```
 **Deferred drops**: Handle drop callbacks fire AFTER successful manifest publish, never during merge.
 
+**Strict Publish Protocol (H-17):**
+- Publication uses bounded retries (3 attempts) with `TL_EBUSY` on manifest change
+- Metrics: `compaction_publish_ebusy` (final EBUSY), `compaction_retries` (interim retries)
+- STRICT mode: Returns EBUSY if manifest changed; REBASE mode: Rebuilds and retries
+
+**Delete Debt Calculation (H-18):**
+- Uses cursor-based O(T+W) algorithm, not O(T*W)
+- Linear sweep with cursor position tracking
+- `MAX_DEBT_WINDOWS = 1000` cap preserved
+- Short-circuit returns 1.0 for unbounded tombstone counts
+
+**Residual Tombstones (H-19):**
+- Tombstones extending beyond merged window are preserved
+- `tl__build_residual_tombstones()` uses unclipped context
+- Residual segment added to manifest builder after main merge
+
 ---
 
 ## Memory Management
@@ -207,6 +298,16 @@ tl_manifest_acquire(m);  // refcnt++
 tl_manifest_release(m);  // refcnt--; if (0) destroy
 ```
 Snapshots "pin" the manifest they reference. While pinned, those structures cannot be freed.
+
+### Manifest Builder Validation (H-10, H-11)
+
+The manifest builder performs validation at build time:
+- **Level validation (H-10)**: Segments added to correct level (L0/L1)
+- **Duplicate detection (H-11)**: Checks for:
+  - Within-list duplicates (same segment added twice)
+  - Add+remove same segment
+  - Adding segment already in base manifest
+- On validation failure: Returns error, caller must release manifest
 
 ---
 
@@ -322,6 +423,25 @@ PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
 PyErr_Restore(exc_type, exc_value, exc_tb);
 ```
 
+### Handle Ownership and on_drop_handle
+
+The `on_drop_handle` callback has a specific, narrow contract:
+
+**When it fires:**
+- During compaction when a tombstone physically deletes a record
+- AFTER successful manifest publish (not speculatively)
+
+**When it does NOT fire:**
+- During tl_close()
+- During flush (flush moves records, doesn't drop them)
+- When segments are released
+- For records not covered by tombstones
+
+**Implication for bindings:**
+- The CPython binding must track inserted PyObject* refs independently
+- At Timelog.close(), the binding should DECREF all tracked refs
+- The on_drop_handle callback is for tombstone-based physical deletes only
+
 ---
 
 ## Testing Strategy
@@ -372,18 +492,25 @@ core/                              # C core engine (all in-memory)
       tl_manifest.c/h             # Manifest (L0/L1 + tombstones)
       tl_window.c/h               # Window mapping for L1
     delta/                        # Write path
-      tl_memtable.c/h             # Mutable ingest buffer
+      tl_memtable.c/h             # Mutable ingest buffer (run + OOO head)
       tl_memrun.c/h               # Sealed immutable snapshot
-      tl_memview.c/h              # Memview (shared memrun refs)
+      tl_memview.c/h              # Memview (deep copy + pinned sealed)
+      tl_ooorun.c/h               # OOO run and runset (refcounted)
       tl_flush.c/h                # Flush memrun to L0
     query/                        # Read path
       tl_snapshot.c/h             # Snapshot acquisition (seqlock)
       tl_plan.c/h                 # Query planning
       tl_filter.c/h               # Tombstone filtering
-      tl_merge_iter.c/h           # K-way merge iterator
+      tl_submerge.c/h             # Internal k-way merge for delta
+      tl_active_iter.c/h          # Active buffer iterator
+      tl_memrun_iter.c/h          # Memrun iterator
+      tl_segment_iter.c/h         # Segment iterator
+      tl_merge_iter.c/h           # Top-level k-way merge iterator
       tl_pagespan_iter.c/h        # PageSpan streaming
+      tl_point.c/h                # Point query support
     maint/                        # Maintenance
       tl_compaction.c/h           # L0 → L1 compaction
+      tl_adaptive.c/h             # Adaptive window segmentation
   tests/                          # C unit tests
 
 bindings/cpython/                 # CPython extension (_timelog)
@@ -411,14 +538,17 @@ python/timelog/                   # Pure Python facade
 
 | Operation | Time | Space |
 |-----------|------|-------|
-| Append | O(1) amortized | O(1) |
+| Append (in-order) | O(1) amortized | O(1) |
+| Append (OOO) | O(1) amortized | O(1) |
+| OOO seal | O(H log H) | O(H) |
 | Range query [t1, t2) | O(K log P + M) | O(K) |
 | Point query at T | O(K log P) | O(K) |
 | Delete range | O(log T) | O(T) |
+| Delete debt calc | O(T + W) | O(1) |
 | Flush | O(M log M) | O(M) |
 | Compaction | O(S log K) | O(K + S) |
 
-Where: K = component count, P = pages/component, M = result size, T = tombstones, S = segment records
+Where: K = component count, P = pages/component, M = result size, T = tombstones, S = segment records, H = OOO head size, W = window count
 
 ### Background Maintenance (Default)
 
@@ -466,13 +596,20 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 4. Signed overflow in timestamp math — UB
 5. Using `malloc()` directly — breaks custom allocator
 6. L1 selection by record bounds — violates non-overlap (use window bounds)
+7. Ring buffer index via addition — use subtraction-based formula (H-07)
+8. Memview capture without epoch validation — stale data (H-09)
+9. Changing window size after L1 exists — violates grid freeze (C-10)
+10. Cross-page ordering not checked — sortedness violation (H-13)
+11. Delete debt O(T*W) algorithm — use cursor-based O(T+W) (H-18)
+12. PageSpan hook fires before arming — symmetric arm/fire pattern (H-15)
+13. Merge iterator ignores error state — must propagate errors (H-16)
 
 **Python Bindings**:
-7. Python C-API without GIL — crash
-8. Missing INCREF on return — leak or UAF
-9. Closing span with exported buffer — must raise `BufferError`
-10. DECREF before INCREF on borrowed ref — UAF
-11. Rollback INCREF on `TL_EBUSY` — wrong (record IS in log)
+14. Python C-API without GIL — crash
+15. Missing INCREF on return — leak or UAF
+16. Closing span with exported buffer — must raise `BufferError`
+17. DECREF before INCREF on borrowed ref — UAF
+18. Rollback INCREF on `TL_EBUSY` — wrong (record IS in log)
 
 ---
 
@@ -493,6 +630,29 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 | `docs/timelog_v1_lld_B4_pagespan_zero_copy.md` | Buffer protocol |
 | `docs/timelog_v2_lld_B5_maintenance_threading_integration.md` | Background worker |
 | `docs/timelog_v2_lld_B6_error_model_subsystem.md` | Exception handling |
+| `docs/timelog_adaptive_segmentation_lld_c17.md` | Adaptive window segmentation |
+
+---
+
+## Engineering Review Status (January 2026)
+
+All critical and high-priority issues have been resolved:
+
+| Category | Issues | Status |
+|----------|--------|--------|
+| **Critical (C-01 to C-14)** | 14 issues | ✅ All resolved |
+| **High (H-01 to H-21)** | 21 issues | ✅ All resolved |
+
+**Key improvements:**
+- **Option B OOO Mini-LSM**: O(1) ingestion for out-of-order records
+- **Ring buffer sealed queue**: Overflow-safe arithmetic (H-07)
+- **Two-phase memview capture**: Epoch-based validation (H-09)
+- **Window grid freeze**: Prevents L1 partitioning violation (C-10)
+- **Release-mode L1 validation**: Catches corruption early (H-12, H-14)
+- **O(T+W) delete debt**: Linear cursor-based algorithm (H-18)
+- **Strict publish protocol**: Bounded retries with metrics (H-17)
+
+Test coverage: 428 tests passing, verified with ASan/UBSan.
 
 ---
 
@@ -511,7 +671,7 @@ cmake -B build-asan -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build-asan
 
 # Python tests
-py -3.14 -m pytest python/tests/ -v
+py -V:3.13 -m pytest python/tests/ -v
 ```
 
 ### When In Doubt

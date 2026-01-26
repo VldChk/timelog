@@ -23,6 +23,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#ifdef TL_TEST_HOOKS
+extern volatile int tl_test_pagespan_fail_iter_alloc;
+#endif
+
 /*===========================================================================
  * Test Helpers
  *===========================================================================*/
@@ -169,6 +173,30 @@ TEST_DECLARE(pagespan_iter_open_without_segments_only_returns_einval) {
     tl_status_t st = tl_pagespan_iter_open(tl, 0, 100, flags, NULL, &it);
     TEST_ASSERT_STATUS(TL_EINVAL, st);
     TEST_ASSERT_NULL(it);
+
+    tl_close(tl);
+}
+
+/**
+ * Test: invalid args do not arm or invoke release hook.
+ */
+TEST_DECLARE(pagespan_iter_open_invalid_args_no_hook) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_tracker_t tracker = { .call_count = 0, .user_data = NULL };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &tracker,
+        .on_release = test_release_hook
+    };
+
+    tl_pagespan_iter_t* it = NULL;
+    uint32_t flags = TL_PAGESPAN_INCLUDE_L0 | TL_PAGESPAN_INCLUDE_L1;
+    tl_status_t st = tl_pagespan_iter_open(tl, 0, 100, flags, &hooks, &it);
+    TEST_ASSERT_STATUS(TL_EINVAL, st);
+    TEST_ASSERT_NULL(it);
+    TEST_ASSERT_EQ(0, tracker.call_count);
 
     tl_close(tl);
 }
@@ -728,6 +756,33 @@ TEST_DECLARE(pagespan_release_hook_called_even_with_no_spans) {
     tl_close(tl);
 }
 
+#ifdef TL_TEST_HOOKS
+/**
+ * Test: iterator allocation failure does not invoke release hook.
+ */
+TEST_DECLARE(pagespan_iter_open_alloc_failure_no_hook) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, create_timelog_with_flushed_data(&tl, 100, 5));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_tracker_t tracker = { .call_count = 0, .user_data = NULL };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &tracker,
+        .on_release = test_release_hook
+    };
+
+    tl_test_pagespan_fail_iter_alloc = 1;
+    tl_pagespan_iter_t* it = NULL;
+    tl_status_t st = tl_pagespan_iter_open(tl, 0, 1000, 0, &hooks, &it);
+    TEST_ASSERT_STATUS(TL_ENOMEM, st);
+    TEST_ASSERT_NULL(it);
+    TEST_ASSERT_EQ(0, tracker.call_count);
+
+    tl_test_pagespan_fail_iter_alloc = 0;
+    tl_close(tl);
+}
+#endif
+
 /*===========================================================================
  * Phase 8: Stress (1 test)
  *===========================================================================*/
@@ -792,6 +847,7 @@ void run_pagespan_iter_tests(void) {
     RUN_TEST(pagespan_iter_open_null_out_returns_einval);
     RUN_TEST(pagespan_iter_open_visible_only_returns_einval);
     RUN_TEST(pagespan_iter_open_without_segments_only_returns_einval);
+    RUN_TEST(pagespan_iter_open_invalid_args_no_hook);
 
     /* Phase 2: Empty Cases */
     RUN_TEST(pagespan_empty_timelog_iter_next_returns_eof);
@@ -818,6 +874,9 @@ void run_pagespan_iter_tests(void) {
     RUN_TEST(pagespan_release_hook_can_close_timelog);
     RUN_TEST(pagespan_release_hook_null_is_safe);
     RUN_TEST(pagespan_release_hook_called_even_with_no_spans);
+#ifdef TL_TEST_HOOKS
+    RUN_TEST(pagespan_iter_open_alloc_failure_no_hook);
+#endif
 
     /* Phase 8: Stress */
     RUN_TEST(pagespan_stress_many_segments);

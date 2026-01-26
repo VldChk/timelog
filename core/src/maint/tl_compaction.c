@@ -33,7 +33,8 @@ volatile int tl_test_force_ebusy_count = 0;
 
 void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
                           tl_timelog_t* tl,
-                          tl_alloc_ctx_t* alloc) {
+                          tl_alloc_ctx_t* alloc,
+                          tl_ts_t window_size) {
     TL_ASSERT(ctx != NULL);
     TL_ASSERT(tl != NULL);
     TL_ASSERT(alloc != NULL);
@@ -43,7 +44,7 @@ void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
     ctx->alloc = alloc;
 
     /* Copy config values */
-    ctx->window_size = tl->effective_window_size;
+    ctx->window_size = window_size;
     ctx->window_origin = tl->config.window_origin;
     ctx->target_page_bytes = tl->config.target_page_bytes;
 
@@ -70,7 +71,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
             tl_segment_release(ctx->input_l0[i]);
         }
     }
-    tl__free(ctx->alloc, ctx->input_l0);
+    tl__free(ctx->alloc, (void*)ctx->input_l0);
     ctx->input_l0 = NULL;
     ctx->input_l0_len = 0;
 
@@ -79,7 +80,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
             tl_segment_release(ctx->input_l1[i]);
         }
     }
-    tl__free(ctx->alloc, ctx->input_l1);
+    tl__free(ctx->alloc, (void*)ctx->input_l1);
     ctx->input_l1 = NULL;
     ctx->input_l1_len = 0;
 
@@ -99,7 +100,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
             tl_segment_release(ctx->output_l1[i]);
         }
     }
-    tl__free(ctx->alloc, ctx->output_l1);
+    tl__free(ctx->alloc, (void*)ctx->output_l1);
     ctx->output_l1 = NULL;
     ctx->output_l1_len = 0;
     ctx->output_l1_cap = 0;
@@ -285,6 +286,9 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         return 1.0;  /* Assume high debt for large or invalid spans */
     }
 
+    size_t tomb_len = tl_intervals_len(&tombs);
+    size_t idx = 0;
+
     for (int64_t wid = min_wid; wid <= max_wid; wid++) {
         tl_ts_t w_start, w_end;
         bool w_unbounded;
@@ -296,32 +300,61 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
             continue;
         }
 
-        /* Clip tombstones to window and compute covered span. */
-        tl_intervals_t clipped;
-        tl_intervals_init(&clipped, (tl_alloc_ctx_t*)&tl->alloc);
-        for (size_t i = 0; i < tl_intervals_len(&tombs); i++) {
-            const tl_interval_t* t = tl_intervals_get(&tombs, i);
-            if (t->end_unbounded) {
-                tl_intervals_insert_unbounded(&clipped, t->start);
-            } else {
-                tl_intervals_insert(&clipped, t->start, t->end);
-            }
-        }
-        /* Clip to bounded window - this converts any unbounded to bounded */
-        tl_intervals_clip(&clipped, w_start, w_end);
+        uint64_t covered = 0;
+        size_t i = idx;
 
-        tl_ts_t span = tl_intervals_covered_span(&clipped);
-        double ratio = (double)span / (double)window_size;
+        while (i < tomb_len) {
+            const tl_interval_t* t = tl_intervals_get(&tombs, i);
+
+            /* Skip intervals that end before the window */
+            if (!t->end_unbounded && t->end <= w_start) {
+                i++;
+                continue;
+            }
+
+            /* If interval starts after window end, we're done for this window */
+            if (t->start >= w_end) {
+                break;
+            }
+
+            tl_ts_t overlap_start = (t->start > w_start) ? t->start : w_start;
+            tl_ts_t overlap_end = t->end_unbounded ? w_end :
+                                  ((t->end < w_end) ? t->end : w_end);
+
+            if (overlap_end > overlap_start) {
+                int64_t diff;
+                if (tl_sub_overflow_i64(overlap_end, overlap_start, &diff)) {
+                    tl_intervals_destroy(&tombs);
+                    return 1.0;
+                }
+                covered += (uint64_t)diff;
+            }
+
+            if (!t->end_unbounded && t->end > w_end) {
+                break; /* Interval continues into next window */
+            }
+
+            i++;
+        }
+
+        idx = i;
+
+        double ratio = (double)covered / (double)window_size;
         if (ratio > max_ratio) {
             max_ratio = ratio;
         }
-
-        tl_intervals_destroy(&clipped);
     }
 
     tl_intervals_destroy(&tombs);
     return max_ratio;
 }
+
+#ifdef TL_TEST_HOOKS
+double tl_test_compute_delete_debt(const tl_timelog_t* tl,
+                                   const tl_manifest_t* m) {
+    return tl__compute_delete_debt(tl, m);
+}
+#endif
 
 /*===========================================================================
  * Phase 1: Trigger Logic
@@ -479,8 +512,8 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
         return TL_OK;  /* No overlapping L1 segments */
     }
 
-    ctx->input_l1 = tl__malloc(ctx->alloc,
-                                overlap_count * sizeof(tl_segment_t*));
+    ctx->input_l1 = (tl_segment_t**)tl__malloc(ctx->alloc,
+                                                overlap_count * sizeof(tl_segment_t*));
     if (ctx->input_l1 == NULL) {
         return TL_ENOMEM;
     }
@@ -530,7 +563,8 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
     if (l0_count > SIZE_MAX / sizeof(tl_segment_t*)) {
         return TL_EOVERFLOW;
     }
-    ctx->input_l0 = tl__malloc(ctx->alloc, l0_count * sizeof(tl_segment_t*));
+    ctx->input_l0 = (tl_segment_t**)tl__malloc(ctx->alloc,
+                                                l0_count * sizeof(tl_segment_t*));
     if (ctx->input_l0 == NULL) {
         return TL_ENOMEM;
     }
@@ -596,8 +630,8 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
 
             if (seg_bytes > SIZE_MAX - est_bytes) {
                 bytes_exceed = true;
-            } else if ((est_bytes + seg_bytes) > target_bytes) {
-                bytes_exceed = true;
+            } else {
+                bytes_exceed = ((est_bytes + seg_bytes) > target_bytes);
             }
         }
 
@@ -698,8 +732,9 @@ static tl_status_t tl__ensure_output_capacity(tl_compact_ctx_t* ctx) {
         return TL_EOVERFLOW;
     }
 
-    tl_segment_t** new_arr = tl__realloc(ctx->alloc, ctx->output_l1,
-                                          new_cap * sizeof(tl_segment_t*));
+    tl_segment_t** new_arr = (tl_segment_t**)tl__realloc(ctx->alloc,
+                                                          (void*)ctx->output_l1,
+                                                          new_cap * sizeof(tl_segment_t*));
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
@@ -1356,10 +1391,7 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     TL_UNLOCK_MAINT(tl);
 
     tl_compact_ctx_t ctx;
-    tl_compact_ctx_init(&ctx, tl, &tl->alloc);
-
-    /* Override window_size with candidate (don't commit to tl until success) */
-    ctx.window_size = candidate_window;
+    tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
 
     tl_status_t st;
 
@@ -1484,12 +1516,17 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
             return publish_st;
         }
 
+        /* Publish returned EBUSY (manifest changed). Count and retry. */
+        tl_atomic_inc_u64(&tl->compaction_publish_ebusy);
+        if (attempt + 1 < max_retries) {
+            tl_atomic_inc_u64(&tl->compaction_retries);
+        }
+
         /* Manifest changed - re-select and re-merge for retry.
          * This is expensive but correct - ensures we don't publish
          * stale outputs. */
         tl_compact_ctx_destroy(&ctx);
-        tl_compact_ctx_init(&ctx, tl, &tl->alloc);
-        ctx.window_size = candidate_window;  /* Re-apply candidate */
+        tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
 
         st = tl_compact_select(&ctx);
         if (st != TL_OK) {

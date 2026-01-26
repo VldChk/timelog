@@ -107,7 +107,7 @@ typedef struct tl_memview_shared {
  * On failure, memview is left in a valid but empty state (safe to destroy).
  */
 tl_status_t tl_memview_capture(tl_memview_t* mv,
-                                tl_memtable_t* mt,
+                                const tl_memtable_t* mt,
                                 tl_mutex_t* memtable_mu,
                                 tl_alloc_ctx_t* alloc);
 
@@ -143,7 +143,7 @@ void tl_memview_destroy(tl_memview_t* mv);
  * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW/TL_EINVAL on failure
  */
 tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
-                                       tl_memtable_t* mt,
+                                       const tl_memtable_t* mt,
                                        tl_mutex_t* memtable_mu,
                                        tl_alloc_ctx_t* alloc,
                                        uint64_t epoch);

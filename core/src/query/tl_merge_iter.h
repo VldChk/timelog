@@ -45,6 +45,7 @@ typedef struct tl_kmerge_iter {
 
     /* State */
     bool            done;
+    tl_status_t     error;
 
     /* Allocator (borrowed) */
     tl_alloc_ctx_t* alloc;
@@ -124,7 +125,7 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target);
  */
 TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
     TL_ASSERT(it != NULL);
-    return it->done;
+    return it->done || (it->error != TL_OK);
 }
 
 /**
@@ -137,7 +138,7 @@ TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
  */
 TL_INLINE const tl_ts_t* tl_kmerge_iter_peek_ts(const tl_kmerge_iter_t* it) {
     TL_ASSERT(it != NULL);
-    if (it->done) return NULL;
+    if (it->done || it->error != TL_OK) return NULL;
     const tl_heap_entry_t* entry = tl_heap_peek(&it->heap);
     return entry != NULL ? &entry->ts : NULL;
 }

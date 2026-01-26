@@ -215,8 +215,8 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     if (st != TL_OK) {
         /*
          * CRITICAL: iter_open failed.
-         * The core may or may not have invoked the hook already, but since
-         * armed == 0, the hook is a no-op. We must clean up manually.
+         * The core does NOT arm the hook until iter_open succeeds, so
+         * the hook will NOT be invoked. We must clean up manually.
          */
         Py_DECREF(hook_ctx->timelog);
         PyMem_Free(hook_ctx);

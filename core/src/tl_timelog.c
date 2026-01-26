@@ -472,6 +472,8 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl_atomic_init_u64(&tl->backpressure_waits, 0);
     tl_atomic_init_u64(&tl->flushes_total, 0);
     tl_atomic_init_u64(&tl->compactions_total, 0);
+    tl_atomic_init_u64(&tl->compaction_retries, 0);
+    tl_atomic_init_u64(&tl->compaction_publish_ebusy, 0);
 
     /* Initialize lifecycle state */
     tl->is_open = true;
@@ -564,7 +566,12 @@ void tl_close(tl_timelog_t* tl) {
         "tl_close() called with outstanding snapshots - caller must release all snapshots first");
 #endif
 
-    /* Release manifest (Phase 5) */
+    /* Release manifest (Phase 5)
+     *
+     * NOTE (H-05): on_drop_handle is NOT invoked for remaining records.
+     * The callback fires only during compaction for tombstone-deleted records.
+     * Caller retains ownership of all handles not explicitly deleted by tombstones.
+     * See tl_on_drop_fn documentation in timelog.h for full contract. */
     if (tl->manifest != NULL) {
         tl_manifest_release(tl->manifest);
         tl->manifest = NULL;
@@ -882,7 +889,7 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
  * Check if compaction is needed.
  * Delegates to compaction module (Phase 8).
  */
-static bool tl__compaction_needed(tl_timelog_t* tl) {
+static bool tl__compaction_needed(const tl_timelog_t* tl) {
     return tl_compact_needed(tl);
 }
 
@@ -2381,6 +2388,8 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
         out->backpressure_waits = tl_atomic_load_relaxed_u64(&tl->backpressure_waits);
         out->flushes_total = tl_atomic_load_relaxed_u64(&tl->flushes_total);
         out->compactions_total = tl_atomic_load_relaxed_u64(&tl->compactions_total);
+        out->compaction_retries = tl_atomic_load_relaxed_u64(&tl->compaction_retries);
+        out->compaction_publish_ebusy = tl_atomic_load_relaxed_u64(&tl->compaction_publish_ebusy);
 
         /*
          * Adaptive segmentation metrics (V-Next).

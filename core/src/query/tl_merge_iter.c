@@ -5,6 +5,11 @@
  * Internal Helpers
  *===========================================================================*/
 
+/* Test hook: force kmerge source_next to return TL_EINTERNAL */
+#ifdef TL_TEST_HOOKS
+volatile int tl_test_kmerge_force_error_count = 0;
+#endif
+
 /* Disable C4702 (unreachable code) for defensive fallback code.
  * LTCG proves these are unreachable, but we keep them for safety. */
 #ifdef _MSC_VER
@@ -20,6 +25,12 @@
  * @return TL_OK if record available, TL_EOF if exhausted
  */
 static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out) {
+#ifdef TL_TEST_HOOKS
+    if (tl_test_kmerge_force_error_count > 0) {
+        tl_test_kmerge_force_error_count--;
+        return TL_EINTERNAL;
+    }
+#endif
     if (src->kind == TL_ITER_SEGMENT) {
         return tl_segment_iter_next(&src->iter.segment, out);
     }
@@ -136,6 +147,7 @@ tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
     memset(it, 0, sizeof(*it));
     it->plan = plan;
     it->alloc = alloc;
+    it->error = TL_OK;
 
     tl_heap_init(&it->heap, alloc);
 
@@ -177,6 +189,7 @@ void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it) {
     tl_heap_destroy(&it->heap);
     it->plan = NULL;
     it->done = true;
+    it->error = TL_OK;
 }
 
 /*===========================================================================
@@ -187,6 +200,9 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
     TL_ASSERT(it != NULL);
     TL_ASSERT(out != NULL);
 
+    if (it->error != TL_OK) {
+        return it->error;
+    }
     if (it->done) {
         return TL_EOF;
     }
@@ -237,12 +253,17 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
             .iter = src
         };
         tl_heap_replace_top(&it->heap, &new_entry);
-    } else {
+    } else if (st == TL_EOF) {
         /* Source exhausted - remove entry from heap (no allocation).
          * Source iterators are expected to return TL_OK or TL_EOF only. */
-        TL_ASSERT(st == TL_EOF);
         tl_heap_entry_t discard;
         (void)tl_heap_pop(&it->heap, &discard);
+    } else {
+        /* Error - clear heap to avoid stale refs */
+        it->error = st;
+        it->done = true;
+        tl_heap_clear(&it->heap);
+        return st;
     }
 
     /* Check if heap is now empty */
@@ -261,6 +282,9 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
     TL_ASSERT(it != NULL);
     TL_ASSERT(it->plan != NULL);
 
+    if (it->error != TL_OK) {
+        return;
+    }
     if (it->done) {
         return;
     }
@@ -334,7 +358,9 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         if (st != TL_OK) {
             /* Error - mark as done and return.
              * Existing behavior: errors become EOF (see H-16 for error state). */
+            it->error = st;
             it->done = true;
+            tl_heap_clear(&it->heap);
             return;
         }
 
@@ -352,7 +378,9 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         if (push_st != TL_OK) {
             /* Allocation failure during seek invalidates the iterator.
              * Subsequent operations will return EOF. */
+            it->error = push_st;
             it->done = true;
+            tl_heap_clear(&it->heap);
             return;
         }
     }

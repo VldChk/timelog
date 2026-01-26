@@ -201,6 +201,8 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * WHEN INVOKED:
  * - Only for records PHYSICALLY dropped during compaction (tombstone application)
  * - NOT called for logical tombstone insertion (tl_delete_range/tl_delete_before)
+ * - NOT called during tl_flush() (flush moves records to L0, does not drop them)
+ * - NOT called during tl_close() - caller retains ownership of all remaining handles
  * - Callbacks are DEFERRED until after successful manifest publish, ensuring
  *   that only truly committed drops trigger the callback
  *
@@ -208,6 +210,18 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * This callback indicates a record is being RETIRED from the newest manifest,
  * NOT that it's safe to free immediately. Existing snapshots acquired before
  * compaction may still reference this handle until those snapshots are released.
+ * CONTRACT:
+ * - Called ONLY when a record is physically deleted during compaction
+ *   (tombstone coverage).
+ * - Called ONLY after successful manifest publish (never speculatively).
+ * - NOT called by tl_close(), flush, or segment release.
+ * - Handles not covered by tombstones are never reported here; callers
+ *   must track them if cleanup-at-close is required.
+ *
+ * THREADING:
+ * - May be called from the maintenance worker thread (background mode)
+ * - May be called from the thread invoking tl_maint_step() (manual mode)
+ *
  * Treat this as a "retire" notification, not a "free now" signal.
  *
  * SAFE usage patterns:
@@ -222,6 +236,16 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * The callback is invoked after manifest publish completes, without holding
  * locks. It must not call back into timelog APIs. If compaction fails before
  * publish, no callbacks are invoked for that compaction attempt.
+ *
+ * THREAD SAFETY:
+ * - May be called from the maintenance worker thread (background mode)
+ * - May be called from the thread that invokes tl_maint_step() (manual mode)
+ * - Must be thread-safe if timelog is accessed from multiple threads
+ *
+ * LIFETIME (H-05 contract clarification):
+ * - Caller retains ownership of handles not covered by tombstones
+ * - At tl_close(), records in the log are NOT notified via this callback
+ * - If cleanup-at-close is needed, caller must track inserted handles independently
  *
  * @param ctx    User-provided context (from tl_config_t.on_drop_ctx)
  * @param ts     Timestamp of the dropped record
@@ -624,6 +648,8 @@ typedef struct tl_stats {
     uint64_t backpressure_waits;       /* Times writer blocked on sealed queue */
     uint64_t flushes_total;            /* Total flush operations completed */
     uint64_t compactions_total;        /* Total compaction operations completed */
+    uint64_t compaction_retries;       /* Compaction publish retries */
+    uint64_t compaction_publish_ebusy; /* Publish attempts returning TL_EBUSY */
 
     /* Adaptive segmentation metrics (V-Next)
      * Only populated when adaptive.target_records > 0 in config. */

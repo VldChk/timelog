@@ -4,6 +4,12 @@
 #include <stdlib.h>  /* qsort */
 #include <string.h>
 
+/* Test hooks for memview capture retry behavior */
+#ifdef TL_TEST_HOOKS
+volatile int tl_test_memview_force_retry_count = 0;
+volatile int tl_test_memview_used_fallback = 0;
+#endif
+
 /*===========================================================================
  * Internal Helpers
  *===========================================================================*/
@@ -265,18 +271,78 @@ static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
  * On failure, releases any already-acquired references.
  */
 static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
-                                        tl_memtable_t* mt,
+                                        const tl_memtable_t* mt,
                                         tl_mutex_t* memtable_mu) {
+    const int max_retries = 3;
+
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        size_t len = 0;
+        size_t head = 0;
+        uint64_t epoch = 0;
+
+        /* Phase 1: snapshot sealed queue metadata under lock */
+        TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+        len = mt->sealed_len;
+        head = mt->sealed_head;
+        epoch = mt->sealed_epoch;
+        if (len == 0) {
+            mv->sealed = NULL;
+            mv->sealed_len = 0;
+            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            return TL_OK;
+        }
+        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+
+        /* C-07 fix: Check for size overflow before multiplication */
+        if (tl__alloc_would_overflow(len, sizeof(tl_memrun_t*))) {
+            return TL_EOVERFLOW;
+        }
+
+        /* Phase 2: allocate outside lock */
+        tl_memrun_t** sealed = (tl_memrun_t**)tl__malloc(mv->alloc,
+                                                          len * sizeof(tl_memrun_t*));
+        if (sealed == NULL) {
+            return TL_ENOMEM;
+        }
+
+        /* Phase 3: re-lock and verify queue unchanged */
+        TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+        if (mt->sealed_len != len ||
+            mt->sealed_head != head ||
+            mt->sealed_epoch != epoch) {
+            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            tl__free(mv->alloc, (void*)sealed);
+            continue; /* retry */
+        }
+
+#ifdef TL_TEST_HOOKS
+        if (tl_test_memview_force_retry_count > 0) {
+            tl_test_memview_force_retry_count--;
+            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            tl__free(mv->alloc, sealed);
+            continue; /* forced retry */
+        }
+#endif
+
+        /* Copy pointers and acquire each memrun */
+        for (size_t i = 0; i < len; i++) {
+            tl_memrun_t* mr = tl_memtable_sealed_at(mt, i);
+            sealed[i] = tl_memrun_acquire(mr);
+        }
+        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+
+        mv->sealed = sealed;
+        mv->sealed_len = len;
+        return TL_OK;
+    }
+
     /*
-     * Lock memtable_mu to safely access the sealed queue.
-     * We need to:
-     * 1. Read sealed_len
-     * 2. Allocate array
-     * 3. Acquire each memrun
-     * All under the lock to ensure the queue doesn't change.
-     *
-     * Use TL_LOCK for debug-mode lock ordering validation.
+     * Fallback: allocate and acquire under lock to avoid livelock.
+     * This is the pre-existing behavior.
      */
+#ifdef TL_TEST_HOOKS
+    tl_test_memview_used_fallback = 1;
+#endif
     TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
 
     size_t len = mt->sealed_len;
@@ -287,25 +353,25 @@ static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
         return TL_OK;
     }
 
-    /* C-07 fix: Check for size overflow before multiplication */
     if (tl__alloc_would_overflow(len, sizeof(tl_memrun_t*))) {
         TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
         return TL_EOVERFLOW;
     }
 
-    /* Allocate array */
-    mv->sealed = tl__malloc(mv->alloc, len * sizeof(tl_memrun_t*));
-    if (mv->sealed == NULL) {
+    tl_memrun_t** sealed = (tl_memrun_t**)tl__malloc(mv->alloc,
+                                                      len * sizeof(tl_memrun_t*));
+    if (sealed == NULL) {
         TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
         return TL_ENOMEM;
     }
 
-    /* Copy pointers and acquire each memrun */
     for (size_t i = 0; i < len; i++) {
-        mv->sealed[i] = tl_memrun_acquire(mt->sealed[i]);
+        tl_memrun_t* mr = tl_memtable_sealed_at(mt, i);
+        sealed[i] = tl_memrun_acquire(mr);
     }
-    mv->sealed_len = len;
 
+    mv->sealed = sealed;
+    mv->sealed_len = len;
     TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
     return TL_OK;
 }
@@ -315,7 +381,7 @@ static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
  *===========================================================================*/
 
 tl_status_t tl_memview_capture(tl_memview_t* mv,
-                                tl_memtable_t* mt,
+                                const tl_memtable_t* mt,
                                 tl_mutex_t* memtable_mu,
                                 tl_alloc_ctx_t* alloc) {
     TL_ASSERT(mv != NULL);
@@ -461,7 +527,7 @@ void tl_memview_destroy(tl_memview_t* mv) {
                 tl_memrun_release(mv->sealed[i]);
             }
         }
-        tl__free(mv->alloc, mv->sealed);
+        tl__free(mv->alloc, (void*)mv->sealed);
         mv->sealed = NULL;
     }
     mv->sealed_len = 0;
@@ -477,7 +543,7 @@ void tl_memview_destroy(tl_memview_t* mv) {
  *===========================================================================*/
 
 tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
-                                       tl_memtable_t* mt,
+                                       const tl_memtable_t* mt,
                                        tl_mutex_t* memtable_mu,
                                        tl_alloc_ctx_t* alloc,
                                        uint64_t epoch) {
@@ -590,17 +656,20 @@ bool tl_memview_validate(const tl_memview_t* mv) {
     }
 
     /*
-     * Invariant 2: active_ooo_head is sorted (ts, handle)
+     * Invariant 2: active_ooo_head is sorted (ts, handle) iff marked sorted.
+     * During two-phase capture, head may be unsorted until post-lock sort.
      */
     const tl_record_t* ooo_head = tl_memview_ooo_head_data(mv);
     size_t ooo_head_len = tl_memview_ooo_head_len(mv);
-    for (size_t i = 1; i < ooo_head_len; i++) {
-        if (ooo_head[i].ts < ooo_head[i - 1].ts) {
-            return false;
-        }
-        if (ooo_head[i].ts == ooo_head[i - 1].ts &&
-            ooo_head[i].handle < ooo_head[i - 1].handle) {
-            return false;
+    if (mv->active_ooo_head_sorted) {
+        for (size_t i = 1; i < ooo_head_len; i++) {
+            if (ooo_head[i].ts < ooo_head[i - 1].ts) {
+                return false;
+            }
+            if (ooo_head[i].ts == ooo_head[i - 1].ts &&
+                ooo_head[i].handle < ooo_head[i - 1].handle) {
+                return false;
+            }
         }
     }
 

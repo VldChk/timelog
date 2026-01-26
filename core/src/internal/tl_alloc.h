@@ -2,6 +2,7 @@
 #define TL_ALLOC_H
 
 #include "tl_defs.h"
+#include "tl_atomic.h"
 
 /*===========================================================================
  * Allocator Context
@@ -19,9 +20,9 @@ typedef struct tl_alloc_ctx {
 
 #ifdef TL_DEBUG
     /* Debug tracking */
-    size_t         total_allocated;
-    size_t         allocation_count;
-    size_t         peak_allocated;
+    tl_atomic_u64  total_allocated;
+    tl_atomic_u64  allocation_count;
+    tl_atomic_u64  peak_allocated;
 #endif
 } tl_alloc_ctx_t;
 
@@ -169,7 +170,7 @@ TL_INLINE size_t tl__grow_capacity(size_t current, size_t required, size_t min_c
  * Usage: TL_FREE(ctx, ptr);
  */
 #define TL_FREE(ctx, ptr) \
-    do { tl__free((ctx), (ptr)); (ptr) = NULL; } while(0)
+    do { tl__free((ctx), (void*)(ptr)); (ptr) = NULL; } while(0)
 
 /*===========================================================================
  * Debug Statistics (Debug Builds Only)

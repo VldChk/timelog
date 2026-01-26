@@ -124,10 +124,13 @@ typedef struct tl_compact_ctx {
 /**
  * Initialize compaction context.
  * Does NOT select segments - call tl_compact_select() next.
+ *
+ * @param window_size Effective window size (caller must read under maint_mu)
  */
 void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
                           tl_timelog_t* tl,
-                          tl_alloc_ctx_t* alloc);
+                          tl_alloc_ctx_t* alloc,
+                          tl_ts_t window_size);
 
 /**
  * Destroy compaction context and release all pinned resources.
@@ -263,5 +266,14 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
  *         TL_EOVERFLOW if window span too large
  */
 tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries);
+
+#ifdef TL_TEST_HOOKS
+/**
+ * Test-only: compute delete debt ratio for a manifest.
+ * Exposes internal heuristic for unit testing.
+ */
+double tl_test_compute_delete_debt(const tl_timelog_t* tl,
+                                   const tl_manifest_t* m);
+#endif
 
 #endif /* TL_COMPACTION_H */

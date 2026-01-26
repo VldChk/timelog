@@ -555,6 +555,57 @@ TEST_DECLARE(api_compact_sets_pending) {
 }
 
 /*===========================================================================
+ * H-05: on_drop_handle Contract Verification
+ *===========================================================================*/
+
+static int g_h05_drop_count = 0;
+
+static void h05_track_drop(void* ctx, tl_ts_t ts, tl_handle_t h) {
+    (void)ctx;
+    (void)ts;
+    (void)h;
+    g_h05_drop_count++;
+}
+
+/**
+ * Test: on_drop_handle NOT invoked at close (H-05 contract).
+ *
+ * This test documents and verifies the intended behavior:
+ * on_drop_handle fires ONLY during compaction (when tombstones delete records),
+ * NOT during flush (which doesn't drop records) and NOT during tl_close().
+ */
+TEST_DECLARE(api_on_drop_handle_not_called_at_close) {
+    g_h05_drop_count = 0;
+
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.on_drop_handle = h05_track_drop;
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert some records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+
+    /* Seal and flush to create a segment.
+     * Note: Flush does NOT invoke on_drop_handle because flush doesn't
+     * drop records - it just moves them from memrun to L0 segment. */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    TEST_ASSERT_EQ(0, g_h05_drop_count);  /* Flush doesn't drop */
+
+    /* Close WITHOUT any tombstones - callback should NOT fire.
+     * on_drop_handle only fires during compaction when tombstones
+     * actually delete records. */
+    tl_close(tl);
+
+    /* Verify: callback was never called (handles NOT dropped at close) */
+    TEST_ASSERT_EQ(0, g_h05_drop_count);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -601,5 +652,8 @@ void run_api_semantics_tests(void) {
     RUN_TEST(api_maint_stop_idempotent);
     RUN_TEST(api_compact_sets_pending);
 
-    /* Total: 19 tests */
+    /* H-05 contract verification (1 test) */
+    RUN_TEST(api_on_drop_handle_not_called_at_close);
+
+    /* Total: 27 tests */
 }

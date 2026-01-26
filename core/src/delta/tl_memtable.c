@@ -34,8 +34,10 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
         tl_intervals_destroy(&mt->active_tombs);
         return TL_ENOMEM;
     }
+    mt->sealed_head = 0;
     mt->sealed_len = 0;
     mt->sealed_max_runs = sealed_max_runs;
+    mt->sealed_epoch = 0;
 
     /* Store configuration */
     mt->memtable_max_bytes = memtable_max_bytes;
@@ -78,17 +80,20 @@ void tl_memtable_destroy(tl_memtable_t* mt) {
 
     /* Release all sealed memruns */
     for (size_t i = 0; i < mt->sealed_len; i++) {
-        if (mt->sealed[i] != NULL) {
-            tl_memrun_release(mt->sealed[i]);
+        size_t idx = tl_memtable_sealed_index(mt, i);
+        if (mt->sealed[idx] != NULL) {
+            tl_memrun_release(mt->sealed[idx]);
         }
     }
 
     /* Free sealed queue array */
     if (mt->sealed != NULL) {
-        tl__free(mt->alloc, mt->sealed);
+        tl__free(mt->alloc, (void*)mt->sealed);
         mt->sealed = NULL;
     }
     mt->sealed_len = 0;
+    mt->sealed_head = 0;
+    mt->sealed_epoch = 0;
 
     /* Destroy active buffers */
     tl_recvec_destroy(&mt->active_run);
@@ -233,14 +238,8 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
     tl_status_t st;
 
     /* Route to appropriate buffer based on timestamp ordering */
-    if (tl_recvec_len(&mt->active_run) == 0) {
-        /* First record: goes to run */
-        st = tl_recvec_push(&mt->active_run, ts, handle);
-        if (st != TL_OK) {
-            return st;
-        }
-        mt->last_inorder_ts = ts;
-    } else if (ts >= mt->last_inorder_ts) {
+    if (tl_recvec_len(&mt->active_run) == 0 ||
+        ts >= mt->last_inorder_ts) {
         /* In-order: fast path to run */
         st = tl_recvec_push(&mt->active_run, ts, handle);
         if (st != TL_OK) {
@@ -614,7 +613,10 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond)
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
     /* Re-check capacity (defensive - single writer, but be safe) */
     TL_ASSERT(mt->sealed_len < mt->sealed_max_runs);
-    mt->sealed[mt->sealed_len++] = mr;
+    size_t idx = tl_memtable_sealed_index(mt, mt->sealed_len);
+    mt->sealed[idx] = mr;
+    mt->sealed_len++;
+    mt->sealed_epoch++;
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
     /* Step 8: Reset active metadata AFTER successful enqueue */
@@ -649,7 +651,7 @@ bool tl_memtable_is_sealed_full(const tl_memtable_t* mt) {
     return mt->sealed_len >= mt->sealed_max_runs;
 }
 
-tl_status_t tl_memtable_peek_oldest(tl_memtable_t* mt, tl_memrun_t** out) {
+tl_status_t tl_memtable_peek_oldest(const tl_memtable_t* mt, tl_memrun_t** out) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(out != NULL);
 
@@ -658,8 +660,8 @@ tl_status_t tl_memtable_peek_oldest(tl_memtable_t* mt, tl_memrun_t** out) {
         return TL_OK;
     }
 
-    /* Peek oldest (FIFO: index 0) and acquire reference */
-    tl_memrun_t* mr = mt->sealed[0];
+    /* Peek oldest (FIFO: sealed_head) and acquire reference */
+    tl_memrun_t* mr = tl_memtable_sealed_at(mt, 0);
     *out = tl_memrun_acquire(mr);
     return TL_OK;
 }
@@ -668,15 +670,21 @@ void tl_memtable_pop_oldest(tl_memtable_t* mt, tl_cond_t* cond) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(mt->sealed_len > 0);
 
-    /* Get oldest (FIFO: index 0) */
-    tl_memrun_t* mr = mt->sealed[0];
+    /* Get oldest (FIFO: sealed_head) */
+    size_t idx = tl_memtable_sealed_index(mt, 0);
+    tl_memrun_t* mr = mt->sealed[idx];
+    mt->sealed[idx] = NULL;
 
-    /* Shift remaining elements down */
-    if (mt->sealed_len > 1) {
-        memmove(&mt->sealed[0], &mt->sealed[1],
-                (mt->sealed_len - 1) * sizeof(tl_memrun_t*));
+    /* Advance head */
+    mt->sealed_head++;
+    if (mt->sealed_head == mt->sealed_max_runs) {
+        mt->sealed_head = 0;
     }
     mt->sealed_len--;
+    if (mt->sealed_len == 0) {
+        mt->sealed_head = 0;
+    }
+    mt->sealed_epoch++;
 
     /* Release queue's reference */
     tl_memrun_release(mr);
@@ -699,7 +707,7 @@ size_t tl_memtable_sealed_len(const tl_memtable_t* mt) {
  * Backpressure
  *===========================================================================*/
 
-bool tl_memtable_wait_for_space(tl_memtable_t* mt, tl_mutex_t* mu,
+bool tl_memtable_wait_for_space(const tl_memtable_t* mt, tl_mutex_t* mu,
                                  tl_cond_t* cond, uint32_t timeout_ms) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(mu != NULL);
@@ -779,10 +787,13 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
     if (mt->sealed_len > mt->sealed_max_runs) {
         return false;
     }
+    if (mt->sealed_head >= mt->sealed_max_runs) {
+        return false;
+    }
 
     /* Check sealed entries are non-NULL */
     for (size_t i = 0; i < mt->sealed_len; i++) {
-        if (mt->sealed[i] == NULL) {
+        if (tl_memtable_sealed_at(mt, i) == NULL) {
             return false;
         }
     }

@@ -37,6 +37,12 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#ifdef TL_TEST_HOOKS
+extern volatile int tl_test_memview_force_retry_count;
+extern volatile int tl_test_memview_used_fallback;
+extern volatile int tl_test_kmerge_force_error_count;
+#endif
+
 typedef struct delta_fail_alloc_ctx {
     size_t fail_after_n;
     size_t alloc_count;
@@ -96,6 +102,11 @@ static tl_status_t make_ooo_runset(tl_alloc_ctx_t* alloc,
     st = tl_ooorunset_create(alloc, runs, 1, out);
     tl_ooorun_release(run);
     return st;
+}
+
+static void seal_one_memrun(tl_memtable_t* mt, tl_mutex_t* mu, tl_ts_t ts) {
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(mt, ts, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal(mt, mu, NULL));
 }
 
 /*===========================================================================
@@ -829,6 +840,8 @@ TEST_DECLARE(delta_memview_captures_head_sorted_and_pins_runs) {
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
     tl__alloc_destroy(&alloc);
+
+    tl_test_memview_used_fallback = 0;
 }
 
 TEST_DECLARE(delta_memview_captures_concurrent_pins) {
@@ -865,6 +878,95 @@ TEST_DECLARE(delta_memview_captures_concurrent_pins) {
     tl_mutex_destroy(&mu);
     tl__alloc_destroy(&alloc);
 }
+
+TEST_DECLARE(delta_memview_copy_sealed_ring_order) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 3));
+
+    seal_one_memrun(&mt, &mu, 10);
+    seal_one_memrun(&mt, &mu, 20);
+    seal_one_memrun(&mt, &mu, 30);
+
+    /* Advance head */
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_EQ(2, mt.sealed_len);
+
+    /* Wrap tail */
+    seal_one_memrun(&mt, &mu, 40);
+    TEST_ASSERT_EQ(3, mt.sealed_len);
+
+    tl_memview_t mv;
+    TEST_ASSERT_STATUS(TL_OK, tl_memview_capture(&mv, &mt, &mu, &alloc));
+
+    TEST_ASSERT_EQ(3, tl_memview_sealed_len(&mv));
+    TEST_ASSERT_EQ(20, tl_memrun_run_data(tl_memview_sealed_get(&mv, 0))[0].ts);
+    TEST_ASSERT_EQ(30, tl_memrun_run_data(tl_memview_sealed_get(&mv, 1))[0].ts);
+    TEST_ASSERT_EQ(40, tl_memrun_run_data(tl_memview_sealed_get(&mv, 2))[0].ts);
+
+    tl_memview_destroy(&mv);
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+#ifdef TL_TEST_HOOKS
+TEST_DECLARE(delta_memview_copy_sealed_no_alloc_under_lock) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 2));
+    seal_one_memrun(&mt, &mu, 10);
+
+    tl_test_memview_force_retry_count = 0;
+    tl_test_memview_used_fallback = 0;
+
+    tl_memview_t mv;
+    TEST_ASSERT_STATUS(TL_OK, tl_memview_capture(&mv, &mt, &mu, &alloc));
+    TEST_ASSERT_EQ(0, tl_test_memview_used_fallback);
+
+    tl_memview_destroy(&mv);
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_memview_copy_sealed_retry_fallback) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 2));
+    seal_one_memrun(&mt, &mu, 10);
+
+    tl_test_memview_force_retry_count = 5;
+    tl_test_memview_used_fallback = 0;
+
+    tl_memview_t mv;
+    TEST_ASSERT_STATUS(TL_OK, tl_memview_capture(&mv, &mt, &mu, &alloc));
+    TEST_ASSERT_EQ(1, tl_memview_sealed_len(&mv));
+    TEST_ASSERT_EQ(1, tl_test_memview_used_fallback);
+
+    tl_memview_destroy(&mv);
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+
+    tl_test_memview_force_retry_count = 0;
+}
+#endif
 
 TEST_DECLARE(delta_memview_capture_alloc_failure) {
     tl_alloc_ctx_t alloc;
@@ -1010,8 +1112,11 @@ TEST_DECLARE(delta_memtable_seal_basic) {
     TEST_ASSERT(tl_memtable_is_active_empty(&mt));
 
     /* Verify sealed memrun */
-    TEST_ASSERT_NOT_NULL(mt.sealed[0]);
-    TEST_ASSERT_EQ(2, tl_memrun_run_len(mt.sealed[0]));
+    {
+        tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
+        TEST_ASSERT_NOT_NULL(mr);
+        TEST_ASSERT_EQ(2, tl_memrun_run_len(mr));
+    }
 
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
@@ -1226,10 +1331,149 @@ TEST_DECLARE(delta_memtable_seal_transfers_multiple_runs) {
     TEST_ASSERT_EQ(1, mt.sealed_len);
     TEST_ASSERT_NULL(mt.ooo_runs);
 
-    tl_memrun_t* mr = mt.sealed[0];
+    tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
     TEST_ASSERT_NOT_NULL(mr);
     TEST_ASSERT_EQ(3, tl_memrun_ooo_run_count(mr));
     TEST_ASSERT_EQ(3, tl_memrun_ooo_len(mr));
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_sealed_queue_single_element_wrap) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    /* Capacity 2 to force wrap quickly */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 2));
+
+    seal_one_memrun(&mt, &mu, 10);
+    seal_one_memrun(&mt, &mu, 20);
+
+    /* Pop one to advance head */
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_EQ(1, mt.sealed_len);
+
+    /* Seal again to wrap tail to index 0 */
+    seal_one_memrun(&mt, &mu, 30);
+    TEST_ASSERT_EQ(2, mt.sealed_len);
+
+    /* Order should be 20, then 30 */
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(20, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(30, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_sealed_queue_full_wrap_around) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 3));
+
+    seal_one_memrun(&mt, &mu, 10);
+    seal_one_memrun(&mt, &mu, 20);
+    seal_one_memrun(&mt, &mu, 30);
+
+    /* Pop two to advance head and shrink */
+    tl_memtable_pop_oldest(&mt, NULL);
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_EQ(1, mt.sealed_len);
+
+    /* Wrap with two new seals */
+    seal_one_memrun(&mt, &mu, 40);
+    seal_one_memrun(&mt, &mu, 50);
+    TEST_ASSERT_EQ(3, mt.sealed_len);
+
+    /* Order should be 30, 40, 50 */
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(30, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(40, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(50, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_sealed_queue_empty_after_wrap) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 2));
+
+    seal_one_memrun(&mt, &mu, 10);
+    seal_one_memrun(&mt, &mu, 20);
+
+    tl_memtable_pop_oldest(&mt, NULL);
+    tl_memtable_pop_oldest(&mt, NULL);
+    TEST_ASSERT_EQ(0, mt.sealed_len);
+
+    /* After emptying, queue should accept new seals in order */
+    seal_one_memrun(&mt, &mu, 30);
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_peek_oldest(&mt, &mr));
+    TEST_ASSERT_EQ(30, tl_memrun_run_data(mr)[0].ts);
+    tl_memrun_release(mr);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_sealed_queue_multiple_cycles) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 3));
+
+    for (int cycle = 0; cycle < 3; cycle++) {
+        seal_one_memrun(&mt, &mu, 100 + cycle * 10);
+        seal_one_memrun(&mt, &mu, 101 + cycle * 10);
+        seal_one_memrun(&mt, &mu, 102 + cycle * 10);
+
+        /* Pop all */
+        tl_memtable_pop_oldest(&mt, NULL);
+        tl_memtable_pop_oldest(&mt, NULL);
+        tl_memtable_pop_oldest(&mt, NULL);
+        TEST_ASSERT_EQ(0, mt.sealed_len);
+    }
 
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
@@ -1551,9 +1795,55 @@ TEST_DECLARE(delta_merge_iter_preserves_all_duplicates) {
         if (results[i].handle == 2) found_ts20_h2 = true;
         if (results[i].handle == 200) found_ts20_h200 = true;
     }
-    TEST_ASSERT(found_ts20_h2);
-    TEST_ASSERT(found_ts20_h200);
+TEST_ASSERT(found_ts20_h2);
+TEST_ASSERT(found_ts20_h200);
 }
+
+#ifdef TL_TEST_HOOKS
+TEST_DECLARE(delta_kmerge_iter_propagates_source_error) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 2);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 2, NULL, NULL, 0, &mr));
+
+    tl_plan_t plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.alloc = &alloc;
+    plan.t1 = 0;
+    plan.t2 = 100;
+    plan.t2_unbounded = false;
+    plan.source_count = 1;
+    plan.source_capacity = 1;
+    plan.sources = TL_NEW_ARRAY(&alloc, tl_iter_source_t, 1);
+    TEST_ASSERT_NOT_NULL(plan.sources);
+
+    tl_iter_source_t* src = &plan.sources[0];
+    src->kind = TL_ITER_MEMRUN;
+    src->priority = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&src->iter.memrun,
+                                                  mr, 0, 100, false, &alloc));
+
+    tl_kmerge_iter_t it;
+    TEST_ASSERT_STATUS(TL_OK, tl_kmerge_iter_init(&it, &plan, &alloc));
+
+    tl_test_kmerge_force_error_count = 1;
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_EINTERNAL, tl_kmerge_iter_next(&it, &rec));
+    TEST_ASSERT(tl_kmerge_iter_done(&it));
+
+    tl_kmerge_iter_destroy(&it);
+    tl_memrun_iter_destroy(&src->iter.memrun);
+    tl_memrun_release(mr);
+    TL_FREE(&alloc, plan.sources);
+    tl__alloc_destroy(&alloc);
+}
+#endif
 
 /*===========================================================================
  * Flush Tests (Internal API)
@@ -1774,7 +2064,7 @@ TEST_DECLARE(delta_memtable_c14_ooo_sorted_at_seal) {
     TEST_ASSERT_NULL(mt.ooo_runs);
 
     /* Verify sealed memrun exists and has correct counts */
-    tl_memrun_t* mr = mt.sealed[0];
+    tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
     TEST_ASSERT_NOT_NULL(mr);
     TEST_ASSERT_EQ(1, tl_memrun_run_len(mr));
     TEST_ASSERT_EQ(3, tl_memrun_ooo_len(mr));
@@ -1833,6 +2123,11 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_flush_head_enomem_returns_ebusy);
     RUN_TEST(delta_memview_captures_head_sorted_and_pins_runs);
     RUN_TEST(delta_memview_captures_concurrent_pins);
+    RUN_TEST(delta_memview_copy_sealed_ring_order);
+#ifdef TL_TEST_HOOKS
+    RUN_TEST(delta_memview_copy_sealed_no_alloc_under_lock);
+    RUN_TEST(delta_memview_copy_sealed_retry_fallback);
+#endif
     RUN_TEST(delta_memview_capture_alloc_failure);
     RUN_TEST(delta_memtable_insert_tombstone);
     RUN_TEST(delta_memtable_insert_tombstone_empty);
@@ -1845,6 +2140,10 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_should_seal_bytes);
     RUN_TEST(delta_memtable_should_seal_ooo);
     RUN_TEST(delta_memtable_sealed_queue_fifo);
+    RUN_TEST(delta_sealed_queue_single_element_wrap);
+    RUN_TEST(delta_sealed_queue_full_wrap_around);
+    RUN_TEST(delta_sealed_queue_empty_after_wrap);
+    RUN_TEST(delta_sealed_queue_multiple_cycles);
     RUN_TEST(delta_memtable_pop_releases_refcnt);
     RUN_TEST(delta_memtable_wait_for_space_timeout);
 
@@ -1859,6 +2158,9 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_merge_iter_single_input);
     RUN_TEST(delta_merge_iter_two_inputs);
     RUN_TEST(delta_merge_iter_preserves_all_duplicates); /* Fixed spec violation */
+#ifdef TL_TEST_HOOKS
+    RUN_TEST(delta_kmerge_iter_propagates_source_error);
+#endif
 
     /* Flush tests (3 tests) */
     RUN_TEST(delta_flush_build_records_only);

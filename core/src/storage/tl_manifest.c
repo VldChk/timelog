@@ -193,7 +193,7 @@ static const size_t MANIFEST_MIN_CAPACITY = 8;
 
 static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
                                     tl_segment_t*** arr,
-                                    size_t* len,
+                                    const size_t* len,
                                     size_t* cap) {
     if (*len < *cap) {
         return TL_OK;
@@ -205,8 +205,9 @@ static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
         return TL_ENOMEM;
     }
 
-    tl_segment_t** new_arr = tl__realloc(alloc, *arr,
-                                          new_cap * sizeof(tl_segment_t*));
+    tl_segment_t** new_arr = (tl_segment_t**)tl__realloc(alloc,
+                                                          (void*)*arr,
+                                                          new_cap * sizeof(tl_segment_t*));
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
@@ -216,8 +217,8 @@ static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
     return TL_OK;
 }
 
-static bool is_in_removal_set(tl_segment_t* seg,
-                               tl_segment_t** remove_arr,
+static bool is_in_removal_set(const tl_segment_t* seg,
+                               tl_segment_t* const* remove_arr,
                                size_t remove_len) {
     for (size_t i = 0; i < remove_len; i++) {
         if (remove_arr[i] == seg) {
@@ -235,6 +236,9 @@ tl_status_t tl_manifest_builder_add_l0(tl_manifest_builder_t* mb,
                                         tl_segment_t* seg) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(seg != NULL);
+    if (seg->level != TL_SEG_L0) {
+        return TL_EINVAL;
+    }
 
     tl_status_t st = ensure_capacity(mb->alloc, &mb->add_l0,
                                       &mb->add_l0_len, &mb->add_l0_cap);
@@ -250,6 +254,9 @@ tl_status_t tl_manifest_builder_add_l1(tl_manifest_builder_t* mb,
                                         tl_segment_t* seg) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(seg != NULL);
+    if (seg->level != TL_SEG_L1) {
+        return TL_EINVAL;
+    }
 
     tl_status_t st = ensure_capacity(mb->alloc, &mb->add_l1,
                                       &mb->add_l1_len, &mb->add_l1_cap);
@@ -341,6 +348,70 @@ static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
     return TL_OK;
 }
 
+/* Check if a segment pointer exists in an array. */
+static bool list_contains(tl_segment_t** arr, size_t len, const tl_segment_t* seg) {
+    for (size_t i = 0; i < len; i++) {
+        if (arr[i] == seg) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Validate add lists (levels, duplicates, and conflicts with base/removals). */
+static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
+    /* Validate add_l0 list */
+    for (size_t i = 0; i < mb->add_l0_len; i++) {
+        const tl_segment_t* seg = mb->add_l0[i];
+        if (seg == NULL || seg->level != TL_SEG_L0) {
+            return TL_EINVAL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (mb->add_l0[j] == seg) {
+                return TL_EINVAL; /* duplicate in add_l0 */
+            }
+        }
+        if (is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len) ||
+            is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
+            return TL_EINVAL; /* add + remove same seg */
+        }
+        if (list_contains(mb->add_l1, mb->add_l1_len, seg)) {
+            return TL_EINVAL; /* same seg in add_l1 */
+        }
+        if (mb->base != NULL) {
+            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
+                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+                return TL_EINVAL; /* already present in base */
+            }
+        }
+    }
+
+    /* Validate add_l1 list */
+    for (size_t i = 0; i < mb->add_l1_len; i++) {
+        const tl_segment_t* seg = mb->add_l1[i];
+        if (seg == NULL || seg->level != TL_SEG_L1) {
+            return TL_EINVAL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (mb->add_l1[j] == seg) {
+                return TL_EINVAL; /* duplicate in add_l1 */
+            }
+        }
+        if (is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len) ||
+            is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
+            return TL_EINVAL; /* add + remove same seg */
+        }
+        if (mb->base != NULL) {
+            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
+                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+                return TL_EINVAL; /* already present in base */
+            }
+        }
+    }
+
+    return TL_OK;
+}
+
 /*
  * Count how many segments from base survive removal.
  * Caller must have already validated that removals are a valid subset.
@@ -387,6 +458,14 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         /* No base: removal lists must be empty */
         if (mb->remove_l0_len > 0 || mb->remove_l1_len > 0) {
             return TL_EINVAL;
+        }
+    }
+
+    /* Validate add lists (levels, duplicates, base conflicts) */
+    {
+        tl_status_t st = validate_adds(mb);
+        if (st != TL_OK) {
+            return st;
         }
     }
 
@@ -485,7 +564,24 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
 
     /* Sort L1 by window_start */
     if (m->n_l1 > 1) {
-        qsort(m->l1, m->n_l1, sizeof(tl_segment_t*), compare_l1_by_window_start);
+        qsort((void*)m->l1, m->n_l1, sizeof(tl_segment_t*), compare_l1_by_window_start);
+    }
+
+    /* Release-mode L1 non-overlap validation (H-14) */
+    if (m->n_l1 > 1) {
+        for (uint32_t i = 1; i < m->n_l1; i++) {
+            const tl_segment_t* prev = m->l1[i - 1];
+            const tl_segment_t* curr = m->l1[i];
+
+            if (prev->window_end_unbounded) {
+                tl_manifest_release(m);
+                return TL_EINVAL;
+            }
+            if (curr->window_start < prev->window_end) {
+                tl_manifest_release(m);
+                return TL_EINVAL;
+            }
+        }
     }
 
     /* Compute cached bounds */

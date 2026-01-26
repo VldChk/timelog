@@ -53,8 +53,10 @@ struct tl_memtable {
      * No realloc ever occurs on the seal path.
      *-----------------------------------------------------------------------*/
     tl_memrun_t**   sealed;           /* FIFO queue (fixed capacity) */
+    size_t          sealed_head;      /* Ring buffer head (oldest index) */
     size_t          sealed_len;       /* Current queue length */
     size_t          sealed_max_runs;  /* Fixed capacity (from config) */
+    uint64_t        sealed_epoch;     /* Monotonic counter for queue changes */
 
     /*-----------------------------------------------------------------------
      * Configuration (immutable after init)
@@ -269,7 +271,7 @@ bool tl_memtable_is_sealed_full(const tl_memtable_t* mt);
  * @param out  Output: pinned memrun, or NULL if queue empty
  * @return TL_OK (out may be NULL if empty)
  */
-tl_status_t tl_memtable_peek_oldest(tl_memtable_t* mt, tl_memrun_t** out);
+tl_status_t tl_memtable_peek_oldest(const tl_memtable_t* mt, tl_memrun_t** out);
 
 /**
  * Pop the oldest sealed memrun (after successful flush).
@@ -292,6 +294,42 @@ void tl_memtable_pop_oldest(tl_memtable_t* mt, tl_cond_t* cond);
  */
 size_t tl_memtable_sealed_len(const tl_memtable_t* mt);
 
+/**
+ * Map logical sealed index [0..sealed_len) to physical array index.
+ * Overflow-safe (avoids head+offset wrap before modulo).
+ */
+TL_INLINE size_t tl_memtable_sealed_index(const tl_memtable_t* mt, size_t offset) {
+    TL_ASSERT(mt != NULL);
+    TL_ASSERT(mt->sealed_max_runs > 0);
+
+    size_t cap = mt->sealed_max_runs;
+    size_t head = mt->sealed_head;
+
+    if (cap == 0) {
+        return 0;
+    }
+
+    if (offset >= cap) {
+        offset %= cap;
+    }
+
+    /* If head + offset would reach cap, wrap with subtraction */
+    if (head >= cap - offset) {
+        return head - (cap - offset);
+    }
+    return head + offset;
+}
+
+/**
+ * Get sealed memrun at logical index (0 = oldest).
+ */
+TL_INLINE tl_memrun_t* tl_memtable_sealed_at(const tl_memtable_t* mt, size_t idx) {
+    TL_ASSERT(mt != NULL);
+    TL_ASSERT(idx < mt->sealed_len);
+    size_t pos = tl_memtable_sealed_index(mt, idx);
+    return mt->sealed[pos];
+}
+
 /*===========================================================================
  * Backpressure (Write Path LLD Section 6.1)
  *===========================================================================*/
@@ -312,7 +350,7 @@ size_t tl_memtable_sealed_len(const tl_memtable_t* mt);
  * @param timeout_ms Maximum wait time in milliseconds
  * @return true if space available, false if timeout (queue still full)
  */
-bool tl_memtable_wait_for_space(tl_memtable_t* mt, tl_mutex_t* mu,
+bool tl_memtable_wait_for_space(const tl_memtable_t* mt, tl_mutex_t* mu,
                                  tl_cond_t* cond, uint32_t timeout_ms);
 
 /*===========================================================================
