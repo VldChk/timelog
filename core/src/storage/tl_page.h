@@ -83,8 +83,8 @@ typedef struct tl_page {
     tl_ts_t*     ts;            /* Timestamp array, length == count */
     tl_handle_t* h;             /* Handle array, length == count */
 
-    /* Backing storage (for single-allocation pattern) */
-    void*     backing;          /* Slab pointer if used, else NULL */
+    /* Backing storage (single-allocation today; reserved for slab allocator). */
+    void*     backing;          /* Points to owning allocation; equals page for V1 */
 } tl_page_t;
 
 /*===========================================================================
@@ -354,7 +354,10 @@ tl_status_t tl_page_catalog_reserve(tl_page_catalog_t* cat, size_t n);
  *
  * @param cat  Catalog
  * @param page Page to add
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * @return TL_OK on success,
+ *         TL_ENOMEM on allocation failure,
+ *         TL_EINVAL if capacity exceeds UINT32_MAX,
+ *         TL_EOVERFLOW if capacity growth overflows
  */
 tl_status_t tl_page_catalog_push(tl_page_catalog_t* cat, tl_page_t* page);
 

@@ -103,6 +103,22 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
                               tl_interval_t* tombs, size_t tombs_len,
                               tl_memrun_t** out);
 
+/**
+ * Allocate a memrun struct (zeroed).
+ * Arrays are NOT owned until tl_memrun_init() succeeds.
+ */
+tl_status_t tl_memrun_alloc(tl_alloc_ctx_t* alloc, tl_memrun_t** out);
+
+/**
+ * Initialize a pre-allocated memrun in-place.
+ * Takes ownership of arrays on success.
+ */
+tl_status_t tl_memrun_init(tl_memrun_t* mr,
+                            tl_alloc_ctx_t* alloc,
+                            tl_record_t* run, size_t run_len,
+                            tl_ooorunset_t* ooo_runs,
+                            tl_interval_t* tombs, size_t tombs_len);
+
 /*===========================================================================
  * Reference Counting
  *
@@ -135,8 +151,23 @@ void tl_memrun_release(tl_memrun_t* mr);
  * Get current reference count (for debugging).
  */
 TL_INLINE uint32_t tl_memrun_refcnt(const tl_memrun_t* mr) {
-    return tl_atomic_load_relaxed_u32(&((tl_memrun_t*)mr)->refcnt);
+    return tl_atomic_load_relaxed_u32(&mr->refcnt);
 }
+
+/*===========================================================================
+ * Internal Helpers (M-11: Exposed for reuse by tl_memtable.c)
+ *===========================================================================*/
+
+/**
+ * Compute bounds for memrun (includes records AND tombstones).
+ *
+ * CRITICAL: Bounds MUST include tombstones, not just records.
+ * This ensures tombstones outside record bounds are NOT pruned during
+ * read-path overlap checks (which would cause missed deletes).
+ *
+ * Assumes ooo_min_ts/ooo_max_ts are already set if OOO runs exist.
+ */
+void tl__memrun_compute_bounds(tl_memrun_t* mr);
 
 /*===========================================================================
  * Accessors
@@ -180,6 +211,10 @@ TL_INLINE const tl_record_t* tl_memrun_run_data(const tl_memrun_t* mr) {
 
 TL_INLINE size_t tl_memrun_ooo_run_count(const tl_memrun_t* mr) {
     return mr->ooo_run_count;
+}
+
+TL_INLINE const tl_ooorunset_t* tl_memrun_ooo_runs(const tl_memrun_t* mr) {
+    return mr->ooo_runs;
 }
 
 TL_INLINE const tl_ooorun_t* tl_memrun_ooo_run_at(const tl_memrun_t* mr, size_t idx) {

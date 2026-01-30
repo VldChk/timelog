@@ -126,13 +126,36 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
 
 #ifndef NDEBUG
 /**
- * Validate that L1 segments in manifest are non-overlapping by window.
+ * M-21: Validate that L0 segments are ordered by generation.
+ *
+ * L0 segments should be ordered by generation (older first) since they
+ * are added in flush order. This invariant ensures correct tie-breaking
+ * during merge.
+ *
+ * @param m  Manifest to validate
+ */
+static void tl__validate_l0_generation_order(const tl_manifest_t* m) {
+    uint32_t n = tl_manifest_l0_count(m);
+    if (n <= 1) {
+        return;  /* 0 or 1 segment is trivially ordered */
+    }
+
+    uint32_t prev_gen = tl_manifest_l0_get(m, 0)->generation;
+    for (uint32_t i = 1; i < n; i++) {
+        uint32_t gen = tl_manifest_l0_get(m, i)->generation;
+        TL_ASSERT(gen > prev_gen && "L0 must be ordered by generation");
+        prev_gen = gen;
+    }
+}
+
+/**
+ * M-28: Validate that L1 segments in manifest are non-overlapping by window.
  *
  * This is a critical system invariant per CLAUDE.md:
  * "L1 non-overlap: L1 segments are non-overlapping by time window"
  *
- * Runs in O(n²) which is acceptable for debug validation with typical
- * L1 segment counts (<100). Production code should never violate this.
+ * Uses O(n) linear scan since L1 segments are sorted by window_start
+ * (invariant maintained by manifest builder).
  *
  * @param m  Manifest to validate
  */
@@ -142,20 +165,17 @@ static void tl__validate_l1_non_overlap(const tl_manifest_t* m) {
         return;  /* 0 or 1 segment cannot overlap */
     }
 
-    for (uint32_t i = 0; i < n; i++) {
-        const tl_segment_t* seg_i = tl_manifest_l1_get(m, i);
-        for (uint32_t j = i + 1; j < n; j++) {
-            const tl_segment_t* seg_j = tl_manifest_l1_get(m, j);
+    /* O(n) validation: L1 segments are sorted by window_start, so we only
+     * need to check adjacent pairs. Overlap if prev.window_end > curr.window_start. */
+    for (uint32_t i = 1; i < n; i++) {
+        const tl_segment_t* prev = tl_manifest_l1_get(m, i - 1);
+        const tl_segment_t* curr = tl_manifest_l1_get(m, i);
 
-            /* Check for overlap: segments overlap if neither ends before the other starts.
-             * Using half-open intervals [start, end), overlap occurs if:
-             * NOT (i.end <= j.start OR j.end <= i.start)
-             * = i.end > j.start AND j.end > i.start */
-            bool overlap = (seg_i->window_end > seg_j->window_start) &&
-                           (seg_j->window_end > seg_i->window_start);
+        /* Unbounded window must be last (can only be the final segment) */
+        TL_ASSERT(!prev->window_end_unbounded && "Unbounded L1 window must be last");
 
-            TL_ASSERT(!overlap && "L1 non-overlap invariant violated after compaction");
-        }
+        /* Non-overlap check: prev.window_end <= curr.window_start */
+        TL_ASSERT(prev->window_end <= curr->window_start && "L1 overlap detected");
     }
 }
 #endif /* NDEBUG */
@@ -274,14 +294,13 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
      * C-12 fix: Use overflow-safe subtraction for window span.
      * Direct subtraction can overflow if window IDs have opposite signs
      * (e.g., min_wid = -INT64_MAX/2, max_wid = INT64_MAX/2). */
-    const int64_t MAX_DEBT_WINDOWS = 1000;
     int64_t debt_span;
     if (tl_sub_overflow_i64(max_wid, min_wid, &debt_span)) {
         /* Overflow - conservatively assume high debt */
         tl_intervals_destroy(&tombs);
         return 1.0;
     }
-    if (debt_span < 0 || debt_span > MAX_DEBT_WINDOWS) {
+    if (debt_span < 0 || debt_span > TL_MAX_DEBT_WINDOWS) {
         tl_intervals_destroy(&tombs);
         return 1.0;  /* Assume high debt for large or invalid spans */
     }
@@ -512,6 +531,11 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
         return TL_OK;  /* No overlapping L1 segments */
     }
 
+    /* M-25 fix: Check allocation size won't overflow */
+    if (tl__alloc_would_overflow(overlap_count, sizeof(tl_segment_t*))) {
+        return TL_EOVERFLOW;
+    }
+
     ctx->input_l1 = (tl_segment_t**)tl__malloc(ctx->alloc,
                                                 overlap_count * sizeof(tl_segment_t*));
     if (ctx->input_l1 == NULL) {
@@ -686,6 +710,9 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
     tl_timelog_t* tl = ctx->tl;
 
+    /* M-23: Selection observability - count attempts */
+    tl_atomic_inc_u64(&tl->compaction_select_calls);
+
     /* Pin current manifest.
      * NOTE: next_gen is protected by writer_mu per lock hierarchy. */
     TL_LOCK_WRITER(tl);
@@ -703,12 +730,19 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
      * base_manifest. This follows the init/destroy lifecycle pattern where
      * ctx_destroy handles cleanup regardless of which phase failed. */
     if (n_l0 == 0) {
+        tl_atomic_inc_u64(&tl->compaction_select_no_work);
         return TL_EOF;
     }
 
     size_t max_inputs = (size_t)tl->config.max_compaction_inputs;
-
-    return tl__compact_select_greedy(ctx, m, max_inputs);
+    tl_status_t st = tl__compact_select_greedy(ctx, m, max_inputs);
+    if (st == TL_OK) {
+        tl_atomic_fetch_add_u64(&tl->compaction_select_l0_inputs,
+                                (uint64_t)ctx->input_l0_len, TL_MO_RELAXED);
+        tl_atomic_fetch_add_u64(&tl->compaction_select_l1_inputs,
+                                (uint64_t)ctx->input_l1_len, TL_MO_RELAXED);
+    }
+    return st;
 }
 
 /*===========================================================================
@@ -1011,6 +1045,14 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
      * Cannot reuse tl_kmerge_iter_t (expects query plan sources).
      * =================================================================== */
     size_t total_inputs = ctx->input_l0_len + ctx->input_l1_len;
+
+    /* M-26 fix: Bounds check for tie_break_key which is uint32_t.
+     * In practice this is unreachable (would need 4B+ segments), but
+     * prevents undefined behavior from size_t -> uint32_t truncation. */
+    if (total_inputs > UINT32_MAX) {
+        return TL_EOVERFLOW;
+    }
+
     tl_segment_iter_t* iters = tl__calloc(ctx->alloc, total_inputs,
                                            sizeof(tl_segment_iter_t));
     if (iters == NULL) {
@@ -1044,7 +1086,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             tl_heap_entry_t entry = {
                 .ts = rec.ts,
                 .handle = rec.handle,
-                .component_id = (uint32_t)i,
+                .tie_break_key = (uint32_t)i,
                 .iter = &iters[i]  /* Store iterator pointer for refill */
             };
             st = tl_heap_push(&heap, &entry);
@@ -1093,7 +1135,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             tl_heap_entry_t refill = {
                 .ts = next_rec.ts,
                 .handle = next_rec.handle,
-                .component_id = min_entry.component_id,
+                .tie_break_key = min_entry.tie_break_key,
                 .iter = min_entry.iter
             };
             st = tl_heap_push(&heap, &refill);
@@ -1122,33 +1164,41 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             continue;  /* Skip this record */
         }
 
-        /* Determine which window this record belongs to */
-        int64_t rec_wid;
-        st = tl_window_id_for_ts(min_entry.ts, ctx->window_size,
-                                  ctx->window_origin, &rec_wid);
-        if (st != TL_OK) {
-            goto cleanup;
-        }
-
-        /* If we've moved to a new window, flush the current window and jump.
-         * IMPORTANT: We jump directly to rec_wid instead of iterating through
-         * empty intermediate windows. This makes compaction O(records) instead
-         * of O(windows), which matters for sparse data spanning wide time ranges
-         * (e.g., records at ts=0 and ts=TL_TS_MAX). */
-        if (current_wid < rec_wid) {
-            /* Flush current window (may be empty - that's fine) */
-            st = tl__flush_window_records(ctx, &window_records,
-                                           current_window_start, current_window_end,
-                                           current_end_unbounded);
+        /*
+         * Determine window membership.
+         *
+         * M-24 fix: Avoid per-record division when records stay within the
+         * current window. Only compute window_id when ts is beyond the current
+         * window end (bounded case).
+         */
+        if (!current_end_unbounded && min_entry.ts >= current_window_end) {
+            int64_t rec_wid;
+            st = tl_window_id_for_ts(min_entry.ts, ctx->window_size,
+                                      ctx->window_origin, &rec_wid);
             if (st != TL_OK) {
                 goto cleanup;
             }
 
-            /* Jump directly to the window containing this record */
-            current_wid = rec_wid;
-            tl_window_bounds(current_wid, ctx->window_size, ctx->window_origin,
-                              &current_window_start, &current_window_end,
-                              &current_end_unbounded);
+            /* If we've moved to a new window, flush the current window and jump.
+             * IMPORTANT: We jump directly to rec_wid instead of iterating through
+             * empty intermediate windows. This makes compaction O(records) instead
+             * of O(windows), which matters for sparse data spanning wide time ranges
+             * (e.g., records at ts=0 and ts=TL_TS_MAX). */
+            if (current_wid < rec_wid) {
+                /* Flush current window (may be empty - that's fine) */
+                st = tl__flush_window_records(ctx, &window_records,
+                                               current_window_start, current_window_end,
+                                               current_end_unbounded);
+                if (st != TL_OK) {
+                    goto cleanup;
+                }
+
+                /* Jump directly to the window containing this record */
+                current_wid = rec_wid;
+                tl_window_bounds(current_wid, ctx->window_size, ctx->window_origin,
+                                  &current_window_start, &current_window_end,
+                                  &current_end_unbounded);
+            }
         }
 
         /* Add record to current window accumulator.
@@ -1333,6 +1383,7 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
      * Using validate_m ensures we check what we built, not what a concurrent
      * flush might have replaced it with. */
     tl__validate_l1_non_overlap(validate_m);
+    tl__validate_l0_generation_order(validate_m);
     tl_manifest_release(validate_m);
 #endif
 
@@ -1399,13 +1450,9 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     st = tl_compact_select(&ctx);
     if (st != TL_OK) {
         tl_compact_ctx_destroy(&ctx);
-        /* Adaptive: record failure for ENOMEM (no restore needed - we didn't
-         * commit to effective_window_size). TL_EOF (no work) is not a failure. */
-        if (tl->config.adaptive.target_records > 0 && st == TL_ENOMEM) {
-            TL_LOCK_MAINT(tl);
-            tl_adaptive_record_failure(&tl->adaptive);
-            TL_UNLOCK_MAINT(tl);
-        }
+        /* M-27: ENOMEM is environmental, not policy failure - don't record.
+         * TL_EOF (no work) is also not a failure. Only EBUSY after retries
+         * is a policy failure (handled at retry exhaustion). */
         return st;  /* TL_EOF = no work, TL_ENOMEM = error */
     }
 
@@ -1413,11 +1460,7 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     st = tl_compact_merge(&ctx);
     if (st != TL_OK) {
         tl_compact_ctx_destroy(&ctx);
-        if (tl->config.adaptive.target_records > 0 && st == TL_ENOMEM) {
-            TL_LOCK_MAINT(tl);
-            tl_adaptive_record_failure(&tl->adaptive);
-            TL_UNLOCK_MAINT(tl);
-        }
+        /* M-27: ENOMEM is environmental - don't record as adaptive failure */
         return st;
     }
 
@@ -1504,14 +1547,8 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
 
                     TL_UNLOCK_MAINT(tl);
                 }
-            } else {
-                /* Fatal error (ENOMEM) - record failure (no restore needed) */
-                if (tl->config.adaptive.target_records > 0 && publish_st == TL_ENOMEM) {
-                    TL_LOCK_MAINT(tl);
-                    tl_adaptive_record_failure(&tl->adaptive);
-                    TL_UNLOCK_MAINT(tl);
-                }
             }
+            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             tl_compact_ctx_destroy(&ctx);
             return publish_st;
         }
@@ -1531,22 +1568,14 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
         st = tl_compact_select(&ctx);
         if (st != TL_OK) {
             tl_compact_ctx_destroy(&ctx);
-            if (tl->config.adaptive.target_records > 0 && st == TL_ENOMEM) {
-                TL_LOCK_MAINT(tl);
-                tl_adaptive_record_failure(&tl->adaptive);
-                TL_UNLOCK_MAINT(tl);
-            }
+            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             return st;
         }
 
         st = tl_compact_merge(&ctx);
         if (st != TL_OK) {
             tl_compact_ctx_destroy(&ctx);
-            if (tl->config.adaptive.target_records > 0 && st == TL_ENOMEM) {
-                TL_LOCK_MAINT(tl);
-                tl_adaptive_record_failure(&tl->adaptive);
-                TL_UNLOCK_MAINT(tl);
-            }
+            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             return st;
         }
     }

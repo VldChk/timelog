@@ -5,7 +5,7 @@
  * Implements lazy access to decoded Python objects from a PageSpan.
  * Uses span->h[] pointer directly (borrowed from core owner's snapshot).
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN

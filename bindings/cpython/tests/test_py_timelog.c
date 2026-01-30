@@ -5,7 +5,7 @@
  * TDD-driven tests for the PyTimelog wrapper type.
  * Tests run with Python initialized and GIL held.
  *
- * See: docs/engineering_plan_B2_pytimelog.md Section 2.2
+ * See: docs/V2/timelog_v2_engineering_plan.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -281,6 +281,60 @@ TEST(init_custom_config)
     ASSERT_EQ(tl->maint_mode, TL_MAINT_BACKGROUND);
     ASSERT_EQ(tl->busy_policy, TL_PY_BUSY_RAISE);
 
+    close_and_dealloc(tl);
+}
+
+TEST(init_extended_config)
+{
+    PyObject* args = PyTuple_New(0);
+    PyObject* kwargs = PyDict_New();
+    ASSERT_NOT_NULL(args);
+    ASSERT_NOT_NULL(kwargs);
+
+    PyObject* val = NULL;
+
+    val = PyUnicode_FromString("background");
+    PyDict_SetItemString(kwargs, "maintenance", val);
+    Py_DECREF(val);
+
+    val = PyUnicode_FromString("raise");
+    PyDict_SetItemString(kwargs, "busy_policy", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(0);
+    PyDict_SetItemString(kwargs, "memtable_max_bytes", val);
+    PyDict_SetItemString(kwargs, "target_page_bytes", val);
+    PyDict_SetItemString(kwargs, "sealed_max_runs", val);
+    PyDict_SetItemString(kwargs, "ooo_budget_bytes", val);
+    PyDict_SetItemString(kwargs, "sealed_wait_ms", val);
+    PyDict_SetItemString(kwargs, "maintenance_wakeup_ms", val);
+    PyDict_SetItemString(kwargs, "max_delta_segments", val);
+    PyDict_SetItemString(kwargs, "compaction_target_bytes", val);
+    PyDict_SetItemString(kwargs, "max_compaction_inputs", val);
+    PyDict_SetItemString(kwargs, "max_compaction_windows", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(3600);
+    PyDict_SetItemString(kwargs, "window_size", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(0);
+    PyDict_SetItemString(kwargs, "window_origin", val);
+    Py_DECREF(val);
+
+    val = PyFloat_FromDouble(0.25);
+    PyDict_SetItemString(kwargs, "delete_debt_threshold", val);
+    Py_DECREF(val);
+
+    PyTimelog* tl = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
+    ASSERT_NOT_NULL(tl);
+
+    int rc = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(tl->tl);
+
+    Py_DECREF(args);
+    Py_DECREF(kwargs);
     close_and_dealloc(tl);
 }
 
@@ -965,6 +1019,7 @@ int main(int argc, char* argv[])
     printf("\n[Lifecycle]\n");
     run_init_defaults();
     run_init_custom_config();
+    run_init_extended_config();
     run_reinit_fails();
     run_close_idempotent();
     run_close_sets_state();

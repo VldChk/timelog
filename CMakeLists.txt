@@ -100,6 +100,7 @@ set(TIMELOG_SOURCES
     core/src/query/tl_segment_iter.c
     core/src/query/tl_memrun_iter.c
     core/src/query/tl_active_iter.c
+    core/src/query/tl_iter_build.c
     core/src/query/tl_submerge.c
     core/src/query/tl_plan.c
     core/src/query/tl_merge_iter.c

@@ -56,6 +56,11 @@ struct tl_memtable {
     size_t          sealed_head;      /* Ring buffer head (oldest index) */
     size_t          sealed_len;       /* Current queue length */
     size_t          sealed_max_runs;  /* Fixed capacity (from config) */
+    /*
+     * M-09: sealed_epoch is protected by memtable_mu only.
+     * Updated atomically when sealed queue changes (seal, pop).
+     * Used for flush synchronization and memview cache invalidation.
+     */
     uint64_t        sealed_epoch;     /* Monotonic counter for queue changes */
 
     /*-----------------------------------------------------------------------
@@ -69,6 +74,12 @@ struct tl_memtable {
     /*-----------------------------------------------------------------------
      * Metadata
      *-----------------------------------------------------------------------*/
+    /*
+     * M-09: epoch is protected by writer_mu only.
+     * Incremented on every write operation (insert, tombstone).
+     * Used for memview cache invalidation - snapshot caching checks if
+     * epoch changed to determine if cached memview is still valid.
+     */
     uint64_t        epoch;            /* Monotonic counter, increments on memtable changes */
 
     /*-----------------------------------------------------------------------

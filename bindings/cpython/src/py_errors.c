@@ -21,8 +21,10 @@ PyObject* TlPy_TimelogError = NULL;
 /**
  * TimelogBusyError exception for TL_EBUSY.
  * Inherits from TimelogError.
- * IMPORTANT: For write operations, this means the write succeeded but
- * backpressure occurred - DO NOT RETRY (would create duplicates).
+ * IMPORTANT:
+ * - Writes: record/tombstone was inserted; do NOT retry.
+ * - Flush/maintenance: publish retry exhausted; safe to retry later.
+ * - start_maintenance: stop in progress; retry later.
  */
 PyObject* TlPy_TimelogBusyError = NULL;
 
@@ -110,7 +112,7 @@ void TlPy_FiniErrors(void)
  * Mapping rationale:
  * - TL_EINVAL   -> ValueError (bad arguments from user)
  * - TL_ESTATE   -> TimelogError (API usage error)
- * - TL_EBUSY    -> TimelogBusyError (backpressure - see header for context)
+ * - TL_EBUSY    -> TimelogBusyError (backpressure/publish-retry - see header for context)
  * - TL_ENOMEM   -> MemoryError (system resource)
  * - TL_EOVERFLOW-> OverflowError (arithmetic)
  * - TL_EINTERNAL-> SystemError (bug in timelog)
@@ -123,7 +125,7 @@ static PyObject* status_to_exception_type(tl_status_t status)
             return PyExc_ValueError;
 
         case TL_EBUSY:
-            /* Transient condition: backpressure, stop in progress, etc. */
+            /* Transient condition: backpressure, publish retry, stop in progress. */
             return TlPy_TimelogBusyError ? TlPy_TimelogBusyError
                                           : PyExc_RuntimeError;
 

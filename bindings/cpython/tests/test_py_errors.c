@@ -15,7 +15,7 @@
  * 4. Return Value and State (3 tests)
  * 5. Integration (4 tests)
  *
- * See: docs/timelog_v2_lld_B6_error_model_subsystem.md
+ * See: docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #define PY_SSIZE_T_CLEAN

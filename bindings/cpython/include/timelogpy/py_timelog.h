@@ -7,13 +7,13 @@
  * and maintenance.
  *
  * Thread Safety:
- *   A Timelog instance is NOT thread-safe. Do not access the same instance
- *   from multiple threads without external synchronization. This is consistent
- *   with Python's sqlite3.Connection and file objects.
+ *   Single-writer model: the same instance must not be used concurrently
+ *   for writes or lifecycle operations without external synchronization.
+ *   Snapshot-based iterators are safe for concurrent reads.
  *
  *   The GIL is released during flush(), compact(), stop_maintenance(), and
- *   close() to allow other Python threads to run. The user must ensure no
- *   other thread accesses this Timelog instance during these operations.
+ *   close(). The user must ensure no other thread touches this Timelog
+ *   instance while these operations are in progress.
  *
  * Known Limitations:
  *   - Unflushed records leak on close(): The core engine's tl_close() does
@@ -22,11 +22,12 @@
  *     compaction will have their references properly released.
  *
  *   - Close-time reclamation: Even with flush(), compaction must run to
- *     physically drop records and trigger DECREF. If maintenance is disabled,
- *     call compact() and run_maintenance() before close().
+ *     physically drop records and trigger DECREF. When maintenance is
+ *     disabled, Python does not expose tl_maint_step(), so compaction will
+ *     not run. Use maintenance='background' for automatic compaction.
  *
- * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
- *      docs/engineering_plan_B2_pytimelog.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_TIMELOG_H
@@ -49,8 +50,11 @@ extern "C" {
  * Controls behavior when TL_EBUSY is returned from write operations.
  *
  * CRITICAL: TL_EBUSY from tl_append/tl_delete_* means the record/tombstone
- * WAS successfully inserted, but backpressure occurred (sealed queue full).
- * This is NOT a failure - the data is in the engine.
+ * WAS successfully inserted, but backpressure occurred. This is NOT a
+ * failure - the data is in the engine.
+ *
+ * Note: TL_EBUSY can also be returned by flush/maintenance publish retries
+ * (safe to retry). Busy policy only applies to write operations.
  *
  * Policy options:
  * - RAISE:  Raise TimelogBusyError (record IS inserted)

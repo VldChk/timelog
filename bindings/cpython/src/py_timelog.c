@@ -3,7 +3,7 @@
  * @brief PyTimelog CPython extension implementation (LLD-B2)
  *
  * Implementation of the PyTimelog type which wraps tl_timelog_t*.
- * Follows the engineering plan in docs/engineering_plan_B2_pytimelog.md
+ * See docs/V2/timelog_v2_engineering_plan.md for current design intent.
  *
  * CRITICAL SEMANTICS:
  * - TL_EBUSY from write operations means record/tombstone WAS inserted
@@ -11,6 +11,7 @@
  * - Do NOT retry on TL_EBUSY (would create duplicates)
  *
  * Thread Safety:
+ * - Single-writer model: external synchronization required for writes
  * - GIL released only for: flush, compact, stop_maintenance, close
  * - All write operations hold GIL throughout
  */
@@ -25,6 +26,7 @@
 #include "timelogpy/py_errors.h"
 #include "timelog/timelog.h"
 
+#include <limits.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -123,13 +125,23 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     static char* kwlist[] = {
-        "time_unit",           /* s - string */
-        "maintenance",         /* s - string */
-        "memtable_max_bytes",  /* n - Py_ssize_t */
-        "target_page_bytes",   /* n - Py_ssize_t */
-        "sealed_max_runs",     /* n - Py_ssize_t */
-        "drain_batch_limit",   /* n - Py_ssize_t */
-        "busy_policy",         /* s - string */
+        "time_unit",             /* s - string */
+        "maintenance",           /* s - string */
+        "memtable_max_bytes",    /* n - Py_ssize_t */
+        "target_page_bytes",     /* n - Py_ssize_t */
+        "sealed_max_runs",       /* n - Py_ssize_t */
+        "drain_batch_limit",     /* n - Py_ssize_t */
+        "busy_policy",           /* s - string */
+        "ooo_budget_bytes",      /* n - Py_ssize_t */
+        "sealed_wait_ms",        /* n - Py_ssize_t */
+        "maintenance_wakeup_ms", /* n - Py_ssize_t */
+        "max_delta_segments",    /* n - Py_ssize_t */
+        "window_size",           /* L - long long */
+        "window_origin",         /* L - long long */
+        "delete_debt_threshold", /* d - double */
+        "compaction_target_bytes", /* n - Py_ssize_t */
+        "max_compaction_inputs", /* n - Py_ssize_t */
+        "max_compaction_windows",/* n - Py_ssize_t */
         NULL
     };
 
@@ -140,12 +152,26 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     Py_ssize_t sealed_max_runs = -1;
     Py_ssize_t drain_batch_limit = -1;
     const char* busy_policy_str = NULL;
+    Py_ssize_t ooo_budget_bytes = -1;
+    Py_ssize_t sealed_wait_ms = -1;
+    Py_ssize_t maintenance_wakeup_ms = -1;
+    Py_ssize_t max_delta_segments = -1;
+    long long window_size = LLONG_MIN;
+    long long window_origin = LLONG_MIN;
+    double delete_debt_threshold = -1.0;
+    Py_ssize_t compaction_target_bytes = -1;
+    Py_ssize_t max_compaction_inputs = -1;
+    Py_ssize_t max_compaction_windows = -1;
 
-    /* CRITICAL: 7 converters for 7 kwargs */
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssnnnns", kwlist,
+    /* CRITICAL: 17 converters for 17 kwargs */
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssnnnnsnnnnLLdnnn", kwlist,
             &time_unit_str, &maint_str,
             &memtable_max_bytes, &target_page_bytes, &sealed_max_runs,
-            &drain_batch_limit, &busy_policy_str)) {
+            &drain_batch_limit, &busy_policy_str,
+            &ooo_budget_bytes, &sealed_wait_ms, &maintenance_wakeup_ms,
+            &max_delta_segments, &window_size, &window_origin,
+            &delete_debt_threshold, &compaction_target_bytes,
+            &max_compaction_inputs, &max_compaction_windows)) {
         return -1;
     }
 
@@ -193,14 +219,14 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     /*
      * Apply numeric overrides with validation.
-     * -1 = unset (use default), 0 or negative = ValueError, positive = apply.
+     * -1 = unset (use default), 0 allowed where supported by core config.
      * Also check for overflow on platforms where size_t < Py_ssize_t.
      */
     if (memtable_max_bytes != -1) {
-        if (memtable_max_bytes <= 0) {
+        if (memtable_max_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
-                "memtable_max_bytes must be positive");
+                "memtable_max_bytes must be >= 0");
             return -1;
         }
         if ((size_t)memtable_max_bytes != (uint64_t)memtable_max_bytes) {
@@ -212,10 +238,10 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.memtable_max_bytes = (size_t)memtable_max_bytes;
     }
     if (target_page_bytes != -1) {
-        if (target_page_bytes <= 0) {
+        if (target_page_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
-                "target_page_bytes must be positive");
+                "target_page_bytes must be >= 0");
             return -1;
         }
         if ((size_t)target_page_bytes != (uint64_t)target_page_bytes) {
@@ -227,10 +253,10 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.target_page_bytes = (size_t)target_page_bytes;
     }
     if (sealed_max_runs != -1) {
-        if (sealed_max_runs <= 0) {
+        if (sealed_max_runs < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
-                "sealed_max_runs must be positive");
+                "sealed_max_runs must be >= 0");
             return -1;
         }
         if ((size_t)sealed_max_runs != (uint64_t)sealed_max_runs) {
@@ -240,6 +266,125 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
             return -1;
         }
         cfg.sealed_max_runs = (size_t)sealed_max_runs;
+    }
+
+    if (ooo_budget_bytes != -1) {
+        if (ooo_budget_bytes < 0) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "ooo_budget_bytes must be >= 0");
+            return -1;
+        }
+        if ((size_t)ooo_budget_bytes != (uint64_t)ooo_budget_bytes) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_OverflowError,
+                "ooo_budget_bytes too large for this platform");
+            return -1;
+        }
+        cfg.ooo_budget_bytes = (size_t)ooo_budget_bytes;
+    }
+
+    if (sealed_wait_ms != -1) {
+        if (sealed_wait_ms < 0 || (uint64_t)sealed_wait_ms > UINT32_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "sealed_wait_ms must be 0-4294967295");
+            return -1;
+        }
+        cfg.sealed_wait_ms = (uint32_t)sealed_wait_ms;
+    }
+
+    if (maintenance_wakeup_ms != -1) {
+        if (maintenance_wakeup_ms < 0 || (uint64_t)maintenance_wakeup_ms > UINT32_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "maintenance_wakeup_ms must be 0-4294967295");
+            return -1;
+        }
+        cfg.maintenance_wakeup_ms = (uint32_t)maintenance_wakeup_ms;
+    }
+
+    if (max_delta_segments != -1) {
+        if (max_delta_segments < 0) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "max_delta_segments must be >= 0");
+            return -1;
+        }
+        if ((size_t)max_delta_segments != (uint64_t)max_delta_segments) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_OverflowError,
+                "max_delta_segments too large for this platform");
+            return -1;
+        }
+        cfg.max_delta_segments = (size_t)max_delta_segments;
+    }
+
+    if (window_size != LLONG_MIN) {
+        if (window_size < 0 || window_size > (long long)TL_TS_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "window_size must be in [0, INT64_MAX]");
+            return -1;
+        }
+        cfg.window_size = (tl_ts_t)window_size;
+    }
+
+    if (window_origin != LLONG_MIN) {
+        if (window_origin < (long long)TL_TS_MIN ||
+            window_origin > (long long)TL_TS_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_OverflowError,
+                "window_origin out of int64 range");
+            return -1;
+        }
+        cfg.window_origin = (tl_ts_t)window_origin;
+    }
+
+    if (delete_debt_threshold != -1.0) {
+        if (delete_debt_threshold < 0.0 || delete_debt_threshold > 1.0) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "delete_debt_threshold must be in [0.0, 1.0]");
+            return -1;
+        }
+        cfg.delete_debt_threshold = delete_debt_threshold;
+    }
+
+    if (compaction_target_bytes != -1) {
+        if (compaction_target_bytes < 0) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "compaction_target_bytes must be >= 0");
+            return -1;
+        }
+        if ((size_t)compaction_target_bytes != (uint64_t)compaction_target_bytes) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_OverflowError,
+                "compaction_target_bytes too large for this platform");
+            return -1;
+        }
+        cfg.compaction_target_bytes = (size_t)compaction_target_bytes;
+    }
+
+    if (max_compaction_inputs != -1) {
+        if (max_compaction_inputs < 0 || (uint64_t)max_compaction_inputs > UINT32_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "max_compaction_inputs must be 0-4294967295");
+            return -1;
+        }
+        cfg.max_compaction_inputs = (uint32_t)max_compaction_inputs;
+    }
+
+    if (max_compaction_windows != -1) {
+        if (max_compaction_windows < 0 || (uint64_t)max_compaction_windows > UINT32_MAX) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "max_compaction_windows must be 0-4294967295");
+            return -1;
+        }
+        cfg.max_compaction_windows = (uint32_t)max_compaction_windows;
     }
 
     /* Wire up drop callback */
@@ -261,19 +406,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
 
-    /* Auto-start maintenance when in background mode. */
-    if (self->maint_mode == TL_MAINT_BACKGROUND) {
-        st = tl_maint_start(self->tl);
-        if (st != TL_OK) {
-            tl_maint_stop(self->tl);
-            tl_close(self->tl);
-            self->tl = NULL;
-            self->closed = 1;
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
-            TlPy_RaiseFromStatus(st);
-            return -1;
-        }
-    }
+    /* tl_open() auto-starts maintenance in background mode. */
 
     return 0;
 }
@@ -440,16 +573,16 @@ PyTimelog_append(PyTimelog* self, PyObject* args)
     if (st == TL_EBUSY) {
         /*
          * CRITICAL: EBUSY means record WAS inserted, but backpressure occurred.
-         * This only happens in manual maintenance mode.
+         * This can happen in background mode (sealed queue timeout) or after
+         * an OOO head flush failure. DO NOT retry - would create duplicates.
          *
          * DO NOT rollback INCREF - record is in engine.
-         * DO NOT retry - would create duplicate.
          */
         if (self->busy_policy == TL_PY_BUSY_RAISE) {
             /* Raise informational exception - record IS in log */
             PyErr_SetString(TlPy_TimelogBusyError,
                 "Record inserted but backpressure occurred. "
-                "Call flush() or run maintenance to relieve.");
+                "Call flush() or wait for background maintenance to relieve.");
             return NULL;
         }
 
@@ -548,7 +681,7 @@ PyTimelog_extend(PyTimelog* self, PyObject* iterable)
                     "Backpressure during batch insert. "
                     "Records up to and including this one are committed; "
                     "remaining records were not attempted. "
-                    "Call flush() or run maintenance to relieve.");
+                    "Call flush() or wait for background maintenance to relieve.");
                 return NULL;
             }
 
@@ -617,7 +750,7 @@ PyTimelog_delete_range(PyTimelog* self, PyObject* args)
         if (self->busy_policy == TL_PY_BUSY_RAISE) {
             PyErr_SetString(TlPy_TimelogBusyError,
                 "Tombstone inserted but backpressure occurred. "
-                "Call flush() or run maintenance to relieve.");
+                "Call flush() or wait for background maintenance to relieve.");
             return NULL;
         }
         if (self->busy_policy == TL_PY_BUSY_FLUSH) {
@@ -667,7 +800,7 @@ PyTimelog_delete_before(PyTimelog* self, PyObject* args)
         if (self->busy_policy == TL_PY_BUSY_RAISE) {
             PyErr_SetString(TlPy_TimelogBusyError,
                 "Tombstone inserted but backpressure occurred. "
-                "Call flush() or run maintenance to relieve.");
+                "Call flush() or wait for background maintenance to relieve.");
             return NULL;
         }
         if (self->busy_policy == TL_PY_BUSY_FLUSH) {
@@ -706,6 +839,10 @@ PyTimelog_flush(PyTimelog* self, PyObject* Py_UNUSED(args))
     st = tl_flush(self->tl);
     Py_END_ALLOW_THREADS
 
+    if (st == TL_EBUSY) {
+        return TlPy_RaiseFromStatusFmt(TL_EBUSY,
+            "Flush publish retry exhausted (safe to retry)");
+    }
     if (st != TL_OK && st != TL_EOF) {
         return TlPy_RaiseFromStatus(st);
     }
@@ -736,12 +873,8 @@ PyTimelog_compact(PyTimelog* self, PyObject* Py_UNUSED(args))
 
     /*
      * Note: In manual mode (maintenance='disabled'), compact() only requests
-     * compaction. The actual work happens when the background worker runs
-     * (if later started) or the application calls tl_maint_step() externally.
-     *
-     * For V1, we do NOT expose maint_step() to Python. Manual mode is for
-     * advanced use cases where the caller controls the maintenance loop.
-     * Typical Python usage should use maintenance='background'.
+     * compaction. Python does NOT expose tl_maint_step(), so no compaction
+     * work will run unless background maintenance is enabled.
      */
 
     /* Opportunistic drain after compact */
@@ -811,13 +944,12 @@ PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     /*
-     * Auto-start maintenance worker when in background mode.
+     * Ensure maintenance worker is running in background mode.
      *
-     * When users create a Timelog with maintenance="background" and use the
-     * context manager, they expect background maintenance to run automatically.
-     * Without this, writes that trigger backpressure would wait on a condvar
-     * that never gets signaled (because the worker isn't running), causing
-     * writes to take 100ms each (the sealed_wait_ms timeout).
+     * tl_open() auto-starts the worker, and tl_maint_start() is idempotent,
+     * so this is a safe no-op in the common case. It also allows users who
+     * previously stopped maintenance to re-enable it by re-entering the
+     * context manager.
      *
      * Note: close() (called by __exit__) already calls tl_maint_stop().
      */
@@ -1082,7 +1214,7 @@ static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
  *
  * @param t1   Range start (inclusive)
  * @param t2   Range end (exclusive)
- * @param kind "segment" (only supported value in V1)
+ * @param kind "segment" (currently supported value)
  * @return PageSpanIter iterator
  */
 static PyObject* PyTimelog_page_spans(PyTimelog* self,
@@ -1210,11 +1342,13 @@ static PyMethodDef PyTimelog_methods[] = {
 
     {"flush", (PyCFunction)PyTimelog_flush, METH_NOARGS,
      "flush() -> None\n\n"
-     "Synchronously flush memtable to L0 segments."},
+     "Synchronously flush memtable to L0 segments.\n"
+     "Raises TimelogBusyError if publish retry is exhausted (safe to retry)."},
 
     {"compact", (PyCFunction)PyTimelog_compact, METH_NOARGS,
      "compact() -> None\n\n"
-     "Request compaction (maintenance must be running or manual step called)."},
+     "Request compaction. In maintenance='disabled', compaction will not\n"
+     "run because Python does not expose a manual maintenance step."},
 
     {"start_maintenance", (PyCFunction)PyTimelog_start_maint, METH_NOARGS,
      "start_maintenance() -> None\n\n"
@@ -1267,7 +1401,7 @@ static PyMethodDef PyTimelog_methods[] = {
      "Parameters:\n"
      "  t1: Range start (inclusive)\n"
      "  t2: Range end (exclusive)\n"
-     "  kind: 'segment' (only supported value in V1)\n\n"
+     "  kind: 'segment' (currently supported value)\n\n"
      "Returns:\n"
      "  PageSpanIter yielding PageSpan objects"},
 
@@ -1291,9 +1425,9 @@ PyTypeObject PyTimelog_Type = {
         "Timelog engine wrapper.\n\n"
         "A time-indexed multimap for (timestamp, object) records.\n\n"
         "Thread Safety:\n"
-        "    A Timelog instance is NOT thread-safe. Do not access the same\n"
-        "    instance from multiple threads without external synchronization.\n"
-        "    This is consistent with Python's sqlite3.Connection and file objects.\n"
+        "    Single-writer model. External synchronization is required for\n"
+        "    concurrent writes or lifecycle operations. Snapshot-based iterators\n"
+        "    are safe for concurrent reads.\n"
     ),
     .tp_basicsize = sizeof(PyTimelog),
     .tp_itemsize = 0,

@@ -18,7 +18,7 @@
  *   The view holds a strong reference to its parent PageSpan.
  *   The PageSpan must remain open for the view to function.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_OBJECTS_H

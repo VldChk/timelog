@@ -675,6 +675,49 @@ TEST_DECLARE(cint_delete_debt_unbounded_returns_max) {
     tl_segment_release(s1);
     tl_close(tl);
 }
+/**
+ * T-33: Delete Debt Extreme Range
+ *
+ * Tombstone covering extreme timestamp range [TL_TS_MIN, TL_TS_MAX).
+ * Verify delete debt calculation doesn't overflow or crash.
+ */
+TEST_DECLARE(cint_delete_debt_extreme_range) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.window_size = 1000;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Create an L0 segment with a massive tombstone range */
+    tl_interval_t tombs[1] = {{TL_TS_MIN, TL_TS_MAX, false}};
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&tl->alloc,
+                                                   NULL, 0,
+                                                   tombs, 1,
+                                                   cfg.target_page_bytes,
+                                                   1, &seg));
+
+    tl_manifest_builder_t mb;
+    tl_manifest_builder_init(&mb, &tl->alloc, NULL);
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_add_l0(&mb, seg));
+
+    tl_manifest_t* m = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_manifest_builder_build(&mb, &m));
+    tl_manifest_builder_destroy(&mb);
+
+    /* Should return 1.0 (fully deleted) without overflow/crash */
+    double debt = tl_test_compute_delete_debt(tl, m);
+    TEST_ASSERT(debt >= 0.0);
+    TEST_ASSERT(debt <= 1.0);
+    /* With such a massive range, expect max debt */
+    TEST_ASSERT(fabs(debt - 1.0) < 1e-6);
+
+    tl_manifest_release(m);
+    tl_segment_release(seg);
+    tl_close(tl);
+}
 #endif /* TL_TEST_HOOKS */
 
 /*===========================================================================
@@ -871,6 +914,8 @@ void run_compaction_internal_tests(void) {
 #ifdef TL_TEST_HOOKS
     RUN_TEST(cint_delete_debt_matches_reference);
     RUN_TEST(cint_delete_debt_unbounded_returns_max);
+    /* Delete debt extreme range (1 test) - T-33 */
+    RUN_TEST(cint_delete_debt_extreme_range);
     /* Delete debt + retry limit tests (3 tests) */
     RUN_TEST(cint_one_exhausts_retries);
 #endif

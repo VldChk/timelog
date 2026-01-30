@@ -58,7 +58,11 @@ tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
         return TL_EINVAL;
     }
 
-    TL_ASSERT(records != NULL);
+    /* M-07 fix: Runtime validation of records pointer.
+     * This is user-provided input; NULL with count > 0 is invalid. */
+    if (records == NULL) {
+        return TL_EINVAL;
+    }
 
     /*
      * Debug: verify records are sorted (catches upstream bugs early)
@@ -95,13 +99,21 @@ tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
     }
     size_t h_array_size = count * sizeof(tl_handle_t);
 
-    size_t ts_offset = TL_ALIGN_UP(sizeof(tl_page_t), ts_align);
+    size_t ts_offset = 0;
+    if (!tl_align_up_safe(sizeof(tl_page_t), ts_align, &ts_offset)) {
+        return TL_EOVERFLOW;
+    }
 
     /* Check: ts_offset + ts_array_size */
     if (ts_offset > SIZE_MAX - ts_array_size) {
         return TL_EOVERFLOW;
     }
-    size_t h_offset = TL_ALIGN_UP(ts_offset + ts_array_size, h_align);
+    size_t ts_end = ts_offset + ts_array_size;
+
+    size_t h_offset = 0;
+    if (!tl_align_up_safe(ts_end, h_align, &h_offset)) {
+        return TL_EOVERFLOW;
+    }
 
     /* Check: h_offset + h_array_size */
     if (h_offset > SIZE_MAX - h_array_size) {
@@ -344,7 +356,7 @@ void tl_page_catalog_destroy(tl_page_catalog_t* cat) {
 tl_status_t tl_page_catalog_reserve(tl_page_catalog_t* cat, size_t n) {
     TL_ASSERT(cat != NULL);
 
-    /* Check for overflow */
+    /* Check for valid page count (catalog uses uint32_t indices) */
     if (n > UINT32_MAX) {
         return TL_EINVAL;
     }
@@ -353,19 +365,23 @@ tl_status_t tl_page_catalog_reserve(tl_page_catalog_t* cat, size_t n) {
         return TL_OK;
     }
 
-    /* Grow capacity - cast to size_t before multiply to avoid 32-bit wrap */
-    size_t new_cap = (cat->capacity == 0) ? 16 : (size_t)cat->capacity * 2;
-    while (new_cap < n) {
-        new_cap *= 2;
-        /* Guard against size_t overflow */
-        if (new_cap < n) {
-            return TL_EOVERFLOW;
-        }
+    /*
+     * Grow capacity using overflow-safe helper.
+     * tl__grow_capacity returns 0 on overflow.
+     */
+    size_t new_cap = tl__grow_capacity(cat->capacity, n, 16);
+    if (new_cap == 0) {
+        return TL_EOVERFLOW;
     }
 
-    /* Clamp to UINT32_MAX */
+    /* Clamp to UINT32_MAX (catalog indices are uint32_t) */
     if (new_cap > UINT32_MAX) {
         new_cap = UINT32_MAX;
+    }
+
+    /* Check allocation size won't overflow */
+    if (tl__alloc_would_overflow(new_cap, sizeof(tl_page_meta_t))) {
+        return TL_EOVERFLOW;
     }
 
     tl_page_meta_t* new_pages = tl__realloc(cat->alloc, cat->pages,

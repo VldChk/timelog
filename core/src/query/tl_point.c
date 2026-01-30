@@ -1,6 +1,7 @@
 #include "tl_point.h"
 #include "tl_snapshot.h"
 #include "../internal/tl_intervals.h"
+#include "../internal/tl_search.h"
 #include "../storage/tl_manifest.h"
 #include "../storage/tl_segment.h"
 #include "../storage/tl_page.h"
@@ -36,12 +37,7 @@ static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional)
         new_cap *= 2;
     }
 
-    /* Overflow guard for allocation size */
-    if (new_cap > SIZE_MAX / sizeof(tl_record_t)) {
-        return TL_ENOMEM;
-    }
-
-    tl_record_t* new_arr = tl__malloc(result->alloc, new_cap * sizeof(tl_record_t));
+    tl_record_t* new_arr = tl__mallocarray(result->alloc, new_cap, sizeof(tl_record_t));
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
@@ -71,25 +67,6 @@ static tl_status_t add_record(tl_point_result_t* result, tl_ts_t ts, tl_handle_t
     return TL_OK;
 }
 
-/**
- * Binary search for lower bound in a sorted record array.
- * Returns index of first record with ts >= target.
- */
-static size_t records_lower_bound(const tl_record_t* data, size_t len, tl_ts_t target) {
-    size_t lo = 0;
-    size_t hi = len;
-
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (data[mid].ts < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    return lo;
-}
 
 /**
  * Collect all records with exact timestamp from a sorted array.
@@ -102,7 +79,7 @@ static tl_status_t collect_from_sorted(tl_point_result_t* result,
     }
 
     /* Binary search to find first occurrence */
-    size_t idx = records_lower_bound(data, len, ts);
+    size_t idx = tl_record_lower_bound(data, len, ts);
 
     /* Collect all matching records */
     while (idx < len && data[idx].ts == ts) {
@@ -291,12 +268,17 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
 
 /**
  * Check if ts is covered by any tombstone in the snapshot.
+ *
+ * M-18 fix: Added bounds pruning before scanning tombstones.
+ * If ts is outside a source's bounds, skip tombstone check entirely.
+ * This avoids O(log T) binary search in tl_intervals_imm_contains
+ * when bounds make it impossible for the tombstone to cover ts.
  */
 static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
     const tl_manifest_t* manifest = snap->manifest;
     const tl_memview_t* mv = tl_snapshot_memview(snap);
 
-    /* Check memview tombstones */
+    /* Check memview tombstones (no bounds check - memview tombs cover full range) */
     tl_intervals_imm_t mv_tombs = tl_memview_tombs_imm(mv);
     if (tl_intervals_imm_contains(mv_tombs, ts)) {
         return true;
@@ -305,6 +287,12 @@ static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
     /* Check sealed memrun tombstones */
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
+
+        /* M-18: Skip if ts outside memrun bounds */
+        if (ts < tl_memrun_min_ts(mr) || ts > tl_memrun_max_ts(mr)) {
+            continue;
+        }
+
         tl_intervals_imm_t mr_tombs = tl_memrun_tombs_imm(mr);
         if (tl_intervals_imm_contains(mr_tombs, ts)) {
             return true;
@@ -314,6 +302,12 @@ static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
     /* Check L0 segment tombstones */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+
+        /* M-18: Skip if ts outside segment bounds */
+        if (ts < seg->min_ts || ts > seg->max_ts) {
+            continue;
+        }
+
         tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
         if (tl_intervals_imm_contains(seg_tombs, ts)) {
             return true;
@@ -323,6 +317,12 @@ static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
     /* Defensive: check L1 tombstones if present (should be empty in V1). */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
+
+        /* M-18: Skip if ts outside segment bounds */
+        if (ts < seg->min_ts || ts > seg->max_ts) {
+            continue;
+        }
+
         tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
         if (tl_intervals_imm_contains(seg_tombs, ts)) {
             return true;

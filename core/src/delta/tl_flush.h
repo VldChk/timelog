@@ -77,6 +77,16 @@ void tl_merge_iter_init(tl_merge_iter_t* it,
                          const tl_record_t* b, size_t b_len);
 
 /**
+ * Peek at the next record without advancing.
+ *
+ * Stable merge: If both inputs have equal timestamps, peeks from 'a' first.
+ *
+ * @param it  Iterator
+ * @return Pointer to next record, or NULL if exhausted
+ */
+const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it);
+
+/**
  * Get the next record from the merge.
  *
  * Stable merge: If both inputs have equal timestamps, returns from 'a' first.
@@ -94,7 +104,7 @@ TL_INLINE bool tl_merge_iter_done(const tl_merge_iter_t* it) {
 }
 
 /**
- * Get count of remaining records.
+ * Get count of remaining records (test/diagnostic helper).
  */
 TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
     return (it->a_len - it->a_pos) + (it->b_len - it->b_pos);

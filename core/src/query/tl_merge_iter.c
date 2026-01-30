@@ -125,7 +125,7 @@ static tl_status_t push_initial_entry(tl_heap_t* h,
      */
     tl_heap_entry_t entry = {
         .ts = rec.ts,
-        .component_id = src->priority,
+        .tie_break_key = src->priority,
         .handle = rec.handle,
         .iter = src
     };
@@ -236,9 +236,9 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
     out->ts = peek->ts;
     out->handle = peek->handle;
 
-    /* Get source pointer and component_id while peek is still valid */
+    /* Get source pointer and tie_break_key while peek is still valid */
     tl_iter_source_t* src = (tl_iter_source_t*)peek->iter;
-    uint32_t component_id = peek->component_id;
+    uint32_t tie_id = peek->tie_break_key;
 
     /* Step 3: Advance the source that produced this record */
     tl_record_t next_rec;
@@ -248,7 +248,7 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
         /* Step 4: Source has more - replace top entry (no allocation) */
         tl_heap_entry_t new_entry = {
             .ts = next_rec.ts,
-            .component_id = component_id,
+            .tie_break_key = tie_id,
             .handle = next_rec.handle,
             .iter = src
         };
@@ -365,11 +365,11 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         }
 
         /* Push onto heap.
-         * Use popped.component_id to preserve original tie-break semantics
+         * Use popped.tie_break_key to preserve original tie-break semantics
          * (Codex review: safer than re-reading src->priority). */
         tl_heap_entry_t entry = {
             .ts = rec.ts,
-            .component_id = popped.component_id,
+            .tie_break_key = popped.tie_break_key,
             .handle = rec.handle,
             .iter = src
         };

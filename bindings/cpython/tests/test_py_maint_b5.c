@@ -11,7 +11,7 @@
  *   immortal on Python 3.12+ (their refcount doesn't change)
  * - Tests for LIFO Treiber stack behavior (not FIFO)
  *
- * See: docs/timelog_v2_lld_B5_maintenance_threading_integration.md
+ * See: docs/V2/timelog_v2_lld_background_maintenance.md
  */
 
 #define PY_SSIZE_T_CLEAN

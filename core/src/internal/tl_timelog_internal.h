@@ -189,6 +189,11 @@ struct tl_timelog {
     tl_atomic_u64   compactions_total;  /* Compaction operations completed */
     tl_atomic_u64   compaction_retries;       /* Compaction publish retries */
     tl_atomic_u64   compaction_publish_ebusy; /* Publish EBUSY returns */
+    /* Compaction selection observability (M-23) */
+    tl_atomic_u64   compaction_select_calls;   /* Selection attempts */
+    tl_atomic_u64   compaction_select_l0_inputs; /* Total L0 inputs selected */
+    tl_atomic_u64   compaction_select_l1_inputs; /* Total L1 inputs selected */
+    tl_atomic_u64   compaction_select_no_work; /* Selections with no L0s */
 
 #ifdef TL_DEBUG
     /*-----------------------------------------------------------------------

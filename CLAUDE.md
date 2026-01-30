@@ -86,7 +86,7 @@ append(ts, handle)
 - `ooo_head`: Mutable append-only buffer, O(1) ingestion, sorted only at seal
 - `ooo_runs`: Immutable sorted runs stored in refcounted `tl_ooorunset_t`
 - Queries use `tl_submerge` for internal k-way merge of delta components
-- Tie-break ordering: `active_run` before `ooo_head` before oldest `ooo_run`
+- Tie-break ordering: `active_run` before `ooo_runs` (by generation) before `ooo_head`
 - Generation numbers (`gen`) ensure deterministic ordering for equal timestamps
 
 **Handles**: The C core stores `tl_handle_t` (uint64_t). For CPython bindings,
@@ -211,7 +211,7 @@ Uses a min-heap of iterators, each yielding records in timestamp order.
 1. **Outer merge** (`tl_merge_iter`): Merges segment iterators + memview iterators
 2. **Inner merge** (`tl_submerge`): Merges delta components within memview
    - Active run + OOO head + OOO runs → single sorted stream
-   - Tie-break by `tie_id` (lower wins): run=0, head=1, ooo_runs=2+
+   - Tie-break by `tie_id` (lower wins): run=0, ooo_runs=1..N, head=N+1
 
 Complexity: O(N log K) where N = total records, K = source count
 Memory: O(K) heap entries

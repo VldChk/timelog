@@ -10,14 +10,15 @@ static const size_t HEAP_MIN_CAPACITY = 8;
 
 /**
  * Compare two heap entries.
- * Entries are compared by (ts, component_id) for deterministic ordering.
+ * Entries are compared by (ts, tie_break_key) for deterministic ordering.
+ * M-14: Renamed from component_id for semantic clarity.
  * @return true if a < b
  */
 TL_INLINE bool heap_entry_less(const tl_heap_entry_t* a, const tl_heap_entry_t* b) {
     if (a->ts != b->ts) {
         return a->ts < b->ts;
     }
-    return a->component_id < b->component_id;
+    return a->tie_break_key < b->tie_break_key;
 }
 
 /**

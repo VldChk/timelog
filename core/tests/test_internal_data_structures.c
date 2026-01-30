@@ -21,6 +21,7 @@
 #include "internal/tl_recvec.h"
 #include "internal/tl_intervals.h"
 #include "internal/tl_heap.h"
+#include "internal/tl_math.h"
 
 #include <string.h>
 
@@ -117,6 +118,34 @@ TEST_DECLARE(ds_recvec_lower_bound_found) {
 
     tl_recvec_destroy(&rv);
     tl__alloc_destroy(&alloc);
+}
+
+/*===========================================================================
+ * Math Helper Tests
+ *===========================================================================*/
+
+TEST_DECLARE(ds_math_overflow_i64) {
+    int64_t out = 0;
+
+    /* Addition */
+    TEST_ASSERT(!tl_add_overflow_i64(10, -3, &out));
+    TEST_ASSERT_EQ(7, out);
+    TEST_ASSERT(tl_add_overflow_i64(INT64_MAX, 1, &out));
+    TEST_ASSERT(tl_add_overflow_i64(INT64_MIN, -1, &out));
+
+    /* Subtraction */
+    TEST_ASSERT(!tl_sub_overflow_i64(5, 7, &out));
+    TEST_ASSERT_EQ(-2, out);
+    TEST_ASSERT(tl_sub_overflow_i64(INT64_MIN, 1, &out));
+    TEST_ASSERT(tl_sub_overflow_i64(INT64_MAX, -1, &out));
+
+    /* Multiplication */
+    TEST_ASSERT(!tl_mul_overflow_i64(6, -7, &out));
+    TEST_ASSERT_EQ(-42, out);
+    TEST_ASSERT(tl_mul_overflow_i64(INT64_MAX, 2, &out));
+    TEST_ASSERT(tl_mul_overflow_i64(INT64_MIN, -1, &out));
+    TEST_ASSERT(!tl_mul_overflow_i64(0, INT64_MIN, &out));
+    TEST_ASSERT_EQ(0, out);
 }
 
 TEST_DECLARE(ds_recvec_upper_bound) {
@@ -938,7 +967,7 @@ TEST_DECLARE(ds_heap_push_pop_single) {
     tl_heap_t h;
     tl_heap_init(&h, &alloc);
 
-    tl_heap_entry_t e = { .ts = 100, .component_id = 0, .handle = 42, .iter = NULL };
+    tl_heap_entry_t e = { .ts = 100, .tie_break_key = 0, .handle = 42, .iter = NULL };
     TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     TEST_ASSERT_EQ(1, tl_heap_len(&h));
 
@@ -978,7 +1007,7 @@ TEST_DECLARE(ds_heap_ordering) {
     /* Push in reverse order */
     tl_heap_entry_t e;
     e.iter = NULL;
-    e.component_id = 0;
+    e.tie_break_key = 0;
     for (tl_ts_t ts = 50; ts >= 10; ts -= 10) {
         e.ts = ts;
         e.handle = (tl_handle_t)ts;
@@ -1002,7 +1031,7 @@ TEST_DECLARE(ds_heap_tie_break_by_component) {
     /*
      * NOTE: This test verifies a DOCUMENTED INVARIANT, not an implementation
      * detail. The K-way merge relies on deterministic tie-breaking by
-     * component_id to ensure stable, reproducible iteration order when
+     * tie_break_key to ensure stable, reproducible iteration order when
      * multiple components have records at the same timestamp.
      *
      * If tie-breaking order changes, update both the implementation AND
@@ -1013,23 +1042,23 @@ TEST_DECLARE(ds_heap_tie_break_by_component) {
     tl_heap_t h;
     tl_heap_init(&h, &alloc);
 
-    /* Same ts, different component_id */
-    tl_heap_entry_t e1 = { .ts = 100, .component_id = 5, .handle = 1, .iter = NULL };
-    tl_heap_entry_t e2 = { .ts = 100, .component_id = 2, .handle = 2, .iter = NULL };
-    tl_heap_entry_t e3 = { .ts = 100, .component_id = 8, .handle = 3, .iter = NULL };
+    /* Same ts, different tie_break_key */
+    tl_heap_entry_t e1 = { .ts = 100, .tie_break_key = 5, .handle = 1, .iter = NULL };
+    tl_heap_entry_t e2 = { .ts = 100, .tie_break_key = 2, .handle = 2, .iter = NULL };
+    tl_heap_entry_t e3 = { .ts = 100, .tie_break_key = 8, .handle = 3, .iter = NULL };
 
     TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e1));
     TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e2));
     TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e3));
 
-    /* Should pop in ascending component_id order (documented tie-breaker) */
+    /* Should pop in ascending tie_break_key order (documented tie-breaker) */
     tl_heap_entry_t out;
     TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
-    TEST_ASSERT_EQ(2, out.component_id);
+    TEST_ASSERT_EQ(2, out.tie_break_key);
     TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
-    TEST_ASSERT_EQ(5, out.component_id);
+    TEST_ASSERT_EQ(5, out.tie_break_key);
     TEST_ASSERT_STATUS(TL_OK, tl_heap_pop(&h, &out));
-    TEST_ASSERT_EQ(8, out.component_id);
+    TEST_ASSERT_EQ(8, out.tie_break_key);
 
     tl_heap_destroy(&h);
     tl__alloc_destroy(&alloc);
@@ -1042,11 +1071,11 @@ TEST_DECLARE(ds_heap_build_heapify) {
     tl_heap_init(&h, &alloc);
 
     tl_heap_entry_t entries[5] = {
-        { .ts = 30, .component_id = 0, .handle = 0, .iter = NULL },
-        { .ts = 10, .component_id = 1, .handle = 0, .iter = NULL },
-        { .ts = 50, .component_id = 2, .handle = 0, .iter = NULL },
-        { .ts = 20, .component_id = 3, .handle = 0, .iter = NULL },
-        { .ts = 40, .component_id = 4, .handle = 0, .iter = NULL },
+        { .ts = 30, .tie_break_key = 0, .handle = 0, .iter = NULL },
+        { .ts = 10, .tie_break_key = 1, .handle = 0, .iter = NULL },
+        { .ts = 50, .tie_break_key = 2, .handle = 0, .iter = NULL },
+        { .ts = 20, .tie_break_key = 3, .handle = 0, .iter = NULL },
+        { .ts = 40, .tie_break_key = 4, .handle = 0, .iter = NULL },
     };
 
     TEST_ASSERT_STATUS(TL_OK, tl_heap_build(&h, entries, 5));
@@ -1075,7 +1104,7 @@ TEST_DECLARE(ds_heap_replace_top) {
 
     tl_heap_entry_t e;
     e.iter = NULL;
-    e.component_id = 0;
+    e.tie_break_key = 0;
     e.handle = 0;
     for (tl_ts_t ts = 10; ts <= 50; ts += 10) {
         e.ts = ts;
@@ -1083,7 +1112,7 @@ TEST_DECLARE(ds_heap_replace_top) {
     }
 
     /* Replace top (10) with 25 */
-    tl_heap_entry_t new_top = { .ts = 25, .component_id = 0, .handle = 0, .iter = NULL };
+    tl_heap_entry_t new_top = { .ts = 25, .tie_break_key = 0, .handle = 0, .iter = NULL };
     tl_heap_replace_top(&h, &new_top);
 
     /* New min should be 20 */
@@ -1102,7 +1131,7 @@ TEST_DECLARE(ds_heap_stress) {
     /* Push 1000 entries in pseudo-random order */
     tl_heap_entry_t e;
     e.iter = NULL;
-    e.component_id = 0;
+    e.tie_break_key = 0;
     for (int i = 0; i < 1000; i++) {
         /* Simple pseudo-random: (i * 7 + 13) % 1000 */
         e.ts = (tl_ts_t)((i * 7 + 13) % 1000);
@@ -1148,7 +1177,7 @@ TEST_DECLARE(ds_heap_destroy_idempotent) {
     tl_heap_t h;
     tl_heap_init(&h, &alloc);
 
-    tl_heap_entry_t e = { .ts = 100, .component_id = 0, .handle = 0, .iter = NULL };
+    tl_heap_entry_t e = { .ts = 100, .tie_break_key = 0, .handle = 0, .iter = NULL };
     tl_heap_push(&h, &e);
     tl_heap_destroy(&h);
 
@@ -1167,7 +1196,7 @@ TEST_DECLARE(ds_heap_replace_top_becomes_smallest) {
     /* Heap with entries: 20, 30, 40 */
     tl_heap_entry_t e;
     e.iter = NULL;
-    e.component_id = 0;
+    e.tie_break_key = 0;
     e.handle = 0;
     for (tl_ts_t ts = 20; ts <= 40; ts += 10) {
         e.ts = ts;
@@ -1175,7 +1204,7 @@ TEST_DECLARE(ds_heap_replace_top_becomes_smallest) {
     }
 
     /* Replace top (20) with 5 - new entry becomes smallest */
-    tl_heap_entry_t new_top = { .ts = 5, .component_id = 0, .handle = 0, .iter = NULL };
+    tl_heap_entry_t new_top = { .ts = 5, .tie_break_key = 0, .handle = 0, .iter = NULL };
     tl_heap_replace_top(&h, &new_top);
 
     TEST_ASSERT_EQ(5, tl_heap_peek(&h)->ts);
@@ -1206,6 +1235,9 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_recvec_insert_invalid_idx);
     RUN_TEST(ds_recvec_shrink_to_fit_empty);
     RUN_TEST(ds_recvec_destroy_idempotent);
+
+    /* Math helper tests */
+    RUN_TEST(ds_math_overflow_i64);
 
     /* Interval Set tests (27 tests, 1 debug-only) */
     RUN_TEST(ds_intervals_init_empty);
@@ -1251,5 +1283,5 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_heap_destroy_idempotent);
     RUN_TEST(ds_heap_replace_top_becomes_smallest);
 
-    /* Total: 53 tests in release, 54 in debug */
+    /* Total: 54 tests in release, 55 in debug */
 }

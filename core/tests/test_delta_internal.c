@@ -29,6 +29,7 @@
 #include "tl_memview.h"
 #include "tl_merge_iter.h"
 #include "tl_flush.h"
+#include "internal/tl_records.h"
 #include "query/tl_active_iter.h"
 #include "query/tl_memrun_iter.h"
 
@@ -1993,7 +1994,347 @@ TEST_DECLARE(delta_memtable_validate_correct) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(delta_memview_validate_bounds) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 50, 2));
+
+    tl_memview_t mv;
+    TEST_ASSERT_STATUS(TL_OK, tl_memview_capture(&mv, &mt, &mu, &alloc));
+    tl_memview_sort_head(&mv);
+    TEST_ASSERT(tl_memview_validate(&mv));
+
+    tl_ts_t saved_min = mv.min_ts;
+    tl_ts_t saved_max = mv.max_ts;
+
+    mv.max_ts = mv.min_ts; /* Exclude later record */
+    TEST_ASSERT(!tl_memview_validate(&mv));
+
+    mv.min_ts = saved_min;
+    mv.max_ts = saved_max;
+    TEST_ASSERT(tl_memview_validate(&mv));
+
+    tl_memview_destroy(&mv);
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
 #endif /* TL_DEBUG */
+
+/*===========================================================================
+ * T-16, T-21, T-22, T-47, T-49, T-50, T-45, T-46:
+ * OOO, Batch, and Overflow Edge Case Tests
+ *===========================================================================*/
+
+/**
+ * T-16: Batch insert with n so large that n * sizeof(tl_record_t)
+ * would overflow size_t. Should return TL_EOVERFLOW.
+ */
+TEST_DECLARE(delta_memtable_batch_insert_overflow) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 4));
+
+    /* Insert one record so active_run has len=1 */
+    tl_record_t seed = {.ts = 100, .handle = 1};
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, &seed, 1, 0));
+    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
+
+    /* Now insert with n = SIZE_MAX. Since run_len=1, the check
+     * n > SIZE_MAX - len becomes SIZE_MAX > SIZE_MAX - 1, which is true.
+     * The batch_is_sorted call won't trigger because records[0].ts < last_inorder_ts
+     * takes the slow path where the overflow check is at the top.
+     *
+     * We use a single OOO record (ts < last_inorder_ts=100) so the slow path
+     * is taken, which has the overflow check before any array access. */
+    tl_record_t ooo = {.ts = 50, .handle = 2};
+    tl_status_t st = tl_memtable_insert_batch(&mt, &ooo, SIZE_MAX, 0);
+    TEST_ASSERT_STATUS(TL_EOVERFLOW, st);
+
+    /* Verify only the seed was inserted */
+    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
+    TEST_ASSERT_EQ(0, tl_memtable_ooo_head_len(&mt));
+
+    tl_memtable_destroy(&mt);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-21: Fully out-of-order batch. All records have timestamps lower than
+ * the current last_inorder_ts, so all go to OOO head.
+ */
+TEST_DECLARE(delta_memtable_fully_ooo_batch) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    /* Set up last_inorder_ts by inserting sorted records */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 300, 3));
+    TEST_ASSERT_EQ(3, tl_memtable_run_len(&mt));
+
+    /* Now insert a batch that is entirely OOO (all < 300) */
+    tl_record_t ooo_batch[3] = {
+        {.ts = 50, .handle = 10},
+        {.ts = 60, .handle = 11},
+        {.ts = 70, .handle = 12},
+    };
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, ooo_batch, 3, 0));
+
+    /* Run should still have 3, OOO head should have 3 new records */
+    TEST_ASSERT_EQ(3, tl_memtable_run_len(&mt));
+    TEST_ASSERT(tl_memtable_ooo_head_len(&mt) >= 3 ||
+                tl_memtable_ooo_total_len(&mt) >= 3);
+
+    /* Seal and verify all 6 records survive through query */
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal(&mt, &mu, NULL));
+
+    tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
+    TEST_ASSERT_NOT_NULL(mr);
+    size_t total = tl_memrun_run_len(mr) + tl_memrun_ooo_len(mr);
+    TEST_ASSERT_EQ(6, total);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-22: Reverse-sorted batch. All records in strictly decreasing order.
+ * Tests worst case for OOO head sorting at seal time.
+ */
+TEST_DECLARE(delta_memtable_reverse_sorted_batch) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    /* Insert records in strictly decreasing order */
+    tl_record_t batch[6] = {
+        {.ts = 100, .handle = 1},
+        {.ts = 90, .handle = 2},
+        {.ts = 80, .handle = 3},
+        {.ts = 70, .handle = 4},
+        {.ts = 60, .handle = 5},
+        {.ts = 50, .handle = 6},
+    };
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, batch, 6, 0));
+
+    /* Seal - this should sort OOO records */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal(&mt, &mu, NULL));
+    TEST_ASSERT_EQ(1, mt.sealed_len);
+
+    /* Query the sealed memrun via iterator to verify sorted output */
+    tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
+    TEST_ASSERT_NOT_NULL(mr);
+    size_t total = tl_memrun_run_len(mr) + tl_memrun_ooo_len(mr);
+    TEST_ASSERT_EQ(6, total);
+
+    /* Verify bounds: min=50, max=100 */
+    TEST_ASSERT_EQ(50, tl_memrun_min_ts(mr));
+    TEST_ASSERT_EQ(100, tl_memrun_max_ts(mr));
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-49: Interleaved OOO batch. Mix of in-order and out-of-order records.
+ */
+TEST_DECLARE(delta_memtable_interleaved_ooo_batch) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    /* Insert a record to set baseline */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
+    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
+
+    /* Batch with mix: 200(in-order), 50(ooo), 300(in-order), 150(ooo) */
+    tl_record_t batch[4] = {
+        {.ts = 200, .handle = 2},
+        {.ts = 50,  .handle = 3},
+        {.ts = 300, .handle = 4},
+        {.ts = 150, .handle = 5},
+    };
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_batch(&mt, batch, 4, 0));
+
+    /* Total records should be 5 across run + ooo */
+    size_t total = tl_memtable_run_len(&mt) + tl_memtable_ooo_head_len(&mt) +
+                   tl_memtable_ooo_total_len(&mt) - tl_memtable_ooo_head_len(&mt);
+    TEST_ASSERT_EQ(5, total);
+
+    tl_memtable_destroy(&mt);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-50: OOO records at extreme timestamp values (TL_TS_MIN and near TL_TS_MAX).
+ */
+TEST_DECLARE(delta_memtable_ooo_boundary_timestamps) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    /* Insert at mid-range, then OOO at extremes */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, TL_TS_MIN, 2)); /* OOO: extreme low */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, TL_TS_MAX, 3)); /* In-order: extreme high */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 0, 4));         /* OOO: zero */
+
+    /* Seal and verify bounds */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal(&mt, &mu, NULL));
+    tl_memrun_t* mr = tl_memtable_sealed_at(&mt, 0);
+    TEST_ASSERT_NOT_NULL(mr);
+    TEST_ASSERT_EQ(TL_TS_MIN, tl_memrun_min_ts(mr));
+    TEST_ASSERT_EQ(TL_TS_MAX, tl_memrun_max_ts(mr));
+
+    size_t total = tl_memrun_run_len(mr) + tl_memrun_ooo_len(mr);
+    TEST_ASSERT_EQ(4, total);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-47: Batch insert all-or-nothing on OOM.
+ * Uses failure-injection allocator to fail during reserve.
+ * Verifies 0 records were inserted.
+ */
+TEST_DECLARE(delta_memtable_batch_all_or_nothing_on_oom) {
+    /* Set up failing allocator that fails on a specific allocation.
+     * We need it to succeed for memtable init but fail during batch reserve. */
+    delta_fail_alloc_ctx_t fail_ctx = { .fail_after_n = 0, .alloc_count = 0 };
+    tl_allocator_t failing_alloc = {
+        .malloc_fn  = delta_fail_malloc,
+        .calloc_fn  = delta_fail_calloc,
+        .realloc_fn = delta_fail_realloc,
+        .free_fn    = delta_fail_free,
+        .ctx        = &fail_ctx
+    };
+
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, &failing_alloc);
+
+    tl_memtable_t mt;
+    tl_status_t st = tl_memtable_init(&mt, &alloc, 4096, 4096, 4);
+    TEST_ASSERT_STATUS(TL_OK, st);
+
+    /* Insert one record normally first. This allocates a recvec with
+     * RECVEC_MIN_CAPACITY=16 slots. */
+    fail_ctx.fail_after_n = 0; /* Don't fail yet */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
+    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
+
+    /* Now insert a batch of 20 records (> 16 capacity), forcing a realloc.
+     * Set failing allocator to fail on the first alloc after reset. */
+    fail_ctx.alloc_count = 0;
+    fail_ctx.fail_after_n = 1; /* Fail on first allocation (the realloc) */
+
+    tl_record_t batch[20];
+    for (int i = 0; i < 20; i++) {
+        batch[i].ts = 200 + i;
+        batch[i].handle = (tl_handle_t)(2 + i);
+    }
+    st = tl_memtable_insert_batch(&mt, batch, 20, 0);
+
+    /* Should fail with ENOMEM */
+    TEST_ASSERT_STATUS(TL_ENOMEM, st);
+
+    /* All-or-nothing: original record count should be unchanged */
+    TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
+    TEST_ASSERT_EQ(0, tl_memtable_ooo_head_len(&mt));
+
+    tl_memtable_destroy(&mt);
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-45: tl_records_copy overflow detection.
+ * When len * sizeof(tl_record_t) would overflow size_t, returns TL_EOVERFLOW.
+ */
+TEST_DECLARE(delta_memview_copy_overflow_detection) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* tl_records_copy with huge len triggers overflow check */
+    tl_record_t dummy = {.ts = 1, .handle = 1};
+    tl_record_t* out = NULL;
+    size_t huge_len = SIZE_MAX / sizeof(tl_record_t) + 1;
+
+    tl_status_t st = tl_records_copy(&alloc, &dummy, huge_len, &out);
+    TEST_ASSERT_STATUS(TL_EOVERFLOW, st);
+    TEST_ASSERT_NULL(out);
+
+    tl__alloc_destroy(&alloc);
+}
+
+/**
+ * T-46: Flush build overflow when run_len + ooo_total_len > SIZE_MAX.
+ * Directly construct a memrun with artificially large sizes.
+ */
+TEST_DECLARE(delta_flush_build_run_ooo_overflow) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Create a real memrun with 1 record, then manipulate its sizes */
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 1);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, NULL, 0, &mr));
+    TEST_ASSERT_NOT_NULL(mr);
+
+    /* Save original values, set overflow values */
+    size_t orig_run_len = mr->run_len;
+    mr->run_len = SIZE_MAX / 2 + 1;
+    mr->ooo_total_len = SIZE_MAX / 2 + 1;
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = TL_DEFAULT_TARGET_PAGE_BYTES,
+        .generation = 1
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_status_t st = tl_flush_build(&ctx, mr, &seg);
+    TEST_ASSERT_STATUS(TL_EOVERFLOW, st);
+    TEST_ASSERT_NULL(seg);
+
+    /* Restore original values for clean destruction */
+    mr->run_len = orig_run_len;
+    mr->ooo_total_len = 0;
+
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
 
 /*===========================================================================
  * C-14: Deferred OOO Sort Tests
@@ -2168,12 +2509,23 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_flush_build_tombstone_only);
 
 #ifdef TL_DEBUG
-    /* Debug validation tests (2 tests) */
+    /* Debug validation tests (3 tests) */
     RUN_TEST(delta_memrun_validate_correct);
     RUN_TEST(delta_memtable_validate_correct);
+    RUN_TEST(delta_memview_validate_bounds);
 #endif
 
     /* C-14: Deferred OOO sort tests (2 tests) */
     RUN_TEST(delta_memtable_c14_ooo_unsorted_during_append);
     RUN_TEST(delta_memtable_c14_ooo_sorted_at_seal);
+
+    /* OOO, batch, and overflow edge case tests (8 tests) */
+    RUN_TEST(delta_memtable_batch_insert_overflow);
+    RUN_TEST(delta_memtable_fully_ooo_batch);
+    RUN_TEST(delta_memtable_reverse_sorted_batch);
+    RUN_TEST(delta_memtable_interleaved_ooo_batch);
+    RUN_TEST(delta_memtable_ooo_boundary_timestamps);
+    RUN_TEST(delta_memtable_batch_all_or_nothing_on_oom);
+    RUN_TEST(delta_memview_copy_overflow_detection);
+    RUN_TEST(delta_flush_build_run_ooo_overflow);
 }

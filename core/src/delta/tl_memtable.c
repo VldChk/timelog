@@ -146,6 +146,40 @@ static void memtable_add_record_bytes(tl_memtable_t* mt, size_t count) {
     memtable_add_bytes(mt, count * TL_RECORD_SIZE);
 }
 
+static void memtable_adjust_tomb_bytes(tl_memtable_t* mt,
+                                       size_t before_len,
+                                       size_t after_len) {
+    if (before_len == after_len) {
+        return;
+    }
+
+    size_t diff = (after_len > before_len)
+                    ? (after_len - before_len)
+                    : (before_len - after_len);
+
+    if (tl__alloc_would_overflow(diff, sizeof(tl_interval_t))) {
+        /* Saturate conservatively on overflow. */
+        if (after_len > before_len) {
+            mt->active_bytes_est = SIZE_MAX;
+        } else {
+            mt->active_bytes_est = 0;
+        }
+        return;
+    }
+
+    size_t bytes = diff * sizeof(tl_interval_t);
+
+    if (after_len > before_len) {
+        memtable_add_bytes(mt, bytes);
+    } else {
+        if (mt->active_bytes_est < bytes) {
+            mt->active_bytes_est = 0;
+        } else {
+            mt->active_bytes_est -= bytes;
+        }
+    }
+}
+
 static size_t memtable_ooo_bytes_est(const tl_memtable_t* mt) {
     size_t total_len = tl_memtable_ooo_total_len(mt);
     if (tl__alloc_would_overflow(total_len, TL_RECORD_SIZE)) {
@@ -421,12 +455,14 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t 
     TL_ASSERT(mt != NULL);
 
     /* Delegate to tl_intervals which handles validation and coalescing */
+    size_t before_len = tl_intervals_len(&mt->active_tombs);
     tl_status_t st = tl_intervals_insert(&mt->active_tombs, t1, t2);
 
     if (st == TL_OK && t1 < t2) {
         /* Only update metadata if actual insert happened (not empty interval) */
         mt->epoch++;
-        memtable_add_bytes(mt, sizeof(tl_interval_t));
+        size_t after_len = tl_intervals_len(&mt->active_tombs);
+        memtable_adjust_tomb_bytes(mt, before_len, after_len);
     }
 
     return st;
@@ -435,11 +471,13 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t 
 tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt, tl_ts_t t1) {
     TL_ASSERT(mt != NULL);
 
+    size_t before_len = tl_intervals_len(&mt->active_tombs);
     tl_status_t st = tl_intervals_insert_unbounded(&mt->active_tombs, t1);
 
     if (st == TL_OK) {
         mt->epoch++;
-        memtable_add_bytes(mt, sizeof(tl_interval_t));
+        size_t after_len = tl_intervals_len(&mt->active_tombs);
+        memtable_adjust_tomb_bytes(mt, before_len, after_len);
     }
 
     return st;
@@ -541,8 +579,9 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond)
      */
 
     /* Step 3: Pre-allocate memrun struct BEFORE detaching arrays */
-    tl_memrun_t* mr = TL_NEW(mt->alloc, tl_memrun_t);
-    if (mr == NULL) {
+    tl_memrun_t* mr = NULL;
+    tl_status_t alloc_st = tl_memrun_alloc(mt->alloc, &mr);
+    if (alloc_st != TL_OK) {
         return TL_ENOMEM; /* Active state PRESERVED */
     }
 
@@ -562,56 +601,33 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond)
     tl_ooorunset_t* ooo_runs = mt->ooo_runs;
     mt->ooo_runs = NULL;
 
-    /* Step 6: Initialize memrun manually (no allocations) */
-    mr->run = run;
-    mr->run_len = run_len;
-    mr->ooo_runs = ooo_runs;
-    mr->ooo_total_len = (ooo_runs == NULL) ? 0 : ooo_runs->total_len;
-    mr->ooo_run_count = (ooo_runs == NULL) ? 0 : ooo_runs->count;
-    mr->ooo_min_ts = TL_TS_MAX;
-    mr->ooo_max_ts = TL_TS_MIN;
-    mr->tombs = tombs;
-    mr->tombs_len = tombs_len;
-    mr->alloc = mt->alloc;
-    tl_atomic_init_u32(&mr->refcnt, 1); /* Queue owns one reference */
-
-    if (mr->ooo_total_len > 0) {
-        for (size_t i = 0; i < mr->ooo_run_count; i++) {
-            const tl_ooorun_t* run_ptr = mr->ooo_runs->runs[i];
-            mr->ooo_min_ts = TL_MIN(mr->ooo_min_ts, run_ptr->min_ts);
-            mr->ooo_max_ts = TL_MAX(mr->ooo_max_ts, run_ptr->max_ts);
-        }
-    }
-
-    /* Compute bounds (MUST include tombstones) */
-    {
-        tl_ts_t min_ts = TL_TS_MAX;
-        tl_ts_t max_ts = TL_TS_MIN;
-
-        if (mr->run_len > 0) {
-            min_ts = TL_MIN(min_ts, mr->run[0].ts);
-            max_ts = TL_MAX(max_ts, mr->run[mr->run_len - 1].ts);
-        }
-        if (mr->ooo_total_len > 0) {
-            min_ts = TL_MIN(min_ts, mr->ooo_min_ts);
-            max_ts = TL_MAX(max_ts, mr->ooo_max_ts);
-        }
-        for (size_t i = 0; i < mr->tombs_len; i++) {
-            const tl_interval_t* tomb = &mr->tombs[i];
-            min_ts = TL_MIN(min_ts, tomb->start);
-            if (tomb->end_unbounded) {
-                max_ts = TL_TS_MAX;
-            } else {
-                max_ts = TL_MAX(max_ts, tomb->end - 1);
-            }
-        }
-        mr->min_ts = min_ts;
-        mr->max_ts = max_ts;
+    /* Step 6: Initialize memrun in-place (no allocations) */
+    tl_status_t init_st = tl_memrun_init(mr, mt->alloc,
+                                         run, run_len,
+                                         ooo_runs,
+                                         tombs, tombs_len);
+    if (init_st != TL_OK) {
+        /* Internal invariant violation - avoid leaks, but data is lost */
+        if (run != NULL) tl__free(mt->alloc, run);
+        if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
+        if (tombs != NULL) tl__free(mt->alloc, tombs);
+        tl__free(mt->alloc, mr);
+        return TL_EINTERNAL;
     }
 
     /* Step 7: Push to sealed queue (under memtable_mu) */
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
-    /* Re-check capacity (defensive - single writer, but be safe) */
+    /*
+     * M-10 fix: Runtime check for queue capacity (defensive).
+     * Single writer means this should never fail, but we check defensively
+     * in case of future code changes. On failure, release memrun and return
+     * TL_EBUSY without corrupting the queue.
+     */
+    if (mt->sealed_len >= mt->sealed_max_runs) {
+        TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
+        tl_memrun_release(mr);
+        return TL_EBUSY;
+    }
     TL_ASSERT(mt->sealed_len < mt->sealed_max_runs);
     size_t idx = tl_memtable_sealed_index(mt, mt->sealed_len);
     mt->sealed[idx] = mr;
@@ -802,6 +818,3 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
 }
 
 #endif /* TL_DEBUG */
-
-
-

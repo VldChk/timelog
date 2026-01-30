@@ -5,7 +5,7 @@
  * Implements streaming iteration over page spans using core tl_pagespan_iter_*.
  * Delegates span enumeration and ownership management to core.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN

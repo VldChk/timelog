@@ -82,8 +82,9 @@ typedef int64_t  tl_ts_t;
  * Records with ts == TL_TS_MAX are fully supported and can be:
  * - Appended via tl_append()
  * - Queried via tl_iter_equal(snap, TL_TS_MAX, &it)
- * - Deleted via tl_delete_range(): use a range ending before TL_TS_MAX,
- *   or use internal unbounded tombstone APIs for [TL_TS_MAX, +inf)
+ * - Deleted via tl_delete_range(): use a range ending before TL_TS_MAX.
+ *   The public API does NOT expose unbounded delete-to-infinity; that is
+ *   reserved for internal maintenance paths.
  *
  * NOTE: The half-open interval [TL_TS_MAX, TL_TS_MAX+1) cannot be expressed
  * in signed int64 arithmetic without overflow. For records at exactly TL_TS_MAX,
@@ -122,6 +123,9 @@ typedef struct tl_record {
  *                   (c) OOO head flush failed after insert (runset allocation/backpressure).
  *                   DO NOT RETRY - would cause duplicates. In manual mode
  *                   call flush(); in background mode worker handles it.
+ *                 - Maintenance/flush APIs (tl_flush, tl_maint_step):
+ *                   Publish retry exhausted due to concurrent manifest change.
+ *                   NO data loss; safe to retry after a short delay.
  *                 - tl_maint_start(): Stop in progress - retry later.
  * - TL_ENOMEM:    Memory allocation failed. For write APIs (tl_append*),
  *                 this means NO data was inserted - caller can rollback
@@ -134,6 +138,7 @@ typedef struct tl_record {
  *
  * Retryability guide:
  * - TL_EBUSY for writes: NOT retryable (data is already in log)
+ * - TL_EBUSY for maintenance/flush: Retryable (publish conflict)
  * - TL_EBUSY for tl_maint_start: Retryable after short delay
  * - TL_ENOMEM/TL_EOVERFLOW for writes: Retryable (no data was inserted)
  * - TL_EINVAL, TL_ESTATE: Not retryable without caller fix
@@ -356,6 +361,7 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  *
  * Preconditions:
  * - All snapshots and iterators must be released before calling tl_close()
+ *   (tl_close reads snapshot counters without locking).
  * - Background maintenance (if enabled) will be stopped automatically
  *
  * Thread Safety:
@@ -406,12 +412,22 @@ TL_API tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
 TL_API tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                                    size_t n, uint32_t flags);
 
+/* Delete range [t1, t2). Unbounded delete-to-infinity is not exposed publicly. */
 TL_API tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
 
 /* Delete [MIN_TS, cutoff) */
 TL_API tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
 
-/* Synchronous flush of active + sealed memruns; publishes L0 before return. */
+/**
+ * Synchronous flush of active + sealed memruns; publishes L0 before return.
+ *
+ * Returns:
+ * - TL_OK: All flushable data published
+ * - TL_EBUSY: Publish retries exhausted due to concurrent manifest change
+ *             (no data loss; safe to retry)
+ * - TL_ENOMEM/TL_EOVERFLOW: Build failed (inputs preserved; retry later)
+ * - TL_ESTATE/TL_EINVAL: Invalid state/args
+ */
 TL_API tl_status_t tl_flush(tl_timelog_t* tl);
 
 /* Request compaction; actual work performed by maintenance. */
@@ -618,6 +634,7 @@ TL_API tl_status_t tl_maint_stop(tl_timelog_t* tl);
  *         TL_EINVAL   tl is NULL
  *         TL_ESTATE   Not open, or mode is not TL_MAINT_DISABLED
  *         TL_ENOMEM   Build failed (inputs preserved, retry later)
+ *         TL_EBUSY    Publish retries exhausted (retry later)
  *
  * Thread Safety: NOT thread-safe. Caller must ensure single-threaded access.
  */
@@ -650,6 +667,11 @@ typedef struct tl_stats {
     uint64_t compactions_total;        /* Total compaction operations completed */
     uint64_t compaction_retries;       /* Compaction publish retries */
     uint64_t compaction_publish_ebusy; /* Publish attempts returning TL_EBUSY */
+    /* Compaction selection observability (M-23) */
+    uint64_t compaction_select_calls;      /* Selection attempts */
+    uint64_t compaction_select_l0_inputs;  /* Total L0 inputs selected */
+    uint64_t compaction_select_l1_inputs;  /* Total L1 inputs selected */
+    uint64_t compaction_select_no_work;    /* Selections with no L0s */
 
     /* Adaptive segmentation metrics (V-Next)
      * Only populated when adaptive.target_records > 0 in config. */

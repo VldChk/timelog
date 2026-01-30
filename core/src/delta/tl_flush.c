@@ -19,6 +19,32 @@ void tl_merge_iter_init(tl_merge_iter_t* it,
     it->b_pos = 0;
 }
 
+const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it) {
+    TL_ASSERT(it != NULL);
+
+    /* If 'a' is exhausted, peek from 'b' */
+    if (it->a_pos >= it->a_len) {
+        if (it->b_pos >= it->b_len) {
+            return NULL; /* Both exhausted */
+        }
+        return &it->b[it->b_pos];
+    }
+
+    /* If 'b' is exhausted, peek from 'a' */
+    if (it->b_pos >= it->b_len) {
+        return &it->a[it->a_pos];
+    }
+
+    /*
+     * Both have elements: compare timestamps.
+     * Stable merge: prefer 'a' on equal timestamps.
+     */
+    if (it->a[it->a_pos].ts <= it->b[it->b_pos].ts) {
+        return &it->a[it->a_pos];
+    }
+    return &it->b[it->b_pos];
+}
+
 const tl_record_t* tl_merge_iter_next(tl_merge_iter_t* it) {
     TL_ASSERT(it != NULL);
 
@@ -188,7 +214,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         const tl_record_t* rec = &srcs[i].data[srcs[i].pos++];
         tl_heap_entry_t entry = {
             .ts = rec->ts,
-            .component_id = srcs[i].tie_id,
+            .tie_break_key = srcs[i].tie_id,
             .handle = rec->handle,
             .iter = &srcs[i]
         };
@@ -210,12 +236,12 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         i++;
 
         flush_src_t* src = (flush_src_t*)top->iter;
-        uint32_t component_id = top->component_id;
+        uint32_t tie_id = top->tie_break_key;
         if (src->pos < src->end) {
             const tl_record_t* rec = &src->data[src->pos++];
             tl_heap_entry_t entry = {
                 .ts = rec->ts,
-                .component_id = component_id,
+                .tie_break_key = tie_id,
                 .handle = rec->handle,
                 .iter = src
             };

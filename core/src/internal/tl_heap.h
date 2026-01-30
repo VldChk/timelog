@@ -8,7 +8,7 @@
  * Min-Heap
  *
  * Provides efficient K-way merge for the read path. Stores
- * (timestamp, component_id) pairs and supports:
+ * (timestamp, tie_break_key) pairs and supports:
  * - Push/pop/peek in O(log K)
  * - Initial heapify in O(K)
  *
@@ -25,15 +25,15 @@
  * Contains the current record from a component iterator.
  */
 typedef struct tl_heap_entry {
-    tl_ts_t       ts;           /* Sort key (timestamp) */
-    uint32_t      component_id; /* Tie-breaker / source identifier */
-    tl_handle_t   handle;       /* Current record handle */
-    void*         iter;         /* Opaque pointer to component iterator */
+    tl_ts_t       ts;            /* Sort key (timestamp) */
+    uint32_t      tie_break_key; /* M-14: Secondary sort key for equal timestamps */
+    tl_handle_t   handle;        /* Current record handle */
+    void*         iter;          /* Opaque pointer to component iterator */
 } tl_heap_entry_t;
 
 /**
  * Min-heap for K-way merge.
- * Entries are ordered by (ts, component_id).
+ * Entries are ordered by (ts, tie_break_key).
  */
 typedef struct tl_heap {
     tl_heap_entry_t* data;

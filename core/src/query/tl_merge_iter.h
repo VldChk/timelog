@@ -25,7 +25,8 @@
  * 3. Continue until heap is empty
  *
  * Tie-Breaking (implementation detail, not a public guarantee):
- * - On timestamp ties, sources are ordered by component_id (source index)
+ * - On timestamp ties, sources are ordered by tie_break_key (priority assigned
+ *   by the query plan, not necessarily the iterator array index)
  * - This provides deterministic results for testing, but clients must not
  *   depend on tie-break ordering - it may change in future versions
  *

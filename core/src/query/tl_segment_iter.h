@@ -46,8 +46,6 @@ typedef struct tl_segment_iter {
 
     /* State */
     bool            done;
-    bool            has_current;
-    tl_record_t     current;
 } tl_segment_iter_t;
 
 /*===========================================================================
@@ -112,26 +110,6 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target);
 TL_INLINE bool tl_segment_iter_done(const tl_segment_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;
-}
-
-/**
- * Peek at current record without advancing.
- *
- * Precondition: !done && has_current
- * The current record is set after a successful tl_segment_iter_next().
- */
-TL_INLINE const tl_record_t* tl_segment_iter_peek(const tl_segment_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    TL_ASSERT(!it->done && it->has_current);
-    return &it->current;
-}
-
-/**
- * Check if iterator has a current record ready for peek.
- */
-TL_INLINE bool tl_segment_iter_has_current(const tl_segment_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    return !it->done && it->has_current;
 }
 
 #endif /* TL_SEGMENT_ITER_H */

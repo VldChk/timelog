@@ -26,7 +26,7 @@
  *   iterator creation) handles pins_exit and Py_DECREF of the timelog.
  *   Page memory remains valid as long as any span holds an owner ref.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_H

@@ -71,7 +71,7 @@ tl_status_t tl_submerge_build(tl_submerge_t* sm) {
         const tl_record_t* rec = &src->data[src->pos++];
         tl_heap_entry_t entry = {
             .ts = rec->ts,
-            .component_id = src->tie_id,
+            .tie_break_key = src->tie_id,
             .handle = rec->handle,
             .iter = src
         };
@@ -99,13 +99,13 @@ tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out) {
     }
 
     tl_subsrc_t* src = (tl_subsrc_t*)peek->iter;
-    uint32_t component_id = peek->component_id;
+    uint32_t tie_id = peek->tie_break_key;
 
     if (src->pos < src->end) {
         const tl_record_t* rec = &src->data[src->pos++];
         tl_heap_entry_t entry = {
             .ts = rec->ts,
-            .component_id = component_id,
+            .tie_break_key = tie_id,
             .handle = rec->handle,
             .iter = src
         };
@@ -140,7 +140,7 @@ void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
         (void)tl_heap_pop(&sm->heap, &popped);
 
         tl_subsrc_t* src = (tl_subsrc_t*)popped.iter;
-        size_t new_pos = tl_submerge_lower_bound(src->data, src->end, target);
+        size_t new_pos = tl_record_lower_bound(src->data, src->end, target);
         if (new_pos > src->pos) {
             src->pos = new_pos;
         }
@@ -152,7 +152,7 @@ void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
         const tl_record_t* rec = &src->data[src->pos++];
         tl_heap_entry_t new_entry = {
             .ts = rec->ts,
-            .component_id = popped.component_id,
+            .tie_break_key = popped.tie_break_key,
             .handle = rec->handle,
             .iter = src
         };

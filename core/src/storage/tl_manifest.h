@@ -33,12 +33,12 @@ typedef struct tl_manifest {
     /* L1 segments: non-overlapping, sorted by window_start */
     tl_segment_t** l1;
     uint32_t       n_l1;
-    uint32_t       cap_l1;
+    uint32_t       cap_l1; /* Capacity cache (diagnostic; == n_l1 when published) */
 
     /* L0 segments: may overlap, in flush order */
     tl_segment_t** l0;
     uint32_t       n_l0;
-    uint32_t       cap_l0;
+    uint32_t       cap_l0; /* Capacity cache (diagnostic; == n_l0 when published) */
 
     /* Cached global bounds (optional optimization) */
     bool      has_bounds;

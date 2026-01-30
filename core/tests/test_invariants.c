@@ -21,6 +21,12 @@
 #include "test_harness.h"
 #include "timelog/timelog.h"
 
+/* Internal headers for T-42 (L0 generation ordering) */
+#include "internal/tl_timelog_internal.h"
+#include "tl_snapshot.h"
+#include "tl_manifest.h"
+#include "tl_segment.h"
+
 #include <stdint.h>
 
 /*===========================================================================
@@ -248,6 +254,49 @@ TEST_DECLARE(inv_validate_tombstone_ending_at_ts_max) {
 }
 
 /*===========================================================================
+ * T-42: L0 Generation Ordering After Flush
+ *
+ * Multiple flush cycles should produce L0 segments with monotonically
+ * increasing generation numbers. This is a fundamental invariant for
+ * correct merge ordering.
+ *===========================================================================*/
+
+TEST_DECLARE(inv_l0_generation_ordering_after_flush) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* No background compaction */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Perform 5 flush cycles */
+    for (int i = 0; i < 5; i++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, (i + 1) * 100, (tl_handle_t)(i + 1)));
+        TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    }
+
+    /* Snapshot and check L0 generation ordering */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    const tl_manifest_t* manifest = tl_snapshot_manifest(snap);
+
+    uint32_t n_l0 = tl_manifest_l0_count(manifest);
+    TEST_ASSERT_EQ(5, (long long)n_l0);
+
+    /* Verify monotonically increasing generations */
+    uint32_t prev_gen = 0;
+    for (uint32_t i = 0; i < n_l0; i++) {
+        tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+        TEST_ASSERT_NOT_NULL(seg);
+        TEST_ASSERT(seg->generation > prev_gen);
+        prev_gen = seg->generation;
+    }
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -266,5 +315,8 @@ void run_invariants_tests(void) {
     RUN_TEST(inv_validate_record_at_ts_max);
     RUN_TEST(inv_validate_tombstone_ending_at_ts_max);
 
-    /* Total: 10 tests (all from Phase 6 validate tests) */
+    /* L0 generation ordering (1 test) - T-42 */
+    RUN_TEST(inv_l0_generation_ordering_after_flush);
+
+    /* Total: 11 tests */
 }

@@ -2,6 +2,7 @@
 #define TL_WINDOW_H
 
 #include "../internal/tl_defs.h"
+#include "../internal/tl_math.h"
 
 /*===========================================================================
  * Window Mapping
@@ -25,36 +26,6 @@
  *
  * Reference: Storage LLD Section 6.1, HLD Section 9.2
  *===========================================================================*/
-
-/*---------------------------------------------------------------------------
- * Overflow-Safe Arithmetic Helpers
- *
- * These return true on overflow, false on success.
- * On success, result is stored in *out.
- *---------------------------------------------------------------------------*/
-
-/*
- * Overflow-safe subtraction: computes a - b.
- * Returns true if overflow would occur, false otherwise.
- */
-TL_INLINE bool tl_sub_overflow_i64(int64_t a, int64_t b, int64_t* out) {
-    /*
-     * Overflow cases:
-     * 1. b > 0 && a < INT64_MIN + b  (a - b would underflow)
-     * 2. b < 0 && a > INT64_MAX + b  (a - b would overflow)
-     *
-     * Note: INT64_MAX + b when b < 0 is safe (result < INT64_MAX)
-     *       INT64_MIN + b when b > 0 is safe (result > INT64_MIN)
-     */
-    if (b > 0 && a < INT64_MIN + b) {
-        return true; /* Underflow */
-    }
-    if (b < 0 && a > INT64_MAX + b) {
-        return true; /* Overflow */
-    }
-    *out = a - b;
-    return false;
-}
 
 /*---------------------------------------------------------------------------
  * Floor Division for Signed Integers

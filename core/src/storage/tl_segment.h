@@ -68,8 +68,16 @@ typedef struct tl_segment {
     tl_ts_t   min_ts;           /* Minimum timestamp (inclusive) */
     tl_ts_t   max_ts;           /* Maximum timestamp (inclusive) */
 
+    /* Record-only bounds (valid when page_count > 0) */
+    tl_ts_t   record_min_ts;    /* First record ts (inclusive) */
+    tl_ts_t   record_max_ts;    /* Last record ts (inclusive) */
+
+    /* Tombstone-only bounds (valid when tombstones exist) */
+    tl_ts_t   tomb_min_ts;      /* Min tombstone start */
+    tl_ts_t   tomb_max_ts;      /* Max tombstone end-1 (or TL_TS_MAX if unbounded) */
+
     /* Counts */
-    uint64_t  record_count;     /* Total records (sum of page counts) */
+    uint64_t  record_count;     /* Cached total; validated vs page catalog */
     uint32_t  page_count;       /* Number of pages (0 for tombstone-only) */
 
     /* Level and generation */
@@ -218,8 +226,28 @@ TL_INLINE bool tl_segment_is_tombstone_only(const tl_segment_t* seg) {
     return seg->page_count == 0 && seg->tombstones != NULL && seg->tombstones->n > 0;
 }
 
+TL_INLINE bool tl_segment_has_records(const tl_segment_t* seg) {
+    return seg->page_count > 0;
+}
+
 TL_INLINE bool tl_segment_has_tombstones(const tl_segment_t* seg) {
     return seg->tombstones != NULL && seg->tombstones->n > 0;
+}
+
+TL_INLINE tl_ts_t tl_segment_record_min_ts(const tl_segment_t* seg) {
+    return seg->record_min_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_record_max_ts(const tl_segment_t* seg) {
+    return seg->record_max_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_tomb_min_ts(const tl_segment_t* seg) {
+    return seg->tomb_min_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_tomb_max_ts(const tl_segment_t* seg) {
+    return seg->tomb_max_ts;
 }
 
 /**

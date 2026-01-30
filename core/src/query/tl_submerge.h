@@ -4,6 +4,7 @@
 #include "../internal/tl_defs.h"
 #include "../internal/tl_alloc.h"
 #include "../internal/tl_heap.h"
+#include "../internal/tl_search.h"
 
 /*===========================================================================
  * Sub-merge helper for active/memrun iterators.
@@ -29,25 +30,29 @@ typedef struct tl_submerge {
 } tl_submerge_t;
 
 /**
- * Binary search: first index where data[i].ts >= target.
- * Returns len if all records have ts < target.
+ * Initialize sub-merge source bounds for a sorted record array.
  */
-TL_INLINE size_t tl_submerge_lower_bound(const tl_record_t* data,
-                                          size_t len,
-                                          tl_ts_t target) {
-    size_t lo = 0;
-    size_t hi = len;
+TL_INLINE void tl_submerge_src_init(tl_subsrc_t* src,
+                                     const tl_record_t* data,
+                                     size_t len,
+                                     tl_ts_t t1,
+                                     tl_ts_t t2,
+                                     bool t2_unbounded,
+                                     uint32_t tie_id) {
+    src->data = data;
+    src->len = len;
+    src->tie_id = tie_id;
 
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (data[mid].ts < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+    src->pos = tl_record_lower_bound(data, len, t1);
+    if (t2_unbounded) {
+        src->end = len;
+    } else {
+        src->end = tl_record_lower_bound(data, len, t2);
     }
 
-    return lo;
+    if (src->pos > src->end) {
+        src->pos = src->end;
+    }
 }
 
 /**

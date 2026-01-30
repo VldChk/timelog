@@ -10,8 +10,8 @@
  *   - Init function remains PyInit__timelog (last component rule)
  *   - Public Python package imports: from timelog._timelog import Timelog
  *
- * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
- *      docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN

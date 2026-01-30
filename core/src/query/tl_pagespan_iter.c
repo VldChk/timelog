@@ -19,6 +19,7 @@
 #include "../internal/tl_defs.h"
 #include "../internal/tl_alloc.h"
 #include "../internal/tl_range.h"
+#include "tl_segment_range.h"
 #include "../internal/tl_timelog_internal.h"
 #include "../storage/tl_page.h"
 #include "../storage/tl_segment.h"
@@ -198,23 +199,9 @@ static bool init_segment_cursor(tl_pagespan_iter_t* it, const tl_segment_t* seg)
         return false;
     }
 
-    const tl_page_catalog_t* cat = tl_segment_catalog(seg);
-
-    /*
-     * Find first page with max_ts >= t1.
-     * This is the first page that might contain records >= t1.
-     */
-    size_t first = tl_page_catalog_find_first_ge(cat, it->t1);
-
-    /*
-     * Find first page with min_ts >= t2.
-     * This is the first page that definitely starts after our range.
-     * All pages before this index might contain records < t2.
-     */
-    size_t last = tl_page_catalog_find_start_ge(cat, it->t2);
-
-    /* No overlapping pages */
-    if (first >= last) {
+    size_t first = 0;
+    size_t last = 0;
+    if (!tl_segment_page_range(seg, it->t1, it->t2, false, &first, &last)) {
         return false;
     }
 
@@ -256,8 +243,25 @@ static bool advance_to_next_segment(tl_pagespan_iter_t* it) {
             }
 
             /* Try next L1 segment */
-            while (it->seg_idx < tl_manifest_l1_count(m)) {
+            bool early_stop = false;
+            size_t l1_count = tl_manifest_l1_count(m);
+            while (it->seg_idx < l1_count) {
                 const tl_segment_t* seg = tl_manifest_l1_get(m, it->seg_idx);
+                /*
+                 * Early terminate L1 scan for bounded ranges.
+                 *
+                 * Correctness proof: L1 segments have strictly increasing min_ts.
+                 * Invariants: (1) L1 sorted by window_start
+                 *             (2) Non-overlapping: window_start[i] >= window_end[i-1]
+                 *             (3) Records in bounds: min_ts >= window_start (H-12)
+                 * Chain: min_ts[i] >= window_start[i] >= window_end[i-1] > max_ts[i-1]
+                 *
+                 * Therefore if min_ts >= t2, all later segments also have min_ts >= t2.
+                 */
+                if (seg->min_ts >= it->t2) {
+                    early_stop = true;
+                    break;
+                }
                 it->seg_idx++;
 
                 if (init_segment_cursor(it, seg)) {
@@ -266,8 +270,10 @@ static bool advance_to_next_segment(tl_pagespan_iter_t* it) {
             }
 
             /* L1 exhausted, move to L0 */
-            it->phase = PHASE_L0;
-            it->seg_idx = 0;
+            if (early_stop || it->seg_idx >= l1_count) {
+                it->phase = PHASE_L0;
+                it->seg_idx = 0;
+            }
             break;
 
         case PHASE_L0:

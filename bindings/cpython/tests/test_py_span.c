@@ -5,7 +5,7 @@
  * TDD-driven tests for the PageSpan, PageSpanIter, and PageSpanObjectsView types.
  * Tests run with Python initialized and GIL held.
  *
- * See: docs/timelog_v1_lld_B4_pagespan_zero_copy.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN

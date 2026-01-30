@@ -153,6 +153,28 @@ void tl_recvec_range_bounds(const tl_recvec_t* rv, tl_ts_t t1, tl_ts_t t2,
                             size_t* lo, size_t* hi);
 
 /*---------------------------------------------------------------------------
+ * Validation Helpers (Debug)
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Validate that all records are within [min_ts, max_ts] (inclusive).
+ * Returns true if bounds are satisfied or len == 0.
+ */
+TL_INLINE bool tl_records_validate_bounds(const tl_record_t* records, size_t len,
+                                          tl_ts_t min_ts, tl_ts_t max_ts) {
+    if (len == 0) {
+        return true;
+    }
+    TL_ASSERT(records != NULL);
+    for (size_t i = 0; i < len; i++) {
+        if (records[i].ts < min_ts || records[i].ts > max_ts) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*---------------------------------------------------------------------------
  * Accessors
  *---------------------------------------------------------------------------*/
 

@@ -53,7 +53,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_alloc.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_alloc.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -65,7 +65,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_log.c.obj: C_COMPILER__timelog
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_log.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -77,7 +77,7 @@ build CMakeFiles/timelog.dir/core/src/tl_timelog.c.obj: C_COMPILER__timelog_unsc
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\tl_timelog.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src
@@ -89,7 +89,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_sync.c.obj: C_COMPILER__timelo
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_sync.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -101,7 +101,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_test_hooks.c.obj: C_COMPILER__
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_test_hooks.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -113,7 +113,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_recvec.c.obj: C_COMPILER__time
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_recvec.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -125,7 +125,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_intervals.c.obj: C_COMPILER__t
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_intervals.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -137,7 +137,7 @@ build CMakeFiles/timelog.dir/core/src/internal/tl_heap.c.obj: C_COMPILER__timelo
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\internal\tl_heap.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\internal
@@ -149,7 +149,7 @@ build CMakeFiles/timelog.dir/core/src/storage/tl_window.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\storage\tl_window.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\storage
@@ -161,7 +161,7 @@ build CMakeFiles/timelog.dir/core/src/storage/tl_page.c.obj: C_COMPILER__timelog
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\storage\tl_page.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\storage
@@ -173,7 +173,7 @@ build CMakeFiles/timelog.dir/core/src/storage/tl_segment.c.obj: C_COMPILER__time
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\storage\tl_segment.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\storage
@@ -185,7 +185,7 @@ build CMakeFiles/timelog.dir/core/src/storage/tl_manifest.c.obj: C_COMPILER__tim
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\storage\tl_manifest.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\storage
@@ -197,7 +197,7 @@ build CMakeFiles/timelog.dir/core/src/delta/tl_memrun.c.obj: C_COMPILER__timelog
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\delta\tl_memrun.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\delta
@@ -209,7 +209,7 @@ build CMakeFiles/timelog.dir/core/src/delta/tl_ooorun.c.obj: C_COMPILER__timelog
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\delta\tl_ooorun.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\delta
@@ -221,7 +221,7 @@ build CMakeFiles/timelog.dir/core/src/delta/tl_memtable.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\delta\tl_memtable.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\delta
@@ -233,7 +233,7 @@ build CMakeFiles/timelog.dir/core/src/delta/tl_flush.c.obj: C_COMPILER__timelog_
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\delta\tl_flush.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\delta
@@ -245,7 +245,7 @@ build CMakeFiles/timelog.dir/core/src/delta/tl_memview.c.obj: C_COMPILER__timelo
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\delta\tl_memview.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\delta
@@ -257,7 +257,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_snapshot.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_snapshot.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -269,7 +269,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_segment_iter.c.obj: C_COMPILER__t
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_segment_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -281,7 +281,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_memrun_iter.c.obj: C_COMPILER__ti
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_memrun_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -293,7 +293,19 @@ build CMakeFiles/timelog.dir/core/src/query/tl_active_iter.c.obj: C_COMPILER__ti
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_active_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
+  OBJECT_DIR = CMakeFiles\timelog.dir
+  OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
+  TARGET_COMPILE_PDB = CMakeFiles\timelog.dir\timelog.pdb
+  TARGET_PDB = timelog.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\timelog.dir
+
+build CMakeFiles/timelog.dir/core/src/query/tl_iter_build.c.obj: C_COMPILER__timelog_unscanned_Debug U$:/Projects/timelog/core/src/query/tl_iter_build.c || cmake_object_order_depends_target_timelog
+  CONFIG = Debug
+  DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
+  DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_iter_build.c.obj.d
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -305,7 +317,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_submerge.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_submerge.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -317,7 +329,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_plan.c.obj: C_COMPILER__timelog_u
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_plan.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -329,7 +341,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_merge_iter.c.obj: C_COMPILER__tim
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_merge_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -341,7 +353,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_filter.c.obj: C_COMPILER__timelog
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_filter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -353,7 +365,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_point.c.obj: C_COMPILER__timelog_
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_point.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -365,7 +377,7 @@ build CMakeFiles/timelog.dir/core/src/query/tl_pagespan_iter.c.obj: C_COMPILER__
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\query\tl_pagespan_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\query
@@ -377,7 +389,7 @@ build CMakeFiles/timelog.dir/core/src/maint/tl_compaction.c.obj: C_COMPILER__tim
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\maint\tl_compaction.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\maint
@@ -389,7 +401,7 @@ build CMakeFiles/timelog.dir/core/src/maint/tl_adaptive.c.obj: C_COMPILER__timel
   CONFIG = Debug
   DEFINES = -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\timelog.dir\core\src\maint\tl_adaptive.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint
   OBJECT_DIR = CMakeFiles\timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\timelog.dir\core\src\maint
@@ -405,9 +417,9 @@ build CMakeFiles/timelog.dir/core/src/maint/tl_adaptive.c.obj: C_COMPILER__timel
 #############################################
 # Link the static library timelog.lib
 
-build timelog.lib: C_STATIC_LIBRARY_LINKER__timelog_Debug CMakeFiles/timelog.dir/core/src/internal/tl_alloc.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_log.c.obj CMakeFiles/timelog.dir/core/src/tl_timelog.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_sync.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_test_hooks.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_recvec.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_intervals.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_heap.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_window.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_page.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_segment.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_manifest.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memrun.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_ooorun.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memtable.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_flush.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memview.c.obj CMakeFiles/timelog.dir/core/src/query/tl_snapshot.c.obj CMakeFiles/timelog.dir/core/src/query/tl_segment_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_memrun_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_active_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_submerge.c.obj CMakeFiles/timelog.dir/core/src/query/tl_plan.c.obj CMakeFiles/timelog.dir/core/src/query/tl_merge_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_filter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_point.c.obj CMakeFiles/timelog.dir/core/src/query/tl_pagespan_iter.c.obj CMakeFiles/timelog.dir/core/src/maint/tl_compaction.c.obj CMakeFiles/timelog.dir/core/src/maint/tl_adaptive.c.obj
+build timelog.lib: C_STATIC_LIBRARY_LINKER__timelog_Debug CMakeFiles/timelog.dir/core/src/internal/tl_alloc.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_log.c.obj CMakeFiles/timelog.dir/core/src/tl_timelog.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_sync.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_test_hooks.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_recvec.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_intervals.c.obj CMakeFiles/timelog.dir/core/src/internal/tl_heap.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_window.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_page.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_segment.c.obj CMakeFiles/timelog.dir/core/src/storage/tl_manifest.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memrun.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_ooorun.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memtable.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_flush.c.obj CMakeFiles/timelog.dir/core/src/delta/tl_memview.c.obj CMakeFiles/timelog.dir/core/src/query/tl_snapshot.c.obj CMakeFiles/timelog.dir/core/src/query/tl_segment_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_memrun_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_active_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_iter_build.c.obj CMakeFiles/timelog.dir/core/src/query/tl_submerge.c.obj CMakeFiles/timelog.dir/core/src/query/tl_plan.c.obj CMakeFiles/timelog.dir/core/src/query/tl_merge_iter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_filter.c.obj CMakeFiles/timelog.dir/core/src/query/tl_point.c.obj CMakeFiles/timelog.dir/core/src/query/tl_pagespan_iter.c.obj CMakeFiles/timelog.dir/core/src/maint/tl_compaction.c.obj CMakeFiles/timelog.dir/core/src/maint/tl_adaptive.c.obj
   CONFIG = Debug
-  LANGUAGE_COMPILE_FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
+  LANGUAGE_COMPILE_FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
   OBJECT_DIR = CMakeFiles\timelog.dir
   POST_BUILD = cd .
   PRE_LINK = cd .
@@ -429,7 +441,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_main.c.obj: C_COMPILER__test_t
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_main.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -441,7 +453,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_internal_sync.c.obj: C_COMPILE
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_internal_sync.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -453,7 +465,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_internal_data_structures.c.obj
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_internal_data_structures.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -465,7 +477,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_storage_internal.c.obj: C_COMP
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_storage_internal.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -477,7 +489,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_delta_internal.c.obj: C_COMPIL
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_delta_internal.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -489,7 +501,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_compaction_internal.c.obj: C_C
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_compaction_internal.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -501,7 +513,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_functional.c.obj: C_COMPILER__
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_functional.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -513,7 +525,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_api_semantics.c.obj: C_COMPILE
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_api_semantics.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -525,7 +537,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_snapshot_lifetime.c.obj: C_COM
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_snapshot_lifetime.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -537,7 +549,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_invariants.c.obj: C_COMPILER__
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_invariants.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -549,7 +561,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_concurrency.c.obj: C_COMPILER_
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_concurrency.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -561,7 +573,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_stress.c.obj: C_COMPILER__test
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_stress.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -573,7 +585,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_pagespan_iter.c.obj: C_COMPILE
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_pagespan_iter.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -585,7 +597,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_adaptive_internal.c.obj: C_COM
   CONFIG = Debug
   DEFINES = -DTL_ADAPTIVE_INTERNAL_TEST -DTL_TEST_HOOKS -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\test_timelog.dir\core\tests\test_adaptive_internal.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/src -IU:/Projects/timelog/core/src/storage -IU:/Projects/timelog/core/src/delta -IU:/Projects/timelog/core/src/query -IU:/Projects/timelog/core/src/maint -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\test_timelog.dir
   OBJECT_FILE_DIR = CMakeFiles\test_timelog.dir\core\tests
@@ -603,7 +615,7 @@ build CMakeFiles/test_timelog.dir/core/tests/test_adaptive_internal.c.obj: C_COM
 
 build test_timelog.exe: C_EXECUTABLE_LINKER__test_timelog_Debug CMakeFiles/test_timelog.dir/core/tests/test_main.c.obj CMakeFiles/test_timelog.dir/core/tests/test_internal_sync.c.obj CMakeFiles/test_timelog.dir/core/tests/test_internal_data_structures.c.obj CMakeFiles/test_timelog.dir/core/tests/test_storage_internal.c.obj CMakeFiles/test_timelog.dir/core/tests/test_delta_internal.c.obj CMakeFiles/test_timelog.dir/core/tests/test_compaction_internal.c.obj CMakeFiles/test_timelog.dir/core/tests/test_functional.c.obj CMakeFiles/test_timelog.dir/core/tests/test_api_semantics.c.obj CMakeFiles/test_timelog.dir/core/tests/test_snapshot_lifetime.c.obj CMakeFiles/test_timelog.dir/core/tests/test_invariants.c.obj CMakeFiles/test_timelog.dir/core/tests/test_concurrency.c.obj CMakeFiles/test_timelog.dir/core/tests/test_stress.c.obj CMakeFiles/test_timelog.dir/core/tests/test_pagespan_iter.c.obj CMakeFiles/test_timelog.dir/core/tests/test_adaptive_internal.c.obj | timelog.lib || timelog.lib
   CONFIG = Debug
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
   LINK_FLAGS = -fsanitize=address,undefined -Xlinker /subsystem:console -fuse-ld=lld-link
   LINK_LIBRARIES = timelog.lib  -lmsvcrtd.lib  -lvcruntimed.lib  -lucrtd.lib  -llegacy_stdio_definitions.lib  -loldnames.lib  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 -loldnames
   OBJECT_DIR = CMakeFiles\test_timelog.dir
@@ -628,7 +640,7 @@ build CMakeFiles/adaptive_segmentation_demo.dir/demo/adaptive_segmentation_demo.
   CONFIG = Debug
   DEFINES = -D_POSIX_C_SOURCE=200809L
   DEP_FILE = CMakeFiles\adaptive_segmentation_demo.dir\demo\adaptive_segmentation_demo.c.obj.d
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined -std=c17 -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter -fvisibility=hidden
   INCLUDES = -IU:/Projects/timelog/core/include
   OBJECT_DIR = CMakeFiles\adaptive_segmentation_demo.dir
   OBJECT_FILE_DIR = CMakeFiles\adaptive_segmentation_demo.dir\demo
@@ -646,7 +658,7 @@ build CMakeFiles/adaptive_segmentation_demo.dir/demo/adaptive_segmentation_demo.
 
 build adaptive_segmentation_demo.exe: C_EXECUTABLE_LINKER__adaptive_segmentation_demo_Debug CMakeFiles/adaptive_segmentation_demo.dir/demo/adaptive_segmentation_demo.c.obj | timelog.lib || timelog.lib
   CONFIG = Debug
-  FLAGS = -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
+  FLAGS = -D_CRT_SECURE_NO_WARNINGS -O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined
   LINK_FLAGS = -fsanitize=address,undefined -Xlinker /subsystem:console -fuse-ld=lld-link
   LINK_LIBRARIES = timelog.lib  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 -loldnames
   OBJECT_DIR = CMakeFiles\adaptive_segmentation_demo.dir

@@ -182,6 +182,18 @@ void tl_manifest_builder_destroy(tl_manifest_builder_t* mb) {
     mb->add_l1 = NULL;
     mb->remove_l0 = NULL;
     mb->remove_l1 = NULL;
+
+    mb->add_l0_len = 0;
+    mb->add_l0_cap = 0;
+    mb->add_l1_len = 0;
+    mb->add_l1_cap = 0;
+    mb->remove_l0_len = 0;
+    mb->remove_l0_cap = 0;
+    mb->remove_l1_len = 0;
+    mb->remove_l1_cap = 0;
+
+    mb->alloc = NULL;
+    mb->base = NULL;
 }
 
 /*===========================================================================

@@ -16,41 +16,39 @@
 
 static void compute_tombstone_bounds(const tl_interval_t* tombstones, size_t n,
                                       tl_ts_t* out_min, tl_ts_t* out_max) {
-    TL_ASSERT(n > 0);
-    TL_ASSERT(tombstones != NULL);
+    TL_ASSERT(n > 0 && tombstones != NULL);
 
-    tl_ts_t min_ts = tombstones[0].start;
-    tl_ts_t max_ts;
+    /*
+     * M-04 fix: Single-pass algorithm with invariant-based assertion.
+     *
+     * Tombstones are canonicalized (non-empty, non-overlapping, sorted).
+     * For bounded intervals: end > start >= TL_TS_MIN, so end > TL_TS_MIN.
+     * This makes (end - 1) safe without saturation.
+     */
+    tl_ts_t min_ts = TL_TS_MAX;
+    tl_ts_t max_ts = TL_TS_MIN;
 
-    /* Check if any interval is unbounded */
-    bool has_unbounded = false;
     for (size_t i = 0; i < n; i++) {
-        if (tombstones[i].end_unbounded) {
-            has_unbounded = true;
-            break;
-        }
-    }
+        const tl_interval_t* t = &tombstones[i];
 
-    if (has_unbounded) {
-        max_ts = TL_TS_MAX;
-    } else {
-        /* All bounded: find max(end - 1) */
-        max_ts = tombstones[0].end - 1;
-        for (size_t i = 1; i < n; i++) {
-            if (tombstones[i].start < min_ts) {
-                min_ts = tombstones[i].start;
-            }
-            tl_ts_t end_inclusive = tombstones[i].end - 1;
+        /* Track minimum start */
+        if (t->start < min_ts) {
+            min_ts = t->start;
+        }
+
+        /* Track maximum end (inclusive) */
+        if (t->end_unbounded) {
+            max_ts = TL_TS_MAX;
+        } else {
+            /*
+             * Invariant: tombstones are canonicalized, so t->end > t->start >= TL_TS_MIN.
+             * Therefore t->end > TL_TS_MIN, making (t->end - 1) safe.
+             */
+            TL_ASSERT(t->end > t->start && "Tombstone must be non-empty (canonicalized)");
+            tl_ts_t end_inclusive = t->end - 1;
             if (end_inclusive > max_ts) {
                 max_ts = end_inclusive;
             }
-        }
-    }
-
-    /* Also check remaining intervals for min_ts */
-    for (size_t i = 1; i < n; i++) {
-        if (tombstones[i].start < min_ts) {
-            min_ts = tombstones[i].start;
         }
     }
 
@@ -137,7 +135,12 @@ static tl_status_t build_pages(tl_segment_t* seg,
     tl_page_builder_init(&pb, alloc, target_page_bytes);
 
     size_t cap = pb.records_per_page;
-    size_t n_pages = (record_count + cap - 1) / cap;
+    /*
+     * M-05 fix: Overflow-safe ceiling division.
+     * The naive (a + b - 1) / b can overflow if a + b - 1 > SIZE_MAX.
+     * This equivalent form avoids overflow: a/b + (a%b != 0 ? 1 : 0)
+     */
+    size_t n_pages = record_count / cap + (record_count % cap != 0 ? 1 : 0);
 
     /* Reserve catalog space */
     tl_status_t st = tl_page_catalog_reserve(&seg->catalog, n_pages);
@@ -224,6 +227,13 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
+    /* Validate tombstone intervals: must be non-empty (end > start for bounded) */
+    for (size_t i = 0; i < tombstones_len; i++) {
+        if (!tombstones[i].end_unbounded && tombstones[i].end <= tombstones[i].start) {
+            return TL_EINVAL;
+        }
+    }
+
     /* Allocate segment */
     tl_segment_t* seg = TL_NEW(alloc, tl_segment_t);
     if (seg == NULL) {
@@ -236,6 +246,10 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->window_start = 0;
     seg->window_end = 0;
     seg->window_end_unbounded = false;  /* L0 doesn't use windows */
+    seg->record_min_ts = 0;
+    seg->record_max_ts = 0;
+    seg->tomb_min_ts = 0;
+    seg->tomb_max_ts = 0;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -279,24 +293,28 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
      * A read in range [A, B) must consider any L0 segment whose bounds
      * overlap [A, B), and tombstones affect what data is visible.
      */
+    if (record_count > 0) {
+        seg->record_min_ts = seg->catalog.pages[0].min_ts;
+        seg->record_max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
+    }
+    if (tombstones_len > 0) {
+        compute_tombstone_bounds(tombstones, tombstones_len,
+                                  &seg->tomb_min_ts, &seg->tomb_max_ts);
+    }
+
     if (record_count > 0 && tombstones_len > 0) {
         /* Both records and tombstones: union of bounds */
-        tl_ts_t rec_min = seg->catalog.pages[0].min_ts;
-        tl_ts_t rec_max = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
-
-        tl_ts_t tomb_min, tomb_max;
-        compute_tombstone_bounds(tombstones, tombstones_len, &tomb_min, &tomb_max);
-
-        seg->min_ts = TL_MIN(rec_min, tomb_min);
-        seg->max_ts = TL_MAX(rec_max, tomb_max);
+        seg->min_ts = TL_MIN(seg->record_min_ts, seg->tomb_min_ts);
+        seg->max_ts = TL_MAX(seg->record_max_ts, seg->tomb_max_ts);
     } else if (record_count > 0) {
         /* Records only: bounds from pages */
-        seg->min_ts = seg->catalog.pages[0].min_ts;
-        seg->max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
+        seg->min_ts = seg->record_min_ts;
+        seg->max_ts = seg->record_max_ts;
     } else {
         /* Tombstone-only: bounds from tombstones */
         TL_ASSERT(tombstones_len > 0);
-        compute_tombstone_bounds(tombstones, tombstones_len, &seg->min_ts, &seg->max_ts);
+        seg->min_ts = seg->tomb_min_ts;
+        seg->max_ts = seg->tomb_max_ts;
     }
 
     *out = seg;
@@ -344,6 +362,10 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->window_end = window_end;
     seg->window_end_unbounded = window_end_unbounded;
     seg->tombstones = NULL;  /* L1 never has tombstones */
+    seg->record_min_ts = 0;
+    seg->record_max_ts = 0;
+    seg->tomb_min_ts = 0;
+    seg->tomb_max_ts = 0;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -362,8 +384,10 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->page_count = seg->catalog.n_pages;
 
     /* Bounds from pages */
-    seg->min_ts = seg->catalog.pages[0].min_ts;
-    seg->max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
+    seg->record_min_ts = seg->catalog.pages[0].min_ts;
+    seg->record_max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
+    seg->min_ts = seg->record_min_ts;
+    seg->max_ts = seg->record_max_ts;
 
     /* H-12: Enforce records within window in release builds */
     if (seg->min_ts < window_start ||
@@ -397,9 +421,14 @@ void tl_segment_release(tl_segment_t* seg) {
     /*
      * Release ordering ensures all prior writes to segment data are visible
      * to the thread that will destroy the segment.
+     *
+     * M-08: The atomic fetch_sub + post-assertion is correct and race-free.
+     * Do NOT add a pre-check load (TOCTOU race). If old==0 after decrement,
+     * this indicates a double-release bug which the assertion catches.
      */
     uint32_t old = tl_atomic_fetch_sub_u32(&seg->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
+    /* M-08 fix: Use TL_VERIFY to avoid UB in release on double-release. */
+    TL_VERIFY(old >= 1 && "segment double-release: refcnt was 0 before decrement");
 
     if (old == 1) {
         /*
@@ -498,6 +527,12 @@ bool tl_segment_validate(const tl_segment_t* seg) {
         if (seg->catalog.n_pages > 0) {
             const tl_page_meta_t* first = &seg->catalog.pages[0];
             const tl_page_meta_t* last = &seg->catalog.pages[seg->catalog.n_pages - 1];
+            if (seg->record_min_ts != first->min_ts) {
+                return false;
+            }
+            if (seg->record_max_ts != last->max_ts) {
+                return false;
+            }
             required_min = first->min_ts;
             required_max = last->max_ts;
             has_content = true;
@@ -505,6 +540,15 @@ bool tl_segment_validate(const tl_segment_t* seg) {
 
         /* Tombstone bounds ALSO contribute to required coverage */
         if (seg->tombstones != NULL && seg->tombstones->n > 0) {
+            tl_ts_t tomb_min_check, tomb_max_check;
+            compute_tombstone_bounds(seg->tombstones->v, seg->tombstones->n,
+                                     &tomb_min_check, &tomb_max_check);
+            if (seg->tomb_min_ts != tomb_min_check) {
+                return false;
+            }
+            if (seg->tomb_max_ts != tomb_max_check) {
+                return false;
+            }
             /* Minimum: first tombstone's start (tombstones are sorted) */
             tl_ts_t tomb_min = seg->tombstones->v[0].start;
             if (!has_content || tomb_min < required_min) {
@@ -602,6 +646,12 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             const tl_page_meta_t* first = &seg->catalog.pages[0];
             const tl_page_meta_t* last = &seg->catalog.pages[seg->catalog.n_pages - 1];
 
+            if (seg->record_min_ts != first->min_ts) {
+                return false;
+            }
+            if (seg->record_max_ts != last->max_ts) {
+                return false;
+            }
             if (seg->min_ts != first->min_ts) {
                 return false;
             }

@@ -207,6 +207,26 @@ void tl_adaptive_record_success(tl_adaptive_state_t* state);
 void tl_adaptive_record_failure(tl_adaptive_state_t* state);
 
 /*===========================================================================
+ * Advisory Resize Query (M-20)
+ *
+ * Returns true if adaptive segmentation has sufficient samples to potentially
+ * resize the window. Used by scheduler to decide if compaction should run.
+ *
+ * This is an advisory function only - actual resize decision happens in
+ * tl_adaptive_compute_candidate() which includes warmup checks, staleness,
+ * hysteresis, etc.
+ *
+ * Thread Safety: This function reads fields without locking (intentionally).
+ * Reads may be racy but are benign for advisory use. See implementation for
+ * detailed rationale. Callers must NOT use this for correctness decisions.
+ *
+ * @param tl  Timelog instance (must not be NULL)
+ * @return true if resize might be beneficial, false otherwise
+ *===========================================================================*/
+
+bool tl_adaptive_wants_resize(const tl_timelog_t* tl);
+
+/*===========================================================================
  * Internal Computation Helpers (Exposed for Testing)
  *
  * These are implementation details but exposed in the header for unit testing.

@@ -2186,6 +2186,273 @@ TEST_DECLARE(func_seek_multiple_sources_all_below_target) {
 }
 
 /*===========================================================================
+ * T-23: Tombstone Skip-Ahead Correctness
+ *
+ * Records at [10,15,20,25,30]. Delete [12,22). Query full range.
+ * Verify records 10, 25, 30 are returned (15, 20 are tombstoned).
+ *===========================================================================*/
+
+TEST_DECLARE(func_tombstone_skip_ahead_correctness) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 15));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 25, 25));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+
+    /* Delete range [12, 22) — covers ts=15 and ts=20 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 12, 22));
+
+    /* Flush to create L0 segment with tombstones */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    /* Should see 10, 25, 30 (15 and 20 tombstoned by [12,22)) */
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(10, rec.ts);
+    TEST_ASSERT_EQ(10, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(25, rec.ts);
+    TEST_ASSERT_EQ(25, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(30, rec.ts);
+    TEST_ASSERT_EQ(30, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * T-37: Segment Refcount Leak Detection (Full Lifecycle)
+ *
+ * Full lifecycle: append → seal → flush → compact → close.
+ * Verify no crashes or leaks (ASan will catch actual leaks).
+ *===========================================================================*/
+
+TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 100;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Phase 1: Append records across multiple flushes */
+    for (int batch = 0; batch < 3; batch++) {
+        for (int i = 0; i < 10; i++) {
+            tl_ts_t ts = (tl_ts_t)(batch * 1000 + i * 10);
+            TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts, (tl_handle_t)(ts + 1)));
+        }
+        TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    }
+
+    /* Phase 2: Take snapshot, verify data */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    tl_stats(snap, &stats);
+    TEST_ASSERT_EQ(3, stats.segments_l0);
+    TEST_ASSERT(stats.records_estimate >= 30);
+
+    tl_snapshot_release(snap);
+
+    /* Phase 3: Compact L0 → L1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do {
+        st = tl_maint_step(tl);
+    } while (st == TL_OK);
+
+    /* Phase 4: Verify L1 exists, L0 consumed */
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_stats(snap, &stats);
+    TEST_ASSERT_EQ(0, stats.segments_l0);
+    TEST_ASSERT(stats.segments_l1 > 0);
+
+    /* Verify all data still readable */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+    int count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        count++;
+    }
+    TEST_ASSERT_EQ(30, count);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Phase 5: Close — ASan will catch any refcount leaks */
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * T-40: Snapshot Isolation + Drop Callback
+ *
+ * Append → snapshot S1 → delete range → compact → S1 still sees records
+ * → release S1.
+ *===========================================================================*/
+
+TEST_DECLARE(func_snapshot_isolation_with_drop_callback) {
+    func_drop_tracker_t tracker = {0};
+
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 100;
+    cfg.on_drop_handle = func_track_dropped_handle;
+    cfg.on_drop_ctx = &tracker;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Take snapshot BEFORE deletion */
+    tl_snapshot_t* snap_before = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap_before));
+
+    /* Delete range [150, 250) — covers ts=200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 150, 250));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact to physically drop ts=200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do {
+        st = tl_maint_step(tl);
+    } while (st == TL_OK);
+
+    /* Drop callback should have fired for ts=200 */
+    TEST_ASSERT_EQ(1, (long long)tracker.dropped_count);
+    TEST_ASSERT_EQ(200, tracker.dropped_ts[0]);
+    TEST_ASSERT_EQ(2, (long long)tracker.dropped_handle[0]);
+
+    /* snap_before (taken before delete) should still see ALL records */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap_before, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(200, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap_before);
+
+    /* New snapshot should NOT see ts=200 */
+    tl_snapshot_t* snap_after = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap_after));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap_after, TL_TS_MIN, TL_TS_MAX, &it));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap_after);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * T-28: Multi-Source Determinism (Same Timestamp)
+ *
+ * Insert records at the same timestamp across multiple components
+ * (memtable + flushed segments). Verify stable deterministic output.
+ *===========================================================================*/
+
+TEST_DECLARE(func_determinism_multi_source_same_timestamp) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Flush 1: records at ts=100 with handle=1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Flush 2: records at ts=100 with handle=2 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Active memtable: ts=100 with handle=3 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 3));
+
+    /* Query twice and verify same order both times */
+    tl_handle_t first_run[3] = {0};
+    tl_handle_t second_run[3] = {0};
+
+    for (int pass = 0; pass < 2; pass++) {
+        tl_snapshot_t* snap = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+        int count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) {
+            TEST_ASSERT_EQ(100, rec.ts);
+            if (pass == 0) {
+                first_run[count] = rec.handle;
+            } else {
+                second_run[count] = rec.handle;
+            }
+            count++;
+        }
+        TEST_ASSERT_EQ(3, count);
+
+        tl_iter_destroy(it);
+        tl_snapshot_release(snap);
+    }
+
+    /* Verify deterministic ordering: both passes must yield same sequence */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ((long long)first_run[i], (long long)second_run[i]);
+    }
+
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -2293,8 +2560,20 @@ void run_functional_tests(void) {
     RUN_TEST(func_seek_mixed_preserve_and_pop);  /* Core bug scenario */
     RUN_TEST(func_seek_multiple_sources_all_below_target);
 
+    /* Tombstone skip-ahead correctness (1 test) - T-23 */
+    RUN_TEST(func_tombstone_skip_ahead_correctness);
+
+    /* Full lifecycle refcount leak detection (1 test) - T-37 */
+    RUN_TEST(func_lifecycle_no_segment_refcount_leak);
+
+    /* Snapshot isolation with drop callback (1 test) - T-40 */
+    RUN_TEST(func_snapshot_isolation_with_drop_callback);
+
+    /* Multi-source determinism (1 test) - T-28 */
+    RUN_TEST(func_determinism_multi_source_same_timestamp);
+
     /*
-     * Total: ~58 tests (public API only)
+     * Total: ~62 tests (public API only)
      *
      * Internal tests moved to:
      * - test_storage_internal.c (~43 tests): window, page, catalog, segment, manifest

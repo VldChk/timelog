@@ -28,6 +28,7 @@
 #define TL_DEFAULT_MAINTENANCE_WAKEUP_MS  100   /* Periodic wake interval */
 #define TL_DEFAULT_MAX_DELTA_SEGMENTS     8
 #define TL_DEFAULT_OOO_RUN_LIMIT          32
+#define TL_MAX_DEBT_WINDOWS               1000
 
 /* OOO run sizing (internal defaults) */
 #define TL_OOO_TARGET_RUNS                16
@@ -125,6 +126,35 @@ typedef struct tl_maint_state   tl_maint_state_t;
 
 /* Round up to power of 2 alignment */
 #define TL_ALIGN_UP(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
+
+/**
+ * Overflow-safe alignment to power-of-2 boundary.
+ *
+ * Unlike TL_ALIGN_UP macro, this function detects overflow when (x + align - 1)
+ * would exceed SIZE_MAX.
+ *
+ * @param x      Value to align
+ * @param align  Alignment (must be power of 2, > 0)
+ * @param out    Output: aligned value on success
+ * @return true on success, false if alignment would overflow
+ *
+ * Example:
+ *   size_t aligned;
+ *   if (!tl_align_up_safe(size, 4096, &aligned)) {
+ *       return TL_EOVERFLOW;
+ *   }
+ */
+TL_INLINE bool tl_align_up_safe(size_t x, size_t align, size_t* out) {
+    TL_ASSERT(align > 0);
+    TL_ASSERT((align & (align - 1)) == 0 && "align must be power of 2");
+
+    size_t mask = align - 1;
+    if (x > SIZE_MAX - mask) {
+        return false;  /* Would overflow */
+    }
+    *out = (x + mask) & ~mask;
+    return true;
+}
 
 /*===========================================================================
  * Internal Allocator Access

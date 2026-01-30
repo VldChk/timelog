@@ -16,7 +16,8 @@
  * - drain: called from Python thread with GIL held
  * - pins: atomic counter, safe from any thread
  *
- * See: docs/timelog_v1_lld_B1_python_handle_lifetime.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_HANDLE_H

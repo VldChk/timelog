@@ -18,7 +18,8 @@
  * - Stack push CAS: RELEASE (make node fields visible)
  * - Stack exchange (drain): ACQ_REL (see all pushed nodes)
  *
- * See: docs/timelog_v1_lld_B1_python_handle_lifetime.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #include "timelogpy/py_handle.h"

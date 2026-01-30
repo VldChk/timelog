@@ -4,7 +4,8 @@
  *
  * Implements snapshot-based iteration over timelog records.
  *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
+ * See: docs/V2/timelog_v2_lld_read_path.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #define PY_SSIZE_T_CLEAN

@@ -5,7 +5,7 @@
  * TDD-driven tests for the PyTimelogIter iterator type.
  * Tests run with Python initialized and GIL held.
  *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
+ * See: docs/V2/timelog_v2_lld_read_path.md
  */
 
 #define PY_SSIZE_T_CLEAN

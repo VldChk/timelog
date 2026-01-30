@@ -5,7 +5,7 @@
  * Implements zero-copy timestamp exposure via the CPython buffer protocol.
  * Delegates ownership management to core tl_pagespan_owner_t.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -396,7 +396,7 @@ static PyObject* PyPageSpan_copy_timestamps(PyPageSpan* self, PyObject* noargs)
 
 static PyObject* PyPageSpan_copy(PyPageSpan* self, PyObject* noargs)
 {
-    /* For V1, copy() returns same as copy_timestamps() */
+    /* Current behavior: copy() returns the same as copy_timestamps(). */
     return PyPageSpan_copy_timestamps(self, noargs);
 }
 

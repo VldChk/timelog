@@ -1,14 +1,14 @@
 #include "tl_memrun.h"
 
 /*===========================================================================
- * Internal: Bounds Computation
+ * Bounds Computation (M-11: Public for reuse)
  *
  * CRITICAL: Bounds MUST include tombstones, not just records.
  * This ensures tombstones outside record bounds are NOT pruned during
  * read-path overlap checks (which would cause missed deletes).
  *===========================================================================*/
 
-static void compute_bounds(tl_memrun_t* mr) {
+void tl__memrun_compute_bounds(tl_memrun_t* mr) {
     /* Start with invalid bounds */
     tl_ts_t min_ts = TL_TS_MAX;
     tl_ts_t max_ts = TL_TS_MIN;
@@ -54,21 +54,26 @@ static void compute_bounds(tl_memrun_t* mr) {
  * Caller must ensure at least one array is non-empty.
  * Sets refcnt to 1.
  */
-static void memrun_init_inplace(tl_memrun_t* mr,
-                                 tl_alloc_ctx_t* alloc,
-                                 tl_record_t* run, size_t run_len,
-                                 tl_ooorunset_t* ooo_runs,
-                                 tl_interval_t* tombs, size_t tombs_len) {
-    TL_ASSERT(mr != NULL);
-    TL_ASSERT(alloc != NULL);
-    TL_ASSERT(run_len > 0 ||
-              (ooo_runs != NULL && ooo_runs->count > 0) ||
-              tombs_len > 0);
-
-    /* Null-check arrays when length is non-zero */
-    TL_ASSERT(run_len == 0 || run != NULL);
-    TL_ASSERT(ooo_runs == NULL || ooo_runs->count > 0);
-    TL_ASSERT(tombs_len == 0 || tombs != NULL);
+tl_status_t tl_memrun_init(tl_memrun_t* mr,
+                            tl_alloc_ctx_t* alloc,
+                            tl_record_t* run, size_t run_len,
+                            tl_ooorunset_t* ooo_runs,
+                            tl_interval_t* tombs, size_t tombs_len) {
+    if (mr == NULL || alloc == NULL) {
+        return TL_EINVAL;
+    }
+    if (run_len == 0 && ooo_runs == NULL && tombs_len == 0) {
+        return TL_EINVAL;
+    }
+    if (run_len > 0 && run == NULL) {
+        return TL_EINVAL;
+    }
+    if (ooo_runs != NULL && ooo_runs->count == 0) {
+        return TL_EINVAL;
+    }
+    if (tombs_len > 0 && tombs == NULL) {
+        return TL_EINVAL;
+    }
 
     /* Take ownership of arrays */
     mr->run = run;
@@ -96,7 +101,8 @@ static void memrun_init_inplace(tl_memrun_t* mr,
     }
 
     /* Compute bounds (includes tombstones) */
-    compute_bounds(mr);
+    tl__memrun_compute_bounds(mr);
+    return TL_OK;
 }
 
 tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
@@ -113,19 +119,42 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
     if (run_len == 0 && ooo_runs == NULL && tombs_len == 0) {
         return TL_EINVAL;
     }
+    if (run_len > 0 && run == NULL) {
+        return TL_EINVAL;
+    }
     if (ooo_runs != NULL && ooo_runs->count == 0) {
         return TL_EINVAL;
     }
-
-    /* Allocate memrun struct */
-    tl_memrun_t* mr = TL_NEW(alloc, tl_memrun_t);
-    if (mr == NULL) {
-        /* Arrays NOT freed - caller retains ownership */
-        return TL_ENOMEM;
+    if (tombs_len > 0 && tombs == NULL) {
+        return TL_EINVAL;
     }
 
-    /* Initialize in-place */
-    memrun_init_inplace(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len);
+    tl_memrun_t* mr = NULL;
+    tl_status_t st = tl_memrun_alloc(alloc, &mr);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    st = tl_memrun_init(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len);
+    if (st != TL_OK) {
+        tl__free(alloc, mr);
+        return st;
+    }
+
+    *out = mr;
+    return TL_OK;
+}
+
+tl_status_t tl_memrun_alloc(tl_alloc_ctx_t* alloc, tl_memrun_t** out) {
+    TL_ASSERT(alloc != NULL);
+    TL_ASSERT(out != NULL);
+
+    *out = NULL;
+
+    tl_memrun_t* mr = TL_NEW(alloc, tl_memrun_t);
+    if (mr == NULL) {
+        return TL_ENOMEM;
+    }
 
     *out = mr;
     return TL_OK;

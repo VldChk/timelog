@@ -14,7 +14,8 @@
  *   ensuring the embedded handle_ctx remains valid. A pin is acquired
  *   on creation and released on close/exhaustion/dealloc.
  *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
+ * See: docs/V2/timelog_v2_lld_read_path.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_ITER_H

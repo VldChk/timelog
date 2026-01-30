@@ -1,6 +1,7 @@
 #include "tl_memview.h"
 #include "../internal/tl_range.h"
 #include "../internal/tl_locks.h"
+#include "../internal/tl_records.h"
 #include <stdlib.h>  /* qsort */
 #include <string.h>
 
@@ -193,35 +194,6 @@ static void update_bounds_from_memrun(tl_ts_t* min_ts, tl_ts_t* max_ts,
  *         TL_EOVERFLOW if len * sizeof(tl_record_t) would overflow,
  *         TL_ENOMEM on allocation failure
  */
-static tl_status_t copy_records(tl_alloc_ctx_t* alloc,
-                                 const tl_record_t* src, size_t len,
-                                 tl_record_t** out) {
-    *out = NULL;
-
-    if (len == 0) {
-        return TL_OK;  /* Success, no allocation needed */
-    }
-
-    if (src == NULL) {
-        return TL_EINVAL;  /* Error: non-zero len but NULL src */
-    }
-
-    /* C-07 fix: Check for size overflow before multiplication */
-    if (tl__alloc_would_overflow(len, sizeof(tl_record_t))) {
-        return TL_EOVERFLOW;
-    }
-
-    size_t bytes = len * sizeof(tl_record_t);
-    tl_record_t* dst = tl__malloc(alloc, bytes);
-    if (dst == NULL) {
-        return TL_ENOMEM;
-    }
-
-    memcpy(dst, src, bytes);
-    *out = dst;
-    return TL_OK;
-}
-
 /**
  * Deep-copy an interval array.
  *
@@ -406,7 +378,7 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
 
     /* Copy active_run */
     size_t run_len = tl_memtable_run_len(mt);
-    status = copy_records(alloc, tl_memtable_run_data(mt), run_len, &mv->active_run);
+    status = tl_records_copy(alloc, tl_memtable_run_data(mt), run_len, &mv->active_run);
     if (status != TL_OK) {
         goto fail;
     }
@@ -414,8 +386,8 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
 
     /* Copy OOO head */
     size_t ooo_head_len = tl_memtable_ooo_head_len(mt);
-    status = copy_records(alloc, tl_memtable_ooo_head_data(mt), ooo_head_len,
-                          &mv->active_ooo_head);
+    status = tl_records_copy(alloc, tl_memtable_ooo_head_data(mt), ooo_head_len,
+                              &mv->active_ooo_head);
     if (status != TL_OK) {
         goto fail;
     }
@@ -625,6 +597,7 @@ bool tl_memview_overlaps(const tl_memview_t* mv, tl_ts_t t1, tl_ts_t t2,
 
 /* Include for tl_intervals_arr_validate */
 #include "../internal/tl_intervals.h"
+#include "../internal/tl_recvec.h"
 
 /**
  * Validate memview invariants.
@@ -654,6 +627,9 @@ bool tl_memview_validate(const tl_memview_t* mv) {
             return false;
         }
     }
+    if (!tl_records_validate_bounds(run, run_len, mv->min_ts, mv->max_ts)) {
+        return false;
+    }
 
     /*
      * Invariant 2: active_ooo_head is sorted (ts, handle) iff marked sorted.
@@ -671,6 +647,9 @@ bool tl_memview_validate(const tl_memview_t* mv) {
                 return false;
             }
         }
+    }
+    if (!tl_records_validate_bounds(ooo_head, ooo_head_len, mv->min_ts, mv->max_ts)) {
+        return false;
     }
 
     /*
@@ -704,6 +683,10 @@ bool tl_memview_validate(const tl_memview_t* mv) {
                 return false;
             }
             total += run_ptr->len;
+            if (!tl_records_validate_bounds(run_ptr->records, run_ptr->len,
+                                            mv->min_ts, mv->max_ts)) {
+                return false;
+            }
         }
         if (total + ooo_head_len != mv->active_ooo_total_len) {
             return false;

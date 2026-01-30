@@ -1,5 +1,6 @@
 #include "tl_segment_iter.h"
 #include "../internal/tl_range.h"
+#include "tl_segment_range.h"
 #include <string.h>
 
 /*===========================================================================
@@ -55,18 +56,6 @@ static bool advance_to_next_page(tl_segment_iter_t* it) {
     return false;
 }
 
-/**
- * Load the current record from the current page and row.
- */
-static void load_current_record(tl_segment_iter_t* it) {
-    const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
-    const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
-    const tl_page_t* page = meta->page;
-
-    tl_page_get_record(page, it->row_idx, &it->current);
-    it->has_current = true;
-}
-
 /*===========================================================================
  * Lifecycle
  *===========================================================================*/
@@ -84,7 +73,6 @@ void tl_segment_iter_init(tl_segment_iter_t* it,
     it->t2 = t2;
     it->t2_unbounded = t2_unbounded;
     it->done = false;
-    it->has_current = false;
 
     /*
      * Check segment bounds first (pruning).
@@ -101,29 +89,15 @@ void tl_segment_iter_init(tl_segment_iter_t* it,
         return;
     }
 
-    const tl_page_catalog_t* cat = tl_segment_catalog(seg);
-
-    /*
-     * Find first page with max_ts >= t1.
-     * This is the first page that might contain records >= t1.
-     */
-    it->page_idx = tl_page_catalog_find_first_ge(cat, t1);
-
-    /*
-     * Find last page with min_ts < t2 (exclusive end).
-     * For unbounded queries, include all pages to the end.
-     */
-    if (t2_unbounded) {
-        it->page_end = tl_page_catalog_count(cat);
-    } else {
-        it->page_end = tl_page_catalog_find_start_ge(cat, t2);
-    }
-
-    /* No overlapping pages */
-    if (it->page_idx >= it->page_end) {
+    size_t first = 0;
+    size_t last = 0;
+    if (!tl_segment_page_range(seg, t1, t2, t2_unbounded, &first, &last)) {
         it->done = true;
         return;
     }
+
+    it->page_idx = first;
+    it->page_end = last;
 
     /* Initialize first page bounds */
     init_page_bounds(it);
@@ -167,11 +141,12 @@ tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out) {
         }
 
         /* Load current record */
-        load_current_record(it);
+        tl_record_t rec;
+        tl_page_get_record(page, it->row_idx, &rec);
 
         /* Output the record if requested */
         if (out != NULL) {
-            *out = it->current;
+            *out = rec;
         }
 
         /* Advance to next row */
@@ -284,6 +259,4 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
         }
     }
 
-    /* Clear has_current since we've moved */
-    it->has_current = false;
 }

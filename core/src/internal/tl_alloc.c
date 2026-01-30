@@ -159,6 +159,35 @@ void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
     return ptr;
 }
 
+void* tl__mallocarray(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
+    TL_ASSERT(ctx != NULL);
+
+    if (count == 0 || size == 0) {
+        return NULL;
+    }
+
+    if (tl__alloc_would_overflow(count, size)) {
+        return NULL;
+    }
+
+    return tl__malloc(ctx, count * size);
+}
+
+void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size) {
+    TL_ASSERT(ctx != NULL);
+
+    if (count == 0 || size == 0) {
+        (void)tl__realloc(ctx, ptr, 0);
+        return NULL;
+    }
+
+    if (tl__alloc_would_overflow(count, size)) {
+        return NULL;  /* ptr NOT freed — caller retains ownership */
+    }
+
+    return tl__realloc(ctx, ptr, count * size);
+}
+
 void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size) {
     TL_ASSERT(ctx != NULL);
 

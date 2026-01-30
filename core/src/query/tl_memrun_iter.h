@@ -34,8 +34,6 @@ typedef struct tl_memrun_iter {
 
     /* Output state */
     bool            done;
-    bool            has_current;
-    tl_record_t     current;
 } tl_memrun_iter_t;
 
 /*===========================================================================
@@ -100,24 +98,6 @@ void tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target);
 TL_INLINE bool tl_memrun_iter_done(const tl_memrun_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;
-}
-
-/**
- * Peek at current record without advancing.
- * Precondition: !done && has_current
- */
-TL_INLINE const tl_record_t* tl_memrun_iter_peek(const tl_memrun_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    TL_ASSERT(!it->done && it->has_current);
-    return &it->current;
-}
-
-/**
- * Check if iterator has a current record.
- */
-TL_INLINE bool tl_memrun_iter_has_current(const tl_memrun_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    return !it->done && it->has_current;
 }
 
 #endif /* TL_MEMRUN_ITER_H */

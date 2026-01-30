@@ -9,7 +9,7 @@
  * - TL_OK / TL_EOF   -> No exception (success)
  * - TL_EINVAL        -> ValueError
  * - TL_ESTATE        -> TimelogError (API usage error)
- * - TL_EBUSY         -> TimelogBusyError (backpressure - write succeeded, do NOT retry)
+ * - TL_EBUSY         -> TimelogBusyError (context-dependent busy/backpressure)
  * - TL_ENOMEM        -> MemoryError
  * - TL_EOVERFLOW     -> OverflowError
  * - TL_EINTERNAL     -> SystemError (bug in timelog)
@@ -53,10 +53,14 @@ extern PyObject* TlPy_TimelogError;
  *   The write WAS accepted, but backpressure occurred. DO NOT RETRY -
  *   retrying would create duplicate records. Call flush() in manual mode,
  *   or wait for background maintenance to catch up.
- * - For start_maintenance(): Stop in progress - retry later is safe.
+ * - For tl_flush()/tl_compact()/tl_maint_step(): publish retry exhausted;
+ *   no data loss, safe to retry later.
+ * - For start_maintenance(): stop in progress - retry later is safe.
  *
  * Typical causes:
  * - Sealed memrun queue is full (backpressure)
+ * - OOO head flush failed after insert (runset pressure)
+ * - Publish retry exhausted (flush/maintenance)
  * - Maintenance stop in progress
  */
 extern PyObject* TlPy_TimelogBusyError;

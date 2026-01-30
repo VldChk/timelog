@@ -324,13 +324,32 @@ static tl_status_t add_active_tombstones(tl_plan_t* plan,
 
 /**
  * Compare intervals by start timestamp for sorting.
+ *
+ * M-16 fix: Add secondary/tertiary comparisons for qsort stability.
+ * Primary: start timestamp (ascending)
+ * Secondary: end_unbounded (bounded < unbounded)
+ * Tertiary: end (ascending, for bounded intervals)
+ *
+ * This ensures deterministic ordering even when intervals have equal starts.
  */
 static int tomb_cmp(const void* a, const void* b) {
     const tl_interval_t* ia = (const tl_interval_t*)a;
     const tl_interval_t* ib = (const tl_interval_t*)b;
 
+    /* Primary: by start timestamp */
     if (ia->start < ib->start) return -1;
     if (ia->start > ib->start) return 1;
+
+    /* Secondary: bounded < unbounded */
+    if (!ia->end_unbounded && ib->end_unbounded) return -1;
+    if (ia->end_unbounded && !ib->end_unbounded) return 1;
+
+    /* Tertiary: by end for bounded intervals */
+    if (!ia->end_unbounded && !ib->end_unbounded) {
+        if (ia->end < ib->end) return -1;
+        if (ia->end > ib->end) return 1;
+    }
+
     return 0;
 }
 
@@ -487,7 +506,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
      */
     size_t l1_start = tl_manifest_l1_find_first_overlap(manifest, t1);
     for (size_t i = l1_start; i < tl_manifest_l1_count(manifest); i++) {
-        tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
+        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
         /* Stop early if segment starts past range end */
         if (!t2_unbounded && seg->min_ts >= t2) {
@@ -518,10 +537,19 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
      * Assign priorities based on position (later = higher priority).
      */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
-        /* Check overlap */
-        if (!tl_range_overlaps(seg->min_ts, seg->max_ts, t1, t2, t2_unbounded)) {
+        /* Check overlap using record/tombstone bounds independently. */
+        bool overlaps = false;
+        if (tl_segment_has_records(seg)) {
+            overlaps |= tl_range_overlaps(seg->record_min_ts, seg->record_max_ts,
+                                          t1, t2, t2_unbounded);
+        }
+        if (tl_segment_has_tombstones(seg)) {
+            overlaps |= tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
+                                          t1, t2, t2_unbounded);
+        }
+        if (!overlaps) {
             plan->segments_pruned++;
             continue;
         }
@@ -563,7 +591,19 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
                                 tl_manifest_l0_count(manifest) - 1)->generation + 1;
         }
 
-        st = add_memrun_source(plan, mr, base_priority + (uint32_t)i);
+        /*
+         * M-15 fix: Overflow-safe priority assignment with saturation.
+         * If base_priority + i would exceed UINT32_MAX, saturate to UINT32_MAX.
+         * This preserves relative ordering within the valid range.
+         */
+        uint32_t priority;
+        if (base_priority > UINT32_MAX - (uint32_t)i) {
+            priority = UINT32_MAX;  /* Saturate on overflow */
+        } else {
+            priority = base_priority + (uint32_t)i;
+        }
+
+        st = add_memrun_source(plan, mr, priority);
         if (st != TL_OK) goto fail;
 
         st = add_memrun_tombstones(plan, mr);

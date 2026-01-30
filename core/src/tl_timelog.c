@@ -474,6 +474,10 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     tl_atomic_init_u64(&tl->compactions_total, 0);
     tl_atomic_init_u64(&tl->compaction_retries, 0);
     tl_atomic_init_u64(&tl->compaction_publish_ebusy, 0);
+    tl_atomic_init_u64(&tl->compaction_select_calls, 0);
+    tl_atomic_init_u64(&tl->compaction_select_l0_inputs, 0);
+    tl_atomic_init_u64(&tl->compaction_select_l1_inputs, 0);
+    tl_atomic_init_u64(&tl->compaction_select_no_work, 0);
 
     /* Initialize lifecycle state */
     tl->is_open = true;
@@ -1793,13 +1797,20 @@ tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
 #define TL_MAINT_BACKOFF_INIT_MS   10
 #define TL_MAINT_BACKOFF_MAX_MS    100
 
+typedef enum tl_work_t {
+    TL_WORK_NONE               = 0,
+    TL_WORK_FLUSH              = 1u << 0,
+    TL_WORK_COMPACT_EXPLICIT   = 1u << 1,
+    TL_WORK_COMPACT_HEURISTIC  = 1u << 2,
+    TL_WORK_RESHAPE_L0         = 1u << 3  /* Reserved for future use */
+} tl_work_t;
+
 static void* tl__maint_worker_entry(void* arg) {
     tl_timelog_t* tl = (tl_timelog_t*)arg;
     uint32_t backoff_ms = TL_MAINT_BACKOFF_INIT_MS;
 
     for (;;) {
-        bool do_flush = false;
-        bool do_compact = false;
+        tl_work_t work = TL_WORK_NONE;
 
         /*-------------------------------------------------------------------
          * Phase 1: Wait for work or shutdown (under maint_mu)
@@ -1830,8 +1841,12 @@ static void* tl__maint_worker_entry(void* arg) {
 
         /* Copy flags and clear under maint_mu.
          * Since we hold the lock, this is atomic with respect to setters. */
-        do_flush = tl->flush_pending;
-        do_compact = tl->compact_pending;
+        if (tl->flush_pending) {
+            work |= TL_WORK_FLUSH;
+        }
+        if (tl->compact_pending) {
+            work |= TL_WORK_COMPACT_EXPLICIT;
+        }
 
         tl->flush_pending = false;
         tl->compact_pending = false;
@@ -1849,7 +1864,7 @@ static void* tl__maint_worker_entry(void* arg) {
 
         /* Override missed signals: if work exists, do it */
         if (sealed_len > 0) {
-            do_flush = true;
+            work |= TL_WORK_FLUSH;
         }
 
         /* Check compaction heuristic only if there's pending flush work.
@@ -1857,8 +1872,8 @@ static void* tl__maint_worker_entry(void* arg) {
          * Rationale: tl__compaction_needed() acquires writer_mu and may compute
          * delete-debt (expensive segment scan). On idle periodic wakes with no
          * pending work, this is wasted effort. We only check heuristics when:
-         * - do_compact is not already set (explicit request already handled)
-         * - do_flush is true (flush will create new L0 segments)
+         * - explicit compaction not already requested
+         * - flush work is pending (flush will create new L0 segments)
          *
          * CORRECTNESS: This gating is safe because compaction triggers (L0 count
          * and delete-debt) can only change when new segments are created via flush.
@@ -1870,9 +1885,9 @@ static void* tl__maint_worker_entry(void* arg) {
          * pure idle periodic wakes (no sealed runs). Users who require prompt
          * delete-debt cleanup should ensure write activity continues or use
          * tl_compact() for explicit compaction requests. */
-        if (!do_compact && do_flush) {
+        if (!(work & TL_WORK_COMPACT_EXPLICIT) && (work & TL_WORK_FLUSH)) {
             if (tl__compaction_needed(tl)) {
-                do_compact = true;
+                work |= TL_WORK_COMPACT_HEURISTIC;
             }
         }
 
@@ -1881,12 +1896,12 @@ static void* tl__maint_worker_entry(void* arg) {
          *
          * Simple fairness policy: flush one, then check compaction.
          *-------------------------------------------------------------------*/
-        if (do_flush) {
+        if (work & TL_WORK_FLUSH) {
             tl_status_t st;
             while ((st = tl__flush_one(tl)) == TL_OK) {
                 /* Fairness: flush one, check compaction */
                 if (tl__compaction_needed(tl)) {
-                    do_compact = true;
+                    work |= TL_WORK_COMPACT_HEURISTIC;
                     break;
                 }
             }
@@ -1947,7 +1962,7 @@ static void* tl__maint_worker_entry(void* arg) {
          * Error handling mirrors flush: backoff on transient errors,
          * re-set compact_pending to ensure retry.
          *-------------------------------------------------------------------*/
-        if (do_compact) {
+        if (work & (TL_WORK_COMPACT_EXPLICIT | TL_WORK_COMPACT_HEURISTIC)) {
             tl_status_t st = tl__compact_one_step(tl);
 
             /* Handle transient errors with backoff */
@@ -2390,6 +2405,10 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
         out->compactions_total = tl_atomic_load_relaxed_u64(&tl->compactions_total);
         out->compaction_retries = tl_atomic_load_relaxed_u64(&tl->compaction_retries);
         out->compaction_publish_ebusy = tl_atomic_load_relaxed_u64(&tl->compaction_publish_ebusy);
+        out->compaction_select_calls = tl_atomic_load_relaxed_u64(&tl->compaction_select_calls);
+        out->compaction_select_l0_inputs = tl_atomic_load_relaxed_u64(&tl->compaction_select_l0_inputs);
+        out->compaction_select_l1_inputs = tl_atomic_load_relaxed_u64(&tl->compaction_select_l1_inputs);
+        out->compaction_select_no_work = tl_atomic_load_relaxed_u64(&tl->compaction_select_no_work);
 
         /*
          * Adaptive segmentation metrics (V-Next).

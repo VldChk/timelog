@@ -89,6 +89,21 @@ void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size);
 void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size);
 
 /**
+ * Allocate array with overflow check.
+ *
+ * Returns NULL if count == 0, size == 0, or (count * size) overflows.
+ */
+void* tl__mallocarray(tl_alloc_ctx_t* ctx, size_t count, size_t size);
+
+/**
+ * Reallocate array with overflow check.
+ *
+ * Returns NULL if count == 0, size == 0, or (count * size) overflows.
+ * If count == 0 or size == 0, frees ptr and returns NULL.
+ */
+void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size);
+
+/**
  * Free memory.
  *
  * @param ctx Allocator context

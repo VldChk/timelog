@@ -1,7 +1,6 @@
 #include "tl_snapshot.h"
 #include "../internal/tl_timelog_internal.h"
 #include "../internal/tl_locks.h"
-#include "../internal/tl_seqlock.h"
 #include "../internal/tl_range.h"
 #include <string.h>
 
@@ -84,91 +83,62 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
     snap->alloc = alloc;
 
     /*
-     * Seqlock retry loop for snapshot consistency.
-     *
-     * Protocol (from Software Design Spec Section 4.2):
-     * 1. Lock writer_mu
-     * 2. Read seqlock seq1 (must be even)
-     * 3. Acquire manifest reference
-     * 4. Capture memview (locks memtable_mu internally)
-     * 5. Read seqlock seq2
-     * 6. Unlock writer_mu
-     * 7. If seq1 != seq2 OR seq1 is odd: retry
+     * Snapshot consistency is guaranteed by writer_mu:
+     * - Writers hold writer_mu during publish (manifest swap + memtable pop)
+     * - Snapshots hold writer_mu during capture
+     * Therefore, we do not need a seqlock retry loop here.
      */
-    for (;;) {
-        tl_manifest_t* manifest = NULL;
-        tl_memview_shared_t* mv = NULL;
-        bool used_cache = false;
+    tl_manifest_t* manifest = NULL;
+    tl_memview_shared_t* mv = NULL;
+    bool used_cache = false;
 
-        TL_LOCK_WRITER(tl);
+    TL_LOCK_WRITER(tl);
 
-        /* Step 1: Read seqlock (must be even = no publish in progress) */
-        uint64_t seq1 = tl_seqlock_read(&tl->view_seq);
-        if (!tl_seqlock_is_even(seq1)) {
-            /* Publish in progress - unlock and retry */
+    /* Acquire manifest reference under writer_mu to prevent UAF */
+    manifest = tl_manifest_acquire(tl->manifest);
+
+    /* Capture or reuse memview (locks memtable_mu internally) */
+    uint64_t epoch = tl_memtable_epoch(&tl->memtable);
+    if (tl->memview_cache != NULL && tl->memview_cache_epoch == epoch) {
+        mv = tl_memview_shared_acquire(tl->memview_cache);
+        used_cache = true;
+    } else {
+        tl_status_t st = tl_memview_shared_capture(&mv,
+                                                    &tl->memtable,
+                                                    &tl->memtable_mu,
+                                                    alloc,
+                                                    epoch);
+        if (st != TL_OK) {
+            tl_manifest_release(manifest);
             TL_UNLOCK_WRITER(tl);
-            continue;
+            tl__free(alloc, snap);
+            return st;
         }
-
-        /* Step 2: Acquire manifest reference */
-        manifest = tl_manifest_acquire(tl->manifest);
-
-        /* Step 3: Capture or reuse memview (locks memtable_mu internally) */
-        uint64_t epoch = tl_memtable_epoch(&tl->memtable);
-        if (tl->memview_cache != NULL && tl->memview_cache_epoch == epoch) {
-            mv = tl_memview_shared_acquire(tl->memview_cache);
-            used_cache = true;
-        } else {
-            tl_status_t st = tl_memview_shared_capture(&mv,
-                                                        &tl->memtable,
-                                                        &tl->memtable_mu,
-                                                        alloc,
-                                                        epoch);
-            if (st != TL_OK) {
-                tl_manifest_release(manifest);
-                TL_UNLOCK_WRITER(tl);
-                tl__free(alloc, snap);
-                return st;
-            }
-        }
-
-        /* Step 4: Read seqlock again and validate */
-        uint64_t seq2 = tl_seqlock_read(&tl->view_seq);
-        bool ok = tl_seqlock_validate(seq1, seq2);
-
-        if (ok) {
-            TL_UNLOCK_WRITER(tl);
-
-            /* Sort OOO head off writer_mu for fresh captures. */
-            if (!used_cache) {
-                tl_memview_sort_head(&mv->view);
-
-                /* Update cache if epoch unchanged (two-phase capture). */
-                TL_LOCK_WRITER(tl);
-                if (tl_memtable_epoch(&tl->memtable) == epoch) {
-                    if (tl->memview_cache == NULL ||
-                        tl->memview_cache_epoch != epoch) {
-                        if (tl->memview_cache != NULL) {
-                            tl_memview_shared_release(tl->memview_cache);
-                        }
-                        tl->memview_cache = tl_memview_shared_acquire(mv);
-                        tl->memview_cache_epoch = epoch;
-                    }
-                }
-                TL_UNLOCK_WRITER(tl);
-            }
-
-            snap->manifest = manifest;
-            snap->memview = mv;
-            break;  /* Success - consistent snapshot */
-        }
-
-        TL_UNLOCK_WRITER(tl);
-
-        /* Inconsistent - release captured state and retry */
-        tl_manifest_release(manifest);
-        tl_memview_shared_release(mv);
     }
+
+    TL_UNLOCK_WRITER(tl);
+
+    /* Sort OOO head off writer_mu for fresh captures. */
+    if (!used_cache) {
+        tl_memview_sort_head(&mv->view);
+
+        /* Update cache if epoch unchanged (two-phase capture). */
+        TL_LOCK_WRITER(tl);
+        if (tl_memtable_epoch(&tl->memtable) == epoch) {
+            if (tl->memview_cache == NULL ||
+                tl->memview_cache_epoch != epoch) {
+                if (tl->memview_cache != NULL) {
+                    tl_memview_shared_release(tl->memview_cache);
+                }
+                tl->memview_cache = tl_memview_shared_acquire(mv);
+                tl->memview_cache_epoch = epoch;
+            }
+        }
+        TL_UNLOCK_WRITER(tl);
+    }
+
+    snap->manifest = manifest;
+    snap->memview = mv;
 
     /* Compute global bounds from manifest + memview */
     snap_compute_bounds(snap);
