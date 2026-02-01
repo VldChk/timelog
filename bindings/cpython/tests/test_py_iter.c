@@ -412,8 +412,7 @@ TEST(empty_range)
 TEST(reversed_range_empty)
 {
     /*
-     * range(10, 5) should return empty iterator (mirrors core behavior)
-     * No ValueError - just empty.
+     * range(10, 5) should raise ValueError (t1 > t2)
      */
     PyTimelog* tl = create_timelog_default();
     ASSERT_NOT_NULL(tl);
@@ -437,14 +436,8 @@ TEST(reversed_range_empty)
     Py_DECREF(t1);
     Py_DECREF(range_method);
 
-    ASSERT_NOT_NULL(iter);  /* Should succeed, not raise */
-
-    /* Iterate - should get nothing (empty iterator) */
-    PyObject* item = PyIter_Next(iter);
-    ASSERT_NULL(item);
-    ASSERT(!PyErr_Occurred());  /* StopIteration, not error */
-
-    Py_DECREF(iter);
+    ASSERT_NULL(iter);
+    ASSERT_EXCEPTION(PyExc_ValueError);
     Py_DECREF(obj);
     close_and_dealloc(tl);
 }

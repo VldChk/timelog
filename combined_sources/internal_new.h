@@ -4,7 +4,7 @@
    COMBINED HEADER FILE: internal.h
 
    Generated from: core\src\internal
-   Generated at:   2026-02-01 01:57:22
+   Generated at:   2026-01-30 00:27:14
 
    This file combines all .h files from the internal/ subfolder.
 

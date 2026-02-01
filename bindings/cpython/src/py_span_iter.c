@@ -210,7 +210,14 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     uint32_t flags = TL_PAGESPAN_DEFAULT;
     tl_pagespan_iter_t* core_iter = NULL;
 
+    if (tl_py_lock_checked(tl_obj) < 0) {
+        Py_DECREF(hook_ctx->timelog);
+        PyMem_Free(hook_ctx);
+        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
+        return NULL;
+    }
     tl_status_t st = tl_pagespan_iter_open(tl_obj->tl, t1, t2, flags, &hooks, &core_iter);
+    TL_PY_UNLOCK(tl_obj);
 
     if (st != TL_OK) {
         /*

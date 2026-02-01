@@ -39,11 +39,14 @@ extern "C" {
  *===========================================================================*/
 
 #if PY_VERSION_HEX < 0x030A0000
+#ifndef TL_Py_NewRef_DEFINED
+#define TL_Py_NewRef_DEFINED
 static inline PyObject* TL_Py_NewRef(PyObject* obj) {
     Py_INCREF(obj);
     return obj;
 }
 #define Py_NewRef TL_Py_NewRef
+#endif
 #endif
 
 /*===========================================================================

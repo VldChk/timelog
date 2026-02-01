@@ -1,14 +1,14 @@
-# Timelog V1 - Engineering Execution Plan (Refined)
+# Timelog V2 - Engineering Execution Plan (Refined)
 
-This document defines the engineering execution path for Timelog V1 as a greenfield
+This document defines the engineering execution path for Timelog V2 as a greenfield
 implementation. It is derived from and consistent with:
-- timelog_v1_c_hld.md (architectural north star)
-- timelog_v1_c_software_design_spec.md (API contracts and protocols)
-- timelog_v1_lld_storage_pages.md (pages, segments, manifest, tombstones)
-- timelog_v1_lld_write_path.md (memtable, flush, publication)
-- timelog_v1_lld_read_path.md (snapshot, iterators, merge, filtering)
-- timelog_v1_lld_compaction_policy.md (selection, merge, L1 output)
-- timelog_v1_lld_background_maintenance.md (scheduling, concurrency)
+- timelog_v2_c_hld.md (architectural north star)
+- timelog_v2_c_software_design_spec.md (API contracts and protocols)
+- timelog_v2_lld_storage_pages.md (pages, segments, manifest, tombstones)
+- timelog_v2_lld_write_path.md (memtable, flush, publication)
+- timelog_v2_lld_read_path.md (snapshot, iterators, merge, filtering)
+- timelog_v2_lld_compaction_policy.md (selection, merge, L1 output)
+- timelog_v2_lld_background_maintenance.md (scheduling, concurrency)
 - timelog.h (public contract, canonical source for API surface)
 
 Each phase builds on the previous. Dependencies are explicit. Deliverables are
@@ -39,7 +39,7 @@ scaffolding. Ensure spec and header are identical before implementation begins.
 Before writing implementation code, verify spec and header alignment:
 
 - Treat `timelog.h` as the canonical public API source.
-- Ensure `timelog_v1_c_software_design_spec.md` code blocks exactly match:
+- Ensure `timelog_v2_c_software_design_spec.md` code blocks exactly match:
   - `tl_status_t` enum values (TL_OK=0, TL_EOF=1, TL_EINVAL=10, etc.)
   - `tl_allocator_t` field order (malloc_fn, calloc_fn, realloc_fn, free_fn)
   - `tl_config_t` field order and names
@@ -258,7 +258,7 @@ Deliverables:
 - tl_page_t with SoA layout (ts[], h[])
 - Page metadata: min_ts, max_ts, count, flags
 - Page delete flags enum (FULLY_LIVE, FULLY_DELETED, PARTIAL_DELETED)
-- Row delete metadata pointer (reserved for V2, always NULL in V1)
+- Row delete metadata pointer (reserved for future versions, always NULL in V2)
 - Page builder: accepts sorted records, computes metadata
 - Within-page binary search for range boundaries
 
@@ -367,7 +367,8 @@ Deliverables:
   - ooo_head (append-only out-of-order head, may be unsorted)
   - ooo_runs (immutable sorted OOO runs)
   - active_tombs (coalesced interval set)
-  - sealed queue (FIFO of tl_memrun_t*)
+  - sealed queue (FIFO ring buffer: sealed_head + sealed_len)
+  - sealed_epoch (monotonic counter for sealed queue changes)
   - last_inorder_ts tracking
   - active_bytes_est for threshold checks
   - ooo_chunk_records and ooo_run_limit
@@ -584,7 +585,7 @@ Memview pruning:
 
 Effective tombstones:
 - Union of L0 tombstones + L1 tombstones (if present) + memview tombstones
-- L1 tombstones should be empty in V1, but include defensively for correctness
+- L1 tombstones should be empty in V2, but include defensively for correctness
 - Clip to [t1, t2)
 
 Deliverables:
@@ -871,7 +872,7 @@ Reference: Background Maintenance LLD Section 9
 ## Phase 8: Compaction Implementation
 
 **Goal:** Implement L0 -> L1 compaction with windowed non-overlap and correct publication.
-Compaction is **required** for V1 to bound read amplification via max_delta_segments.
+Compaction is **required** for V2 to bound read amplification via max_delta_segments.
 
 ### 8.1 Compaction Triggers
 
@@ -1078,9 +1079,9 @@ Reference: Spec Section 6.5
 
 ---
 
-## Definition of Done (V1 Feature Complete)
+## Definition of Done (V2 Feature Complete)
 
-V1 is complete when:
+V2 is complete when:
 
 1. **Contract coherence:**
    - Spec code blocks match timelog.h exactly
@@ -1191,6 +1192,7 @@ From `timelog.h`:
 ---
 
 This plan provides a clear engineering path from empty repository to feature-complete
-Timelog V1 implementation, with concurrency invariants established early and
-compaction treated as a required V1 component.
+Timelog V2 implementation, with concurrency invariants established early and
+compaction treated as a required V2 component.
+
 

@@ -64,6 +64,7 @@ static struct PyModuleDef timelog_module = {
 PyMODINIT_FUNC PyInit__timelog(void)
 {
     PyObject* m = NULL;
+    int errors_inited = 0;
 
     /* Create module */
     m = PyModule_Create(&timelog_module);
@@ -79,6 +80,7 @@ PyMODINIT_FUNC PyInit__timelog(void)
     if (TlPy_InitErrors(m) < 0) {
         goto error;
     }
+    errors_inited = 1;
 
     /*
      * Ready the PyTimelog type.
@@ -172,6 +174,9 @@ PyMODINIT_FUNC PyInit__timelog(void)
     return m;
 
 error:
+    if (errors_inited) {
+        TlPy_FiniErrors();
+    }
     Py_XDECREF(m);
     return NULL;
 }

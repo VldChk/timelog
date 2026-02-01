@@ -109,6 +109,29 @@ static int tlpy_finalize_python(void)
  * Tests
  *===========================================================================*/
 
+typedef struct {
+    PyObject_HEAD
+    tl_py_handle_ctx_t* ctx;
+} ReentrantObj;
+
+static void Reentrant_dealloc(ReentrantObj* self)
+{
+    if (self->ctx != NULL) {
+        /* Re-enter drain while already draining */
+        (void)tl_py_drain_retired(self->ctx, 0);
+    }
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyTypeObject Reentrant_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "timelog._test.ReentrantObj",
+    .tp_basicsize = sizeof(ReentrantObj),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_dealloc = (destructor)Reentrant_dealloc,
+    .tp_new = PyType_GenericNew,
+};
+
 TEST(ctx_init_destroy)
 {
     tl_py_handle_ctx_t ctx;
@@ -197,6 +220,32 @@ TEST(on_drop_enqueues)
 
     /* Clean up */
     Py_DECREF(obj);
+    tl_py_handle_ctx_destroy(&ctx);
+}
+
+TEST(drain_reentrancy_guard)
+{
+    tl_py_handle_ctx_t ctx;
+    tl_py_handle_ctx_init(&ctx, 0);
+
+    if (PyType_Ready(&Reentrant_Type) < 0) {
+        PyErr_Print();
+        tests_failed++;
+        return;
+    }
+
+    ReentrantObj* obj = (ReentrantObj*)Reentrant_Type.tp_alloc(&Reentrant_Type, 0);
+    ASSERT(obj != NULL);
+    obj->ctx = &ctx;
+
+    /* Use the sole reference as the engine-owned ref */
+    tl_handle_t h = tl_py_handle_encode((PyObject*)obj);
+    tl_py_on_drop_handle(&ctx, 1000, h);
+
+    size_t drained = tl_py_drain_retired(&ctx, 0);
+    ASSERT_EQ(drained, 1);
+    ASSERT_EQ(tl_py_retired_queue_len(&ctx), 0);
+
     tl_py_handle_ctx_destroy(&ctx);
 }
 
@@ -356,6 +405,7 @@ int run_py_handle_tests(void)
     run_pins_enter_exit();
     run_handle_encode_decode_roundtrip();
     run_on_drop_enqueues();
+    run_drain_reentrancy_guard();
     run_drain_blocked_by_pins();
     run_force_drain_ignores_pins();
     run_batch_limit();

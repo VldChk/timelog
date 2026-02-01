@@ -466,6 +466,11 @@ static PyObject* PyPageSpan_get_end_ts(PyPageSpan* self, void* closure)
     return PyLong_FromLongLong((long long)self->last_ts);
 }
 
+static PyObject* PyPageSpan_get_last_ts(PyPageSpan* self, void* closure)
+{
+    return PyPageSpan_get_end_ts(self, closure);
+}
+
 static PyObject* PyPageSpan_get_closed(PyPageSpan* self, void* closure)
 {
     (void)closure;
@@ -502,7 +507,9 @@ static PyGetSetDef PyPageSpan_getset[] = {
     {"start_ts", (getter)PyPageSpan_get_start_ts, NULL,
      "First timestamp in this span.", NULL},
     {"end_ts", (getter)PyPageSpan_get_end_ts, NULL,
-     "Last timestamp in this span.", NULL},
+     "Last (inclusive) timestamp in this span.", NULL},
+    {"last_ts", (getter)PyPageSpan_get_last_ts, NULL,
+     "Alias for end_ts (inclusive last timestamp).", NULL},
     {"closed", (getter)PyPageSpan_get_closed, NULL,
      "True if span is closed.", NULL},
     {NULL, NULL, NULL, NULL, NULL}

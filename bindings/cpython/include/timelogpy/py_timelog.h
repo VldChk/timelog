@@ -9,22 +9,22 @@
  * Thread Safety:
  *   Single-writer model: the same instance must not be used concurrently
  *   for writes or lifecycle operations without external synchronization.
+ *   The binding serializes core calls to prevent concurrent use while the
+ *   GIL is released, but this is not a guarantee of full thread safety.
  *   Snapshot-based iterators are safe for concurrent reads.
  *
  *   The GIL is released during flush(), compact(), stop_maintenance(), and
  *   close(). The user must ensure no other thread touches this Timelog
  *   instance while these operations are in progress.
  *
- * Known Limitations:
- *   - Unflushed records leak on close(): The core engine's tl_close() does
- *     not invoke the on_drop callback for memtable records. To avoid leaking
- *     Python objects, ALWAYS call flush() before close(). Records that reach
- *     compaction will have their references properly released.
+ *   This binding requires the CPython GIL and is NOT supported on
+ *   free-threaded/no-GIL Python builds.
  *
- *   - Close-time reclamation: Even with flush(), compaction must run to
- *     physically drop records and trigger DECREF. When maintenance is
- *     disabled, Python does not expose tl_maint_step(), so compaction will
- *     not run. Use maintenance='background' for automatic compaction.
+ * Known Limitations:
+ *   - Unflushed records are dropped on close(). The binding tracks all
+ *     inserted handles and releases Python objects during close(), but
+ *     data is not persisted. Call flush() before close() if you need to
+ *     preserve all records.
  *
  * See: docs/V2/timelog_v2_engineering_plan.md
  *      docs/V2/timelog_v2_c_software_design_spec.md
@@ -98,6 +98,12 @@ typedef struct {
     tl_py_handle_ctx_t handle_ctx;
 
     /**
+     * Per-instance lock to serialize all core calls.
+     * Protects against concurrent use while GIL is released.
+     */
+    PyThread_type_lock core_lock;
+
+    /**
      * Config introspection (stored for Python access).
      * Set during init, immutable after.
      */
@@ -127,6 +133,12 @@ extern PyTypeObject PyTimelog_Type;
  */
 #define PyTimelog_Check(op) PyObject_TypeCheck(op, &PyTimelog_Type)
 
+/**
+ * Internal helper: acquire core lock and re-check closed state.
+ * Returns 0 on success, -1 with exception set on closed.
+ */
+int tl_py_lock_checked(PyTimelog* self);
+
 /*===========================================================================
  * Macros for Method Implementation
  *===========================================================================*/
@@ -151,6 +163,23 @@ extern PyTypeObject PyTimelog_Type;
         if ((self)->closed || (self)->tl == NULL) { \
             TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
             return -1; \
+        } \
+    } while (0)
+
+/**
+ * Serialize core calls. No-op if lock is NULL.
+ */
+#define TL_PY_LOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_acquire_lock((self)->core_lock, 1); \
+        } \
+    } while (0)
+
+#define TL_PY_UNLOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_release_lock((self)->core_lock); \
         } \
     } while (0)
 

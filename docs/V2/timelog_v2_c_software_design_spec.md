@@ -1,12 +1,12 @@
-# Timelog V1 C Software Design Spec (Refined)
+# Timelog V2 C Software Design Spec (Refined)
 
-This document consolidates the current Timelog V1 design decisions from:
-- docs/timelog_v1_c_hld.md
-- docs/timelog_v1_lld_background_maintenance.md
-- docs/timelog_v1_lld_compaction_policy.md
-- docs/timelog_v1_lld_read_path.md
-- docs/timelog_v1_lld_storage_pages.md
-- docs/timelog_v1_lld_write_path.md
+This document consolidates the current Timelog V2 design decisions from:
+- docs/V2/timelog_v2_c_hld.md
+- docs/V2/timelog_v2_lld_background_maintenance.md
+- docs/V2/timelog_v2_lld_compaction_policy.md
+- docs/V2/timelog_v2_lld_read_path.md
+- docs/V2/timelog_v2_lld_storage_pages.md
+- docs/V2/timelog_v2_lld_write_path.md
 
 It defines the public API contracts, configuration, module boundaries, and
 critical concurrency/publication protocols. It is written to be implementation
@@ -31,11 +31,12 @@ LLDs; those are referenced by name.
 
 - Timelog stores (ts:int64, handle:opaque) and does not interpret payloads.
 - Range semantics are half-open: [t1, t2).
-- Duplicates are preserved; tie order is unspecified.
+- Duplicates are preserved; tie order is deterministic by source priority/handle
+  but not a public contract.
 - All writes go to L0 first (memtable); segments are immutable after publish.
 - L0 segments may overlap; L1 segments are non-overlapping by time window.
-- Deletes are time-range tombstones; per-page masks are reserved for V2.
-- Reads are snapshot-based: manifest + memview are captured atomically.
+- Deletes are time-range tombstones; per-page masks remain a future optimization.
+- Reads are snapshot-based: manifest + memview captured via seqlock protocol.
 - Single writer externally; multiple readers supported.
 
 ---
@@ -90,6 +91,7 @@ Locks:
 - flush_mu: serializes flush build + publish (single flusher at a time).
 - maint_mu: protects maintenance state and signaling.
 - memtable.mu: protects sealed memrun queue.
+- memtable.cond: backpressure waiters for sealed queue space (paired with memtable.mu).
 - view_seq: atomic seqlock counter for snapshot consistency.
 
 Lock ordering (strict):
@@ -513,7 +515,7 @@ Utilities:
 - L1 outputs are tombstone-free.
 - Tombstone-only L0 segments are allowed to preserve residual intervals.
 - Manifest version increments on each publish.
-- Per-page row bitsets are reserved for V2 (defensive read support only).
+- Per-page row bitsets are reserved for future versions (defensive read support only).
 
 ---
 
@@ -524,6 +526,7 @@ Utilities:
 
 ---
 
-This spec is the implementation-ready contract for Timelog V1. Any changes to
+This spec is the implementation-ready contract for Timelog V2. Any changes to
 protocols or public APIs must be reflected here and in the LLDs to preserve
 cross-document consistency.
+

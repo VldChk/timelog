@@ -1,10 +1,10 @@
-﻿# Timelog V1 LLD (Read Path)
+# Timelog V2 LLD (Read Path)
 
-This document defines the read-path LLD for Timelog V1, aligned with:
+This document defines the read-path LLD for Timelog V2, aligned with:
 - proposal_unified.md
-- timelog_v1_c_hld.md
-- timelog_v1_lld_storage_pages.md
-- timelog_v1_lld_write_path.md
+- docs/V2/timelog_v2_c_hld.md
+- docs/V2/timelog_v2_lld_storage_pages.md
+- docs/V2/timelog_v2_lld_write_path.md
 
 It updates the read path for the L0/L1 model, windowed L1 non-overlap, and the
 new memtable design. It targets maximum lookup performance while preserving
@@ -16,7 +16,8 @@ snapshot isolation and delete correctness.
 
 1) Correctness: return exactly all visible records in [t1, t2) not deleted by
    tombstones in the snapshot.
-2) Ordering: emit non-decreasing ts; duplicates preserved; tie order unspecified.
+2) Ordering: emit non-decreasing ts; duplicates preserved; tie order deterministic
+   by source priority/handle but not a public contract.
 3) Snapshot isolation: a query sees a consistent manifest + memview.
 4) Performance: prune aggressively, scan sequentially, avoid unnecessary work.
 
@@ -91,7 +92,9 @@ L1 (sorted, non-overlapping):
 - scan forward until min_ts >= t2
 
 L0 (small, overlapping):
-- linear scan and select seg where seg.max_ts >= t1 and seg.min_ts < t2
+- linear scan and select seg if **records overlap** OR **tombstones overlap**
+  the query range. Use record_min/max and tomb_min/max independently to
+  avoid false positives when tombstones are disjoint from records.
 
 ### 4.2 Page pruning (segment iterator internal)
 
@@ -113,7 +116,7 @@ Sealed memruns:
 
 Build eff_tombs as union of:
 - L0 segment tombstones (all overlapping L0 segments)
-- L1 segment tombstones (should be empty in V1, but include for safety)
+- L1 segment tombstones (should be empty in V2, but include for safety)
 - memview tombstones (active + sealed)
 
 Clip to [t1, t2) during union.
@@ -138,7 +141,7 @@ Algorithm:
 
 Output: sorted stream of records from that segment.
 
-V1 note: PARTIAL_DELETED pages are not emitted in V1; this path is defensive.
+V2 note: PARTIAL_DELETED pages are not emitted in V2; this path is defensive.
 
 ### 5.2 Memrun iterator
 
@@ -273,5 +276,6 @@ If any of these invariants break, read correctness fails.
 
 ---
 
-This LLD defines the complete read path for Timelog V1 with L0/L1 model,
+This LLD defines the complete read path for Timelog V2 with L0/L1 model,
 windowed non-overlap in L1, and a high-performance lookup path.
+

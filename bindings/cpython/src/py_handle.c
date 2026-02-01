@@ -31,6 +31,101 @@
 #include <string.h>   /* memset */
 
 /*===========================================================================
+ * Live Handle Tracking (multiset)
+ *===========================================================================*/
+
+/* Hash table entry states */
+#define TL_PY_LIVE_EMPTY     0
+#define TL_PY_LIVE_FULL      1
+#define TL_PY_LIVE_TOMBSTONE 2
+
+struct tl_py_live_entry {
+    PyObject* obj;
+    uint64_t  count;
+    uint8_t   state;
+};
+
+static size_t tl_py_live_hash_ptr(const void* ptr)
+{
+    uintptr_t x = (uintptr_t)ptr;
+    /* Simple mix; sufficient for pointer keys */
+    x ^= x >> 17;
+    x *= (uintptr_t)0xed5ad4bbU;
+    x ^= x >> 11;
+    x *= (uintptr_t)0xac4c1b51U;
+    x ^= x >> 15;
+    return (size_t)x;
+}
+
+static tl_status_t tl_py_live_rehash(tl_py_handle_ctx_t* ctx, size_t new_cap)
+{
+    tl_py_live_entry_t* old_entries = ctx->live_entries;
+    size_t old_cap = ctx->live_cap;
+
+    tl_py_live_entry_t* entries = (tl_py_live_entry_t*)calloc(
+        new_cap, sizeof(*entries));
+    if (entries == NULL) {
+        return TL_ENOMEM;
+    }
+
+    ctx->live_entries = entries;
+    ctx->live_cap = new_cap;
+    ctx->live_len = 0;
+    ctx->live_tombstones = 0;
+
+    if (old_entries != NULL) {
+        for (size_t i = 0; i < old_cap; i++) {
+            if (old_entries[i].state == TL_PY_LIVE_FULL) {
+                /* Reinsert */
+                PyObject* obj = old_entries[i].obj;
+                uint64_t count = old_entries[i].count;
+                size_t mask = ctx->live_cap - 1;
+                size_t idx = tl_py_live_hash_ptr(obj) & mask;
+                for (;;) {
+                    tl_py_live_entry_t* e = &ctx->live_entries[idx];
+                    if (e->state == TL_PY_LIVE_EMPTY) {
+                        e->state = TL_PY_LIVE_FULL;
+                        e->obj = obj;
+                        e->count = count;
+                        ctx->live_len++;
+                        break;
+                    }
+                    idx = (idx + 1) & mask;
+                }
+            }
+        }
+        free(old_entries);
+    }
+
+    return TL_OK;
+}
+
+static tl_status_t tl_py_live_ensure(tl_py_handle_ctx_t* ctx, size_t needed)
+{
+    size_t cap = ctx->live_cap;
+    if (cap == 0) {
+        size_t init_cap = 64;
+        if (init_cap < needed) {
+            while (init_cap < needed) {
+                init_cap *= 2;
+            }
+        }
+        return tl_py_live_rehash(ctx, init_cap);
+    }
+
+    /* Keep load factor <= ~0.7 (including tombstones) */
+    size_t used = ctx->live_len + ctx->live_tombstones + needed;
+    if (used * 10 <= cap * 7) {
+        return TL_OK;
+    }
+
+    size_t new_cap = cap * 2;
+    if (new_cap < cap) {
+        return TL_EOVERFLOW;
+    }
+    return tl_py_live_rehash(ctx, new_cap);
+}
+/*===========================================================================
  * Compile-Time Validation
  *===========================================================================*/
 
@@ -58,17 +153,21 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
         return TL_EINVAL;
     }
 
-    memset(ctx, 0, sizeof(*ctx));
-
     /* Initialize atomics */
     atomic_init(&ctx->retired_head, NULL);
     atomic_init(&ctx->pins, 0);
     atomic_init(&ctx->retired_count, 0);
     atomic_init(&ctx->drained_count, 0);
     atomic_init(&ctx->alloc_failures, 0);
+    atomic_flag_clear_explicit(&ctx->drain_guard, memory_order_release);
 
     /* Store configuration (immutable after init) */
     ctx->drain_batch_limit = drain_batch_limit;
+    ctx->live_entries = NULL;
+    ctx->live_cap = 0;
+    ctx->live_len = 0;
+    ctx->live_tombstones = 0;
+    ctx->live_tracking_failed = 0;
 
     return TL_OK;
 }
@@ -100,9 +199,24 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
             "This indicates a snapshot/iterator leak.\n",
             pins);
     }
+
+    if (ctx->live_len != 0) {
+        fprintf(stderr,
+            "WARNING: tl_py_handle_ctx_destroy called with %zu live objects. "
+            "Did you forget to call tl_py_live_release_all()?\n",
+            ctx->live_len);
+    }
 #endif
 
-    memset(ctx, 0, sizeof(*ctx));
+    if (ctx->live_entries != NULL) {
+        free(ctx->live_entries);
+    }
+
+    ctx->live_entries = NULL;
+    ctx->live_cap = 0;
+    ctx->live_len = 0;
+    ctx->live_tombstones = 0;
+    ctx->live_tracking_failed = 0;
 }
 
 /*===========================================================================
@@ -277,6 +391,17 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 #endif
 
     /*
+     * Reentrancy guard: prevent nested drains triggered via __del__.
+     * If already draining, bail out immediately.
+     */
+    if (atomic_flag_test_and_set_explicit(
+            &ctx->drain_guard, memory_order_acquire)) {
+        return 0;
+    }
+
+    size_t count = 0;
+
+    /*
      * Check pin count before draining.
      *
      * If pins > 0, snapshots/iterators are active and might still yield
@@ -287,7 +412,7 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
      */
     uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_acquire);
     if (pins != 0 && !force) {
-        return 0;
+        goto out;
     }
 
     /*
@@ -304,10 +429,8 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
         &ctx->retired_head, NULL, memory_order_acq_rel);
 
     if (list == NULL) {
-        return 0;  /* Nothing to drain */
+        goto out;  /* Nothing to drain */
     }
-
-    size_t count = 0;
 
     /*
      * Batch limit: 0 = unlimited.
@@ -350,6 +473,9 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
         tl_py_drop_node_t* node = list;
         list = node->next;
 
+        /* Update live tracking before DECREF */
+        tl_py_live_note_drop(ctx, node->obj);
+
         /*
          * CRITICAL: Py_DECREF may run arbitrary Python code via __del__.
          *
@@ -369,7 +495,132 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
     /* Update metrics */
     atomic_fetch_add_explicit(&ctx->drained_count, count, memory_order_relaxed);
 
+out:
+    atomic_flag_clear_explicit(&ctx->drain_guard, memory_order_release);
     return count;
+}
+
+/*===========================================================================
+ * Live Handle Tracking (multiset) Implementation
+ *===========================================================================*/
+
+tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(PyGILState_Check() &&
+           "tl_py_live_note_insert requires GIL");
+#endif
+
+    if (ctx == NULL || obj == NULL) {
+        return TL_EINVAL;
+    }
+
+    tl_status_t st = tl_py_live_ensure(ctx, 1);
+    if (st != TL_OK) {
+        ctx->live_tracking_failed = 1;
+        return st;
+    }
+
+    size_t mask = ctx->live_cap - 1;
+    size_t idx = tl_py_live_hash_ptr(obj) & mask;
+    size_t first_tombstone = (size_t)-1;
+
+    for (;;) {
+        tl_py_live_entry_t* e = &ctx->live_entries[idx];
+        if (e->state == TL_PY_LIVE_EMPTY) {
+            if (first_tombstone != (size_t)-1) {
+                e = &ctx->live_entries[first_tombstone];
+                ctx->live_tombstones--;
+            }
+            e->state = TL_PY_LIVE_FULL;
+            e->obj = obj;
+            e->count = 1;
+            ctx->live_len++;
+            return TL_OK;
+        }
+        if (e->state == TL_PY_LIVE_TOMBSTONE) {
+            if (first_tombstone == (size_t)-1) {
+                first_tombstone = idx;
+            }
+        } else if (e->obj == obj) {
+            e->count++;
+            return TL_OK;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(PyGILState_Check() &&
+           "tl_py_live_note_drop requires GIL");
+#endif
+
+    if (ctx == NULL || obj == NULL || ctx->live_cap == 0) {
+        return;
+    }
+
+    size_t mask = ctx->live_cap - 1;
+    size_t idx = tl_py_live_hash_ptr(obj) & mask;
+
+    for (;;) {
+        tl_py_live_entry_t* e = &ctx->live_entries[idx];
+        if (e->state == TL_PY_LIVE_EMPTY) {
+            return;
+        }
+        if (e->state == TL_PY_LIVE_FULL && e->obj == obj) {
+            if (e->count > 1) {
+                e->count--;
+                return;
+            }
+            e->obj = NULL;
+            e->count = 0;
+            e->state = TL_PY_LIVE_TOMBSTONE;
+            ctx->live_len--;
+            ctx->live_tombstones++;
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
+{
+#ifndef NDEBUG
+    assert(PyGILState_Check() &&
+           "tl_py_live_release_all requires GIL");
+#endif
+
+    if (ctx == NULL || ctx->live_entries == NULL) {
+        return;
+    }
+
+#ifndef NDEBUG
+    if (ctx->live_tracking_failed) {
+        fprintf(stderr,
+            "WARNING: live handle tracking encountered allocation failures; "
+            "some objects may leak.\n");
+    }
+#endif
+
+    for (size_t i = 0; i < ctx->live_cap; i++) {
+        tl_py_live_entry_t* e = &ctx->live_entries[i];
+        if (e->state == TL_PY_LIVE_FULL) {
+            for (uint64_t c = e->count; c > 0; c--) {
+                Py_DECREF(e->obj);
+            }
+            e->obj = NULL;
+            e->count = 0;
+            e->state = TL_PY_LIVE_EMPTY;
+        }
+    }
+
+    free(ctx->live_entries);
+    ctx->live_entries = NULL;
+    ctx->live_cap = 0;
+    ctx->live_len = 0;
+    ctx->live_tombstones = 0;
 }
 
 /*===========================================================================

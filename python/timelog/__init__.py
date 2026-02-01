@@ -23,15 +23,23 @@ Example:
     2000 {'event': 'end'}
 
 Thread Safety:
-    Timelog instances are NOT thread-safe. Use external locks or
-    separate instances per thread.
+    Single-writer model. All write/maintenance calls must be externally
+    serialized. Snapshot-based iterators are safe for concurrent reads,
+    but the Timelog object is not generally thread-safe and some methods
+    (flush/compact/close) release the GIL. The binding serializes core
+    calls to avoid concurrent use during GIL-released operations, but
+    this is not a full thread-safety guarantee. Use external coordination
+    if the same instance can be touched from multiple threads. This
+    binding requires the CPython GIL and is not supported on
+    free-threaded/no-GIL Python builds.
 
 Resource Management:
     Call close() or use the context manager to release resources.
-    Note: close() may leave unflushed objects in sealed memruns
-    unreachable unless flush() or background maintenance ran first.
-    For guaranteed cleanup, keep maintenance="background" (default)
-    or call flush() before close().
+    Note: close() will drop any unflushed records (data loss) but will
+    release all Python objects still owned by the engine. For data safety,
+    call flush() before close().
+    In maintenance="disabled" mode, use maint_step() to run compaction
+    manually when needed.
 """
 
 from __future__ import annotations
@@ -83,15 +91,25 @@ class Timelog(_CTimelog):
     - Out-of-order ingestion with LSM-style compaction
     - Snapshot isolation for concurrent reads
     - Zero-copy bulk timestamp access via page_spans()
+    - Snapshot diagnostics via stats(), validate(), min_ts/max_ts, next_ts/prev_ts
 
     Thread Safety:
-        NOT thread-safe. Access from multiple threads requires external
-        synchronization. Consistent with sqlite3.Connection semantics.
+        Single-writer. Access from multiple threads requires external
+        synchronization. Iterators are snapshot-based and safe for
+        concurrent reads, but the Timelog object is not generally
+        thread-safe because some methods release the GIL. The binding
+        serializes core calls during GIL-released operations, but this
+        does not make the API fully thread-safe. This binding requires
+        the CPython GIL and is not supported on free-threaded builds.
 
     Warning:
-        close() may leave unflushed objects unreachable if sealed memruns
-        exist. Call flush() before close(), or keep maintenance="background"
-        (default) to ensure all objects are properly released.
+        close() drops any unflushed records (data loss) but releases all
+        Python objects still owned by the engine. Call flush() before close()
+        if you need to persist all records.
+
+    Manual maintenance:
+        In maintenance="disabled" mode, use maint_step() to perform flush/
+        compaction work explicitly. compact() only requests work.
 
     Example:
         >>> with Timelog(time_unit="ms") as log:
@@ -107,14 +125,39 @@ class Timelog(_CTimelog):
             Default: "ms" (milliseconds).
         maintenance: Background maintenance mode. "disabled" for manual
             control, "background" for automatic. Default: "background".
-        memtable_max_bytes: Maximum bytes before memtable seals (default ~1MB).
-        target_page_bytes: Target size for storage pages (default ~64KB).
-        sealed_max_runs: Max sealed memruns before backpressure (default 4).
+        memtable_max_bytes: Maximum bytes before memtable seals (0 = default).
+        target_page_bytes: Target size for storage pages (0 = default).
+        sealed_max_runs: Max sealed memruns before backpressure (0 = default).
         drain_batch_limit: Objects to drain per operation (0=unlimited).
-        busy_policy: How to handle backpressure.
+        busy_policy: How to handle write backpressure (TL_EBUSY) for
+            append/delete operations.
             "raise": Raise TimelogBusyError (record still inserted).
             "silent": Silently continue (record inserted).
             "flush": Auto-flush then continue (record inserted).
+            Note: TL_EBUSY can also occur for flush/maintenance publish
+            retries; those are safe to retry and are not controlled by
+            busy_policy.
+        ooo_budget_bytes: OOO budget before early seal (0 = default).
+        sealed_wait_ms: Backpressure wait timeout in background mode
+            (0 = immediate TL_EBUSY).
+        maintenance_wakeup_ms: Worker wake interval (0 = default).
+        max_delta_segments: L0 segment bound (0 = default).
+        window_size: L1 window size (0 = default based on time_unit).
+        window_origin: Window origin (default 0).
+        delete_debt_threshold: Ratio [0,1] to trigger delete-debt compaction.
+        compaction_target_bytes: Optional compaction output cap (0 = unlimited).
+        max_compaction_inputs: Optional cap on inputs per compaction (0 = unlimited).
+        max_compaction_windows: Optional cap on windows per compaction (0 = unlimited).
+        adaptive_target_records: Enable adaptive segmentation (0 = disabled).
+        adaptive_min_window: Minimum window size.
+        adaptive_max_window: Maximum window size.
+        adaptive_hysteresis_pct: Minimum % change to apply.
+        adaptive_window_quantum: Snap window to multiples (0 = no snapping).
+        adaptive_alpha: EWMA smoothing factor [0.0, 1.0].
+        adaptive_warmup_flushes: Flushes before adapting.
+        adaptive_stale_flushes: Flushes without update = stale (0 = infinite).
+        adaptive_failure_backoff_threshold: Failures before backoff.
+        adaptive_failure_backoff_pct: % to grow window on backoff.
 
     Raises:
         ValueError: Invalid configuration parameter.

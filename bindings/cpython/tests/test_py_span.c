@@ -1296,6 +1296,12 @@ TEST(span_start_end_ts)
     ASSERT_EQ(PyLong_AsLongLong(end_ts), 300);
     Py_DECREF(end_ts);
 
+    /* last_ts is an alias for end_ts */
+    PyObject* last_ts = PyObject_GetAttrString(span, "last_ts");
+    ASSERT_NOT_NULL(last_ts);
+    ASSERT_EQ(PyLong_AsLongLong(last_ts), 300);
+    Py_DECREF(last_ts);
+
     Py_DECREF(span);
     Py_DECREF(iter);
     Py_DECREF(obj);

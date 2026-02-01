@@ -4,7 +4,7 @@
    COMBINED HEADER FILE: bindings.h
 
    Generated from: bindings\cpython\include\timelogpy
-   Generated at:   2026-01-26 20:20:58
+   Generated at:   2026-02-01 01:57:22
 
    This file combines all .h files from the bindings/ subfolder.
 
@@ -38,7 +38,7 @@
  * - TL_OK / TL_EOF   -> No exception (success)
  * - TL_EINVAL        -> ValueError
  * - TL_ESTATE        -> TimelogError (API usage error)
- * - TL_EBUSY         -> TimelogBusyError (backpressure - write succeeded, do NOT retry)
+ * - TL_EBUSY         -> TimelogBusyError (context-dependent busy/backpressure)
  * - TL_ENOMEM        -> MemoryError
  * - TL_EOVERFLOW     -> OverflowError
  * - TL_EINTERNAL     -> SystemError (bug in timelog)
@@ -82,10 +82,14 @@ extern PyObject* TlPy_TimelogError;
  *   The write WAS accepted, but backpressure occurred. DO NOT RETRY -
  *   retrying would create duplicate records. Call flush() in manual mode,
  *   or wait for background maintenance to catch up.
- * - For start_maintenance(): Stop in progress - retry later is safe.
+ * - For tl_flush()/tl_compact()/tl_maint_step(): publish retry exhausted;
+ *   no data loss, safe to retry later.
+ * - For start_maintenance(): stop in progress - retry later is safe.
  *
  * Typical causes:
  * - Sealed memrun queue is full (backpressure)
+ * - OOO head flush failed after insert (runset pressure)
+ * - Publish retry exhausted (flush/maintenance)
  * - Maintenance stop in progress
  */
 extern PyObject* TlPy_TimelogBusyError;
@@ -172,13 +176,15 @@ static inline int TlPy_StatusOK(tl_status_t status) {
  * - Track active snapshot pins to prevent premature release
  * - Queue retired objects for deferred DECREF via lock-free stack
  * - Drain retired objects when safe (pins == 0 and GIL held)
+ * - Track live handles (multiset) to release all objects on close()
  *
  * Thread safety:
  * - on_drop callback: called from maintenance thread, NO GIL, NO Python C-API
  * - drain: called from Python thread with GIL held
  * - pins: atomic counter, safe from any thread
  *
- * See: docs/timelog_v1_lld_B1_python_handle_lifetime.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_HANDLE_H
@@ -195,6 +201,8 @@ static inline int TlPy_StatusOK(tl_status_t status) {
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct tl_py_live_entry tl_py_live_entry_t;
 
 /*===========================================================================
  * Compile-Time Safety
@@ -290,6 +298,24 @@ typedef struct tl_py_handle_ctx {
      * Each failure represents a leaked object (unavoidable to prevent UAF).
      */
     _Atomic(uint64_t) alloc_failures;
+
+    /**
+     * Reentrancy guard for drain path.
+     * Prevents nested tl_py_drain_retired() calls via __del__ reentry.
+     */
+    atomic_flag drain_guard;
+
+    /**
+     * Live handle tracking (multiset by pointer identity).
+     * Used to DECREF all remaining objects on close().
+     *
+     * NOTE: Accessed only with GIL held (append/extend/drain/close).
+     */
+    struct tl_py_live_entry* live_entries;
+    size_t                  live_cap;
+    size_t                  live_len;
+    size_t                  live_tombstones;
+    uint8_t                 live_tracking_failed;
 
 } tl_py_handle_ctx_t;
 
@@ -395,6 +421,34 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle);
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force);
 
 /*===========================================================================
+ * Live Handle Tracking (Multiset)
+ *
+ * Best-effort tracking of inserted handles so close() can DECREF all
+ * remaining objects even if they were never tombstoned/compacted.
+ *===========================================================================*/
+
+/**
+ * Record that a handle was inserted (increments count).
+ * Must be called with GIL held.
+ *
+ * @return TL_OK on success, TL_ENOMEM on allocation failure.
+ *         On failure, tracking is best-effort; caller should continue.
+ */
+tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj);
+
+/**
+ * Record that a handle was physically dropped (decrements count).
+ * Must be called with GIL held.
+ */
+void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj);
+
+/**
+ * Release all remaining tracked objects (DECREF counts).
+ * Must be called with GIL held. Clears tracking table.
+ */
+void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
+
+/*===========================================================================
  * Metrics API
  *===========================================================================*/
 
@@ -449,7 +503,8 @@ uint64_t tl_py_alloc_failures(const tl_py_handle_ctx_t* ctx);
  *   ensuring the embedded handle_ctx remains valid. A pin is acquired
  *   on creation and released on close/exhaustion/dealloc.
  *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
+ * See: docs/V2/timelog_v2_lld_read_path.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_ITER_H
@@ -473,11 +528,14 @@ extern "C" {
  *===========================================================================*/
 
 #if PY_VERSION_HEX < 0x030A0000
+#ifndef TL_Py_NewRef_DEFINED
+#define TL_Py_NewRef_DEFINED
 static inline PyObject* TL_Py_NewRef(PyObject* obj) {
     Py_INCREF(obj);
     return obj;
 }
 #define Py_NewRef TL_Py_NewRef
+#endif
 #endif
 
 /*===========================================================================
@@ -592,7 +650,7 @@ extern PyTypeObject PyTimelogIter_Type;
  *   iterator creation) handles pins_exit and Py_DECREF of the timelog.
  *   Page memory remains valid as long as any span holds an owner ref.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_H
@@ -794,7 +852,7 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog);
  *   Individual PageSpan instances each hold their own owner ref, remaining
  *   valid after the iterator is closed.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_ITER_H
@@ -882,7 +940,7 @@ extern PyTypeObject PyPageSpanIter_Type;
  * @param timelog PyTimelog instance
  * @param t1      Range start (inclusive)
  * @param t2      Range end (exclusive)
- * @param kind    "segment" (only supported value)
+ * @param kind    "segment" (currently supported value)
  * @return New PageSpanIter object, or NULL on error with exception set
  */
 PyObject* PyPageSpanIter_Create(PyObject* timelog,
@@ -926,7 +984,7 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
  *   The view holds a strong reference to its parent PageSpan.
  *   The PageSpan must remain open for the view to function.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_OBJECTS_H
@@ -1021,26 +1079,27 @@ PyObject* PyPageSpanObjectsView_Create(PyObject* span);
  * and maintenance.
  *
  * Thread Safety:
- *   A Timelog instance is NOT thread-safe. Do not access the same instance
- *   from multiple threads without external synchronization. This is consistent
- *   with Python's sqlite3.Connection and file objects.
+ *   Single-writer model: the same instance must not be used concurrently
+ *   for writes or lifecycle operations without external synchronization.
+ *   The binding serializes core calls to prevent concurrent use while the
+ *   GIL is released, but this is not a guarantee of full thread safety.
+ *   Snapshot-based iterators are safe for concurrent reads.
  *
  *   The GIL is released during flush(), compact(), stop_maintenance(), and
- *   close() to allow other Python threads to run. The user must ensure no
- *   other thread accesses this Timelog instance during these operations.
+ *   close(). The user must ensure no other thread touches this Timelog
+ *   instance while these operations are in progress.
+ *
+ *   This binding requires the CPython GIL and is NOT supported on
+ *   free-threaded/no-GIL Python builds.
  *
  * Known Limitations:
- *   - Unflushed records leak on close(): The core engine's tl_close() does
- *     not invoke the on_drop callback for memtable records. To avoid leaking
- *     Python objects, ALWAYS call flush() before close(). Records that reach
- *     compaction will have their references properly released.
+ *   - Unflushed records are dropped on close(). The binding tracks all
+ *     inserted handles and releases Python objects during close(), but
+ *     data is not persisted. Call flush() before close() if you need to
+ *     preserve all records.
  *
- *   - Close-time reclamation: Even with flush(), compaction must run to
- *     physically drop records and trigger DECREF. If maintenance is disabled,
- *     call compact() and run_maintenance() before close().
- *
- * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
- *      docs/engineering_plan_B2_pytimelog.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_TIMELOG_H
@@ -1063,8 +1122,11 @@ extern "C" {
  * Controls behavior when TL_EBUSY is returned from write operations.
  *
  * CRITICAL: TL_EBUSY from tl_append/tl_delete_* means the record/tombstone
- * WAS successfully inserted, but backpressure occurred (sealed queue full).
- * This is NOT a failure - the data is in the engine.
+ * WAS successfully inserted, but backpressure occurred. This is NOT a
+ * failure - the data is in the engine.
+ *
+ * Note: TL_EBUSY can also be returned by flush/maintenance publish retries
+ * (safe to retry). Busy policy only applies to write operations.
  *
  * Policy options:
  * - RAISE:  Raise TimelogBusyError (record IS inserted)
@@ -1108,6 +1170,12 @@ typedef struct {
     tl_py_handle_ctx_t handle_ctx;
 
     /**
+     * Per-instance lock to serialize all core calls.
+     * Protects against concurrent use while GIL is released.
+     */
+    PyThread_type_lock core_lock;
+
+    /**
      * Config introspection (stored for Python access).
      * Set during init, immutable after.
      */
@@ -1137,6 +1205,12 @@ extern PyTypeObject PyTimelog_Type;
  */
 #define PyTimelog_Check(op) PyObject_TypeCheck(op, &PyTimelog_Type)
 
+/**
+ * Internal helper: acquire core lock and re-check closed state.
+ * Returns 0 on success, -1 with exception set on closed.
+ */
+int tl_py_lock_checked(PyTimelog* self);
+
 /*===========================================================================
  * Macros for Method Implementation
  *===========================================================================*/
@@ -1161,6 +1235,23 @@ extern PyTypeObject PyTimelog_Type;
         if ((self)->closed || (self)->tl == NULL) { \
             TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
             return -1; \
+        } \
+    } while (0)
+
+/**
+ * Serialize core calls. No-op if lock is NULL.
+ */
+#define TL_PY_LOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_acquire_lock((self)->core_lock, 1); \
+        } \
+    } while (0)
+
+#define TL_PY_UNLOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_release_lock((self)->core_lock); \
         } \
     } while (0)
 

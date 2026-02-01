@@ -1,10 +1,10 @@
-﻿# Timelog V1 LLD (Write Path)
+# Timelog V2 LLD (Write Path)
 
-This document defines the write-path LLD for Timelog V1. It aligns with:
+This document defines the write-path LLD for Timelog V2. It aligns with:
 - proposal_unified.md
-- timelog_v1_c_hld.md
-- timelog_v1_lld_storage_pages.md
-- timelog_v1_lld_read_path.md
+- docs/V2/timelog_v2_c_hld.md
+- docs/V2/timelog_v2_lld_storage_pages.md
+- docs/V2/timelog_v2_lld_read_path.md
 
 Scope:
 - Memtable design and ingestion algorithms.
@@ -14,7 +14,7 @@ Scope:
 
 Out of scope:
 - Compaction selection, merge, and L1 output rules.
-  See docs/timelog_v1_lld_compaction_policy.md.
+  See docs/V2/timelog_v2_lld_compaction_policy.md.
 
 ---
 
@@ -63,7 +63,7 @@ triggers it; it does not define selection or output rules.
 ### 3.1 Requirements
 - High ingest throughput for mostly ordered writes.
 - Efficient range and point lookups (lower_bound + scan).
-- Avoid snapshot-time sorting.
+- Avoid large snapshot-time sorting; only bounded head sorting off-lock is acceptable.
 - Support tombstone inserts with coalescing.
 
 ### 3.2 Data structures
@@ -75,7 +75,8 @@ Active state (single-writer only):
 - active_tombs: coalesced interval set [t1, t2).
 
 Sealed state:
-- sealed queue of memruns (FIFO), each immutable.
+- sealed queue of memruns (FIFO), fixed-capacity ring buffer to avoid realloc
+  on the seal hot path (sealed_head + sealed_len).
 
 Metadata:
 - last_inorder_ts
@@ -91,9 +92,11 @@ Config (tl_config_t):
 
 ### 3.3 Chosen OOO structure (rationale)
 
-- OOO head + immutable runs (mini-LSM) for V1.
+- OOO head + immutable runs (mini-LSM) for V2.
 - OOO inserts are O(1) appends into the head.
 - Sorting cost is bounded to head flushes (O(H log H) per chunk).
+- Sorting uses (ts, handle) comparator to ensure deterministic order even
+  when the underlying sort is unstable (qsort).
 - Snapshots pin immutable runs and sort only the head copy off-lock.
 - Read path merges run + head + runs with a small, bounded fan-in.
 
@@ -115,8 +118,10 @@ typedef struct tl_memtable {
     tl_intervals_t active_tombs;    /* coalesced intervals */
 
     tl_memrun_t**  sealed;          /* FIFO queue (preallocated) */
+    size_t         sealed_head;     /* Ring buffer head (oldest index) */
     size_t         sealed_len;
     size_t         sealed_max_runs; /* capacity of sealed[] */
+    uint64_t       sealed_epoch;    /* Monotonic counter for queue changes */
 
     tl_ts_t        last_inorder_ts;
     size_t         active_bytes_est;
@@ -173,7 +178,7 @@ else if ts >= last_inorder_ts:
     last_inorder_ts = ts
 else:
     append to ooo_head
-    update head sortedness tracking
+    update head sortedness tracking (monotonic by (ts, handle))
     if ooo_head_len >= ooo_chunk_records:
         flush head -> new OOO run (sorted)
 ```
@@ -381,4 +386,5 @@ signal compaction worker or run compaction once in manual mode
 
 This LLD defines the write path only. Compaction selection, merge, L1 output,
 and manifest updates for compaction are defined in
- docs/timelog_v1_lld_compaction_policy.md.
+ docs/timelog_v2_lld_compaction_policy.md.
+

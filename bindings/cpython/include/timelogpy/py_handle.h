@@ -10,6 +10,7 @@
  * - Track active snapshot pins to prevent premature release
  * - Queue retired objects for deferred DECREF via lock-free stack
  * - Drain retired objects when safe (pins == 0 and GIL held)
+ * - Track live handles (multiset) to release all objects on close()
  *
  * Thread safety:
  * - on_drop callback: called from maintenance thread, NO GIL, NO Python C-API
@@ -34,6 +35,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct tl_py_live_entry tl_py_live_entry_t;
 
 /*===========================================================================
  * Compile-Time Safety
@@ -129,6 +132,24 @@ typedef struct tl_py_handle_ctx {
      * Each failure represents a leaked object (unavoidable to prevent UAF).
      */
     _Atomic(uint64_t) alloc_failures;
+
+    /**
+     * Reentrancy guard for drain path.
+     * Prevents nested tl_py_drain_retired() calls via __del__ reentry.
+     */
+    atomic_flag drain_guard;
+
+    /**
+     * Live handle tracking (multiset by pointer identity).
+     * Used to DECREF all remaining objects on close().
+     *
+     * NOTE: Accessed only with GIL held (append/extend/drain/close).
+     */
+    struct tl_py_live_entry* live_entries;
+    size_t                  live_cap;
+    size_t                  live_len;
+    size_t                  live_tombstones;
+    uint8_t                 live_tracking_failed;
 
 } tl_py_handle_ctx_t;
 
@@ -232,6 +253,34 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle);
  * @return Number of objects drained
  */
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force);
+
+/*===========================================================================
+ * Live Handle Tracking (Multiset)
+ *
+ * Best-effort tracking of inserted handles so close() can DECREF all
+ * remaining objects even if they were never tombstoned/compacted.
+ *===========================================================================*/
+
+/**
+ * Record that a handle was inserted (increments count).
+ * Must be called with GIL held.
+ *
+ * @return TL_OK on success, TL_ENOMEM on allocation failure.
+ *         On failure, tracking is best-effort; caller should continue.
+ */
+tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj);
+
+/**
+ * Record that a handle was physically dropped (decrements count).
+ * Must be called with GIL held.
+ */
+void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj);
+
+/**
+ * Release all remaining tracked objects (DECREF counts).
+ * Must be called with GIL held. Clears tracking table.
+ */
+void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
 
 /*===========================================================================
  * Metrics API
