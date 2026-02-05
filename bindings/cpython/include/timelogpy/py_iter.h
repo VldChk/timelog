@@ -94,6 +94,14 @@ typedef struct {
     tl_py_handle_ctx_t* handle_ctx;
 
     /**
+     * Query range bounds for view() support.
+     * Normalized at creation time so view() can create a PageSpanIter
+     * covering the same range regardless of original factory method.
+     */
+    tl_ts_t range_t1;
+    tl_ts_t range_t2;
+
+    /**
      * State flag.
      * 0 = open (resources valid)
      * 1 = closed/exhausted (resources released)

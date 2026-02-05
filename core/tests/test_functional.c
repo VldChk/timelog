@@ -652,6 +652,70 @@ TEST_DECLARE(func_iter_tombstone_after_flush) {
     tl_close(tl);
 }
 
+/*
+ * BUG REPRO: Tombstone filter drops first record of each subsequent segment.
+ * Two segments flushed, then delete range in first segment's range.
+ * The merge iterator's skip-ahead optimization drops ts=60.
+ */
+TEST_DECLARE(func_iter_tombstone_multi_segment) {
+    tl_config_t cfg = {0};
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Segment 1: [10, 20, 30, 40, 50] */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 50));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Segment 2: [60, 70, 80, 90, 100] */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 60, 60));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 70, 70));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 80, 80));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 90, 90));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Delete [25, 45) — removes ts=30, ts=40 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 25, 45));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Expected: 10, 20, 50, 60, 70, 80, 90, 100 (8 records) */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, TL_TS_MIN, &it));
+
+    tl_record_t rec;
+    int count = 0;
+    int64_t expected[] = {10, 20, 50, 60, 70, 80, 90, 100};
+    int64_t got[16] = {0};
+
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        if (count < 16) got[count] = rec.ts;
+        count++;
+    }
+
+    printf("    Got %d records:", count);
+    for (int i = 0; i < count && i < 16; i++) {
+        printf(" %lld", (long long)got[i]);
+    }
+    printf("\n");
+
+    TEST_ASSERT_EQ(8, count);
+    for (int i = 0; i < 8; i++) {
+        TEST_ASSERT_EQ(expected[i], got[i]);
+    }
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Edge Case Tests (migrated from test_phase5.c)
  *===========================================================================*/
@@ -2509,6 +2573,7 @@ void run_functional_tests(void) {
     /* Post-flush tests (2 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_after_flush);
     RUN_TEST(func_iter_tombstone_after_flush);
+    RUN_TEST(func_iter_tombstone_multi_segment);
 
     /* Edge case tests (5 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_at_ts_max);

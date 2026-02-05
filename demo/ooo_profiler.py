@@ -26,6 +26,7 @@ import argparse
 import csv
 import gc
 import io
+import json
 import os
 import platform
 import random
@@ -41,6 +42,25 @@ from typing import Iterator, NamedTuple, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
 
 from timelog import Timelog, TimelogBusyError
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
+
+
+def _install_timelog_overrides(overrides: dict[str, object]) -> None:
+    """Force Timelog constructor overrides for all profiler-created instances."""
+    global Timelog
+    if not overrides:
+        return
+
+    class _TimelogOverride(Timelog):
+        def __init__(self, *args, **kwargs):
+            kwargs.update(overrides)
+            super().__init__(*args, **kwargs)
+
+    Timelog = _TimelogOverride
 
 # =============================================================================
 # Configuration
@@ -164,11 +184,9 @@ def format_memory(mb: float) -> str:
 
 def get_memory_rss_mb() -> float:
     """Get current process RSS memory in MB."""
-    try:
-        import psutil
-        return psutil.Process().memory_info().rss / (1024 * 1024)
-    except ImportError:
+    if psutil is None:
         return 0.0
+    return psutil.Process().memory_info().rss / (1024 * 1024)
 
 
 def get_gc_counts() -> tuple[int, int, int]:
@@ -296,6 +314,55 @@ def print_phase_summary(state: ProfilerState, phase_name: str, records: int, wal
 
     print("-" * 80)
     print()
+
+
+def _percentiles(values: list[float]) -> dict:
+    if not values:
+        return {}
+    s = sorted(values)
+    n = len(s)
+
+    def pct(p: float) -> float:
+        idx = int((p / 100.0) * (n - 1))
+        return s[idx]
+
+    return {
+        "count": n,
+        "min": s[0],
+        "p50": pct(50),
+        "p95": pct(95),
+        "p99": pct(99),
+        "max": s[-1],
+        "avg": sum(s) / n,
+    }
+
+
+def build_run_summary(
+    dataset: str,
+    path: Path,
+    maintenance_mode: str,
+    busy_policy: str,
+    state: ProfilerState,
+    total: int,
+    elapsed: float,
+) -> dict:
+    rps = total / elapsed if elapsed > 0 else 0
+    return {
+        "dataset": dataset,
+        "source": str(path),
+        "records": total,
+        "wall_sec": elapsed,
+        "records_per_sec": rps,
+        "ooo_rate": state.overall_ooo_rate(),
+        "adjacent_ooo_rate": state.adjacent_ooo_rate(),
+        "busy_events": state.busy_events,
+        "slow_batch_count": state.slow_batch_count,
+        "memory_rss_mb": get_memory_rss_mb(),
+        "maintenance": maintenance_mode,
+        "busy_policy": busy_policy,
+        "batch_timing_ms": _percentiles(state.all_batch_times_ms),
+        "flush_timing_ms": _percentiles(state.flush_times_ms),
+    }
 
 
 # =============================================================================
@@ -501,7 +568,7 @@ def investigate_dataset(
     use_tiny: bool = False,
     maintenance_mode: str = "background",
     busy_policy: str = "flush",
-) -> None:
+) -> dict:
     """Profile ingestion on a real dataset."""
 
     if dataset == "more_ordered":
@@ -525,7 +592,12 @@ def investigate_dataset(
 
     state = ProfilerState(phase=f"{dataset}_ingest")
 
-    with Timelog(time_unit="ns", maintenance=maintenance_mode, busy_policy=busy_policy) as log:
+    log = Timelog.for_streaming(
+        time_unit="ns",
+        maintenance=maintenance_mode,
+        busy_policy=busy_policy,
+    )
+    try:
         records_iter = load_csv_streaming(path, limit=record_limit)
 
         start = time.perf_counter_ns()
@@ -539,6 +611,11 @@ def investigate_dataset(
             print("  Waiting for maintenance to settle (5s)...")
             time.sleep(5.0)
         print(f"  Final memory: {format_memory(get_memory_rss_mb())}")
+        return build_run_summary(
+            dataset, path, maintenance_mode, busy_policy, state, total, elapsed
+        )
+    finally:
+        log.close()
 
 
 def investigate_synthetic_ooo(
@@ -559,7 +636,8 @@ def investigate_synthetic_ooo(
 
     state = ProfilerState(phase=f"synthetic_ooo_{ooo_rate:.2f}")
 
-    with Timelog(time_unit="ns", maintenance="background", busy_policy=busy_policy) as log:
+    log = Timelog.for_streaming(time_unit="ns", busy_policy=busy_policy)
+    try:
         records_iter = generate_synthetic(record_count, ooo_rate=ooo_rate)
 
         start = time.perf_counter_ns()
@@ -576,6 +654,8 @@ def investigate_synthetic_ooo(
             "rps": rps,
             "memory_mb": get_memory_rss_mb(),
         }
+    finally:
+        log.close()
 
 
 def run_ooo_grid(record_count: int = 500_000) -> None:
@@ -714,7 +794,8 @@ def investigate_dataset_with_manual_flush(
     state = ProfilerState(phase=f"{dataset}_sync_flush")
 
     # Use busy_policy="flush" to automatically flush when backpressure hits
-    with Timelog(time_unit="ns", maintenance="disabled", busy_policy="flush") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         records_iter = load_csv_streaming(path, limit=record_limit)
 
         start = time.perf_counter_ns()
@@ -728,6 +809,8 @@ def investigate_dataset_with_manual_flush(
 
         print_phase_summary(state, f"{name} [sync-flush]", total, elapsed)
         print(f"  Final memory: {format_memory(get_memory_rss_mb())}")
+    finally:
+        log.close()
 
 
 def continuous_monitor(
@@ -764,7 +847,8 @@ def continuous_monitor(
     overall_start = time.perf_counter_ns()
     deadline = time.time() + duration_sec
 
-    with Timelog(time_unit="ns", maintenance="background", busy_policy="flush") as log:
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
         pass_num = 0
 
         try:
@@ -809,6 +893,8 @@ def continuous_monitor(
         print(f"  Final memory: {format_memory(get_memory_rss_mb())}")
         print(f"  Passes:       {pass_num}")
         print("=" * 100)
+    finally:
+        log.close()
 
 
 # =============================================================================
@@ -885,28 +971,103 @@ Examples:
         default="flush",
         help="Backpressure policy for profiling runs (default: flush)",
     )
+    parser.add_argument(
+        "--export-json",
+        type=str,
+        help="Write a JSON summary report to this path",
+    )
+    parser.add_argument(
+        "--force-maintenance",
+        choices=["disabled", "background"],
+        help="Override maintenance mode for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-busy-policy",
+        choices=["raise", "silent", "flush"],
+        help="Override busy_policy for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-memtable-max-bytes",
+        type=int,
+        help="Override memtable_max_bytes for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-target-page-bytes",
+        type=int,
+        help="Override target_page_bytes for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-sealed-max-runs",
+        type=int,
+        help="Override sealed_max_runs for all Timelog instances in this run",
+    )
 
     args = parser.parse_args()
 
+    log_overrides: dict[str, object] = {}
+    if args.force_maintenance is not None:
+        log_overrides["maintenance"] = args.force_maintenance
+    if args.force_busy_policy is not None:
+        log_overrides["busy_policy"] = args.force_busy_policy
+    if args.force_memtable_max_bytes is not None:
+        log_overrides["memtable_max_bytes"] = args.force_memtable_max_bytes
+    if args.force_target_page_bytes is not None:
+        log_overrides["target_page_bytes"] = args.force_target_page_bytes
+    if args.force_sealed_max_runs is not None:
+        log_overrides["sealed_max_runs"] = args.force_sealed_max_runs
+    if log_overrides:
+        _install_timelog_overrides(log_overrides)
+
     print_header()
+    if log_overrides:
+        print("Timelog overrides:")
+        for key in sorted(log_overrides.keys()):
+            print(f"  {key}: {log_overrides[key]}")
+        print()
+
+    summary: Optional[dict] = None
+    mode = "unspecified"
 
     if args.grid:
+        mode = "grid"
         run_ooo_grid(args.records)
     elif args.compare:
+        mode = "compare"
         compare_datasets(args.records, use_tiny=args.tiny)
     elif args.maint_impact:
+        mode = "maintenance_impact"
         investigate_maintenance_impact(args.records, use_tiny=args.tiny)
     elif args.synthetic:
-        investigate_synthetic_ooo(args.ooo_rate, args.records, busy_policy=args.busy_policy)
+        mode = "synthetic"
+        summary = investigate_synthetic_ooo(args.ooo_rate, args.records, busy_policy=args.busy_policy)
     elif args.monitor:
+        mode = "monitor"
         dataset = args.dataset or "less_ordered"
         continuous_monitor(dataset, args.duration, use_tiny=args.tiny)
     elif args.dataset:
-        investigate_dataset(args.dataset, args.records, use_tiny=args.tiny, busy_policy=args.busy_policy)
+        mode = "dataset"
+        summary = investigate_dataset(args.dataset, args.records, use_tiny=args.tiny, busy_policy=args.busy_policy)
     else:
         # Default: quick comparison
+        mode = "compare_default"
         print("No mode specified. Running quick comparison (100K records each)...")
         compare_datasets(100_000, use_tiny=True)
+
+    if args.export_json:
+        payload = {
+            "mode": mode,
+            "summary": summary,
+            "log_overrides": log_overrides,
+            "system": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "cpu_count": os.cpu_count(),
+                "psutil_version": getattr(psutil, "__version__", None),
+            },
+        }
+        with open(args.export_json, "w", newline="") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+        print(f"\nJSON report written to: {args.export_json}")
 
 
 if __name__ == "__main__":

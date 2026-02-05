@@ -14,6 +14,7 @@
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
+#include "timelogpy/py_span_iter.h"
 #include "timelog/timelog.h"
 
 /*===========================================================================
@@ -297,12 +298,27 @@ static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
  * Method/GetSet Tables
  *===========================================================================*/
 
+static PyObject* PyTimelogIter_view(PyTimelogIter* self, PyObject* Py_UNUSED(noargs))
+{
+    if (self->closed) {
+        PyErr_SetString(PyExc_ValueError, "iterator is closed");
+        return NULL;
+    }
+    if (!self->owner) {
+        PyErr_SetString(PyExc_RuntimeError, "iterator owner is no longer available");
+        return NULL;
+    }
+    return PyPageSpanIter_Create(self->owner, self->range_t1, self->range_t2, "segment");
+}
+
 static PyMethodDef PyTimelogIter_methods[] = {
     {"close", (PyCFunction)PyTimelogIter_close, METH_NOARGS,
      "close() -> None\n\nRelease iterator resources. Idempotent."},
     {"next_batch", (PyCFunction)PyTimelogIter_next_batch, METH_O,
      "next_batch(n) -> list[tuple[int, object]]\n\n"
      "Return up to n records. Empty list on exhaustion."},
+    {"view", (PyCFunction)PyTimelogIter_view, METH_NOARGS,
+     "view() -> PageSpanIter\n\nReturn a PageSpanIter for the same time range."},
     {"__enter__", (PyCFunction)PyTimelogIter_enter, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyTimelogIter_exit, METH_VARARGS,

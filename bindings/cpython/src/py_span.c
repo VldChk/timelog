@@ -394,12 +394,6 @@ static PyObject* PyPageSpan_copy_timestamps(PyPageSpan* self, PyObject* noargs)
     return list;
 }
 
-static PyObject* PyPageSpan_copy(PyPageSpan* self, PyObject* noargs)
-{
-    /* Current behavior: copy() returns the same as copy_timestamps(). */
-    return PyPageSpan_copy_timestamps(self, noargs);
-}
-
 /*===========================================================================
  * Sequence Protocol (__len__)
  *===========================================================================*/
@@ -491,9 +485,6 @@ static PyMethodDef PyPageSpan_methods[] = {
     {"copy_timestamps", (PyCFunction)PyPageSpan_copy_timestamps, METH_NOARGS,
      "copy_timestamps() -> list[int]\n\n"
      "Return a copy of timestamps as a Python list."},
-    {"copy", (PyCFunction)PyPageSpan_copy, METH_NOARGS,
-     "copy() -> list[int]\n\n"
-     "Return a copy of timestamps as a Python list."},
     {"__enter__", (PyCFunction)PyPageSpan_enter, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyPageSpan_exit, METH_VARARGS,
@@ -525,7 +516,8 @@ PyTypeObject PyPageSpan_Type = {
     .tp_doc = PyDoc_STR(
         "Zero-copy view of timestamps from a single page slice.\n\n"
         "The .timestamps property returns a memoryview directly backed by\n"
-        "page memory. Cannot be instantiated directly; use Timelog.page_spans()."
+        "page memory. Cannot be instantiated directly; use Timelog.views()\n"
+        "(alias: page_spans())."
     ),
     .tp_basicsize = sizeof(PyPageSpan),
     .tp_itemsize = 0,

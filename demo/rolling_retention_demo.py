@@ -17,9 +17,9 @@ It focuses on long-run behavior under continuous delete/append:
 All monitoring is written to a JSONL file for offline analysis.
 
 Delete modes:
-  - ttl: uses delete_before(cutoff) where cutoff = latest_ts - retain_span
+  - ttl: uses cutoff(cutoff) where cutoff = latest_ts - retain_span
     retain_span is a fraction of the full file time span.
-  - range: uses delete_range(old_min, old_max) for queued batch ranges.
+  - range: uses delete(old_min, old_max) for queued batch ranges.
 """
 
 from __future__ import annotations
@@ -219,8 +219,6 @@ def build_timelog(args: argparse.Namespace) -> Timelog:
     kwargs = {}
     if args.time_unit is not None:
         kwargs["time_unit"] = args.time_unit
-    if args.maintenance is not None:
-        kwargs["maintenance"] = args.maintenance
     if args.memtable_max_bytes is not None:
         kwargs["memtable_max_bytes"] = args.memtable_max_bytes
     if args.target_page_bytes is not None:
@@ -231,7 +229,12 @@ def build_timelog(args: argparse.Namespace) -> Timelog:
         kwargs["drain_batch_limit"] = args.drain_batch_limit
     if args.busy_policy is not None:
         kwargs["busy_policy"] = args.busy_policy
-    return Timelog(**kwargs)
+    # Use preset constructors based on maintenance mode
+    maintenance = args.maintenance or "background"
+    if maintenance == "disabled":
+        return Timelog.for_bulk_ingest(**kwargs)
+    else:
+        return Timelog.for_streaming(**kwargs)
 
 
 def write_jsonl(path: str, record: dict) -> None:
@@ -461,7 +464,8 @@ def main() -> int:
         assert step_min is not None and step_max is not None
         return step_min, step_max, collected
 
-    with build_timelog(args) as log:
+    log = build_timelog(args)
+    try:
         # Initial load
         print("Initial load...")
         init_min = None
@@ -486,7 +490,7 @@ def main() -> int:
             if args.delete_mode == "ttl":
                 t0 = time.perf_counter_ns()
                 try:
-                    log.delete_before(cutoff)
+                    log.cutoff(cutoff)
                 except TimelogBusyError:
                     handle_busy()
                 t1 = time.perf_counter_ns()
@@ -498,7 +502,7 @@ def main() -> int:
                     t0 = time.perf_counter_ns()
                     r_min, r_max, r_count = ranges.popleft()
                     try:
-                        log.delete_range(r_min, r_max)
+                        log.delete(r_min, r_max)
                     except TimelogBusyError:
                         handle_busy()
                     t1 = time.perf_counter_ns()
@@ -534,7 +538,7 @@ def main() -> int:
                     if (appended_total // step_rows) % args.delete_interval_batches == 0:
                         t0 = time.perf_counter_ns()
                         try:
-                            log.delete_before(cutoff)
+                            log.cutoff(cutoff)
                         except TimelogBusyError:
                             handle_busy()
                         t1 = time.perf_counter_ns()
@@ -548,7 +552,7 @@ def main() -> int:
                     t0 = time.perf_counter_ns()
                     r_min, r_max, r_count = ranges.popleft()
                     try:
-                        log.delete_range(r_min, r_max)
+                        log.delete(r_min, r_max)
                     except TimelogBusyError:
                         handle_busy()
                     t1 = time.perf_counter_ns()
@@ -614,6 +618,8 @@ def main() -> int:
                 last_deleted_requests = deleted_requests
                 last_busy_errors = busy_errors
                 last_report = now
+    finally:
+        log.close()
 
     total_time = time.perf_counter() - start_wall
     summary = {

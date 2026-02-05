@@ -24,23 +24,35 @@
 #include "timelogpy/py_span_iter.h"  /* LLD-B4: PageSpan factory */
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_compat.h"
 #include "timelog/timelog.h"
 
 #include <limits.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
 
 /*===========================================================================
  * Exception Preservation Helpers
  *===========================================================================*/
 
+#if PY_VERSION_HEX >= 0x030C0000
+#define TL_PY_PRESERVE_EXC_BEGIN \
+    PyObject *tl_py_saved_exc = PyErr_GetRaisedException()
+#define TL_PY_PRESERVE_EXC_END \
+    PyErr_SetRaisedException(tl_py_saved_exc)
+#else
 #define TL_PY_PRESERVE_EXC_BEGIN \
     PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL; \
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb)
-
 #define TL_PY_PRESERVE_EXC_END \
     PyErr_Restore(exc_type, exc_value, exc_tb)
+#endif
+
+/*===========================================================================
+ * Finalization Helpers (Python 3.12+)
+ *===========================================================================*/
 
 /*===========================================================================
  * Forward Declarations
@@ -55,6 +67,10 @@ static PyObject* PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject* args);
 static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject* args);
 static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
+static void PyTimelog_finalize(PyObject* self_obj);
+
+/* Internal non-throwing close helper */
+static void pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
 
 /*===========================================================================
  * Config Parsing Helpers
@@ -132,6 +148,34 @@ static int parse_busy_policy(const char* s, tl_py_busy_policy_t* out)
 }
 
 /**
+ * Check whether a kwarg was provided (positional or keyword).
+ *
+ * Returns 0 on success, -1 on error (exception set).
+ */
+static int
+kwarg_was_provided(PyObject* args, PyObject* kwds,
+                   int index, const char* name, int* out)
+{
+    *out = 0;
+    if (kwds != NULL) {
+        PyObject* v = PyDict_GetItemString(kwds, name);
+        if (v != NULL) {
+            *out = 1;
+            return 0;
+        }
+        if (PyErr_Occurred()) {
+            return -1;
+        }
+    }
+    if (args != NULL) {
+        Py_ssize_t nargs = PyTuple_GET_SIZE(args);
+        if (nargs > index) {
+            *out = 1;
+        }
+    }
+    return 0;
+}
+/**
  * Validate timestamp range (defense-in-depth).
  *
  * PyArg_ParseTuple("L") already enforces LLONG range; this keeps
@@ -205,6 +249,90 @@ int tl_py_lock_checked(PyTimelog* self)
 }
 
 /*===========================================================================
+ * Dict kwarg helpers for grouped config (adaptive={...}, compaction={...})
+ *===========================================================================*/
+
+/**
+ * Get an optional integer value from a Python dict.
+ * Returns 0 on success, -1 on error (exception set).
+ * If key is not present, *out is unchanged.
+ */
+static int
+dict_get_ssize(PyObject* dict, const char* key, Py_ssize_t* out)
+{
+    PyObject* val = PyDict_GetItemString(dict, key);  /* borrowed ref */
+    if (val == NULL) {
+        /* PyDict_GetItemString returns NULL for both "key absent" and
+         * internal error (e.g. OOM during key string creation).
+         * Distinguish via PyErr_Occurred(). */
+        return PyErr_Occurred() ? -1 : 0;
+    }
+    Py_ssize_t v = PyLong_AsSsize_t(val);
+    if (v == -1 && PyErr_Occurred()) return -1;
+    *out = v;
+    return 0;
+}
+
+/**
+ * Get an optional long long value from a Python dict.
+ */
+static int
+dict_get_llong(PyObject* dict, const char* key, long long* out)
+{
+    PyObject* val = PyDict_GetItemString(dict, key);
+    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    long long v = PyLong_AsLongLong(val);
+    if (v == -1 && PyErr_Occurred()) return -1;
+    *out = v;
+    return 0;
+}
+
+/**
+ * Get an optional double value from a Python dict.
+ */
+static int
+dict_get_double(PyObject* dict, const char* key, double* out)
+{
+    PyObject* val = PyDict_GetItemString(dict, key);
+    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    double v = PyFloat_AsDouble(val);
+    if (v == -1.0 && PyErr_Occurred()) return -1;
+    *out = v;
+    return 0;
+}
+
+/**
+ * Validate that a dict contains only known keys.
+ * Returns 0 on success, -1 on error (exception set).
+ */
+static int
+dict_validate_keys(PyObject* dict, const char* dict_name,
+                   const char* const* known_keys, size_t nkeys)
+{
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(dict, &pos, &key, &value)) {
+        if (!PyUnicode_Check(key)) {
+            PyErr_Format(PyExc_TypeError,
+                "%s keys must be str", dict_name);
+            return -1;
+        }
+        const char* ks = PyUnicode_AsUTF8(key);
+        if (ks == NULL) return -1;
+        int found = 0;
+        for (size_t i = 0; i < nkeys; i++) {
+            if (strcmp(ks, known_keys[i]) == 0) { found = 1; break; }
+        }
+        if (!found) {
+            PyErr_Format(PyExc_ValueError,
+                "Unknown key '%s' in %s dict", ks, dict_name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*===========================================================================
  * PyTimelog_init (tp_init)
  *===========================================================================*/
 
@@ -218,6 +346,38 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     self->core_lock = NULL;
+
+    enum {
+        KW_TIME_UNIT = 0,
+        KW_MAINTENANCE,
+        KW_MEMTABLE_MAX_BYTES,
+        KW_TARGET_PAGE_BYTES,
+        KW_SEALED_MAX_RUNS,
+        KW_DRAIN_BATCH_LIMIT,
+        KW_BUSY_POLICY,
+        KW_OOO_BUDGET_BYTES,
+        KW_SEALED_WAIT_MS,
+        KW_MAINTENANCE_WAKEUP_MS,
+        KW_MAX_DELTA_SEGMENTS,
+        KW_WINDOW_SIZE,
+        KW_WINDOW_ORIGIN,
+        KW_DELETE_DEBT_THRESHOLD,
+        KW_COMPACTION_TARGET_BYTES,
+        KW_MAX_COMPACTION_INPUTS,
+        KW_MAX_COMPACTION_WINDOWS,
+        KW_ADAPTIVE_TARGET_RECORDS,
+        KW_ADAPTIVE_MIN_WINDOW,
+        KW_ADAPTIVE_MAX_WINDOW,
+        KW_ADAPTIVE_HYSTERESIS_PCT,
+        KW_ADAPTIVE_WINDOW_QUANTUM,
+        KW_ADAPTIVE_ALPHA,
+        KW_ADAPTIVE_WARMUP_FLUSHES,
+        KW_ADAPTIVE_STALE_FLUSHES,
+        KW_ADAPTIVE_FAILURE_BACKOFF_THRESHOLD,
+        KW_ADAPTIVE_FAILURE_BACKOFF_PCT,
+        KW_ADAPTIVE_DICT,
+        KW_COMPACTION_DICT
+    };
 
     static char* kwlist[] = {
         "time_unit",             /* s - string */
@@ -247,40 +407,44 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         "adaptive_stale_flushes",  /* n - Py_ssize_t */
         "adaptive_failure_backoff_threshold", /* n - Py_ssize_t */
         "adaptive_failure_backoff_pct",       /* n - Py_ssize_t */
+        "adaptive",              /* O - dict */
+        "compaction",            /* O - dict */
         NULL
     };
 
     const char* time_unit_str = NULL;
     const char* maint_str = NULL;
-    Py_ssize_t memtable_max_bytes = -1;
-    Py_ssize_t target_page_bytes = -1;
-    Py_ssize_t sealed_max_runs = -1;
-    Py_ssize_t drain_batch_limit = -1;
+    Py_ssize_t memtable_max_bytes = PY_SSIZE_T_MIN;
+    Py_ssize_t target_page_bytes = PY_SSIZE_T_MIN;
+    Py_ssize_t sealed_max_runs = PY_SSIZE_T_MIN;
+    Py_ssize_t drain_batch_limit = PY_SSIZE_T_MIN;
     const char* busy_policy_str = NULL;
-    Py_ssize_t ooo_budget_bytes = -1;
-    Py_ssize_t sealed_wait_ms = -1;
-    Py_ssize_t maintenance_wakeup_ms = -1;
-    Py_ssize_t max_delta_segments = -1;
+    Py_ssize_t ooo_budget_bytes = PY_SSIZE_T_MIN;
+    Py_ssize_t sealed_wait_ms = PY_SSIZE_T_MIN;
+    Py_ssize_t maintenance_wakeup_ms = PY_SSIZE_T_MIN;
+    Py_ssize_t max_delta_segments = PY_SSIZE_T_MIN;
     long long window_size = LLONG_MIN;
     long long window_origin = LLONG_MIN;
     double delete_debt_threshold = -1.0;
-    Py_ssize_t compaction_target_bytes = -1;
-    Py_ssize_t max_compaction_inputs = -1;
-    Py_ssize_t max_compaction_windows = -1;
-    Py_ssize_t adaptive_target_records = -1;
+    Py_ssize_t compaction_target_bytes = PY_SSIZE_T_MIN;
+    Py_ssize_t max_compaction_inputs = PY_SSIZE_T_MIN;
+    Py_ssize_t max_compaction_windows = PY_SSIZE_T_MIN;
+    Py_ssize_t adaptive_target_records = PY_SSIZE_T_MIN;
     long long adaptive_min_window = LLONG_MIN;
     long long adaptive_max_window = LLONG_MIN;
-    Py_ssize_t adaptive_hysteresis_pct = -1;
+    Py_ssize_t adaptive_hysteresis_pct = PY_SSIZE_T_MIN;
     long long adaptive_window_quantum = LLONG_MIN;
     double adaptive_alpha = -1.0;
-    Py_ssize_t adaptive_warmup_flushes = -1;
-    Py_ssize_t adaptive_stale_flushes = -1;
-    Py_ssize_t adaptive_failure_backoff_threshold = -1;
-    Py_ssize_t adaptive_failure_backoff_pct = -1;
+    Py_ssize_t adaptive_warmup_flushes = PY_SSIZE_T_MIN;
+    Py_ssize_t adaptive_stale_flushes = PY_SSIZE_T_MIN;
+    Py_ssize_t adaptive_failure_backoff_threshold = PY_SSIZE_T_MIN;
+    Py_ssize_t adaptive_failure_backoff_pct = PY_SSIZE_T_MIN;
+    PyObject* adaptive_dict = NULL;
+    PyObject* compaction_dict = NULL;
 
-    /* CRITICAL: 27 converters for 27 kwargs */
+    /* 29 converters: 27 original + 2 dict kwargs */
     if (!PyArg_ParseTupleAndKeywords(args, kwds,
-            "|ssnnnnsnnnnLLdnnnnLLnLdnnnn", kwlist,
+            "|ssnnnnsnnnnLLdnnnnLLnLdnnnnOO", kwlist,
             &time_unit_str, &maint_str,
             &memtable_max_bytes, &target_page_bytes, &sealed_max_runs,
             &drain_batch_limit, &busy_policy_str,
@@ -291,12 +455,156 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
             &adaptive_target_records, &adaptive_min_window, &adaptive_max_window,
             &adaptive_hysteresis_pct, &adaptive_window_quantum,
             &adaptive_alpha, &adaptive_warmup_flushes, &adaptive_stale_flushes,
-            &adaptive_failure_backoff_threshold, &adaptive_failure_backoff_pct)) {
+            &adaptive_failure_backoff_threshold, &adaptive_failure_backoff_pct,
+            &adaptive_dict, &compaction_dict)) {
         return -1;
     }
 
+    int delete_debt_threshold_set = 0;
+    int adaptive_alpha_flat_set = 0;
+    int adaptive_alpha_set = 0;
+    if (kwarg_was_provided(args, kwds, KW_DELETE_DEBT_THRESHOLD,
+                           "delete_debt_threshold", &delete_debt_threshold_set) < 0) {
+        return -1;
+    }
+    if (kwarg_was_provided(args, kwds, KW_ADAPTIVE_ALPHA,
+                           "adaptive_alpha", &adaptive_alpha_flat_set) < 0) {
+        return -1;
+    }
+    adaptive_alpha_set = adaptive_alpha_flat_set;
+
+    /*
+     * Parse adaptive={...} dict kwarg.
+     * Values from the dict override flat adaptive_* kwargs.
+     * Passing both a flat kwarg and the same key in the dict is an error.
+     */
+    if (adaptive_dict != NULL && adaptive_dict != Py_None) {
+        if (!PyDict_Check(adaptive_dict)) {
+            PyErr_SetString(PyExc_TypeError,
+                "adaptive must be a dict or None");
+            return -1;
+        }
+
+        static const char* const adaptive_keys[] = {
+            "target_records", "min_window", "max_window",
+            "hysteresis_pct", "window_quantum", "alpha",
+            "warmup_flushes", "stale_flushes",
+            "failure_backoff_threshold", "failure_backoff_pct",
+        };
+        if (dict_validate_keys(adaptive_dict, "adaptive",
+                adaptive_keys, 10) < 0)
+            return -1;
+
+        /* Conflict detection: flat kwarg vs dict key */
+#define CHECK_ADAPTIVE_CONFLICT(flat_var, sentinel, key_name)           \
+        do {                                                            \
+            if ((flat_var) != (sentinel)) {                             \
+                PyObject* _v = PyDict_GetItemString(                    \
+                    adaptive_dict, key_name);                           \
+                if (_v == NULL && PyErr_Occurred()) return -1;          \
+                if (_v != NULL) {                                       \
+                    PyErr_Format(PyExc_ValueError,                      \
+                        "Cannot specify both adaptive_%s and "          \
+                        "adaptive={'%s': ...}", key_name, key_name);    \
+                    return -1;                                          \
+                }                                                       \
+            }                                                           \
+        } while (0)
+
+        CHECK_ADAPTIVE_CONFLICT(adaptive_target_records, PY_SSIZE_T_MIN, "target_records");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_min_window, LLONG_MIN, "min_window");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_max_window, LLONG_MIN, "max_window");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_hysteresis_pct, PY_SSIZE_T_MIN, "hysteresis_pct");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_window_quantum, LLONG_MIN, "window_quantum");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_warmup_flushes, PY_SSIZE_T_MIN, "warmup_flushes");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_stale_flushes, PY_SSIZE_T_MIN, "stale_flushes");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_failure_backoff_threshold, PY_SSIZE_T_MIN, "failure_backoff_threshold");
+        CHECK_ADAPTIVE_CONFLICT(adaptive_failure_backoff_pct, PY_SSIZE_T_MIN, "failure_backoff_pct");
+
+        if (adaptive_alpha_flat_set) {
+            PyObject* _v = PyDict_GetItemString(adaptive_dict, "alpha");
+            if (_v == NULL && PyErr_Occurred()) return -1;
+            if (_v != NULL) {
+                PyErr_Format(PyExc_ValueError,
+                    "Cannot specify both adaptive_alpha and "
+                    "adaptive={'alpha': ...}");
+                return -1;
+            }
+        }
+#undef CHECK_ADAPTIVE_CONFLICT
+
+        /* Extract values from dict into the flat variables */
+        if (dict_get_ssize(adaptive_dict, "target_records", &adaptive_target_records) < 0 ||
+            dict_get_llong(adaptive_dict, "min_window", &adaptive_min_window) < 0 ||
+            dict_get_llong(adaptive_dict, "max_window", &adaptive_max_window) < 0 ||
+            dict_get_ssize(adaptive_dict, "hysteresis_pct", &adaptive_hysteresis_pct) < 0 ||
+            dict_get_llong(adaptive_dict, "window_quantum", &adaptive_window_quantum) < 0 ||
+            dict_get_double(adaptive_dict, "alpha", &adaptive_alpha) < 0 ||
+            dict_get_ssize(adaptive_dict, "warmup_flushes", &adaptive_warmup_flushes) < 0 ||
+            dict_get_ssize(adaptive_dict, "stale_flushes", &adaptive_stale_flushes) < 0 ||
+            dict_get_ssize(adaptive_dict, "failure_backoff_threshold", &adaptive_failure_backoff_threshold) < 0 ||
+            dict_get_ssize(adaptive_dict, "failure_backoff_pct", &adaptive_failure_backoff_pct) < 0) {
+            return -1;
+        }
+
+        PyObject* alpha_val = PyDict_GetItemString(adaptive_dict, "alpha");
+        if (alpha_val == NULL && PyErr_Occurred()) return -1;
+        if (alpha_val != NULL) {
+            adaptive_alpha_set = 1;
+        }
+    }
+
+    /*
+     * Parse compaction={...} dict kwarg.
+     */
+    if (compaction_dict != NULL && compaction_dict != Py_None) {
+        if (!PyDict_Check(compaction_dict)) {
+            PyErr_SetString(PyExc_TypeError,
+                "compaction must be a dict or None");
+            return -1;
+        }
+
+        static const char* const compaction_keys[] = {
+            "target_bytes", "max_inputs", "max_windows",
+        };
+        if (dict_validate_keys(compaction_dict, "compaction",
+                compaction_keys, 3) < 0)
+            return -1;
+
+        /* Conflict detection */
+#define CHECK_COMPACTION_CONFLICT(flat_var, sentinel, key_name, flat_name) \
+        do {                                                              \
+            if ((flat_var) != (sentinel)) {                               \
+                PyObject* _v = PyDict_GetItemString(                      \
+                    compaction_dict, key_name);                           \
+                if (_v == NULL && PyErr_Occurred()) return -1;            \
+                if (_v != NULL) {                                         \
+                    PyErr_Format(PyExc_ValueError,                        \
+                        "Cannot specify both %s and "                     \
+                        "compaction={'%s': ...}", flat_name, key_name);   \
+                    return -1;                                            \
+                }                                                         \
+            }                                                             \
+        } while (0)
+
+        CHECK_COMPACTION_CONFLICT(compaction_target_bytes, PY_SSIZE_T_MIN,
+            "target_bytes", "compaction_target_bytes");
+        CHECK_COMPACTION_CONFLICT(max_compaction_inputs, PY_SSIZE_T_MIN,
+            "max_inputs", "max_compaction_inputs");
+        CHECK_COMPACTION_CONFLICT(max_compaction_windows, PY_SSIZE_T_MIN,
+            "max_windows", "max_compaction_windows");
+#undef CHECK_COMPACTION_CONFLICT
+
+        /* Extract values */
+        if (dict_get_ssize(compaction_dict, "target_bytes", &compaction_target_bytes) < 0 ||
+            dict_get_ssize(compaction_dict, "max_inputs", &max_compaction_inputs) < 0 ||
+            dict_get_ssize(compaction_dict, "max_windows", &max_compaction_windows) < 0) {
+            return -1;
+        }
+    }
+
     /* Validate drain_batch_limit range */
-    if (drain_batch_limit != -1) {
+    if (drain_batch_limit != PY_SSIZE_T_MIN) {
         if (drain_batch_limit < 0 || (uint64_t)drain_batch_limit > UINT32_MAX) {
             PyErr_SetString(PyExc_ValueError,
                 "drain_batch_limit must be 0-4294967295");
@@ -304,8 +612,9 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         }
     }
 
-    /* Map -1 (unset) to 0 (unlimited) for ctx init */
-    uint32_t drain_limit = (drain_batch_limit == -1) ? 0 : (uint32_t)drain_batch_limit;
+    /* Map unset to 0 (unlimited) for ctx init */
+    uint32_t drain_limit = (drain_batch_limit == PY_SSIZE_T_MIN) ? 0
+        : (uint32_t)drain_batch_limit;
 
     /* Initialize handle context first */
     tl_status_t st = tl_py_handle_ctx_init(&self->handle_ctx, drain_limit);
@@ -339,10 +648,10 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     /*
      * Apply numeric overrides with validation.
-     * -1 = unset (use default), 0 allowed where supported by core config.
+     * Unset = use default, 0 allowed where supported by core config.
      * Also check for overflow on platforms where size_t < Py_ssize_t.
      */
-    if (memtable_max_bytes != -1) {
+    if (memtable_max_bytes != PY_SSIZE_T_MIN) {
         if (memtable_max_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -357,7 +666,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         }
         cfg.memtable_max_bytes = (size_t)memtable_max_bytes;
     }
-    if (target_page_bytes != -1) {
+    if (target_page_bytes != PY_SSIZE_T_MIN) {
         if (target_page_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -372,7 +681,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         }
         cfg.target_page_bytes = (size_t)target_page_bytes;
     }
-    if (sealed_max_runs != -1) {
+    if (sealed_max_runs != PY_SSIZE_T_MIN) {
         if (sealed_max_runs < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -388,7 +697,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.sealed_max_runs = (size_t)sealed_max_runs;
     }
 
-    if (ooo_budget_bytes != -1) {
+    if (ooo_budget_bytes != PY_SSIZE_T_MIN) {
         if (ooo_budget_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -404,7 +713,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.ooo_budget_bytes = (size_t)ooo_budget_bytes;
     }
 
-    if (sealed_wait_ms != -1) {
+    if (sealed_wait_ms != PY_SSIZE_T_MIN) {
         if (sealed_wait_ms < 0 || (uint64_t)sealed_wait_ms > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -414,7 +723,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.sealed_wait_ms = (uint32_t)sealed_wait_ms;
     }
 
-    if (maintenance_wakeup_ms != -1) {
+    if (maintenance_wakeup_ms != PY_SSIZE_T_MIN) {
         if (maintenance_wakeup_ms < 0 || (uint64_t)maintenance_wakeup_ms > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -424,7 +733,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.maintenance_wakeup_ms = (uint32_t)maintenance_wakeup_ms;
     }
 
-    if (max_delta_segments != -1) {
+    if (max_delta_segments != PY_SSIZE_T_MIN) {
         if (max_delta_segments < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -461,7 +770,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.window_origin = (tl_ts_t)window_origin;
     }
 
-    if (delete_debt_threshold != -1.0) {
+    if (delete_debt_threshold_set) {
+        if (!isfinite(delete_debt_threshold)) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "delete_debt_threshold must be finite");
+            return -1;
+        }
         if (delete_debt_threshold < 0.0 || delete_debt_threshold > 1.0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -471,7 +786,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.delete_debt_threshold = delete_debt_threshold;
     }
 
-    if (compaction_target_bytes != -1) {
+    if (compaction_target_bytes != PY_SSIZE_T_MIN) {
         if (compaction_target_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -487,7 +802,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.compaction_target_bytes = (size_t)compaction_target_bytes;
     }
 
-    if (max_compaction_inputs != -1) {
+    if (max_compaction_inputs != PY_SSIZE_T_MIN) {
         if (max_compaction_inputs < 0 || (uint64_t)max_compaction_inputs > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -497,7 +812,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.max_compaction_inputs = (uint32_t)max_compaction_inputs;
     }
 
-    if (max_compaction_windows != -1) {
+    if (max_compaction_windows != PY_SSIZE_T_MIN) {
         if (max_compaction_windows < 0 || (uint64_t)max_compaction_windows > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -507,7 +822,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.max_compaction_windows = (uint32_t)max_compaction_windows;
     }
 
-    if (adaptive_target_records != -1) {
+    if (adaptive_target_records != PY_SSIZE_T_MIN) {
         if (adaptive_target_records < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -537,7 +852,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.adaptive.max_window = (tl_ts_t)adaptive_max_window;
     }
 
-    if (adaptive_hysteresis_pct != -1) {
+    if (adaptive_hysteresis_pct != PY_SSIZE_T_MIN) {
         if (adaptive_hysteresis_pct < 0 || (uint64_t)adaptive_hysteresis_pct > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -557,7 +872,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.adaptive.window_quantum = (tl_ts_t)adaptive_window_quantum;
     }
 
-    if (adaptive_alpha != -1.0) {
+    if (adaptive_alpha_set) {
+        if (!isfinite(adaptive_alpha)) {
+            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            PyErr_SetString(PyExc_ValueError,
+                "adaptive_alpha must be finite");
+            return -1;
+        }
         if (adaptive_alpha < 0.0 || adaptive_alpha > 1.0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -567,7 +888,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.adaptive.alpha = adaptive_alpha;
     }
 
-    if (adaptive_warmup_flushes != -1) {
+    if (adaptive_warmup_flushes != PY_SSIZE_T_MIN) {
         if (adaptive_warmup_flushes < 0 || (uint64_t)adaptive_warmup_flushes > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -577,7 +898,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.adaptive.warmup_flushes = (uint32_t)adaptive_warmup_flushes;
     }
 
-    if (adaptive_stale_flushes != -1) {
+    if (adaptive_stale_flushes != PY_SSIZE_T_MIN) {
         if (adaptive_stale_flushes < 0 || (uint64_t)adaptive_stale_flushes > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
             PyErr_SetString(PyExc_ValueError,
@@ -587,7 +908,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         cfg.adaptive.stale_flushes = (uint32_t)adaptive_stale_flushes;
     }
 
-    if (adaptive_failure_backoff_threshold != -1) {
+    if (adaptive_failure_backoff_threshold != PY_SSIZE_T_MIN) {
         if (adaptive_failure_backoff_threshold < 0 ||
             (uint64_t)adaptive_failure_backoff_threshold > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
@@ -599,7 +920,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
             (uint32_t)adaptive_failure_backoff_threshold;
     }
 
-    if (adaptive_failure_backoff_pct != -1) {
+    if (adaptive_failure_backoff_pct != PY_SSIZE_T_MIN) {
         if (adaptive_failure_backoff_pct < 0 ||
             (uint64_t)adaptive_failure_backoff_pct > UINT32_MAX) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
@@ -652,6 +973,78 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
  * PyTimelog_close
  *===========================================================================*/
 
+/**
+ * Non-throwing close helper used by close(), finalizer, and dealloc.
+ *
+ * - Always performs C-only shutdown (stop maint + tl_close).
+ * - Only drains Python handles if the interpreter is NOT finalizing.
+ */
+static void
+pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
+{
+    if (self == NULL) {
+        return;
+    }
+
+    /* Idempotence guard */
+    if (self->closed || self->tl == NULL) {
+        return;
+    }
+    int finalizing = TL_PY_IS_FINALIZING();
+    int allow_threads = (!finalizing && !from_finalizer);
+
+    /* Always do C-only shutdown */
+    TL_PY_LOCK(self);
+    if (self->closed || self->tl == NULL) {
+        TL_PY_UNLOCK(self);
+        return;
+    }
+    self->closed = 1;
+    if (self->tl != NULL) {
+        tl_timelog_t* tl = self->tl;
+        if (allow_threads) {
+            Py_BEGIN_ALLOW_THREADS
+            tl_maint_stop(tl);
+            tl_close(tl);
+            self->tl = NULL;
+            /*
+             * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
+             * deadlock: Thread A holds core_lock + wants GIL, Thread B
+             * holds GIL + wants core_lock.
+             */
+            PyThread_release_lock(self->core_lock);
+            Py_END_ALLOW_THREADS
+        } else {
+            /*
+             * Avoid releasing GIL during interpreter shutdown or
+             * finalizer-driven cleanup.
+             */
+            tl_maint_stop(tl);
+            tl_close(tl);
+            self->tl = NULL;
+            TL_PY_UNLOCK(self);
+        }
+    } else {
+        TL_PY_UNLOCK(self);
+    }
+
+    /* Skip Python-aware cleanup during interpreter finalization */
+    if (!finalizing) {
+        TL_PY_PRESERVE_EXC_BEGIN;
+        tl_py_drain_retired(&self->handle_ctx, 1);
+        tl_py_live_release_all(&self->handle_ctx);
+        TL_PY_PRESERVE_EXC_END;
+    }
+
+    tl_py_handle_ctx_destroy(&self->handle_ctx);
+
+    if (self->core_lock) {
+        PyThread_type_lock lk = self->core_lock;
+        self->core_lock = NULL;
+        PyThread_free_lock(lk);
+    }
+}
+
 static PyObject*
 PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
@@ -679,50 +1072,8 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
             (unsigned long long)pins);
     }
 
-    /* Mark closed (reentrancy guard) - after pins check passes */
-    self->closed = 1;
-
-    /*
-     * Stop maintenance (release GIL).
-     * Ignore return value - close is a "must complete" operation.
-     * Any maint_stop failure is logged internally but shouldn't
-     * prevent cleanup from proceeding.
-     */
-    TL_PY_LOCK(self);
-    Py_BEGIN_ALLOW_THREADS
-    tl_maint_stop(self->tl);
-    tl_close(self->tl);
-    /*
-     * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-     * deadlock: Thread A holds core_lock + wants GIL, Thread B
-     * holds GIL + wants core_lock.
-     */
-    PyThread_release_lock(self->core_lock);
-    Py_END_ALLOW_THREADS
-
-    /* Clear pointer */
-    self->tl = NULL;
-
-    /*
-     * Drain retired objects (force=1).
-     * Preserve exception state: drain executes Py_DECREF which can
-     * trigger __del__ methods that may clobber active exceptions
-     * (e.g., when close() is called from __exit__).
-     */
-    {
-        TL_PY_PRESERVE_EXC_BEGIN;
-        tl_py_drain_retired(&self->handle_ctx, 1);
-        tl_py_live_release_all(&self->handle_ctx);
-        TL_PY_PRESERVE_EXC_END;
-    }
-
-    /* Destroy handle context */
-    tl_py_handle_ctx_destroy(&self->handle_ctx);
-
-    if (self->core_lock) {
-        PyThread_free_lock(self->core_lock);
-        self->core_lock = NULL;
-    }
+    /* Close using the shared non-throwing helper */
+    pytimelog_close_no_raise(self, 0);
 
     Py_RETURN_NONE;
 }
@@ -731,60 +1082,50 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
  * PyTimelog_dealloc (tp_dealloc)
  *===========================================================================*/
 
+/**
+ * tp_finalize (PEP 442): best-effort cleanup without raising.
+ */
+static void
+PyTimelog_finalize(PyObject* self_obj)
+{
+    PyTimelog* self = (PyTimelog*)self_obj;
+#if PY_VERSION_HEX >= 0x030C0000
+    PyObject* exc = PyErr_GetRaisedException();
+    pytimelog_close_no_raise(self, 1);
+    if (PyErr_Occurred()) {
+        PyErr_WriteUnraisable(self_obj);
+    }
+    PyErr_SetRaisedException(exc);
+#else
+    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    pytimelog_close_no_raise(self, 1);
+    if (PyErr_Occurred()) {
+        PyErr_WriteUnraisable(self_obj);
+    }
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+#endif
+}
+
 static void
 PyTimelog_dealloc(PyTimelog* self)
 {
-    /*
-     * Best-effort close if not already closed.
-     *
-     * Note: The condition `!self->closed && self->tl != NULL` is carefully
-     * chosen. If init() fails after handle_ctx_init but before tl_open,
-     * handle_ctx is destroyed in init(), and self->tl remains NULL.
-     * This condition correctly skips cleanup in that case.
-     */
-    if (!self->closed && self->tl != NULL) {
-        uint64_t pins = tl_py_pins_count(&self->handle_ctx);
-        if (pins == 0) {
-            TL_PY_LOCK(self);
-            if (self->tl != NULL) {
-                Py_BEGIN_ALLOW_THREADS
-                tl_maint_stop(self->tl);
-                tl_close(self->tl);
-                PyThread_release_lock(self->core_lock);
-                Py_END_ALLOW_THREADS
-                self->tl = NULL;
-            } else {
-                TL_PY_UNLOCK(self);
-            }
+    /* Ensure tp_finalize runs before deallocation */
+    if (PyObject_CallFinalizerFromDealloc((PyObject*)self) < 0) {
+        return;
+    }
 
-            /*
-             * Drain retired objects with exception preservation.
-             * Per LLD-B6: Py_DECREF in drain can trigger __del__ that
-             * may clobber active exceptions during finalization.
-             */
-            {
-                TL_PY_PRESERVE_EXC_BEGIN;
-                tl_py_drain_retired(&self->handle_ctx, 1);
-                tl_py_live_release_all(&self->handle_ctx);
-                TL_PY_PRESERVE_EXC_END;
-            }
-
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
-        } else {
-            /* WARNING: leaking resources (pins active) */
-#ifndef NDEBUG
-            fprintf(stderr, "WARNING: PyTimelog dealloc with pins=%llu\n",
-                    (unsigned long long)pins);
-#endif
-        }
+    /* If resurrected by finalizer, abort dealloc */
+    if (Py_REFCNT(self) > 0) {
+        return;
     }
 
     if (self->core_lock) {
-        PyThread_free_lock(self->core_lock);
+        PyThread_type_lock lk = self->core_lock;
         self->core_lock = NULL;
+        PyThread_free_lock(lk);
     }
 
-    /* Free object */
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -1924,6 +2265,16 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
     pyit->handle_ctx = ctx;  /* borrowed pointer, safe due to strong owner ref */
     pyit->closed = 0;
 
+    /* Store normalized range for view() support */
+    switch (mode) {
+        case ITER_MODE_RANGE:  pyit->range_t1 = t1; pyit->range_t2 = t2; break;
+        case ITER_MODE_SINCE:  pyit->range_t1 = t1; pyit->range_t2 = TL_TS_MAX; break;
+        case ITER_MODE_UNTIL:  pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = t2; break;
+        case ITER_MODE_EQUAL:
+        case ITER_MODE_POINT:  pyit->range_t1 = t1; pyit->range_t2 = (t1 < TL_TS_MAX) ? t1 + 1 : TL_TS_MAX; break;
+        default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
+    }
+
     /* Enable GC tracking */
     PyObject_GC_Track((PyObject*)pyit);
 
@@ -2302,6 +2653,10 @@ static PyMethodDef PyTimelog_methods[] = {
      "Returns:\n"
      "  PageSpanIter yielding PageSpan objects"},
 
+    {"views", (PyCFunction)PyTimelog_page_spans, METH_VARARGS | METH_KEYWORDS,
+     "views(t1, t2, *, kind='segment') -> PageSpanIter\n\n"
+     "Alias for page_spans()."},
+
     {"__enter__", (PyCFunction)PyTimelog_enter, METH_NOARGS,
      "Context manager entry."},
 
@@ -2332,6 +2687,7 @@ PyTypeObject PyTimelog_Type = {
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)PyTimelog_init,
     .tp_dealloc = (destructor)PyTimelog_dealloc,
+    .tp_finalize = (destructor)PyTimelog_finalize,
     .tp_methods = PyTimelog_methods,
     .tp_getset = PyTimelog_getset,
 };
