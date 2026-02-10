@@ -2,6 +2,7 @@
 #include "../internal/tl_range.h"
 #include "../internal/tl_locks.h"
 #include "../internal/tl_records.h"
+#include "../internal/tl_recvec.h"
 #include <stdlib.h>  /* qsort */
 #include <string.h>
 
@@ -14,22 +15,6 @@ volatile int tl_test_memview_used_fallback = 0;
 /*===========================================================================
  * Internal Helpers
  *===========================================================================*/
-
-/**
- * Comparison function for qsort.
- * Sorts records by (ts, handle) in non-decreasing order.
- */
-static int cmp_record_ts_mv(const void* a, const void* b) {
-    const tl_record_t* ra = (const tl_record_t*)a;
-    const tl_record_t* rb = (const tl_record_t*)b;
-
-    /* Use explicit comparison to avoid integer overflow in subtraction. */
-    if (ra->ts < rb->ts) return -1;
-    if (ra->ts > rb->ts) return 1;
-    if (ra->handle < rb->handle) return -1;
-    if (ra->handle > rb->handle) return 1;
-    return 0;
-}
 
 /**
  * Update bounds with a record array.
@@ -238,6 +223,46 @@ static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
 }
 
 /**
+ * Deep-copy a sequence array.
+ *
+ * @param alloc Allocator context
+ * @param src   Source seq array (may be NULL if len == 0)
+ * @param len   Number of seqs
+ * @param out   Output: copied array (set to NULL on error or len==0)
+ * @return TL_OK on success (including len==0),
+ *         TL_EINVAL if len > 0 but src == NULL,
+ *         TL_EOVERFLOW if len * sizeof(tl_seq_t) would overflow,
+ *         TL_ENOMEM on allocation failure
+ */
+static tl_status_t copy_seqs(tl_alloc_ctx_t* alloc,
+                              const tl_seq_t* src, size_t len,
+                              tl_seq_t** out) {
+    *out = NULL;
+
+    if (len == 0) {
+        return TL_OK;
+    }
+
+    if (src == NULL) {
+        return TL_EINVAL;
+    }
+
+    if (tl__alloc_would_overflow(len, sizeof(tl_seq_t))) {
+        return TL_EOVERFLOW;
+    }
+
+    size_t bytes = len * sizeof(tl_seq_t);
+    tl_seq_t* dst = tl__malloc(alloc, bytes);
+    if (dst == NULL) {
+        return TL_ENOMEM;
+    }
+
+    memcpy(dst, src, bytes);
+    *out = dst;
+    return TL_OK;
+}
+
+/**
  * Allocate and populate sealed memrun array.
  * Acquires references to each memrun.
  * On failure, releases any already-acquired references.
@@ -383,6 +408,10 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
         goto fail;
     }
     mv->active_run_len = run_len;
+    status = copy_seqs(alloc, tl_memtable_run_seqs(mt), run_len, &mv->active_run_seqs);
+    if (status != TL_OK) {
+        goto fail;
+    }
 
     /* Copy OOO head */
     size_t ooo_head_len = tl_memtable_ooo_head_len(mt);
@@ -393,6 +422,11 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
     }
     mv->active_ooo_head_len = ooo_head_len;
     mv->active_ooo_head_sorted = mt->ooo_head_sorted;
+    status = copy_seqs(alloc, tl_memtable_ooo_head_seqs(mt), ooo_head_len,
+                       &mv->active_ooo_head_seqs);
+    if (status != TL_OK) {
+        goto fail;
+    }
 
     /* Pin OOO runs */
     mv->active_ooo_runs = tl_ooorunset_acquire(
@@ -442,23 +476,33 @@ fail:
     return status;
 }
 
-void tl_memview_sort_head(tl_memview_t* mv) {
+tl_status_t tl_memview_sort_head(tl_memview_t* mv) {
     if (mv == NULL) {
-        return;
+        return TL_OK;
     }
 
     if (mv->active_ooo_head_sorted) {
-        return;
+        return TL_OK;
     }
 
     if (mv->active_ooo_head_len > 1) {
-        qsort(mv->active_ooo_head,
-              mv->active_ooo_head_len,
-              sizeof(tl_record_t),
-              cmp_record_ts_mv);
+        if (mv->active_ooo_head_seqs == NULL) {
+            return TL_EINVAL;
+        }
+        tl_recvec_t tmp = {
+            .data = mv->active_ooo_head,
+            .len = mv->active_ooo_head_len,
+            .cap = mv->active_ooo_head_len,
+            .alloc = mv->alloc
+        };
+        tl_status_t st = tl_recvec_sort_with_seqs(&tmp, mv->active_ooo_head_seqs);
+        if (st != TL_OK) {
+            return st;
+        }
     }
 
     mv->active_ooo_head_sorted = true;
+    return TL_OK;
 }
 
 void tl_memview_destroy(tl_memview_t* mv) {
@@ -472,6 +516,10 @@ void tl_memview_destroy(tl_memview_t* mv) {
         mv->active_run = NULL;
     }
     mv->active_run_len = 0;
+    if (mv->active_run_seqs != NULL) {
+        tl__free(mv->alloc, mv->active_run_seqs);
+        mv->active_run_seqs = NULL;
+    }
 
     if (mv->active_ooo_head != NULL) {
         tl__free(mv->alloc, mv->active_ooo_head);
@@ -479,6 +527,10 @@ void tl_memview_destroy(tl_memview_t* mv) {
     }
     mv->active_ooo_head_len = 0;
     mv->active_ooo_head_sorted = false;
+    if (mv->active_ooo_head_seqs != NULL) {
+        tl__free(mv->alloc, mv->active_ooo_head_seqs);
+        mv->active_ooo_head_seqs = NULL;
+    }
 
     if (mv->active_ooo_runs != NULL) {
         tl_ooorunset_release(mv->active_ooo_runs);
@@ -622,6 +674,9 @@ bool tl_memview_validate(const tl_memview_t* mv) {
      */
     const tl_record_t* run = tl_memview_run_data(mv);
     size_t run_len = tl_memview_run_len(mv);
+    if (run_len > 0 && mv->active_run_seqs == NULL) {
+        return false;
+    }
     for (size_t i = 1; i < run_len; i++) {
         if (run[i].ts < run[i - 1].ts) {
             return false;
@@ -637,6 +692,9 @@ bool tl_memview_validate(const tl_memview_t* mv) {
      */
     const tl_record_t* ooo_head = tl_memview_ooo_head_data(mv);
     size_t ooo_head_len = tl_memview_ooo_head_len(mv);
+    if (ooo_head_len > 0 && mv->active_ooo_head_seqs == NULL) {
+        return false;
+    }
     if (mv->active_ooo_head_sorted) {
         for (size_t i = 1; i < ooo_head_len; i++) {
             if (ooo_head[i].ts < ooo_head[i - 1].ts) {

@@ -4,6 +4,7 @@
 #include "../internal/tl_defs.h"
 #include "../internal/tl_alloc.h"
 #include "../internal/tl_recvec.h"
+#include "../internal/tl_seqvec.h"
 #include "../internal/tl_intervals.h"
 #include "../internal/tl_sync.h"
 #include "tl_memrun.h"
@@ -33,7 +34,9 @@ struct tl_memtable {
      * Active State (single-writer, protected by writer_mu externally)
      *-----------------------------------------------------------------------*/
     tl_recvec_t     active_run;       /* Append-only sorted records */
+    tl_seqvec_t     active_run_seqs;  /* Per-record seqs for active_run */
     tl_recvec_t     ooo_head;         /* Mutable OOO head (append-only) */
+    tl_seqvec_t     ooo_head_seqs;    /* Per-record seqs for OOO head */
     tl_intervals_t  active_tombs;     /* Coalesced tombstone intervals */
 
     tl_ooorunset_t* ooo_runs;         /* Immutable OOO runs (pinned) */
@@ -141,7 +144,8 @@ void tl_memtable_destroy(tl_memtable_t* mt);
  * @return TL_OK on success, TL_ENOMEM (no insert), or TL_EBUSY (inserted but
  *         head flush failed; do not retry)
  */
-tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle);
+tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle,
+                                tl_seq_t seq);
 
 /**
  * Insert a batch of records.
@@ -170,7 +174,8 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
  */
 tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
                                       const tl_record_t* records, size_t n,
-                                      uint32_t flags);
+                                      uint32_t flags,
+                                      tl_seq_t seq);
 
 /**
  * Insert a tombstone interval [t1, t2).
@@ -184,7 +189,9 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
  *
  * @return TL_OK, TL_EINVAL (if t1 > t2), TL_ENOMEM
  */
-tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t t2);
+tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt,
+                                          tl_ts_t t1, tl_ts_t t2,
+                                          tl_seq_t seq);
 
 /**
  * Insert an unbounded tombstone [t1, +inf).
@@ -193,7 +200,9 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t 
  *
  * @return TL_OK, TL_ENOMEM
  */
-tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt, tl_ts_t t1);
+tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt,
+                                                    tl_ts_t t1,
+                                                    tl_seq_t seq);
 
 /*===========================================================================
  * Seal Operations
@@ -252,7 +261,8 @@ bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt);
  * @param cond Pointer to condvar for signaling (may be NULL)
  * @return TL_OK, TL_EBUSY (queue full), TL_ENOMEM (active state PRESERVED)
  */
-tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond);
+tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
+                              tl_seq_t applied_seq);
 
 /**
  * Check if active state is empty (no records, no tombstones).
@@ -386,6 +396,10 @@ TL_INLINE const tl_record_t* tl_memtable_run_data(const tl_memtable_t* mt) {
     return tl_recvec_data(&mt->active_run);
 }
 
+TL_INLINE const tl_seq_t* tl_memtable_run_seqs(const tl_memtable_t* mt) {
+    return tl_seqvec_data(&mt->active_run_seqs);
+}
+
 TL_INLINE size_t tl_memtable_run_len(const tl_memtable_t* mt) {
     return tl_recvec_len(&mt->active_run);
 }
@@ -395,6 +409,10 @@ TL_INLINE size_t tl_memtable_run_len(const tl_memtable_t* mt) {
  */
 TL_INLINE const tl_record_t* tl_memtable_ooo_head_data(const tl_memtable_t* mt) {
     return tl_recvec_data(&mt->ooo_head);
+}
+
+TL_INLINE const tl_seq_t* tl_memtable_ooo_head_seqs(const tl_memtable_t* mt) {
+    return tl_seqvec_data(&mt->ooo_head_seqs);
 }
 
 TL_INLINE size_t tl_memtable_ooo_head_len(const tl_memtable_t* mt) {
@@ -441,4 +459,3 @@ bool tl_memtable_validate(const tl_memtable_t* mt);
 #endif
 
 #endif /* TL_MEMTABLE_H */
-

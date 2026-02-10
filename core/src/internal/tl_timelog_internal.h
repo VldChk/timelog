@@ -162,6 +162,9 @@ struct tl_timelog {
     /* Memtable: mutable write buffer for inserts and tombstones */
     tl_memtable_t   memtable;
 
+    /* Monotonic operation sequence (writer_mu protected) */
+    tl_seq_t        op_seq;
+
     /* Snapshot memview cache (for reuse when memtable epoch unchanged) */
     tl_memview_shared_t* memview_cache;
     uint64_t             memview_cache_epoch;

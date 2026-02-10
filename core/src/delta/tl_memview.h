@@ -36,10 +36,12 @@ struct tl_memview {
      *-----------------------------------------------------------------------*/
     tl_record_t*    active_run;      /* Copy of active_run data (sorted) */
     size_t          active_run_len;
+    tl_seq_t*       active_run_seqs; /* Copy of active_run seqs */
 
     tl_record_t*    active_ooo_head; /* Copy of OOO head data (sorted after capture) */
     size_t          active_ooo_head_len;
     bool            active_ooo_head_sorted;
+    tl_seq_t*       active_ooo_head_seqs; /* Copy of OOO head seqs */
 
     tl_ooorunset_t* active_ooo_runs; /* Pinned OOO runset */
     size_t          active_ooo_total_len;
@@ -115,7 +117,7 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
  * Sort the copied OOO head in-place (off-lock).
  * Safe to call multiple times.
  */
-void tl_memview_sort_head(tl_memview_t* mv);
+tl_status_t tl_memview_sort_head(tl_memview_t* mv);
 
 /**
  * Destroy memview and release all resources.
@@ -257,6 +259,10 @@ TL_INLINE const tl_record_t* tl_memview_run_data(const tl_memview_t* mv) {
     return mv->active_run;
 }
 
+TL_INLINE const tl_seq_t* tl_memview_run_seqs(const tl_memview_t* mv) {
+    return mv->active_run_seqs;
+}
+
 TL_INLINE size_t tl_memview_run_len(const tl_memview_t* mv) {
     return mv->active_run_len;
 }
@@ -266,6 +272,10 @@ TL_INLINE size_t tl_memview_run_len(const tl_memview_t* mv) {
  */
 TL_INLINE const tl_record_t* tl_memview_ooo_head_data(const tl_memview_t* mv) {
     return mv->active_ooo_head;
+}
+
+TL_INLINE const tl_seq_t* tl_memview_ooo_head_seqs(const tl_memview_t* mv) {
+    return mv->active_ooo_head_seqs;
 }
 
 TL_INLINE size_t tl_memview_ooo_head_len(const tl_memview_t* mv) {

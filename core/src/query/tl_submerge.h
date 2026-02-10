@@ -16,10 +16,12 @@
 
 typedef struct tl_subsrc {
     const tl_record_t* data;
+    const tl_seq_t*    seqs;      /* Optional per-record seqs (NULL => use watermark) */
     size_t             len;
     size_t             pos;
     size_t             end;
     uint32_t           tie_id;
+    tl_seq_t           watermark; /* Source watermark when seqs == NULL */
 } tl_subsrc_t;
 
 typedef struct tl_submerge {
@@ -34,14 +36,18 @@ typedef struct tl_submerge {
  */
 TL_INLINE void tl_submerge_src_init(tl_subsrc_t* src,
                                      const tl_record_t* data,
+                                     const tl_seq_t* seqs,
                                      size_t len,
                                      tl_ts_t t1,
                                      tl_ts_t t2,
                                      bool t2_unbounded,
-                                     uint32_t tie_id) {
+                                     uint32_t tie_id,
+                                     tl_seq_t watermark) {
     src->data = data;
+    src->seqs = seqs;
     src->len = len;
     src->tie_id = tie_id;
+    src->watermark = watermark;
 
     src->pos = tl_record_lower_bound(data, len, t1);
     if (t2_unbounded) {
@@ -78,7 +84,8 @@ tl_status_t tl_submerge_build(tl_submerge_t* sm);
  * Advance to next record.
  * @return TL_OK if record available, TL_EOF if exhausted
  */
-tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out);
+tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out,
+                              tl_seq_t* out_watermark);
 
 /**
  * Seek to first record with ts >= target (forward-only).

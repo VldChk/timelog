@@ -83,6 +83,7 @@ typedef struct tl_segment {
     /* Level and generation */
     uint32_t  level;            /* tl_segment_level_t */
     uint32_t  generation;       /* Monotonic generation counter (diagnostics) */
+    tl_seq_t  applied_seq;      /* Tombstone watermark applied to this segment */
 
     /* Window bounds (L1 only, 0 for L0) */
     tl_ts_t   window_start;     /* Inclusive start (L1 only) */
@@ -137,6 +138,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
                                  const tl_interval_t* tombstones, size_t tombstones_len,
                                  size_t target_page_bytes,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out);
 
 /**
@@ -171,6 +173,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  tl_ts_t window_start, tl_ts_t window_end,
                                  bool window_end_unbounded,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out);
 
 /*===========================================================================
@@ -248,6 +251,10 @@ TL_INLINE tl_ts_t tl_segment_tomb_min_ts(const tl_segment_t* seg) {
 
 TL_INLINE tl_ts_t tl_segment_tomb_max_ts(const tl_segment_t* seg) {
     return seg->tomb_max_ts;
+}
+
+TL_INLINE tl_seq_t tl_segment_applied_seq(const tl_segment_t* seg) {
+    return seg->applied_seq;
 }
 
 /**

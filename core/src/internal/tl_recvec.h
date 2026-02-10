@@ -122,6 +122,18 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
  */
 void tl_recvec_sort(tl_recvec_t* rv);
 
+/**
+ * Sort the record vector by (ts, handle) and reorder parallel seq array.
+ *
+ * The seqs array must be aligned with rv->data (same length).
+ * Uses a temporary buffer to keep records and seqs paired during sort.
+ *
+ * @param rv   Vector to sort (modified in place)
+ * @param seqs Parallel seq array (len == rv->len)
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs);
+
 /*---------------------------------------------------------------------------
  * Binary Search (for sorted vectors)
  *---------------------------------------------------------------------------*/

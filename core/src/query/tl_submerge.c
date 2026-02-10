@@ -68,11 +68,14 @@ tl_status_t tl_submerge_build(tl_submerge_t* sm) {
             continue;
         }
 
-        const tl_record_t* rec = &src->data[src->pos++];
+        const tl_record_t* rec = &src->data[src->pos];
+        tl_seq_t watermark = src->seqs != NULL ? src->seqs[src->pos] : src->watermark;
+        src->pos++;
         tl_heap_entry_t entry = {
             .ts = rec->ts,
             .tie_break_key = src->tie_id,
             .handle = rec->handle,
+            .watermark = watermark,
             .iter = src
         };
         st = tl_heap_push(&sm->heap, &entry);
@@ -85,7 +88,8 @@ tl_status_t tl_submerge_build(tl_submerge_t* sm) {
     return TL_OK;
 }
 
-tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out) {
+tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out,
+                              tl_seq_t* out_watermark) {
     TL_ASSERT(sm != NULL);
 
     const tl_heap_entry_t* peek = tl_heap_peek(&sm->heap);
@@ -97,16 +101,22 @@ tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out) {
         out->ts = peek->ts;
         out->handle = peek->handle;
     }
+    if (out_watermark != NULL) {
+        *out_watermark = peek->watermark;
+    }
 
     tl_subsrc_t* src = (tl_subsrc_t*)peek->iter;
     uint32_t tie_id = peek->tie_break_key;
 
     if (src->pos < src->end) {
-        const tl_record_t* rec = &src->data[src->pos++];
+        const tl_record_t* rec = &src->data[src->pos];
+        tl_seq_t watermark = src->seqs != NULL ? src->seqs[src->pos] : src->watermark;
+        src->pos++;
         tl_heap_entry_t entry = {
             .ts = rec->ts,
             .tie_break_key = tie_id,
             .handle = rec->handle,
+            .watermark = watermark,
             .iter = src
         };
         tl_heap_replace_top(&sm->heap, &entry);
@@ -149,11 +159,14 @@ void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
             continue;
         }
 
-        const tl_record_t* rec = &src->data[src->pos++];
+        const tl_record_t* rec = &src->data[src->pos];
+        tl_seq_t watermark = src->seqs != NULL ? src->seqs[src->pos] : src->watermark;
+        src->pos++;
         tl_heap_entry_t new_entry = {
             .ts = rec->ts,
             .tie_break_key = popped.tie_break_key,
             .handle = rec->handle,
+            .watermark = watermark,
             .iter = src
         };
         tl_status_t st = tl_heap_push(&sm->heap, &new_entry);

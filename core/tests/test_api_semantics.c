@@ -571,8 +571,8 @@ static void h05_track_drop(void* ctx, tl_ts_t ts, tl_handle_t h) {
  * Test: on_drop_handle NOT invoked at close (H-05 contract).
  *
  * This test documents and verifies the intended behavior:
- * on_drop_handle fires ONLY during compaction (when tombstones delete records),
- * NOT during flush (which doesn't drop records) and NOT during tl_close().
+ * on_drop_handle fires ONLY when tombstones physically delete records
+ * (compaction or flush). It is NOT invoked during tl_close().
  */
 TEST_DECLARE(api_on_drop_handle_not_called_at_close) {
     g_h05_drop_count = 0;
@@ -591,8 +591,7 @@ TEST_DECLARE(api_on_drop_handle_not_called_at_close) {
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
 
     /* Seal and flush to create a segment.
-     * Note: Flush does NOT invoke on_drop_handle because flush doesn't
-     * drop records - it just moves them from memrun to L0 segment. */
+     * No tombstones: flush should not invoke on_drop_handle. */
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
     TEST_ASSERT_EQ(0, g_h05_drop_count);  /* Flush doesn't drop */
 

@@ -30,6 +30,36 @@
 #include <string.h>
 #include <stdint.h>
 
+static tl_status_t test_segment_build_l0(tl_alloc_ctx_t* alloc,
+                                          const tl_record_t* records,
+                                          size_t record_count,
+                                          const tl_interval_t* tombstones,
+                                          size_t tombstones_len,
+                                          size_t target_page_bytes,
+                                          uint32_t generation,
+                                          tl_segment_t** out) {
+    return tl_segment_build_l0(alloc, records, record_count,
+                               tombstones, tombstones_len,
+                               target_page_bytes, generation, 0, out);
+}
+
+static tl_status_t test_segment_build_l1(tl_alloc_ctx_t* alloc,
+                                          const tl_record_t* records,
+                                          size_t record_count,
+                                          size_t target_page_bytes,
+                                          tl_ts_t window_start,
+                                          tl_ts_t window_end,
+                                          bool window_end_unbounded,
+                                          uint32_t generation,
+                                          tl_segment_t** out) {
+    return tl_segment_build_l1(alloc, records, record_count,
+                               target_page_bytes, window_start, window_end,
+                               window_end_unbounded, generation, 0, out);
+}
+
+#define tl_segment_build_l0 test_segment_build_l0
+#define tl_segment_build_l1 test_segment_build_l1
+
 /*===========================================================================
  * Window Mapping Tests (Internal API)
  *
@@ -516,7 +546,7 @@ TEST_DECLARE(storage_segment_build_l0_with_tombstones) {
     tl_record_t records[5] = {
         {10, 0}, {20, 0}, {30, 0}, {40, 0}, {50, 0}
     };
-    tl_interval_t tombs[1] = {{100, 200, false}};
+    tl_interval_t tombs[1] = {{100, 200, false, 1}};
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 5,
@@ -537,7 +567,7 @@ TEST_DECLARE(storage_segment_build_l0_tombstone_only) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
-    tl_interval_t tombs[1] = {{100, 200, false}};
+    tl_interval_t tombs[1] = {{100, 200, false, 1}};
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, NULL, 0,
@@ -604,7 +634,7 @@ TEST_DECLARE(storage_segment_build_l0_null_records_invalid) {
     tl__alloc_init(&alloc, NULL);
 
     /* Some tombstones but NULL records with non-zero count */
-    tl_interval_t tombs[1] = {{100, 200, false}};
+    tl_interval_t tombs[1] = {{100, 200, false, 1}};
 
     tl_segment_t* seg = NULL;
     /* record_count=3 but records=NULL => TL_EINVAL (C-04 fix) */
@@ -641,7 +671,7 @@ TEST_DECLARE(storage_segment_build_l0_unbounded_tombstone) {
     tl__alloc_init(&alloc, NULL);
 
     /* Unbounded interval [100, +inf) */
-    tl_interval_t tombs[1] = {{100, 0, true}};
+    tl_interval_t tombs[1] = {{100, 0, true, 1}};
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, NULL, 0,
@@ -826,7 +856,7 @@ TEST_DECLARE(storage_segment_tombstones_imm) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
-    tl_interval_t tombs[2] = {{10, 20, false}, {30, 40, false}};
+    tl_interval_t tombs[2] = {{10, 20, false, 1}, {30, 40, false, 1}};
     tl_record_t records[1] = {{5, 0}};
 
     tl_segment_t* seg = NULL;
@@ -851,8 +881,8 @@ TEST_DECLARE(storage_segment_l0_bounds_include_tombstones) {
 
     /* Tombstones in range [50, 80) and [300, 400) - outside records */
     tl_interval_t tombs[2] = {
-        {50, 80, false},   /* Earlier than records */
-        {300, 400, false}  /* Later than records */
+        {50, 80, false, 1},   /* Earlier than records */
+        {300, 400, false, 1}  /* Later than records */
     };
 
     tl_segment_t* seg = NULL;
@@ -880,7 +910,7 @@ TEST_DECLARE(storage_segment_l0_bounds_tombstones_extend_max) {
     tl_record_t records[2] = {{100, 0}, {200, 0}};
 
     /* Unbounded tombstone starting after records */
-    tl_interval_t tombs[1] = {{300, 0, true}};  /* [300, +inf) */
+    tl_interval_t tombs[1] = {{300, 0, true, 1}};  /* [300, +inf) */
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 2,
@@ -1004,7 +1034,7 @@ TEST_DECLARE(storage_segment_build_l0_record_tomb_bounds) {
     tl__alloc_init(&alloc, NULL);
 
     tl_record_t records[2] = {{10, 1}, {20, 2}};
-    tl_interval_t tombs[1] = {{100, 110, false}}; /* [100, 110) */
+    tl_interval_t tombs[1] = {{100, 110, false, 1}}; /* [100, 110) */
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc,
@@ -1529,7 +1559,7 @@ TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_interval) {
     tl_record_t records[2] = {{10, 1}, {20, 2}};
 
     /* Case 1: end < start (inverted interval) */
-    tl_interval_t tombs_inverted[1] = {{100, 50, false}};
+    tl_interval_t tombs_inverted[1] = {{100, 50, false, 1}};
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 2,
                                                        tombs_inverted, 1,
@@ -1538,7 +1568,7 @@ TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_interval) {
     TEST_ASSERT_NULL(seg);
 
     /* Case 2: end == start (empty interval) */
-    tl_interval_t tombs_empty[1] = {{100, 100, false}};
+    tl_interval_t tombs_empty[1] = {{100, 100, false, 1}};
     seg = NULL;
     TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 2,
                                                        tombs_empty, 1,

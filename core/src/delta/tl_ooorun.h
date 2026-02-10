@@ -22,6 +22,8 @@ typedef struct tl_ooorun {
     tl_ts_t         min_ts;     /* records[0].ts */
     tl_ts_t         max_ts;     /* records[len - 1].ts */
 
+    tl_seq_t        applied_seq;/* Tombstone watermark applied to this run */
+
     uint64_t        gen;        /* Monotonic generation for tie-breaks */
 } tl_ooorun_t;
 
@@ -47,6 +49,7 @@ typedef struct tl_ooorunset {
 
 tl_status_t tl_ooorun_create(tl_alloc_ctx_t* alloc,
                               tl_record_t* records, size_t len,
+                              tl_seq_t applied_seq,
                               uint64_t gen,
                               tl_ooorun_t** out);
 
@@ -92,6 +95,10 @@ TL_INLINE tl_ts_t tl_ooorun_max_ts(const tl_ooorun_t* run) {
 
 TL_INLINE uint64_t tl_ooorun_gen(const tl_ooorun_t* run) {
     return run->gen;
+}
+
+TL_INLINE tl_seq_t tl_ooorun_applied_seq(const tl_ooorun_t* run) {
+    return run->applied_seq;
 }
 
 TL_INLINE size_t tl_ooorunset_count(const tl_ooorunset_t* set) {

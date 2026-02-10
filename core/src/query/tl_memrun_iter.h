@@ -75,7 +75,9 @@ void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
  * @param out  Output record (may be NULL)
  * @return TL_OK if record available, TL_EOF if exhausted
  */
-tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it, tl_record_t* out);
+tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
+                                 tl_record_t* out,
+                                 tl_seq_t* out_watermark);
 
 /**
  * Seek to first record with ts >= target.

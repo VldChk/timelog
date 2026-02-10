@@ -445,6 +445,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
         temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
         return status;
     }
+    tl->op_seq = 0;
 
     /* Initialize manifest (Phase 5) */
     status = tl_manifest_create(&tl->alloc, &tl->manifest);
@@ -644,7 +645,8 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     /* Try to seal (no signal: seal GROWS queue, not frees space) */
     tl_status_t seal_st = tl_memtable_seal(&tl->memtable,
                                             &tl->memtable_mu,
-                                            NULL);
+                                            NULL,
+                                            tl->op_seq);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
@@ -692,7 +694,8 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     /* Retry seal now that we have space (no signal: seal GROWS queue) */
     seal_st = tl_memtable_seal(&tl->memtable,
                                 &tl->memtable_mu,
-                                NULL);
+                                NULL,
+                                tl->op_seq);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
@@ -730,7 +733,8 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     TL_LOCK_WRITER(tl);
 
     /* Insert into memtable */
-    tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle);
+    tl_seq_t seq = ++tl->op_seq;
+    tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle, seq);
     if (insert_st != TL_OK && insert_st != TL_EBUSY) {
         TL_UNLOCK_WRITER(tl);
         return insert_st;
@@ -774,7 +778,9 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     TL_LOCK_WRITER(tl);
 
     /* Insert batch into memtable */
-    tl_status_t insert_st = tl_memtable_insert_batch(&tl->memtable, records, n, flags);
+    tl_seq_t seq = ++tl->op_seq;
+    tl_status_t insert_st = tl_memtable_insert_batch(&tl->memtable, records, n,
+                                                      flags, seq);
     if (insert_st != TL_OK && insert_st != TL_EBUSY) {
         TL_UNLOCK_WRITER(tl);
         /* C-08 fix: With all-or-nothing semantics (pre-reserve in slow path),
@@ -829,7 +835,8 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     TL_LOCK_WRITER(tl);
 
     /* Insert tombstone into memtable */
-    st = tl_memtable_insert_tombstone(&tl->memtable, t1, t2);
+    tl_seq_t seq = ++tl->op_seq;
+    st = tl_memtable_insert_tombstone(&tl->memtable, t1, t2, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
         return st;
@@ -863,7 +870,8 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     TL_LOCK_WRITER(tl);
 
     /* Insert unbounded tombstone [TL_TS_MIN, cutoff) */
-    st = tl_memtable_insert_tombstone(&tl->memtable, TL_TS_MIN, cutoff);
+    tl_seq_t seq = ++tl->op_seq;
+    st = tl_memtable_insert_tombstone(&tl->memtable, TL_TS_MIN, cutoff, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
         return st;
@@ -1006,6 +1014,22 @@ static tl_status_t flush_publish(tl_timelog_t* tl, tl_memrun_t* mr, tl_segment_t
     return TL_OK;
 }
 
+static void flush_discard_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
+    TL_ASSERT(tl != NULL);
+    TL_ASSERT(mr != NULL);
+
+    TL_LOCK_WRITER(tl);
+    tl_seqlock_write_begin(&tl->view_seq);
+    TL_LOCK_MEMTABLE(tl);
+    tl_memtable_pop_oldest(&tl->memtable, &tl->memtable_cond);
+    TL_UNLOCK_MEMTABLE(tl);
+    tl_seqlock_write_end(&tl->view_seq);
+    TL_UNLOCK_WRITER(tl);
+
+    tl_memrun_release(mr);
+    tl_atomic_inc_u64(&tl->flushes_total);
+}
+
 /**
  * Flush a single memrun to L0 segment and publish to manifest.
  *
@@ -1037,20 +1061,73 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     uint32_t gen = tl->next_gen++;
     TL_UNLOCK_WRITER(tl);
 
-    /* Step 2: Build L0 segment OFF-LOCK (expensive, only once) */
+    /* Step 2: Capture tombstone snapshot for filtering and watermark */
+    tl_snapshot_t* snap = NULL;
+    st = tl_snapshot_acquire_internal(tl, &tl->alloc, &snap);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    tl_intervals_t tombs;
+    tl_intervals_init(&tombs, &tl->alloc);
+
+    tl_ts_t min_ts = tl_memrun_min_ts(mr);
+    tl_ts_t max_ts = tl_memrun_max_ts(mr);
+    bool t2_unbounded = (max_ts == TL_TS_MAX);
+    tl_ts_t t2 = t2_unbounded ? 0 : (max_ts + 1);
+
+    st = tl_snapshot_collect_tombstones(snap, &tombs,
+                                        min_ts, t2, t2_unbounded);
+    if (st != TL_OK) {
+        tl_intervals_destroy(&tombs);
+        tl_snapshot_release_internal(snap);
+        return st;
+    }
+
+    if (!tl_intervals_is_empty(&tombs)) {
+        if (t2_unbounded) {
+            tl_intervals_clip_lower(&tombs, min_ts);
+        } else {
+            tl_intervals_clip(&tombs, min_ts, t2);
+        }
+    }
+
+    /* Step 3: Build L0 segment OFF-LOCK (expensive, only once) */
     tl_flush_ctx_t ctx = {
         .alloc = &tl->alloc,
         .target_page_bytes = tl->config.target_page_bytes,
-        .generation = gen
+        .generation = gen,
+        .applied_seq = tl_snapshot_seq(snap),
+        .tombs = tl_intervals_as_imm(&tombs),
+        .collect_drops = (tl->config.on_drop_handle != NULL)
     };
 
     tl_segment_t* seg = NULL;
-    st = tl_flush_build(&ctx, mr, &seg);
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    st = tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len);
+    tl_intervals_destroy(&tombs);
+    tl_snapshot_release_internal(snap);
     if (st != TL_OK) {
         return st;  /* mr NOT released - caller handles */
     }
 
-    /* Step 3: Publish with retry (manifest may become stale during build).
+    if (seg == NULL) {
+        flush_discard_memrun(tl, mr);
+        if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
+            for (size_t i = 0; i < dropped_len; i++) {
+                tl->config.on_drop_handle(tl->config.on_drop_ctx,
+                                          dropped[i].ts,
+                                          dropped[i].handle);
+            }
+        }
+        if (dropped != NULL) {
+            tl__free(&tl->alloc, dropped);
+        }
+        return TL_OK;
+    }
+
+    /* Step 4: Publish with retry (manifest may become stale during build).
      * Use same retry limit (3) as compaction for consistency.
      * flush_mu is held by caller, serializing this entire operation. */
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -1059,6 +1136,18 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
             /* Success or hard error - either way, we're done.
              * On success: flush_publish released mr and transferred seg.
              * On error: flush_publish released seg, we return error. */
+            if (st == TL_OK) {
+                if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
+                    for (size_t i = 0; i < dropped_len; i++) {
+                        tl->config.on_drop_handle(tl->config.on_drop_ctx,
+                                                  dropped[i].ts,
+                                                  dropped[i].handle);
+                    }
+                }
+            }
+            if (dropped != NULL) {
+                tl__free(&tl->alloc, dropped);
+            }
             return st;
         }
         /* TL_EBUSY: manifest changed by concurrent compaction.
@@ -1068,6 +1157,9 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     /* Exhausted retries (rare: concurrent compaction storm).
      * Release segment, but NOT mr - caller must release it. */
     tl_segment_release(seg);
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
+    }
     return TL_EBUSY;
 }
 
@@ -1195,7 +1287,8 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
             /* No signal: seal GROWS queue, manual mode has no backpressure waiters */
             st = tl_memtable_seal(&tl->memtable,
                                    &tl->memtable_mu,
-                                   NULL);
+                                   NULL,
+                                   tl->op_seq);
             if (st != TL_OK && st != TL_EBUSY) {
                 TL_UNLOCK_WRITER(tl);
                 TL_UNLOCK_FLUSH(tl);

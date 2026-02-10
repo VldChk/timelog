@@ -6,6 +6,7 @@
 
 tl_status_t tl_ooorun_create(tl_alloc_ctx_t* alloc,
                               tl_record_t* records, size_t len,
+                              tl_seq_t applied_seq,
                               uint64_t gen,
                               tl_ooorun_t** out) {
     TL_ASSERT(alloc != NULL);
@@ -34,6 +35,7 @@ tl_status_t tl_ooorun_create(tl_alloc_ctx_t* alloc,
     run->alloc = alloc;
     run->records = records;
     run->len = len;
+    run->applied_seq = applied_seq;
     run->gen = gen;
 
     run->min_ts = records[0].ts;

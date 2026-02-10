@@ -29,6 +29,9 @@ typedef struct tl_flush_ctx {
     tl_alloc_ctx_t* alloc;              /* Allocator */
     size_t          target_page_bytes;  /* Page size target */
     uint32_t        generation;         /* Generation for L0 segment */
+    tl_seq_t        applied_seq;        /* Tombstone watermark for output */
+    tl_intervals_imm_t tombs;           /* Tombstone fragments for filtering */
+    bool            collect_drops;      /* Collect dropped records */
 } tl_flush_ctx_t;
 
 /*===========================================================================
@@ -126,9 +129,14 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  * 6. Call tl_segment_build_l0(merged, tombstones)
  * 7. Free merged[] buffer
  *
- * @param ctx      Flush context with configuration
- * @param mr       Pinned memrun (caller holds reference)
- * @param out_seg  Output: built L0 segment (caller takes ownership, refcnt = 1)
+ * @param ctx              Flush context with configuration
+ * @param mr               Pinned memrun (caller holds reference)
+ * @param out_seg          Output: built L0 segment (caller takes ownership,
+ *                         refcnt = 1). May be NULL if all records are dropped
+ *                         and no tombstones exist.
+ * @param out_dropped      Output: dropped records (ts, handle) for on_drop
+ *                         callback. Owned by caller; free with alloc.
+ * @param out_dropped_len  Output: length of out_dropped
  * @return TL_OK on success,
  *         TL_ENOMEM on allocation failure,
  *         TL_EOVERFLOW if total_records * sizeof overflows,
@@ -136,6 +144,8 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  */
 tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                             const tl_memrun_t* mr,
-                            tl_segment_t** out_seg);
+                            tl_segment_t** out_seg,
+                            tl_record_t** out_dropped,
+                            size_t* out_dropped_len);
 
 #endif /* TL_FLUSH_H */

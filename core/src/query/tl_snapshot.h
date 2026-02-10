@@ -52,6 +52,11 @@ struct tl_snapshot {
     tl_memview_shared_t* memview;
 
     /*-----------------------------------------------------------------------
+     * Operation Sequence Watermark
+     *-----------------------------------------------------------------------*/
+    tl_seq_t        op_seq;          /* op_seq captured at acquisition */
+
+    /*-----------------------------------------------------------------------
      * Cached Bounds (computed at acquisition time)
      *-----------------------------------------------------------------------*/
     tl_ts_t         min_ts;          /* Global min across manifest + memview */
@@ -100,6 +105,14 @@ TL_INLINE const tl_memview_t* tl_snapshot_memview(const tl_snapshot_t* snap) {
 TL_INLINE tl_alloc_ctx_t* tl_snapshot_alloc(const tl_snapshot_t* snap) {
     TL_ASSERT(snap != NULL);
     return snap->alloc;
+}
+
+/**
+ * Get operation sequence watermark captured with the snapshot.
+ */
+TL_INLINE tl_seq_t tl_snapshot_seq(const tl_snapshot_t* snap) {
+    TL_ASSERT(snap != NULL);
+    return snap->op_seq;
 }
 
 /**
@@ -176,5 +189,28 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
  * @param snap  Snapshot to release (may be NULL)
  */
 void tl_snapshot_release_internal(tl_snapshot_t* snap);
+
+/**
+ * Collect tombstones from snapshot into a mutable interval set.
+ *
+ * Builds a piecewise-max tombstone map across:
+ * - Active memview tombstones
+ * - Sealed memruns in the memview
+ * - Manifest L0/L1 segments (if present)
+ *
+ * Intervals are filtered to those overlapping [t1, t2) or [t1, +inf).
+ * The output set is cleared before insertions.
+ *
+ * @param snap         Snapshot (must remain valid)
+ * @param out          Output interval set (initialized by caller)
+ * @param t1           Range start (inclusive)
+ * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
+ * @param t2_unbounded True => [t1, +inf)
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on failure
+ */
+tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
+                                            tl_intervals_t* out,
+                                            tl_ts_t t1, tl_ts_t t2,
+                                            bool t2_unbounded);
 
 #endif /* TL_SNAPSHOT_H */

@@ -48,6 +48,10 @@ typedef struct tl_kmerge_iter {
     bool            done;
     tl_status_t     error;
 
+    /* Skip-ahead optimization state */
+    tl_seq_t        max_watermark;
+    bool            has_variable_watermark;
+
     /* Allocator (borrowed) */
     tl_alloc_ctx_t* alloc;
 } tl_kmerge_iter_t;
@@ -93,7 +97,8 @@ void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it);
  * @param out  Output record
  * @return TL_OK if record available, TL_EOF if exhausted
  */
-tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
+tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
+                                 tl_seq_t* out_watermark);
 
 /**
  * Seek all sources to first record with ts >= target.
@@ -116,6 +121,17 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
  * @param target Target timestamp to seek to
  */
 void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target);
+
+/**
+ * Check if skip-ahead is safe for a tombstone seq.
+ *
+ * Safe when all sources have constant watermarks and tomb_seq is newer
+ * than every source watermark.
+ */
+TL_INLINE bool tl_kmerge_iter_can_skip(const tl_kmerge_iter_t* it,
+                                       tl_seq_t tomb_seq) {
+    return !it->has_variable_watermark && tomb_seq > it->max_watermark;
+}
 
 /*===========================================================================
  * State Queries

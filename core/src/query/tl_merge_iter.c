@@ -24,7 +24,8 @@ volatile int tl_test_kmerge_force_error_count = 0;
  * @param out    Output record
  * @return TL_OK if record available, TL_EOF if exhausted
  */
-static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out) {
+static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out,
+                               tl_seq_t* out_watermark) {
 #ifdef TL_TEST_HOOKS
     if (tl_test_kmerge_force_error_count > 0) {
         tl_test_kmerge_force_error_count--;
@@ -32,13 +33,17 @@ static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out) {
     }
 #endif
     if (src->kind == TL_ITER_SEGMENT) {
-        return tl_segment_iter_next(&src->iter.segment, out);
+        tl_status_t st = tl_segment_iter_next(&src->iter.segment, out);
+        if (st == TL_OK && out_watermark != NULL) {
+            *out_watermark = src->watermark;
+        }
+        return st;
     }
     if (src->kind == TL_ITER_MEMRUN) {
-        return tl_memrun_iter_next(&src->iter.memrun, out);
+        return tl_memrun_iter_next(&src->iter.memrun, out, out_watermark);
     }
     if (src->kind == TL_ITER_ACTIVE) {
-        return tl_active_iter_next(&src->iter.active, out);
+        return tl_active_iter_next(&src->iter.active, out, out_watermark);
     }
     /* Should never reach here - all enum values handled above */
     TL_ASSERT(false && "Invalid source kind");
@@ -107,7 +112,8 @@ static tl_status_t push_initial_entry(tl_heap_t* h,
 
     /* Prime the iterator */
     tl_record_t rec;
-    tl_status_t st = source_next(src, &rec);
+    tl_seq_t watermark = 0;
+    tl_status_t st = source_next(src, &rec, &watermark);
 
     if (st == TL_EOF) {
         /* Source was empty */
@@ -127,6 +133,7 @@ static tl_status_t push_initial_entry(tl_heap_t* h,
         .ts = rec.ts,
         .tie_break_key = src->priority,
         .handle = rec.handle,
+        .watermark = watermark,
         .iter = src
     };
 
@@ -155,6 +162,20 @@ tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
     if (plan->source_count == 0) {
         it->done = true;
         return TL_OK;
+    }
+
+    /* Compute skip-ahead metadata */
+    it->max_watermark = 0;
+    it->has_variable_watermark = false;
+    for (size_t i = 0; i < plan->source_count; i++) {
+        const tl_iter_source_t* src = tl_plan_source(plan, i);
+        if (src->kind == TL_ITER_ACTIVE) {
+            it->has_variable_watermark = true;
+            continue;
+        }
+        if (src->watermark > it->max_watermark) {
+            it->max_watermark = src->watermark;
+        }
     }
 
     /* Reserve heap capacity */
@@ -190,13 +211,16 @@ void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it) {
     it->plan = NULL;
     it->done = true;
     it->error = TL_OK;
+    it->max_watermark = 0;
+    it->has_variable_watermark = false;
 }
 
 /*===========================================================================
  * Iteration
  *===========================================================================*/
 
-tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
+tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
+                                 tl_seq_t* out_watermark) {
     TL_ASSERT(it != NULL);
     TL_ASSERT(out != NULL);
 
@@ -235,6 +259,9 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
     /* Step 2: Output the record */
     out->ts = peek->ts;
     out->handle = peek->handle;
+    if (out_watermark != NULL) {
+        *out_watermark = peek->watermark;
+    }
 
     /* Get source pointer and tie_break_key while peek is still valid */
     tl_iter_source_t* src = (tl_iter_source_t*)peek->iter;
@@ -242,7 +269,8 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
 
     /* Step 3: Advance the source that produced this record */
     tl_record_t next_rec;
-    tl_status_t st = source_next(src, &next_rec);
+    tl_seq_t next_watermark = 0;
+    tl_status_t st = source_next(src, &next_rec, &next_watermark);
 
     if (st == TL_OK) {
         /* Step 4: Source has more - replace top entry (no allocation) */
@@ -250,6 +278,7 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out) {
             .ts = next_rec.ts,
             .tie_break_key = tie_id,
             .handle = next_rec.handle,
+            .watermark = next_watermark,
             .iter = src
         };
         tl_heap_replace_top(&it->heap, &new_entry);
@@ -349,7 +378,8 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
 
         /* Prime the iterator with next record */
         tl_record_t rec;
-        tl_status_t st = source_next(src, &rec);
+        tl_seq_t watermark = 0;
+        tl_status_t st = source_next(src, &rec, &watermark);
 
         if (st == TL_EOF) {
             continue;
@@ -371,6 +401,7 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
             .ts = rec.ts,
             .tie_break_key = popped.tie_break_key,
             .handle = rec.handle,
+            .watermark = watermark,
             .iter = src
         };
 

@@ -201,12 +201,13 @@ typedef struct tl_allocator {
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 
 /**
- * Handle drop callback (invoked after compaction when records are removed).
+ * Handle drop callback (invoked after physical deletes during compaction
+ * and during flush when tombstones remove sealed records).
  *
  * WHEN INVOKED:
- * - Only for records PHYSICALLY dropped during compaction (tombstone application)
+ * - Only for records PHYSICALLY dropped during compaction or flush
+ *   (tombstone application)
  * - NOT called for logical tombstone insertion (tl_delete_range/tl_delete_before)
- * - NOT called during tl_flush() (flush moves records to L0, does not drop them)
  * - NOT called during tl_close() - caller retains ownership of all remaining handles
  * - Callbacks are DEFERRED until after successful manifest publish, ensuring
  *   that only truly committed drops trigger the callback
@@ -216,10 +217,10 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * NOT that it's safe to free immediately. Existing snapshots acquired before
  * compaction may still reference this handle until those snapshots are released.
  * CONTRACT:
- * - Called ONLY when a record is physically deleted during compaction
+ * - Called ONLY when a record is physically deleted during compaction or flush
  *   (tombstone coverage).
  * - Called ONLY after successful manifest publish (never speculatively).
- * - NOT called by tl_close(), flush, or segment release.
+ * - NOT called by tl_close() or segment release.
  * - Handles not covered by tombstones are never reported here; callers
  *   must track them if cleanup-at-close is required.
  *

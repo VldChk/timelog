@@ -1,5 +1,6 @@
 #include "tl_flush.h"
 #include "../internal/tl_heap.h"
+#include "../internal/tl_intervals.h"
 
 /*===========================================================================
  * Merge Iterator Implementation
@@ -80,13 +81,19 @@ const tl_record_t* tl_merge_iter_next(tl_merge_iter_t* it) {
 
 tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                             const tl_memrun_t* mr,
-                            tl_segment_t** out_seg) {
+                            tl_segment_t** out_seg,
+                            tl_record_t** out_dropped,
+                            size_t* out_dropped_len) {
     TL_ASSERT(ctx != NULL);
     TL_ASSERT(ctx->alloc != NULL);
     TL_ASSERT(mr != NULL);
     TL_ASSERT(out_seg != NULL);
+    TL_ASSERT(out_dropped != NULL);
+    TL_ASSERT(out_dropped_len != NULL);
 
     *out_seg = NULL;
+    *out_dropped = NULL;
+    *out_dropped_len = 0;
 
     /*
      * Step 1: Addition overflow check FIRST.
@@ -110,6 +117,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                                         mr->tombs, mr->tombs_len,
                                         ctx->target_page_bytes,
                                         ctx->generation,
+                                        ctx->applied_seq,
                                         out_seg);
         } else {
             /* Empty memrun should never reach here (invariant violation) */
@@ -134,6 +142,10 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         return TL_ENOMEM;
     }
 
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    size_t dropped_cap = 0;
+
     /*
      * Step 5: K-way merge run + OOO runs into merged[].
      * Stable tie-break: run first, then OOO runs by gen order.
@@ -154,6 +166,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         size_t             pos;
         size_t             end;
         uint32_t           tie_id;
+        tl_seq_t           watermark;
     } flush_src_t;
 
     if (src_count > SIZE_MAX / sizeof(flush_src_t)) {
@@ -173,6 +186,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         srcs[src_idx].pos = 0;
         srcs[src_idx].end = mr->run_len;
         srcs[src_idx].tie_id = 0;
+        srcs[src_idx].watermark = mr->applied_seq;
         src_idx++;
     }
 
@@ -187,6 +201,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
             srcs[src_idx].pos = 0;
             srcs[src_idx].end = run->len;
             srcs[src_idx].tie_id = (uint32_t)(1 + i);
+            srcs[src_idx].watermark = run->applied_seq;
             src_idx++;
         }
     }
@@ -216,6 +231,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
             .ts = rec->ts,
             .tie_break_key = srcs[i].tie_id,
             .handle = rec->handle,
+            .watermark = srcs[i].watermark,
             .iter = &srcs[i]
         };
         st = tl_heap_push(&heap, &entry);
@@ -227,13 +243,47 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         }
     }
 
+    tl_intervals_cursor_t tomb_cursor;
+    tl_intervals_cursor_init(&tomb_cursor, ctx->tombs);
+
     size_t i = 0;
     while (!tl_heap_is_empty(&heap)) {
         const tl_heap_entry_t* top = tl_heap_peek(&heap);
         TL_ASSERT(top != NULL);
-        merged[i].ts = top->ts;
-        merged[i].handle = top->handle;
-        i++;
+        tl_seq_t tomb_seq = 0;
+        if (ctx->tombs.len > 0) {
+            tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, top->ts);
+        }
+        if (tomb_seq <= top->watermark) {
+            merged[i].ts = top->ts;
+            merged[i].handle = top->handle;
+            i++;
+        } else if (ctx->collect_drops) {
+            if (dropped_len >= dropped_cap) {
+                size_t new_cap = (dropped_cap == 0) ? 64 : dropped_cap * 2;
+                if (tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+                    tl_heap_destroy(&heap);
+                    tl__free(ctx->alloc, srcs);
+                    tl__free(ctx->alloc, merged);
+                    tl__free(ctx->alloc, dropped);
+                    return TL_EOVERFLOW;
+                }
+                tl_record_t* new_arr = tl__realloc(ctx->alloc, dropped,
+                                                   new_cap * sizeof(tl_record_t));
+                if (new_arr == NULL) {
+                    tl_heap_destroy(&heap);
+                    tl__free(ctx->alloc, srcs);
+                    tl__free(ctx->alloc, merged);
+                    tl__free(ctx->alloc, dropped);
+                    return TL_ENOMEM;
+                }
+                dropped = new_arr;
+                dropped_cap = new_cap;
+            }
+            dropped[dropped_len].ts = top->ts;
+            dropped[dropped_len].handle = top->handle;
+            dropped_len++;
+        }
 
         flush_src_t* src = (flush_src_t*)top->iter;
         uint32_t tie_id = top->tie_break_key;
@@ -243,6 +293,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                 .ts = rec->ts,
                 .tie_break_key = tie_id,
                 .handle = rec->handle,
+                .watermark = src->watermark,
                 .iter = src
             };
             tl_heap_replace_top(&heap, &entry);
@@ -255,22 +306,46 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     tl_heap_destroy(&heap);
     tl__free(ctx->alloc, srcs);
 
-    TL_ASSERT(i == total_records);
+    size_t kept = i;
 
     /*
      * Step 6: Build L0 segment from merged records and tombstones.
      */
-    st = tl_segment_build_l0(ctx->alloc,
-                             merged, total_records,
-                             mr->tombs, mr->tombs_len,
-                             ctx->target_page_bytes,
-                             ctx->generation,
-                             out_seg);
+    if (kept == 0) {
+        if (mr->tombs_len > 0) {
+            st = tl_segment_build_l0(ctx->alloc,
+                                     NULL, 0,
+                                     mr->tombs, mr->tombs_len,
+                                     ctx->target_page_bytes,
+                                     ctx->generation,
+                                     ctx->applied_seq,
+                                     out_seg);
+        } else {
+            st = TL_OK;
+            *out_seg = NULL;
+        }
+    } else {
+        st = tl_segment_build_l0(ctx->alloc,
+                                 merged, kept,
+                                 mr->tombs, mr->tombs_len,
+                                 ctx->target_page_bytes,
+                                 ctx->generation,
+                                 ctx->applied_seq,
+                                 out_seg);
+    }
 
     /*
      * Step 7: Free merged buffer regardless of build result.
      */
     tl__free(ctx->alloc, merged);
 
-    return st;
+    if (st != TL_OK) {
+        tl__free(ctx->alloc, dropped);
+        return st;
+    }
+
+    *out_dropped = dropped;
+    *out_dropped_len = dropped_len;
+
+    return TL_OK;
 }

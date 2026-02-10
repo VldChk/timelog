@@ -83,6 +83,52 @@ static void delta_fail_free(void* ctx, void* ptr) {
     free(ptr);
 }
 
+static tl_seq_t delta_test_seq = 0;
+
+static tl_seq_t delta_next_seq(void) {
+    return ++delta_test_seq;
+}
+
+static tl_status_t test_memtable_insert(tl_memtable_t* mt,
+                                         tl_ts_t ts,
+                                         tl_handle_t handle) {
+    return tl_memtable_insert(mt, ts, handle, delta_next_seq());
+}
+
+static tl_status_t test_memtable_insert_batch(tl_memtable_t* mt,
+                                               const tl_record_t* records,
+                                               size_t n,
+                                               uint32_t flags) {
+    return tl_memtable_insert_batch(mt, records, n, flags, delta_next_seq());
+}
+
+static tl_status_t test_memtable_insert_tombstone(tl_memtable_t* mt,
+                                                   tl_ts_t t1,
+                                                   tl_ts_t t2) {
+    return tl_memtable_insert_tombstone(mt, t1, t2, delta_next_seq());
+}
+
+static tl_status_t test_memtable_seal(tl_memtable_t* mt,
+                                       tl_mutex_t* mu,
+                                       tl_cond_t* cond) {
+    return tl_memtable_seal(mt, mu, cond, delta_next_seq());
+}
+
+static tl_status_t test_memrun_create(tl_alloc_ctx_t* alloc,
+                                       tl_record_t* run, size_t run_len,
+                                       tl_ooorunset_t* ooo_runs,
+                                       tl_interval_t* tombs, size_t tombs_len,
+                                       tl_memrun_t** out) {
+    return tl_memrun_create(alloc, run, run_len, ooo_runs, tombs, tombs_len,
+                            delta_next_seq(), out);
+}
+
+#define tl_memtable_insert test_memtable_insert
+#define tl_memtable_insert_batch test_memtable_insert_batch
+#define tl_memtable_insert_tombstone test_memtable_insert_tombstone
+#define tl_memtable_seal test_memtable_seal
+#define tl_memrun_create test_memrun_create
+
 static tl_status_t make_ooo_runset(tl_alloc_ctx_t* alloc,
                                    tl_record_t* records, size_t len,
                                    tl_ooorunset_t** out) {
@@ -94,7 +140,8 @@ static tl_status_t make_ooo_runset(tl_alloc_ctx_t* alloc,
     }
 
     tl_ooorun_t* run = NULL;
-    tl_status_t st = tl_ooorun_create(alloc, records, len, 1, &run);
+    tl_seq_t applied_seq = delta_next_seq();
+    tl_status_t st = tl_ooorun_create(alloc, records, len, applied_seq, 1, &run);
     if (st != TL_OK) {
         return st;
     }
@@ -125,7 +172,7 @@ TEST_DECLARE(delta_ooorun_create_bounds) {
     recs[2] = (tl_record_t){.ts = 9, .handle = 3};
 
     tl_ooorun_t* run = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs, 3, 7, &run));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs, 3, 0, 7, &run));
     TEST_ASSERT_NOT_NULL(run);
     TEST_ASSERT_EQ(3, run->len);
     TEST_ASSERT_EQ(5, run->min_ts);
@@ -151,8 +198,8 @@ TEST_DECLARE(delta_ooorunset_create_total_len) {
 
     tl_ooorun_t* run_a = NULL;
     tl_ooorun_t* run_b = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_a, 2, 1, &run_a));
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_b, 1, 2, &run_b));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_a, 2, 0, 1, &run_a));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_b, 1, 0, 2, &run_b));
 
     tl_ooorun_t* runs[2] = { run_a, run_b };
     tl_ooorunset_t* set = NULL;
@@ -186,8 +233,8 @@ TEST_DECLARE(delta_ooorunset_append) {
 
     tl_ooorun_t* run_a = NULL;
     tl_ooorun_t* run_b = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_a, 1, 1, &run_a));
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_b, 2, 2, &run_b));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_a, 1, 0, 1, &run_a));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, recs_b, 2, 0, 2, &run_b));
 
     tl_ooorun_t* runs[1] = { run_a };
     tl_ooorunset_t* set_a = NULL;
@@ -283,7 +330,8 @@ TEST_DECLARE(delta_memrun_create_with_tombstones) {
     TEST_ASSERT_NOT_NULL(tombs);
 
     run[0] = (tl_record_t){.ts = 50, .handle = 1};
-    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, tombs, 1, &mr));
@@ -305,7 +353,8 @@ TEST_DECLARE(delta_memrun_create_tombstone_only) {
 
     tl_interval_t* tombs = TL_NEW_ARRAY(&alloc, tl_interval_t, 1);
     TEST_ASSERT_NOT_NULL(tombs);
-    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, NULL, 0, NULL, tombs, 1, &mr));
@@ -343,7 +392,8 @@ TEST_DECLARE(delta_memrun_bounds_include_tombstones) {
     TEST_ASSERT_NOT_NULL(tombs);
 
     run[0] = (tl_record_t){.ts = 50, .handle = 1};
-    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, tombs, 1, &mr));
@@ -367,7 +417,8 @@ TEST_DECLARE(delta_memrun_bounds_unbounded_tomb) {
     TEST_ASSERT_NOT_NULL(tombs);
 
     run[0] = (tl_record_t){.ts = 50, .handle = 1};
-    tombs[0] = (tl_interval_t){.start = 100, .end = 0, .end_unbounded = true};
+    tombs[0] = (tl_interval_t){.start = 100, .end = 0, .end_unbounded = true,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, tombs, 1, &mr));
@@ -397,7 +448,8 @@ TEST_DECLARE(delta_memrun_bounds_tomb_extends_max) {
     TEST_ASSERT_NOT_NULL(tombs);
 
     run[0] = (tl_record_t){.ts = 50, .handle = 1};
-    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, tombs, 1, &mr));
@@ -592,12 +644,13 @@ TEST_DECLARE(delta_memtable_insert_updates_bytes) {
     tl_memtable_t mt;
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 4));
     TEST_ASSERT_EQ(0, mt.active_bytes_est);
+    size_t rec_bytes = TL_RECORD_SIZE + sizeof(tl_seq_t);
 
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 1));
-    TEST_ASSERT_EQ(TL_RECORD_SIZE, mt.active_bytes_est);
+    TEST_ASSERT_EQ(rec_bytes, mt.active_bytes_est);
 
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 20, 2));
-    TEST_ASSERT_EQ(2 * TL_RECORD_SIZE, mt.active_bytes_est);
+    TEST_ASSERT_EQ(2 * rec_bytes, mt.active_bytes_est);
 
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
@@ -682,7 +735,7 @@ TEST_DECLARE(delta_memtable_insert_batch_no_double_count) {
      * bytes should be 3 * record size.
      */
     TEST_ASSERT_EQ(1, tl_memtable_epoch(&mt));
-    TEST_ASSERT_EQ(3 * TL_RECORD_SIZE, mt.active_bytes_est);
+    TEST_ASSERT_EQ(3 * (TL_RECORD_SIZE + sizeof(tl_seq_t)), mt.active_bytes_est);
 
     tl_memtable_destroy(&mt);
     tl__alloc_destroy(&alloc);
@@ -780,6 +833,7 @@ TEST_DECLARE(delta_memtable_flush_head_enomem_returns_ebusy) {
     /* Force flush on first OOO insert, and pre-reserve head capacity. */
     mt.ooo_chunk_records = 1;
     TEST_ASSERT_STATUS(TL_OK, tl_recvec_reserve(&mt.ooo_head, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_seqvec_reserve(&mt.ooo_head_seqs, 1));
 
     /* Seed last_inorder_ts. */
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 1));
@@ -1509,17 +1563,17 @@ TEST_DECLARE(delta_memrun_iter_merges_run_and_runs) {
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
     TEST_ASSERT_EQ(2, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
     TEST_ASSERT_EQ(99, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(30, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
 
     tl_memrun_iter_destroy(&it);
     tl_memrun_release(mr);
@@ -1548,9 +1602,9 @@ TEST_DECLARE(delta_memrun_iter_merges_multiple_runs) {
     tl_ooorun_t* run1 = NULL;
     tl_ooorun_t* run2 = NULL;
     tl_ooorun_t* run3 = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r1, 1, 1, &run1));
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r2, 1, 2, &run2));
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r3, 1, 3, &run3));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r1, 1, 0, 1, &run1));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r2, 1, 0, 2, &run2));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r3, 1, 0, 3, &run3));
 
     tl_ooorun_t* runs[3] = { run1, run2, run3 };
     tl_ooorunset_t* ooo_runs = NULL;
@@ -1567,15 +1621,15 @@ TEST_DECLARE(delta_memrun_iter_merges_multiple_runs) {
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(5, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(15, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
 
     tl_memrun_iter_destroy(&it);
     tl_memrun_release(mr);
@@ -1596,8 +1650,8 @@ TEST_DECLARE(delta_memrun_iter_generation_tie_break) {
 
     tl_ooorun_t* run1 = NULL;
     tl_ooorun_t* run2 = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r1, 1, 1, &run1));
-    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r2, 1, 2, &run2));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r1, 1, 0, 1, &run1));
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorun_create(&alloc, r2, 1, 0, 2, &run2));
 
     tl_ooorun_t* runs[2] = { run1, run2 };
     tl_ooorunset_t* ooo_runs = NULL;
@@ -1613,13 +1667,13 @@ TEST_DECLARE(delta_memrun_iter_generation_tie_break) {
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
     TEST_ASSERT_EQ(1, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
     TEST_ASSERT_EQ(2, rec.handle);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
 
     tl_memrun_iter_destroy(&it);
     tl_memrun_release(mr);
@@ -1655,17 +1709,17 @@ TEST_DECLARE(delta_active_iter_merges_run_head_runs) {
     TEST_ASSERT_STATUS(TL_OK, tl_active_iter_init(&it, &mv, 0, 200, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(30, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(50, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(60, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(80, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(100, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_active_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_EOF, tl_active_iter_next(&it, &rec, NULL));
 
     tl_active_iter_destroy(&it);
     tl_memview_destroy(&mv);
@@ -1835,7 +1889,7 @@ TEST_DECLARE(delta_kmerge_iter_propagates_source_error) {
 
     tl_test_kmerge_force_error_count = 1;
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_EINTERNAL, tl_kmerge_iter_next(&it, &rec));
+    TEST_ASSERT_STATUS(TL_EINTERNAL, tl_kmerge_iter_next(&it, &rec, NULL));
     TEST_ASSERT(tl_kmerge_iter_done(&it));
 
     tl_kmerge_iter_destroy(&it);
@@ -1877,18 +1931,27 @@ TEST_DECLARE(delta_flush_build_records_only) {
     tl_flush_ctx_t ctx = {
         .alloc = &alloc,
         .target_page_bytes = 64 * 1024,
-        .generation = 1
+        .generation = 1,
+        .applied_seq = 42,
+        .collect_drops = false
     };
 
     tl_segment_t* seg = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg));
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
     TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(0, dropped_len);
     TEST_ASSERT_EQ(4, seg->record_count);
     TEST_ASSERT_EQ(10, seg->min_ts);
     TEST_ASSERT_EQ(40, seg->max_ts);
     TEST_ASSERT(tl_segment_is_l0(seg));
+    TEST_ASSERT_EQ(42, tl_segment_applied_seq(seg));
 
     tl_segment_release(seg);
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -1903,7 +1966,8 @@ TEST_DECLARE(delta_flush_build_with_tombstones) {
     TEST_ASSERT_NOT_NULL(tombs);
 
     run[0] = (tl_record_t){.ts = 50, .handle = 1};
-    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 10, .end = 30, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, NULL, tombs, 1, &mr));
@@ -1911,16 +1975,25 @@ TEST_DECLARE(delta_flush_build_with_tombstones) {
     tl_flush_ctx_t ctx = {
         .alloc = &alloc,
         .target_page_bytes = 64 * 1024,
-        .generation = 1
+        .generation = 1,
+        .applied_seq = 7,
+        .collect_drops = false
     };
 
     tl_segment_t* seg = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg));
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
     TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(0, dropped_len);
     TEST_ASSERT(tl_segment_has_tombstones(seg));
     TEST_ASSERT_EQ(1, seg->record_count);
+    TEST_ASSERT_EQ(7, tl_segment_applied_seq(seg));
 
     tl_segment_release(seg);
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -1931,7 +2004,8 @@ TEST_DECLARE(delta_flush_build_tombstone_only) {
 
     tl_interval_t* tombs = TL_NEW_ARRAY(&alloc, tl_interval_t, 1);
     TEST_ASSERT_NOT_NULL(tombs);
-    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false};
+    tombs[0] = (tl_interval_t){.start = 100, .end = 200, .end_unbounded = false,
+                               .max_seq = 1};
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, NULL, 0, NULL, tombs, 1, &mr));
@@ -1939,16 +2013,25 @@ TEST_DECLARE(delta_flush_build_tombstone_only) {
     tl_flush_ctx_t ctx = {
         .alloc = &alloc,
         .target_page_bytes = 64 * 1024,
-        .generation = 1
+        .generation = 1,
+        .applied_seq = 9,
+        .collect_drops = false
     };
 
     tl_segment_t* seg = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg));
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
     TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(0, dropped_len);
     TEST_ASSERT(tl_segment_is_tombstone_only(seg));
     TEST_ASSERT_EQ(0, seg->record_count);
+    TEST_ASSERT_EQ(9, tl_segment_applied_seq(seg));
 
     tl_segment_release(seg);
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -2320,13 +2403,19 @@ TEST_DECLARE(delta_flush_build_run_ooo_overflow) {
     tl_flush_ctx_t ctx = {
         .alloc = &alloc,
         .target_page_bytes = TL_DEFAULT_TARGET_PAGE_BYTES,
-        .generation = 1
+        .generation = 1,
+        .applied_seq = 0,
+        .collect_drops = false
     };
 
     tl_segment_t* seg = NULL;
-    tl_status_t st = tl_flush_build(&ctx, mr, &seg);
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    tl_status_t st = tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len);
     TEST_ASSERT_STATUS(TL_EOVERFLOW, st);
     TEST_ASSERT_NULL(seg);
+    TEST_ASSERT_NULL(dropped);
+    TEST_ASSERT_EQ(0, dropped_len);
 
     /* Restore original values for clean destruction */
     mr->run_len = orig_run_len;

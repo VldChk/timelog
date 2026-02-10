@@ -55,6 +55,9 @@ typedef struct tl_iter_source {
      * Memruns: index in sealed queue (0 = oldest)
      * Active: always highest priority (youngest data) */
     uint32_t priority;
+
+    /* Tombstone watermark for immutable sources (segments/memruns). */
+    tl_seq_t watermark;
 } tl_iter_source_t;
 
 /*---------------------------------------------------------------------------

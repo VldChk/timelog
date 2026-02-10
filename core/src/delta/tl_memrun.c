@@ -58,7 +58,8 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
                             tl_alloc_ctx_t* alloc,
                             tl_record_t* run, size_t run_len,
                             tl_ooorunset_t* ooo_runs,
-                            tl_interval_t* tombs, size_t tombs_len) {
+                            tl_interval_t* tombs, size_t tombs_len,
+                            tl_seq_t applied_seq) {
     if (mr == NULL || alloc == NULL) {
         return TL_EINVAL;
     }
@@ -85,6 +86,7 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
     mr->ooo_max_ts = TL_TS_MIN;
     mr->tombs = tombs;
     mr->tombs_len = tombs_len;
+    mr->applied_seq = applied_seq;
 
     /* Store allocator */
     mr->alloc = alloc;
@@ -109,6 +111,7 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
                               tl_record_t* run, size_t run_len,
                               tl_ooorunset_t* ooo_runs,
                               tl_interval_t* tombs, size_t tombs_len,
+                              tl_seq_t applied_seq,
                               tl_memrun_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
@@ -135,7 +138,8 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
         return st;
     }
 
-    st = tl_memrun_init(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len);
+    st = tl_memrun_init(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len,
+                        applied_seq);
     if (st != TL_OK) {
         tl__free(alloc, mr);
         return st;
@@ -265,8 +269,8 @@ static bool is_tombs_valid(const tl_interval_t* arr, size_t len) {
             return false;
         }
 
-        /* Must not be adjacent (should be coalesced): curr->end < next->start */
-        if (curr->end == next->start) {
+        /* Must not be adjacent with same max_seq (should be coalesced) */
+        if (curr->end == next->start && curr->max_seq == next->max_seq) {
             return false;
         }
     }

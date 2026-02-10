@@ -7,7 +7,8 @@
 /*===========================================================================
  * Interval Set
  *
- * Stores half-open time intervals [t1, t2) representing tombstones.
+ * Stores half-open time intervals [t1, t2) representing tombstones
+ * with an associated max sequence number for that range.
  * Provides:
  * - Mutable insert with automatic coalescing
  * - Immutable snapshot for storage attachment
@@ -26,16 +27,17 @@
  *===========================================================================*/
 
 /**
- * A single half-open interval [start, end).
+ * A single half-open interval [start, end) with max tombstone seq.
  * If end_unbounded is true, represents [start, +inf).
  *
  * When end_unbounded is true, the 'end' field is ignored (set to 0 for clarity).
  * Always check end_unbounded BEFORE reading 'end'.
  */
 typedef struct tl_interval {
-    tl_ts_t start;        /* Inclusive start bound */
-    tl_ts_t end;          /* Exclusive end bound (ONLY valid if !end_unbounded) */
-    bool    end_unbounded;/* True => [start, +inf), 'end' is ignored */
+    tl_ts_t  start;        /* Inclusive start bound */
+    tl_ts_t  end;          /* Exclusive end bound (ONLY valid if !end_unbounded) */
+    bool     end_unbounded;/* True => [start, +inf), 'end' is ignored */
+    tl_seq_t max_seq;      /* Max tombstone seq covering this interval */
 } tl_interval_t;
 
 /**
@@ -97,7 +99,10 @@ void tl_intervals_clear(tl_intervals_t* iv);
  * - Adjacent intervals (end1 == start2) are merged.
  * - Unboundedness propagates: merging with [x, +inf) yields unbounded result.
  */
-tl_status_t tl_intervals_insert(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2);
+tl_status_t tl_intervals_insert(tl_intervals_t* iv,
+                                 tl_ts_t t1,
+                                 tl_ts_t t2,
+                                 tl_seq_t seq);
 
 /**
  * Insert an unbounded interval [t1, +inf).
@@ -108,18 +113,26 @@ tl_status_t tl_intervals_insert(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2);
  *
  * @return TL_OK on success, TL_ENOMEM on allocation failure
  */
-tl_status_t tl_intervals_insert_unbounded(tl_intervals_t* iv, tl_ts_t t1);
+tl_status_t tl_intervals_insert_unbounded(tl_intervals_t* iv,
+                                           tl_ts_t t1,
+                                           tl_seq_t seq);
 
 /*---------------------------------------------------------------------------
  * Point Containment
  *---------------------------------------------------------------------------*/
 
 /**
- * Check if timestamp ts is contained in any interval.
+ * Check if timestamp ts is contained in any interval (max_seq > 0).
  * @return true if ts is in [start, end) for some interval, false otherwise
  */
 bool tl_intervals_contains(const tl_intervals_t* iv, tl_ts_t ts);
 bool tl_intervals_imm_contains(tl_intervals_imm_t iv, tl_ts_t ts);
+
+/**
+ * Get max tombstone seq covering ts (0 if none).
+ */
+tl_seq_t tl_intervals_max_seq(const tl_intervals_t* iv, tl_ts_t ts);
+tl_seq_t tl_intervals_imm_max_seq(tl_intervals_imm_t iv, tl_ts_t ts);
 
 /*---------------------------------------------------------------------------
  * Set Operations
@@ -252,22 +265,22 @@ TL_INLINE void tl_intervals_cursor_init(tl_intervals_cursor_t* cur,
 }
 
 /**
- * Check if timestamp is deleted and advance cursor.
+ * Get max tombstone seq at ts and advance cursor.
  *
  * Algorithm (Read Path LLD Section 7.1):
  * - Advance cursor while ts >= cur.end (for bounded intervals)
- * - Return true if cur.start <= ts (and ts < cur.end for bounded, always for unbounded)
+ * - Return max_seq if cur.start <= ts (and ts < cur.end for bounded, always for unbounded)
  *
  * Unbounded interval handling:
  * - An unbounded interval [start, +inf) covers all ts >= start.
- * - Once cursor reaches an unbounded interval, it stays there (all future ts are deleted).
+ * - Once cursor reaches an unbounded interval, it stays there (all future ts are covered).
  *
  * @param ts Timestamp to check
- * @return true if ts is covered by a tombstone, false otherwise
+ * @return max tombstone seq covering ts, or 0 if none
  *
  * Precondition: Timestamps must be passed in non-decreasing order.
  */
-bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts);
+tl_seq_t tl_intervals_cursor_max_seq(tl_intervals_cursor_t* cur, tl_ts_t ts);
 
 /**
  * Get the next uncovered timestamp after the current position.

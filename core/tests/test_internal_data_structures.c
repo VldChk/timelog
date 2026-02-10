@@ -25,6 +25,37 @@
 
 #include <string.h>
 
+static tl_status_t intervals_insert_seq(tl_intervals_t* iv,
+                                        tl_ts_t t1,
+                                        tl_ts_t t2,
+                                        tl_seq_t seq) {
+    return tl_intervals_insert(iv, t1, t2, seq);
+}
+
+static tl_status_t intervals_insert_unbounded_seq(tl_intervals_t* iv,
+                                                  tl_ts_t t1,
+                                                  tl_seq_t seq) {
+    return tl_intervals_insert_unbounded(iv, t1, seq);
+}
+
+static tl_status_t test_intervals_insert(tl_intervals_t* iv,
+                                          tl_ts_t t1,
+                                          tl_ts_t t2) {
+    return tl_intervals_insert(iv, t1, t2, 1);
+}
+
+static tl_status_t test_intervals_insert_unbounded(tl_intervals_t* iv,
+                                                    tl_ts_t t1) {
+    return tl_intervals_insert_unbounded(iv, t1, 1);
+}
+
+#define tl_intervals_insert test_intervals_insert
+#define tl_intervals_insert_unbounded test_intervals_insert_unbounded
+
+static bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts) {
+    return tl_intervals_cursor_max_seq(cur, ts) > 0;
+}
+
 /*===========================================================================
  * Record Vector Tests (16 tests)
  *===========================================================================*/
@@ -463,6 +494,50 @@ TEST_DECLARE(ds_intervals_coalesce_adjacent) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(ds_intervals_piecewise_max_overlap) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t iv;
+    tl_intervals_init(&iv, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&iv, 0, 100, 5));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&iv, 50, 200, 10));
+
+    TEST_ASSERT_EQ(2, iv.len);
+    TEST_ASSERT_EQ(0, iv.data[0].start);
+    TEST_ASSERT_EQ(50, iv.data[0].end);
+    TEST_ASSERT_EQ(5, iv.data[0].max_seq);
+
+    TEST_ASSERT_EQ(50, iv.data[1].start);
+    TEST_ASSERT_EQ(200, iv.data[1].end);
+    TEST_ASSERT_EQ(10, iv.data[1].max_seq);
+
+    tl_intervals_destroy(&iv);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_max_seq_cursor_mixed) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t iv;
+    tl_intervals_init(&iv, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&iv, 0, 100, 5));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&iv, 20, 40, 8));
+
+    tl_intervals_cursor_t cur;
+    tl_intervals_cursor_init(&cur, tl_intervals_as_imm(&iv));
+
+    TEST_ASSERT_EQ(5, tl_intervals_cursor_max_seq(&cur, 10));
+    TEST_ASSERT_EQ(8, tl_intervals_cursor_max_seq(&cur, 30));
+    TEST_ASSERT_EQ(5, tl_intervals_cursor_max_seq(&cur, 50));
+
+    tl_intervals_destroy(&iv);
+    tl__alloc_destroy(&alloc);
+}
+
 TEST_DECLARE(ds_intervals_no_coalesce_gap) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -537,10 +612,11 @@ TEST_DECLARE(ds_intervals_unbounded) {
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_unbounded_seq(&iv, 50, 2));
 
     TEST_ASSERT_EQ(1, tl_intervals_len(&iv));
     TEST_ASSERT(tl_intervals_get(&iv, 0)->end_unbounded);
+    TEST_ASSERT_EQ(2, tl_intervals_get(&iv, 0)->max_seq);
 
     TEST_ASSERT(!tl_intervals_contains(&iv, 49));
     TEST_ASSERT(tl_intervals_contains(&iv, 50));
@@ -567,6 +643,33 @@ TEST_DECLARE(ds_intervals_union_basic) {
     TEST_ASSERT_EQ(1, tl_intervals_len(&out));
     TEST_ASSERT_EQ(10, tl_intervals_get(&out, 0)->start);
     TEST_ASSERT_EQ(40, tl_intervals_get(&out, 0)->end);
+
+    tl_intervals_destroy(&out);
+    tl_intervals_destroy(&b);
+    tl_intervals_destroy(&a);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_union_max_seq) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t a, b, out;
+    tl_intervals_init(&a, &alloc);
+    tl_intervals_init(&b, &alloc);
+    tl_intervals_init(&out, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&a, 0, 50, 3));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&b, 25, 75, 7));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_union(&out, &a, &b));
+    TEST_ASSERT_EQ(2, tl_intervals_len(&out));
+    TEST_ASSERT_EQ(0, tl_intervals_get(&out, 0)->start);
+    TEST_ASSERT_EQ(25, tl_intervals_get(&out, 0)->end);
+    TEST_ASSERT_EQ(3, tl_intervals_get(&out, 0)->max_seq);
+    TEST_ASSERT_EQ(25, tl_intervals_get(&out, 1)->start);
+    TEST_ASSERT_EQ(75, tl_intervals_get(&out, 1)->end);
+    TEST_ASSERT_EQ(7, tl_intervals_get(&out, 1)->max_seq);
 
     tl_intervals_destroy(&out);
     tl_intervals_destroy(&b);
@@ -1239,17 +1342,20 @@ void run_internal_data_structures_tests(void) {
     /* Math helper tests */
     RUN_TEST(ds_math_overflow_i64);
 
-    /* Interval Set tests (27 tests, 1 debug-only) */
+    /* Interval Set tests (30 tests, 1 debug-only) */
     RUN_TEST(ds_intervals_init_empty);
     RUN_TEST(ds_intervals_insert_single);
     RUN_TEST(ds_intervals_insert_empty_is_noop);
     RUN_TEST(ds_intervals_coalesce_overlapping);
     RUN_TEST(ds_intervals_coalesce_adjacent);
+    RUN_TEST(ds_intervals_piecewise_max_overlap);
+    RUN_TEST(ds_intervals_max_seq_cursor_mixed);
     RUN_TEST(ds_intervals_no_coalesce_gap);
     RUN_TEST(ds_intervals_coalesce_multi);
     RUN_TEST(ds_intervals_contains_basic);
     RUN_TEST(ds_intervals_unbounded);
     RUN_TEST(ds_intervals_union_basic);
+    RUN_TEST(ds_intervals_union_max_seq);
     RUN_TEST(ds_intervals_clip);
     RUN_TEST(ds_intervals_clip_removes_outside);
     RUN_TEST(ds_intervals_clip_lower_removes_before);

@@ -48,9 +48,11 @@
  * Reference: timelog_v1_lld_compaction_policy.md
  *===========================================================================*/
 
-/* Forward declaration - actual struct in tl_timelog_internal.h */
+/* Forward declarations */
 struct tl_timelog;
 typedef struct tl_timelog tl_timelog_t;
+struct tl_snapshot;
+typedef struct tl_snapshot tl_snapshot_t;
 
 /*===========================================================================
  * Compaction Context
@@ -71,6 +73,8 @@ typedef struct tl_compact_ctx {
 
     /* Manifest snapshot at selection time */
     tl_manifest_t*      base_manifest;   /* Pinned base manifest */
+    tl_snapshot_t*      snapshot;        /* Pinned snapshot (for tombs + seq) */
+    tl_seq_t            applied_seq;     /* Tombstone watermark for outputs */
 
     /* Effective tombstone set */
     tl_intervals_t      tombs;           /* Union of all tombstones (unclipped) */

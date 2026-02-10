@@ -209,6 +209,59 @@ void tl_recvec_sort(tl_recvec_t* rv) {
     qsort(rv->data, rv->len, sizeof(tl_record_t), cmp_record_ts);
 }
 
+/*===========================================================================*/
+/* Sorting With Seq */
+/*===========================================================================*/
+
+typedef struct tl_recseq_pair {
+    tl_record_t rec;
+    tl_seq_t    seq;
+} tl_recseq_pair_t;
+
+static int cmp_recseq_pair(const void* a, const void* b) {
+    const tl_recseq_pair_t* ra = (const tl_recseq_pair_t*)a;
+    const tl_recseq_pair_t* rb = (const tl_recseq_pair_t*)b;
+
+    if (ra->rec.ts < rb->rec.ts) return -1;
+    if (ra->rec.ts > rb->rec.ts) return 1;
+    if (ra->rec.handle < rb->rec.handle) return -1;
+    if (ra->rec.handle > rb->rec.handle) return 1;
+    return 0;
+}
+
+tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs) {
+    TL_ASSERT(rv != NULL);
+    TL_ASSERT(seqs != NULL);
+
+    if (rv->len <= 1) {
+        return TL_OK;
+    }
+
+    if (tl__alloc_would_overflow(rv->len, sizeof(tl_recseq_pair_t))) {
+        return TL_ENOMEM;
+    }
+
+    tl_recseq_pair_t* tmp = tl__malloc(rv->alloc, rv->len * sizeof(tl_recseq_pair_t));
+    if (tmp == NULL) {
+        return TL_ENOMEM;
+    }
+
+    for (size_t i = 0; i < rv->len; i++) {
+        tmp[i].rec = rv->data[i];
+        tmp[i].seq = seqs[i];
+    }
+
+    qsort(tmp, rv->len, sizeof(tl_recseq_pair_t), cmp_recseq_pair);
+
+    for (size_t i = 0; i < rv->len; i++) {
+        rv->data[i] = tmp[i].rec;
+        seqs[i] = tmp[i].seq;
+    }
+
+    tl__free(rv->alloc, tmp);
+    return TL_OK;
+}
+
 /*===========================================================================
  * Binary Search
  *===========================================================================*/

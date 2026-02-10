@@ -28,6 +28,7 @@ typedef struct tl_heap_entry {
     tl_ts_t       ts;            /* Sort key (timestamp) */
     uint32_t      tie_break_key; /* M-14: Secondary sort key for equal timestamps */
     tl_handle_t   handle;        /* Current record handle */
+    tl_seq_t      watermark;     /* Per-record/source tombstone watermark */
     void*         iter;          /* Opaque pointer to component iterator */
 } tl_heap_entry_t;
 

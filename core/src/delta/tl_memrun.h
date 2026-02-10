@@ -67,6 +67,11 @@ struct tl_memrun {
      *-----------------------------------------------------------------------*/
     tl_atomic_u32   refcnt;      /* Reference count */
     tl_alloc_ctx_t* alloc;       /* Allocator (borrowed) */
+
+    /*-----------------------------------------------------------------------
+     * Tombstone watermark
+     *-----------------------------------------------------------------------*/
+    tl_seq_t        applied_seq; /* Tombstones <= applied_seq already applied */
 };
 
 /*===========================================================================
@@ -101,6 +106,7 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
                               tl_record_t* run, size_t run_len,
                               tl_ooorunset_t* ooo_runs,
                               tl_interval_t* tombs, size_t tombs_len,
+                              tl_seq_t applied_seq,
                               tl_memrun_t** out);
 
 /**
@@ -117,7 +123,8 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
                             tl_alloc_ctx_t* alloc,
                             tl_record_t* run, size_t run_len,
                             tl_ooorunset_t* ooo_runs,
-                            tl_interval_t* tombs, size_t tombs_len);
+                            tl_interval_t* tombs, size_t tombs_len,
+                            tl_seq_t applied_seq);
 
 /*===========================================================================
  * Reference Counting
@@ -224,6 +231,10 @@ TL_INLINE const tl_ooorun_t* tl_memrun_ooo_run_at(const tl_memrun_t* mr, size_t 
 
 TL_INLINE const tl_interval_t* tl_memrun_tombs_data(const tl_memrun_t* mr) {
     return mr->tombs;
+}
+
+TL_INLINE tl_seq_t tl_memrun_applied_seq(const tl_memrun_t* mr) {
+    return mr->applied_seq;
 }
 
 /**

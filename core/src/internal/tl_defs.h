@@ -20,6 +20,9 @@
  * Size Constants
  *===========================================================================*/
 
+/* Sequence number type for ordered operations (monotonic). */
+typedef uint64_t tl_seq_t;
+
 /* Default configuration values (use size_t to avoid implicit widening) */
 #define TL_DEFAULT_TARGET_PAGE_BYTES      ((size_t)64 * 1024)   /* 64 KiB */
 #define TL_DEFAULT_MEMTABLE_MAX_BYTES     ((size_t)1024 * 1024) /* 1 MiB */

@@ -25,6 +25,7 @@
 #include "internal/tl_timelog_internal.h"  /* For tl->alloc access */
 #include "tl_compaction.h"
 #include "tl_segment.h"
+#include "query/tl_segment_iter.h"
 #include "tl_manifest.h"
 #include "tl_snapshot.h"  /* For tl_snapshot_manifest */
 #include "tl_window.h"
@@ -55,6 +56,35 @@ static void compact_flush_n_times(tl_timelog_t* tl, int n, tl_ts_t base_ts, int 
         TEST_ASSERT_STATUS(TL_OK, st);
     }
 }
+
+static tl_status_t test_segment_build_l0(tl_alloc_ctx_t* alloc,
+                                          const tl_record_t* records,
+                                          size_t record_count,
+                                          const tl_interval_t* tombstones,
+                                          size_t tombstones_len,
+                                          size_t target_page_bytes,
+                                          uint32_t generation,
+                                          tl_segment_t** out) {
+    return tl_segment_build_l0(alloc, records, record_count,
+                               tombstones, tombstones_len,
+                               target_page_bytes, generation, 0, out);
+}
+
+static tl_status_t test_segment_build_l0_with_seq(tl_alloc_ctx_t* alloc,
+                                                   const tl_record_t* records,
+                                                   size_t record_count,
+                                                   const tl_interval_t* tombstones,
+                                                   size_t tombstones_len,
+                                                   size_t target_page_bytes,
+                                                   uint32_t generation,
+                                                   tl_seq_t applied_seq,
+                                                   tl_segment_t** out) {
+    return tl_segment_build_l0(alloc, records, record_count,
+                               tombstones, tombstones_len,
+                               target_page_bytes, generation, applied_seq, out);
+}
+
+#define tl_segment_build_l0 test_segment_build_l0
 
 #ifdef TL_TEST_HOOKS
 static double delete_debt_reference(tl_ts_t window_size,
@@ -372,8 +402,10 @@ TEST_DECLARE(cint_residual_tombstones_preserved_under_window_cap) {
 
     tl_compact_ctx_t ctx;
     tl_compact_ctx_init(&ctx, tl, &tl->alloc, tl->effective_window_size);
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx.snapshot));
+    ctx.applied_seq = tl_snapshot_seq(ctx.snapshot);
 
-    tl_interval_t tomb = {0, 300, false};
+    tl_interval_t tomb = {0, 300, false, 1};
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&tl->alloc,
                                                    NULL, 0,
@@ -420,8 +452,10 @@ TEST_DECLARE(cint_residual_tombstones_unbounded) {
 
     tl_compact_ctx_t ctx;
     tl_compact_ctx_init(&ctx, tl, &tl->alloc, tl->effective_window_size);
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx.snapshot));
+    ctx.applied_seq = tl_snapshot_seq(ctx.snapshot);
 
-    tl_interval_t tomb = {50, 0, true};
+    tl_interval_t tomb = {50, 0, true, 1};
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&tl->alloc,
                                                    NULL, 0,
@@ -449,6 +483,81 @@ TEST_DECLARE(cint_residual_tombstones_unbounded) {
     TEST_ASSERT_EQ(1, res.len);
     TEST_ASSERT_EQ(100, res.data[0].start);
     TEST_ASSERT(res.data[0].end_unbounded);
+
+    tl_compact_ctx_destroy(&ctx);
+    tl_close(tl);
+}
+
+/**
+ * Test compaction filtering respects per-input watermarks.
+ *
+ * Tombstone seq=2 should delete records from sources with applied_seq < 2
+ * while preserving records from sources with applied_seq > 2.
+ */
+TEST_DECLARE(cint_compaction_respects_input_watermarks) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.window_size = 1000;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Bump op_seq and create tombstone seq=2 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 0, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 90, 120));
+
+    tl_compact_ctx_t ctx;
+    tl_compact_ctx_init(&ctx, tl, &tl->alloc, tl->effective_window_size);
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx.snapshot));
+    ctx.applied_seq = tl_snapshot_seq(ctx.snapshot);
+
+    tl_record_t old_rec = {.ts = 100, .handle = 1};
+    tl_record_t new_rec = {.ts = 110, .handle = 2};
+
+    tl_segment_t* seg_old = NULL;
+    tl_segment_t* seg_new = NULL;
+
+    TEST_ASSERT_STATUS(TL_OK, test_segment_build_l0_with_seq(&tl->alloc,
+                                                              &old_rec, 1,
+                                                              NULL, 0,
+                                                              cfg.target_page_bytes,
+                                                              1,
+                                                              1,
+                                                              &seg_old));
+    TEST_ASSERT_STATUS(TL_OK, test_segment_build_l0_with_seq(&tl->alloc,
+                                                              &new_rec, 1,
+                                                              NULL, 0,
+                                                              cfg.target_page_bytes,
+                                                              2,
+                                                              3,
+                                                              &seg_new));
+
+    ctx.input_l0 = tl__malloc(ctx.alloc, 2 * sizeof(tl_segment_t*));
+    TEST_ASSERT_NOT_NULL(ctx.input_l0);
+    ctx.input_l0[0] = seg_old;
+    ctx.input_l0[1] = seg_new;
+    ctx.input_l0_len = 2;
+    ctx.input_l1_len = 0;
+
+    ctx.output_min_wid = 0;
+    ctx.output_max_wid = 0;
+    ctx.output_min_ts = 0;
+    ctx.output_max_ts = 999;
+    ctx.generation = 1;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_compact_merge(&ctx));
+    TEST_ASSERT_EQ(1, ctx.output_l1_len);
+
+    tl_segment_t* out = ctx.output_l1[0];
+    TEST_ASSERT_NOT_NULL(out);
+    TEST_ASSERT_EQ(1, out->record_count);
+
+    tl_segment_iter_t it;
+    tl_segment_iter_init(&it, out, TL_TS_MIN, 0, true);
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_iter_next(&it, &rec));
+    TEST_ASSERT_EQ(110, rec.ts);
+    TEST_ASSERT_STATUS(TL_EOF, tl_segment_iter_next(&it, &rec));
 
     tl_compact_ctx_destroy(&ctx);
     tl_close(tl);
@@ -603,8 +712,8 @@ TEST_DECLARE(cint_delete_debt_matches_reference) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    tl_interval_t tombs_a[1] = {{10, 30, false}};
-    tl_interval_t tombs_b[1] = {{50, 120, false}};
+    tl_interval_t tombs_a[1] = {{10, 30, false, 1}};
+    tl_interval_t tombs_b[1] = {{50, 120, false, 1}};
 
     tl_segment_t* s1 = NULL;
     tl_segment_t* s2 = NULL;
@@ -629,8 +738,8 @@ TEST_DECLARE(cint_delete_debt_matches_reference) {
     tl_manifest_builder_destroy(&mb);
 
     tl_interval_t union_tombs[2] = {
-        {10, 30, false},
-        {50, 120, false}
+        {10, 30, false, 1},
+        {50, 120, false, 1}
     };
     double expected = delete_debt_reference(cfg.window_size, cfg.window_origin,
                                             union_tombs, 2);
@@ -651,7 +760,7 @@ TEST_DECLARE(cint_delete_debt_unbounded_returns_max) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    tl_interval_t tombs[1] = {{50, 0, true}};
+    tl_interval_t tombs[1] = {{50, 0, true, 1}};
 
     tl_segment_t* s1 = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&tl->alloc,
@@ -690,7 +799,7 @@ TEST_DECLARE(cint_delete_debt_extreme_range) {
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
     /* Create an L0 segment with a massive tombstone range */
-    tl_interval_t tombs[1] = {{TL_TS_MIN, TL_TS_MAX, false}};
+    tl_interval_t tombs[1] = {{TL_TS_MIN, TL_TS_MAX, false, 1}};
 
     tl_segment_t* seg = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&tl->alloc,
@@ -895,12 +1004,13 @@ void run_compaction_internal_tests(void) {
     RUN_TEST(cint_select_no_l0);
     RUN_TEST(cint_select_selects_all_l0);
 
-    /* Compaction merge tests (5 tests) */
+    /* Compaction merge tests (6 tests) */
     RUN_TEST(cint_merge_basic);
     RUN_TEST(cint_merge_with_tombstones);
     RUN_TEST(cint_merge_multi_window);
     RUN_TEST(cint_residual_tombstones_preserved_under_window_cap);
     RUN_TEST(cint_residual_tombstones_unbounded);
+    RUN_TEST(cint_compaction_respects_input_watermarks);
 
     /* Compaction publication tests (1 test) */
     RUN_TEST(cint_publish_basic);

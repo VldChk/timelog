@@ -82,6 +82,7 @@ set(TIMELOG_SOURCES
     core/src/internal/tl_test_hooks.c
     # Phase 2
     core/src/internal/tl_recvec.c
+    core/src/internal/tl_seqvec.c
     core/src/internal/tl_intervals.c
     core/src/internal/tl_heap.c
     # Phase 3

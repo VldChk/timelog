@@ -1,7 +1,10 @@
 #include "tl_snapshot.h"
 #include "../internal/tl_timelog_internal.h"
 #include "../internal/tl_locks.h"
+#include "../internal/tl_intervals.h"
 #include "../internal/tl_range.h"
+#include "../internal/tl_tombstone_utils.h"
+#include "../storage/tl_segment.h"
 #include <string.h>
 
 /*===========================================================================
@@ -116,11 +119,20 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
         }
     }
 
+    /* Capture op_seq under writer_mu for tombstone watermarks */
+    snap->op_seq = tl->op_seq;
+
     TL_UNLOCK_WRITER(tl);
 
     /* Sort OOO head off writer_mu for fresh captures. */
     if (!used_cache) {
-        tl_memview_sort_head(&mv->view);
+        tl_status_t sort_st = tl_memview_sort_head(&mv->view);
+        if (sort_st != TL_OK) {
+            tl_memview_shared_release(mv);
+            tl_manifest_release(manifest);
+            tl__free(alloc, snap);
+            return sort_st;
+        }
 
         /* Update cache if epoch unchanged (two-phase capture). */
         TL_LOCK_WRITER(tl);
@@ -178,4 +190,88 @@ void tl_snapshot_release_internal(tl_snapshot_t* snap) {
 
     /* Free snapshot structure */
     tl__free(snap->alloc, snap);
+}
+
+/*===========================================================================
+ * Tombstone Collection
+ *===========================================================================*/
+
+tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
+                                           tl_intervals_t* out,
+                                           tl_ts_t t1, tl_ts_t t2,
+                                           bool t2_unbounded) {
+    TL_ASSERT(snap != NULL);
+    TL_ASSERT(out != NULL);
+
+    tl_intervals_clear(out);
+
+    const tl_manifest_t* manifest = snap->manifest;
+    const tl_memview_t* mv = tl_snapshot_memview(snap);
+
+    tl_status_t st;
+
+    /* Active memview tombstones */
+    st = tl_tombstones_add_intervals(out, tl_memview_tombs_imm(mv),
+                                     t1, t2, t2_unbounded);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    /* Sealed memrun tombstones */
+    for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
+        const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
+
+        if (!tl_range_overlaps(tl_memrun_min_ts(mr), tl_memrun_max_ts(mr),
+                               t1, t2, t2_unbounded)) {
+            continue;
+        }
+
+        st = tl_tombstones_add_intervals(out, tl_memrun_tombs_imm(mr),
+                                         t1, t2, t2_unbounded);
+        if (st != TL_OK) {
+            return st;
+        }
+    }
+
+    /* L0 segment tombstones */
+    for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
+        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+
+        bool overlaps = false;
+        if (tl_segment_has_tombstones(seg)) {
+            overlaps = tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
+                                         t1, t2, t2_unbounded);
+        }
+        if (!overlaps) {
+            continue;
+        }
+
+        st = tl_tombstones_add_intervals(out, tl_segment_tombstones_imm(seg),
+                                         t1, t2, t2_unbounded);
+        if (st != TL_OK) {
+            return st;
+        }
+    }
+
+    /* Defensive: L1 tombstones if present (should be empty in V1) */
+    for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
+        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
+
+        bool overlaps = false;
+        if (tl_segment_has_tombstones(seg)) {
+            overlaps = tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
+                                         t1, t2, t2_unbounded);
+        }
+        if (!overlaps) {
+            continue;
+        }
+
+        st = tl_tombstones_add_intervals(out, tl_segment_tombstones_imm(seg),
+                                         t1, t2, t2_unbounded);
+        if (st != TL_OK) {
+            return st;
+        }
+    }
+
+    return TL_OK;
 }

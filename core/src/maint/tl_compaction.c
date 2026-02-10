@@ -6,6 +6,7 @@
 #include "../internal/tl_heap.h"
 #include "../internal/tl_recvec.h"
 #include "../query/tl_segment_iter.h"
+#include "../query/tl_snapshot.h"
 #include "../storage/tl_window.h"
 #include <string.h>
 
@@ -56,6 +57,9 @@ void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
     tl_intervals_init(&ctx->tombs, alloc);
     tl_intervals_init(&ctx->tombs_clipped, alloc);
 
+    ctx->snapshot = NULL;
+    ctx->applied_seq = 0;
+
     /* Initialize deferred drop records (empty) */
     ctx->dropped_records = NULL;
     ctx->dropped_len = 0;
@@ -88,6 +92,12 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
     if (ctx->base_manifest != NULL) {
         tl_manifest_release(ctx->base_manifest);
         ctx->base_manifest = NULL;
+    }
+
+    /* Release pinned snapshot */
+    if (ctx->snapshot != NULL) {
+        tl_snapshot_release_internal(ctx->snapshot);
+        ctx->snapshot = NULL;
     }
 
     /* Destroy tombstone sets */
@@ -199,9 +209,11 @@ static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
         for (size_t i = 0; i < add.len; i++) {
             tl_status_t st;
             if (add.data[i].end_unbounded) {
-                st = tl_intervals_insert_unbounded(accum, add.data[i].start);
+                st = tl_intervals_insert_unbounded(accum, add.data[i].start,
+                                                   add.data[i].max_seq);
             } else {
-                st = tl_intervals_insert(accum, add.data[i].start, add.data[i].end);
+                st = tl_intervals_insert(accum, add.data[i].start, add.data[i].end,
+                                         add.data[i].max_seq);
             }
             if (st != TL_OK) return st;
         }
@@ -709,14 +721,22 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
 
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
     tl_timelog_t* tl = ctx->tl;
+    tl_status_t st;
 
     /* M-23: Selection observability - count attempts */
     tl_atomic_inc_u64(&tl->compaction_select_calls);
 
-    /* Pin current manifest.
-     * NOTE: next_gen is protected by writer_mu per lock hierarchy. */
+    /* Acquire snapshot for consistent tombstones + op_seq watermark */
+    st = tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx->snapshot);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    ctx->applied_seq = tl_snapshot_seq(ctx->snapshot);
+    ctx->base_manifest = tl_manifest_acquire(ctx->snapshot->manifest);
+
+    /* NOTE: next_gen is protected by writer_mu per lock hierarchy. */
     TL_LOCK_WRITER(tl);
-    ctx->base_manifest = tl_manifest_acquire(tl->manifest);
     ctx->generation = tl->next_gen++;
     TL_UNLOCK_WRITER(tl);
 
@@ -735,7 +755,7 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
     }
 
     size_t max_inputs = (size_t)tl->config.max_compaction_inputs;
-    tl_status_t st = tl__compact_select_greedy(ctx, m, max_inputs);
+    st = tl__compact_select_greedy(ctx, m, max_inputs);
     if (st == TL_OK) {
         tl_atomic_fetch_add_u64(&tl->compaction_select_l0_inputs,
                                 (uint64_t)ctx->input_l0_len, TL_MO_RELAXED);
@@ -859,6 +879,7 @@ static tl_status_t tl__flush_window_records(tl_compact_ctx_t* ctx,
         window_end,
         end_unbounded,
         ctx->generation,
+        ctx->applied_seq,
         &seg
     );
 
@@ -907,7 +928,8 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
         if (t->start < first_w_start) {
             tl_ts_t res_end = TL_MIN(t->end_unbounded ? first_w_start : t->end, first_w_start);
             if (t->start < res_end) {
-                tl_status_t st = tl_intervals_insert(&residual, t->start, res_end);
+                tl_status_t st = tl_intervals_insert(&residual, t->start, res_end,
+                                                     t->max_seq);
                 if (st != TL_OK) {
                     tl_intervals_destroy(&residual);
                     return st;
@@ -923,7 +945,8 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
                  * If t->start > last_w_end, inserting at last_w_end would incorrectly
                  * delete records in [last_w_end, t->start) that were never covered. */
                 tl_ts_t res_start = TL_MAX(t->start, last_w_end);
-                tl_status_t st = tl_intervals_insert_unbounded(&residual, res_start);
+                tl_status_t st = tl_intervals_insert_unbounded(&residual, res_start,
+                                                               t->max_seq);
                 if (st != TL_OK) {
                     tl_intervals_destroy(&residual);
                     return st;
@@ -931,7 +954,8 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
             } else if (t->end > last_w_end) {
                 tl_ts_t res_start = TL_MAX(t->start, last_w_end);
                 if (res_start < t->end) {
-                    tl_status_t st = tl_intervals_insert(&residual, res_start, t->end);
+                    tl_status_t st = tl_intervals_insert(&residual, res_start, t->end,
+                                                         t->max_seq);
                     if (st != TL_OK) {
                         tl_intervals_destroy(&residual);
                         return st;
@@ -953,6 +977,7 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
             tomb_data, tomb_len,
             ctx->target_page_bytes,
             ctx->generation,
+            ctx->applied_seq,
             &seg
         );
 
@@ -1006,22 +1031,12 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         }
     }
 
-    /* Step 1b: Create clipped copy of tombstones for filtering.
-     * Keep original tombs for residual computation (done after merge).
-     *
-     * Note: tombs_clipped was initialized in ctx_init; use clear() not init(). */
+    /* Step 1b: Build clipped tombstone set for filtering.
+     * Use snapshot tombstones so deletes outside the compaction inputs
+     * still apply correctly to records in those inputs. */
     tl_intervals_clear(&ctx->tombs_clipped);
-    for (size_t i = 0; i < tl_intervals_len(&ctx->tombs); i++) {
-        const tl_interval_t* t = tl_intervals_get(&ctx->tombs, i);
-        if (t->end_unbounded) {
-            st = tl_intervals_insert_unbounded(&ctx->tombs_clipped, t->start);
-        } else {
-            st = tl_intervals_insert(&ctx->tombs_clipped, t->start, t->end);
-        }
-        if (st != TL_OK) return st;
-    }
 
-    /* Clip to output window range [first_window_start, last_window_end) */
+    /* Compute output window bounds for clipping */
     tl_ts_t first_start, first_end;
     bool first_unbounded;
     tl_window_bounds(ctx->output_min_wid, ctx->window_size, ctx->window_origin,
@@ -1032,10 +1047,20 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
     tl_window_bounds(ctx->output_max_wid, ctx->window_size, ctx->window_origin,
                       &last_start, &last_end, &last_unbounded);
 
-    if (!last_unbounded) {
-        tl_intervals_clip(&ctx->tombs_clipped, first_start, last_end);
-    } else {
-        tl_intervals_clip_lower(&ctx->tombs_clipped, first_start);
+    st = tl_snapshot_collect_tombstones(ctx->snapshot, &ctx->tombs_clipped,
+                                        first_start,
+                                        last_unbounded ? 0 : last_end,
+                                        last_unbounded);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    if (!tl_intervals_is_empty(&ctx->tombs_clipped)) {
+        if (!last_unbounded) {
+            tl_intervals_clip(&ctx->tombs_clipped, first_start, last_end);
+        } else {
+            tl_intervals_clip_lower(&ctx->tombs_clipped, first_start);
+        }
     }
 
     /* ===================================================================
@@ -1059,15 +1084,30 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         return TL_ENOMEM;
     }
 
+    if (total_inputs > SIZE_MAX / sizeof(tl_seq_t)) {
+        tl__free(ctx->alloc, iters);
+        return TL_EOVERFLOW;
+    }
+
+    tl_seq_t* watermarks = tl__malloc(ctx->alloc, total_inputs * sizeof(tl_seq_t));
+    if (watermarks == NULL) {
+        tl__free(ctx->alloc, iters);
+        return TL_ENOMEM;
+    }
+
     /* Initialize segment iterators (unbounded range - all records) */
     size_t iter_idx = 0;
     for (size_t i = 0; i < ctx->input_l0_len; i++) {
-        tl_segment_iter_init(&iters[iter_idx++], ctx->input_l0[i],
+        tl_segment_iter_init(&iters[iter_idx], ctx->input_l0[i],
                               TL_TS_MIN, 0, true);  /* [TL_TS_MIN, +inf) */
+        watermarks[iter_idx] = tl_segment_applied_seq(ctx->input_l0[i]);
+        iter_idx++;
     }
     for (size_t i = 0; i < ctx->input_l1_len; i++) {
-        tl_segment_iter_init(&iters[iter_idx++], ctx->input_l1[i],
+        tl_segment_iter_init(&iters[iter_idx], ctx->input_l1[i],
                               TL_TS_MIN, 0, true);
+        watermarks[iter_idx] = tl_segment_applied_seq(ctx->input_l1[i]);
+        iter_idx++;
     }
 
     /* Build heap for K-way merge. */
@@ -1075,6 +1115,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
     tl_heap_init(&heap, ctx->alloc);
     st = tl_heap_reserve(&heap, total_inputs);
     if (st != TL_OK) {
+        tl__free(ctx->alloc, watermarks);
         tl__free(ctx->alloc, iters);
         return st;
     }
@@ -1087,11 +1128,13 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                 .ts = rec.ts,
                 .handle = rec.handle,
                 .tie_break_key = (uint32_t)i,
+                .watermark = watermarks[i],
                 .iter = &iters[i]  /* Store iterator pointer for refill */
             };
             st = tl_heap_push(&heap, &entry);
             if (st != TL_OK) {
                 tl_heap_destroy(&heap);
+                tl__free(ctx->alloc, watermarks);
                 tl__free(ctx->alloc, iters);
                 return st;
             }
@@ -1136,6 +1179,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                 .ts = next_rec.ts,
                 .handle = next_rec.handle,
                 .tie_break_key = min_entry.tie_break_key,
+                .watermark = min_entry.watermark,
                 .iter = min_entry.iter
             };
             st = tl_heap_push(&heap, &refill);
@@ -1145,7 +1189,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         }
 
         /* Check if record is deleted by tombstone */
-        if (tl_intervals_cursor_is_deleted(&tomb_cursor, min_entry.ts)) {
+        tl_seq_t tomb_seq = 0;
+        if (ctx->tombs_clipped.len > 0) {
+            tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, min_entry.ts);
+        }
+        if (tomb_seq > min_entry.watermark) {
             /* Record is deleted - collect for deferred callback.
              *
              * CRITICAL: We do NOT invoke on_drop_handle here because:
@@ -1230,6 +1278,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
 cleanup:
     tl_recvec_destroy(&window_records);
     tl_heap_destroy(&heap);
+    tl__free(ctx->alloc, watermarks);
     tl__free(ctx->alloc, iters);
     return st;
 }

@@ -31,10 +31,14 @@ tl_status_t tl_active_iter_init(tl_active_iter_t* it,
     tl_status_t st = tl_iter_build_submerge(&it->merge,
                                             alloc,
                                             tl_memview_run_data(mv),
+                                            tl_memview_run_seqs(mv),
                                             run_len,
+                                            0,
                                             runs,
                                             tl_memview_ooo_head_data(mv),
+                                            tl_memview_ooo_head_seqs(mv),
                                             head_len,
+                                            0,
                                             t1,
                                             t2,
                                             t2_unbounded);
@@ -63,7 +67,8 @@ void tl_active_iter_destroy(tl_active_iter_t* it) {
  * Iteration
  *===========================================================================*/
 
-tl_status_t tl_active_iter_next(tl_active_iter_t* it, tl_record_t* out) {
+tl_status_t tl_active_iter_next(tl_active_iter_t* it, tl_record_t* out,
+                                 tl_seq_t* out_watermark) {
     TL_ASSERT(it != NULL);
 
     if (it->done) {
@@ -71,7 +76,8 @@ tl_status_t tl_active_iter_next(tl_active_iter_t* it, tl_record_t* out) {
     }
 
     tl_record_t rec;
-    tl_status_t st = tl_submerge_next(&it->merge, &rec);
+    tl_seq_t watermark = 0;
+    tl_status_t st = tl_submerge_next(&it->merge, &rec, &watermark);
     if (st != TL_OK) {
         it->done = true;
         return TL_EOF;
@@ -79,6 +85,9 @@ tl_status_t tl_active_iter_next(tl_active_iter_t* it, tl_record_t* out) {
 
     if (out != NULL) {
         *out = rec;
+    }
+    if (out_watermark != NULL) {
+        *out_watermark = watermark;
     }
 
     return TL_OK;

@@ -1,6 +1,7 @@
 #include "tl_plan.h"
 #include "../internal/tl_range.h"
 #include "../internal/tl_intervals.h"
+#include "../internal/tl_tombstone_utils.h"
 #include "../storage/tl_manifest.h"
 #include <string.h>
 #include <stdlib.h>
@@ -11,9 +12,6 @@
 
 /* Initial capacity for source array */
 #define TL_PLAN_INIT_SOURCES 8
-
-/* Initial capacity for tombstone array */
-#define TL_PLAN_INIT_TOMBS 16
 
 /*===========================================================================
  * Internal Helpers
@@ -61,52 +59,6 @@ static tl_status_t ensure_source_capacity(tl_plan_t* plan) {
 }
 
 /**
- * Ensure tombstone array has capacity for more entries.
- */
-static tl_status_t ensure_tomb_capacity(tl_plan_t* plan, size_t additional) {
-    /* Overflow guard for addition */
-    if (additional > SIZE_MAX - plan->tomb_count) {
-        return TL_ENOMEM;
-    }
-    size_t needed = plan->tomb_count + additional;
-    if (needed <= plan->tomb_capacity) {
-        return TL_OK;
-    }
-
-    size_t new_cap = (plan->tomb_capacity == 0)
-                         ? TL_PLAN_INIT_TOMBS
-                         : plan->tomb_capacity;
-    while (new_cap < needed) {
-        /* Overflow guard for capacity doubling */
-        if (new_cap > SIZE_MAX / 2) {
-            return TL_ENOMEM;
-        }
-        new_cap *= 2;
-    }
-
-    /* Overflow guard for allocation size */
-    if (new_cap > SIZE_MAX / sizeof(tl_interval_t)) {
-        return TL_ENOMEM;
-    }
-
-    tl_interval_t* new_arr = tl__malloc(plan->alloc,
-                                         new_cap * sizeof(tl_interval_t));
-    if (new_arr == NULL) {
-        return TL_ENOMEM;
-    }
-
-    if (plan->tombstones != NULL) {
-        memcpy(new_arr, plan->tombstones,
-               plan->tomb_count * sizeof(tl_interval_t));
-        tl__free(plan->alloc, plan->tombstones);
-    }
-
-    plan->tombstones = new_arr;
-    plan->tomb_capacity = new_cap;
-    return TL_OK;
-}
-
-/**
  * Add a segment source to the plan.
  */
 static tl_status_t add_segment_source(tl_plan_t* plan,
@@ -120,6 +72,7 @@ static tl_status_t add_segment_source(tl_plan_t* plan,
     tl_iter_source_t* src = &plan->sources[plan->source_count];
     src->kind = TL_ITER_SEGMENT;
     src->priority = priority;
+    src->watermark = tl_segment_applied_seq(seg);
 
     tl_segment_iter_init(&src->iter.segment, seg,
                          plan->t1, plan->t2, plan->t2_unbounded);
@@ -146,6 +99,7 @@ static tl_status_t add_memrun_source(tl_plan_t* plan,
     tl_iter_source_t* src = &plan->sources[plan->source_count];
     src->kind = TL_ITER_MEMRUN;
     src->priority = priority;
+    src->watermark = tl_memrun_applied_seq(mr);
 
     tl_status_t init_st = tl_memrun_iter_init(&src->iter.memrun, mr,
                                               plan->t1, plan->t2, plan->t2_unbounded,
@@ -178,6 +132,7 @@ static tl_status_t add_active_source(tl_plan_t* plan,
     tl_iter_source_t* src = &plan->sources[plan->source_count];
     src->kind = TL_ITER_ACTIVE;
     src->priority = UINT32_MAX;  /* Active is always highest priority */
+    src->watermark = 0;
 
     tl_status_t init_st = tl_active_iter_init(&src->iter.active, mv,
                                               plan->t1, plan->t2, plan->t2_unbounded,
@@ -197,267 +152,28 @@ static tl_status_t add_active_source(tl_plan_t* plan,
     return TL_OK;
 }
 
-/**
- * Clip a single interval's lower bound to t1.
- * Modifies interval in place, returns true if interval is still valid.
- */
-static bool clip_interval_lower(tl_interval_t* interval, tl_ts_t t1) {
-    /* If bounded and ends at or before t1, remove it */
-    if (!interval->end_unbounded && interval->end <= t1) {
-        return false;
-    }
-
-    /* Clip start to t1 if needed */
-    if (interval->start < t1) {
-        interval->start = t1;
-    }
-
-    return true;
-}
-
-/**
- * Add tombstone intervals from a segment to the plan.
- * Clips intervals to [t1, ...) range.
- */
-static tl_status_t add_segment_tombstones(tl_plan_t* plan,
-                                           const tl_segment_t* seg) {
+static tl_status_t add_segment_tombstones(tl_intervals_t* accum,
+                                           const tl_segment_t* seg,
+                                           tl_ts_t t1, tl_ts_t t2,
+                                           bool t2_unbounded) {
     tl_intervals_imm_t tombs = tl_segment_tombstones_imm(seg);
-    if (tombs.len == 0) {
-        return TL_OK;
-    }
-
-    tl_status_t st = ensure_tomb_capacity(plan, tombs.len);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    for (size_t i = 0; i < tombs.len; i++) {
-        tl_interval_t interval = tombs.data[i];
-
-        /* Skip if interval doesn't overlap query range */
-        tl_ts_t int_max = interval.end_unbounded ? TL_TS_MAX : interval.end - 1;
-        if (!tl_range_overlaps(interval.start, int_max,
-                               plan->t1, plan->t2, plan->t2_unbounded)) {
-            continue;
-        }
-
-        /* Clip to lower bound and add if still valid */
-        if (clip_interval_lower(&interval, plan->t1)) {
-            plan->tombstones[plan->tomb_count++] = interval;
-        }
-    }
-
-    return TL_OK;
+    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
 }
 
-/**
- * Add tombstone intervals from a memrun to the plan.
- */
-static tl_status_t add_memrun_tombstones(tl_plan_t* plan,
-                                          const tl_memrun_t* mr) {
-    size_t tomb_count = tl_memrun_tombs_len(mr);
-    if (tomb_count == 0) {
-        return TL_OK;
-    }
-
-    tl_status_t st = ensure_tomb_capacity(plan, tomb_count);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    const tl_interval_t* tombs = tl_memrun_tombs_data(mr);
-
-    for (size_t i = 0; i < tomb_count; i++) {
-        tl_interval_t interval = tombs[i];
-
-        /* Skip if interval doesn't overlap query range */
-        tl_ts_t int_max = interval.end_unbounded ? TL_TS_MAX : interval.end - 1;
-        if (!tl_range_overlaps(interval.start, int_max,
-                               plan->t1, plan->t2, plan->t2_unbounded)) {
-            continue;
-        }
-
-        /* Clip to lower bound and add if still valid */
-        if (clip_interval_lower(&interval, plan->t1)) {
-            plan->tombstones[plan->tomb_count++] = interval;
-        }
-    }
-
-    return TL_OK;
+static tl_status_t add_memrun_tombstones(tl_intervals_t* accum,
+                                          const tl_memrun_t* mr,
+                                          tl_ts_t t1, tl_ts_t t2,
+                                          bool t2_unbounded) {
+    tl_intervals_imm_t tombs = tl_memrun_tombs_imm(mr);
+    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
 }
 
-/**
- * Add tombstone intervals from active memview to the plan.
- */
-static tl_status_t add_active_tombstones(tl_plan_t* plan,
-                                          const tl_memview_t* mv) {
-    size_t tomb_count = tl_memview_tomb_len(mv);
-    if (tomb_count == 0) {
-        return TL_OK;
-    }
-
-    tl_status_t st = ensure_tomb_capacity(plan, tomb_count);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    const tl_interval_t* tombs = tl_memview_tomb_data(mv);
-
-    for (size_t i = 0; i < tomb_count; i++) {
-        tl_interval_t interval = tombs[i];
-
-        /* Skip if interval doesn't overlap query range */
-        tl_ts_t int_max = interval.end_unbounded ? TL_TS_MAX : interval.end - 1;
-        if (!tl_range_overlaps(interval.start, int_max,
-                               plan->t1, plan->t2, plan->t2_unbounded)) {
-            continue;
-        }
-
-        /* Clip to lower bound and add if still valid */
-        if (clip_interval_lower(&interval, plan->t1)) {
-            plan->tombstones[plan->tomb_count++] = interval;
-        }
-    }
-
-    return TL_OK;
-}
-
-/**
- * Compare intervals by start timestamp for sorting.
- *
- * M-16 fix: Add secondary/tertiary comparisons for qsort stability.
- * Primary: start timestamp (ascending)
- * Secondary: end_unbounded (bounded < unbounded)
- * Tertiary: end (ascending, for bounded intervals)
- *
- * This ensures deterministic ordering even when intervals have equal starts.
- */
-static int tomb_cmp(const void* a, const void* b) {
-    const tl_interval_t* ia = (const tl_interval_t*)a;
-    const tl_interval_t* ib = (const tl_interval_t*)b;
-
-    /* Primary: by start timestamp */
-    if (ia->start < ib->start) return -1;
-    if (ia->start > ib->start) return 1;
-
-    /* Secondary: bounded < unbounded */
-    if (!ia->end_unbounded && ib->end_unbounded) return -1;
-    if (ia->end_unbounded && !ib->end_unbounded) return 1;
-
-    /* Tertiary: by end for bounded intervals */
-    if (!ia->end_unbounded && !ib->end_unbounded) {
-        if (ia->end < ib->end) return -1;
-        if (ia->end > ib->end) return 1;
-    }
-
-    return 0;
-}
-
-/**
- * Sort tombstone intervals by start timestamp.
- */
-static void sort_tombstones(tl_plan_t* plan) {
-    if (plan->tomb_count <= 1) {
-        return;
-    }
-
-    qsort(plan->tombstones, plan->tomb_count,
-          sizeof(tl_interval_t), tomb_cmp);
-}
-
-/**
- * Clip tombstone intervals to upper bound (t2) for bounded queries.
- *
- * For bounded queries [t1, t2):
- * - If tombstone end > t2, clip end to t2
- * - If tombstone is unbounded [x, +inf), it becomes [max(x, t1), t2)
- * - Removes intervals that start at or past t2
- *
- * For unbounded queries, this is a no-op.
- *
- * Precondition: tombstones are already clipped to lower bound.
- */
-static void clip_tombstones_upper(tl_plan_t* plan) {
-    if (plan->t2_unbounded || plan->tomb_count == 0) {
-        return;  /* Nothing to clip for unbounded queries */
-    }
-
-    size_t write = 0;
-    for (size_t read = 0; read < plan->tomb_count; read++) {
-        tl_interval_t* interval = &plan->tombstones[read];
-
-        /* Remove intervals that start at or past t2 */
-        if (interval->start >= plan->t2) {
-            continue;
-        }
-
-        /* Clip unbounded intervals to t2 */
-        if (interval->end_unbounded) {
-            interval->end_unbounded = false;
-            interval->end = plan->t2;
-        } else if (interval->end > plan->t2) {
-            /* Clip bounded intervals that extend past t2 */
-            interval->end = plan->t2;
-        }
-
-        /* Copy to output position if needed */
-        if (write != read) {
-            plan->tombstones[write] = *interval;
-        }
-        write++;
-    }
-
-    plan->tomb_count = write;
-}
-
-/**
- * Coalesce overlapping/adjacent tombstone intervals in-place.
- *
- * Precondition: tombstones are sorted by start timestamp.
- * Result: disjoint intervals with gaps between them.
- *
- * Algorithm (LLD Section 4.4):
- * - Merge intervals that overlap or are adjacent
- * - Unbounded interval absorbs all subsequent intervals
- */
-static void coalesce_tombstones(tl_plan_t* plan) {
-    if (plan->tomb_count <= 1) {
-        return;
-    }
-
-    size_t write = 0;  /* Write position for coalesced output */
-
-    for (size_t read = 1; read < plan->tomb_count; read++) {
-        tl_interval_t* cur = &plan->tombstones[write];
-        const tl_interval_t* next = &plan->tombstones[read];
-
-        /* If current is unbounded, it absorbs everything */
-        if (cur->end_unbounded) {
-            break;
-        }
-
-        /* Check if next overlaps or is adjacent to current:
-         * Overlap: next.start < cur.end
-         * Adjacent: next.start == cur.end
-         * Combined: next.start <= cur.end */
-        if (next->start <= cur->end) {
-            /* Merge: extend current to cover next */
-            if (next->end_unbounded) {
-                cur->end_unbounded = true;
-                /* No need to update end - unbounded means infinite */
-            } else if (next->end > cur->end) {
-                cur->end = next->end;
-            }
-            /* Continue to potentially merge more */
-        } else {
-            /* Gap between intervals - emit current, start new */
-            write++;
-            plan->tombstones[write] = *next;
-        }
-    }
-
-    /* Update count to number of coalesced intervals */
-    plan->tomb_count = write + 1;
+static tl_status_t add_active_tombstones(tl_intervals_t* accum,
+                                          const tl_memview_t* mv,
+                                          tl_ts_t t1, tl_ts_t t2,
+                                          bool t2_unbounded) {
+    tl_intervals_imm_t tombs = tl_memview_tombs_imm(mv);
+    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
 }
 
 /*===========================================================================
@@ -488,9 +204,11 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
     plan->t2_unbounded = t2_unbounded;
     plan->snapshot = snapshot;
 
-    tl_status_t st;
     const tl_manifest_t* manifest = snapshot->manifest;
     const tl_memview_t* mv = tl_snapshot_memview(snapshot);
+    tl_intervals_t tombs;
+    tl_intervals_init(&tombs, alloc);
+    tl_status_t st;
 
     /*
      * Check if range is empty (bounded only).
@@ -524,7 +242,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
 
         /* Defensive: include L1 tombstones if present (should be empty in V1). */
-        st = add_segment_tombstones(plan, seg);
+        st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -558,7 +276,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
-        st = add_segment_tombstones(plan, seg);
+        st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -606,7 +324,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_memrun_source(plan, mr, priority);
         if (st != TL_OK) goto fail;
 
-        st = add_memrun_tombstones(plan, mr);
+        st = add_memrun_tombstones(&tombs, mr, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -623,24 +341,31 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             if (st != TL_OK) goto fail;
         }
 
-        st = add_active_tombstones(plan, mv);
+        st = add_active_tombstones(&tombs, mv, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
     /*
-     * Step 5: Sort, coalesce, and clip tombstones (LLD Section 4.4).
-     * - Sort by start timestamp
-     * - Merge overlapping/adjacent intervals
-     * - Clip to upper bound [t1, t2) for bounded queries
-     * This ensures efficient filtering during merge.
+     * Step 5: Clip tombstones to query range and finalize plan tombstones.
+     * Intervals are already in piecewise-max form via tl_intervals_insert().
      */
-    sort_tombstones(plan);
-    coalesce_tombstones(plan);
-    clip_tombstones_upper(plan);
+    if (!tl_intervals_is_empty(&tombs)) {
+        if (t2_unbounded) {
+            tl_intervals_clip_lower(&tombs, t1);
+        } else {
+            tl_intervals_clip(&tombs, t1, t2);
+        }
+    }
+
+    plan->tombstones = tl_intervals_take(&tombs, &plan->tomb_count);
+    plan->tomb_capacity = plan->tomb_count;
+
+    tl_intervals_destroy(&tombs);
 
     return TL_OK;
 
 fail:
+    tl_intervals_destroy(&tombs);
     tl_plan_destroy(plan);
     return st;
 }

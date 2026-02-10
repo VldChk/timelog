@@ -342,6 +342,58 @@ TEST_DECLARE(func_iter_point_with_tombstone) {
     tl_close(tl);
 }
 
+TEST_DECLARE(func_reinsert_visible_after_delete) {
+    tl_timelog_t* tl = NULL;
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert, delete, then reinsert same timestamp */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 200));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+
+    /* Visible before flush */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Flush to L0 and verify visibility */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Compaction and verify again */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    tl_close(tl);
+}
+
 TEST_DECLARE(func_iter_point_at_ts_max) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
@@ -2550,11 +2602,12 @@ void run_functional_tests(void) {
     RUN_TEST(func_iter_since_basic);
     RUN_TEST(func_iter_until_basic);
 
-    /* Point lookup tests (5 tests) - migrated from test_phase5.c */
+    /* Point lookup tests (6 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_equal_basic);
     RUN_TEST(func_iter_point_not_found);
     RUN_TEST(func_iter_point_fast_path);
     RUN_TEST(func_iter_point_with_tombstone);
+    RUN_TEST(func_reinsert_visible_after_delete);
     RUN_TEST(func_iter_point_at_ts_max);
 
     /* Tombstone tests (2 tests) - migrated from test_phase5.c */

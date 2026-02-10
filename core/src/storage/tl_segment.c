@@ -202,6 +202,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
                                  const tl_interval_t* tombstones, size_t tombstones_len,
                                  size_t target_page_bytes,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
@@ -243,6 +244,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->alloc = alloc;
     seg->level = TL_SEG_L0;
     seg->generation = generation;
+    seg->applied_seq = applied_seq;
     seg->window_start = 0;
     seg->window_end = 0;
     seg->window_end_unbounded = false;  /* L0 doesn't use windows */
@@ -331,6 +333,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  tl_ts_t window_start, tl_ts_t window_end,
                                  bool window_end_unbounded,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
@@ -358,6 +361,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->alloc = alloc;
     seg->level = TL_SEG_L1;
     seg->generation = generation;
+    seg->applied_seq = applied_seq;
     seg->window_start = window_start;
     seg->window_end = window_end;
     seg->window_end_unbounded = window_end_unbounded;
