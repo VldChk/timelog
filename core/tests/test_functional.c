@@ -629,6 +629,22 @@ TEST_DECLARE(func_next_prev_ts_basic) {
     tl_close(tl);
 }
 
+TEST_DECLARE(func_next_ts_at_ts_max_eof) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX, 1));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_ts_t ts = 0;
+    TEST_ASSERT_STATUS(TL_EOF, tl_next_ts(snap, TL_TS_MAX, &ts));
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Post-Flush Read Tests (migrated from test_phase5.c)
  *===========================================================================*/
@@ -2622,6 +2638,7 @@ void run_functional_tests(void) {
     RUN_TEST(func_min_max_ts_basic);
     RUN_TEST(func_min_max_ts_empty);
     RUN_TEST(func_next_prev_ts_basic);
+    RUN_TEST(func_next_ts_at_ts_max_eof);
 
     /* Post-flush tests (2 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_after_flush);

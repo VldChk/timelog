@@ -45,7 +45,7 @@ Resource Management:
     deterministic release.
     Note: close() will drop any unflushed records (data loss) but will
     release all Python objects still owned by the engine. For data safety,
-    call flush() before close().
+    call flush() to materialize pending writes before close().
     In maintenance="disabled" mode, use maint_step() to run compaction
     manually when needed.
 """
@@ -120,7 +120,7 @@ class Timelog(_CTimelog):
     Warning:
         close() drops any unflushed records (data loss) but releases all
         Python objects still owned by the engine. Call flush() before close()
-        if you need to persist all records. If close() is not called
+        if you need to materialize all records. If close() is not called
         explicitly, GC finalization will attempt cleanup (best-effort).
 
     Manual maintenance:
@@ -394,7 +394,7 @@ class Timelog(_CTimelog):
                 raise ValueError("extend() expects (ts, obj) pairs") from exc
             try:
                 ts = self._coerce_and_guard(ts)
-            except (TypeError, ValueError, OverflowError):
+            except (TypeError, OverflowError):
                 continue
             yield (ts, obj)
 
@@ -455,8 +455,8 @@ class Timelog(_CTimelog):
                 and valid records are inserted as they come (best-effort).
                 Structural errors (non-pairs) raise ValueError even in
                 streaming mode to avoid silent data loss. If False,
-                pre-validate ALL records before inserting any (atomic mode).
-                Generators are not supported in atomic mode (raises TypeError).
+                pre-validate ALL records before inserting any (pre-validated mode).
+                Generators are not supported in pre-validated mode (raises TypeError).
 
         Note:
             TimelogBusyError means the records WERE committed; do not retry.
@@ -489,7 +489,7 @@ class Timelog(_CTimelog):
                 for ts_val, obj in zip(ts_or_iterable, objects, strict=True):
                     try:
                         ts = self._coerce_and_guard(ts_val)
-                    except (TypeError, ValueError, OverflowError):
+                    except (TypeError, OverflowError):
                         continue
                     yield (ts, obj)
 
@@ -497,7 +497,7 @@ class Timelog(_CTimelog):
             return
 
         if not insert_on_error:
-            # Atomic mode requires materialized input
+            # Pre-validated mode: materialize and validate all items before insert
             if not hasattr(ts_or_iterable, '__len__'):
                 raise TypeError(
                     "insert_on_error=False requires a sequence, not a generator"
@@ -584,17 +584,11 @@ class Timelog(_CTimelog):
             For slice: TimelogIter for the specified range.
 
         Raises:
-            ValueError: If slice step is not None or 1, or if timestamp
-                is at TL_TS_MAX (overflow on point query).
+            ValueError: If slice step is not None or 1.
         """
         if isinstance(key, slice):
             return _slice_to_iter(self, key)
         ts = _coerce_ts(key)
-        if ts >= TL_TS_MAX:
-            raise ValueError(
-                f"point query at TL_TS_MAX ({TL_TS_MAX}) would overflow; "
-                "use .equal(ts) instead"
-            )
         return [obj for _, obj in self.point(ts)]
 
     def at(self, ts: int):
@@ -619,6 +613,14 @@ class Timelog(_CTimelog):
     # ------------------------------------------------------------------
     # Delete path
     # ------------------------------------------------------------------
+
+    def _delete_point_checked(self, ts: int) -> None:
+        if ts >= TL_TS_MAX:
+            raise ValueError(
+                f"point delete at TL_TS_MAX ({TL_TS_MAX}) is not representable "
+                "with half-open delete ranges"
+            )
+        super().delete_range(ts, ts + 1)
 
     def cutoff(self, ts):
         """
@@ -645,22 +647,21 @@ class Timelog(_CTimelog):
             t2: Range end (exclusive). If None, does point delete.
 
         Raises:
-            ValueError: If t1 is at TL_TS_MAX for point delete (overflow).
+            ValueError: If point delete is requested at TL_TS_MAX.
         """
         t1 = _coerce_ts(t1)
         if t2 is None:
-            if t1 >= TL_TS_MAX:
-                raise ValueError(
-                    f"point delete at TL_TS_MAX ({TL_TS_MAX}) would overflow; "
-                    "use delete_range(t, t+1) with appropriate bounds"
-                )
-            super().delete_range(t1, t1 + 1)
+            self._delete_point_checked(t1)
         else:
             super().delete_range(t1, _coerce_ts(t2))
 
     def __delitem__(self, key):
         """
         Delete records: ``del log[ts]`` or ``del log[t1:t2]``.
+
+        Note:
+            Half-open delete ranges cannot represent a single-point delete
+            at `TL_TS_MAX`.
 
         Args:
             key: Integer timestamp (point delete) or slice (range delete).
@@ -677,11 +678,7 @@ class Timelog(_CTimelog):
             super().delete_range(t1, t2)
         else:
             ts = _coerce_ts(key)
-            if ts >= TL_TS_MAX:
-                raise ValueError(
-                    f"point delete at TL_TS_MAX ({TL_TS_MAX}) would overflow"
-                )
-            super().delete_range(ts, ts + 1)
+            self._delete_point_checked(ts)
 
     # ------------------------------------------------------------------
     # Views (PageSpan)
@@ -702,6 +699,13 @@ class Timelog(_CTimelog):
 
         Returns:
             PageSpanIter yielding PageSpan objects.
+
+        Notes:
+            `views()` reflects physical storage spans (page ranges), not
+            tombstone-filtered logical rows.
+            Because ranges are half-open, `views()` uses `[TL_TS_MIN, TL_TS_MAX)`;
+            a single-point `TL_TS_MAX` query should use `log[TL_TS_MAX]` or
+            `log.point(TL_TS_MAX)`.
 
         Raises:
             ValueError: If only one of t1/t2 is provided.

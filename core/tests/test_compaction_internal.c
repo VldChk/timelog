@@ -65,9 +65,10 @@ static tl_status_t test_segment_build_l0(tl_alloc_ctx_t* alloc,
                                           size_t target_page_bytes,
                                           uint32_t generation,
                                           tl_segment_t** out) {
+    tl_seq_t applied_seq = (generation == 0) ? 1 : (tl_seq_t)generation;
     return tl_segment_build_l0(alloc, records, record_count,
                                tombstones, tombstones_len,
-                               target_page_bytes, generation, 0, out);
+                               target_page_bytes, generation, applied_seq, out);
 }
 
 static tl_status_t test_segment_build_l0_with_seq(tl_alloc_ctx_t* alloc,
@@ -403,7 +404,7 @@ TEST_DECLARE(cint_residual_tombstones_preserved_under_window_cap) {
     tl_compact_ctx_t ctx;
     tl_compact_ctx_init(&ctx, tl, &tl->alloc, tl->effective_window_size);
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx.snapshot));
-    ctx.applied_seq = tl_snapshot_seq(ctx.snapshot);
+    ctx.applied_seq = TL_MAX((tl_seq_t)1, tl_snapshot_seq(ctx.snapshot));
 
     tl_interval_t tomb = {0, 300, false, 1};
     tl_segment_t* seg = NULL;
@@ -453,7 +454,7 @@ TEST_DECLARE(cint_residual_tombstones_unbounded) {
     tl_compact_ctx_t ctx;
     tl_compact_ctx_init(&ctx, tl, &tl->alloc, tl->effective_window_size);
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire_internal(tl, &tl->alloc, &ctx.snapshot));
-    ctx.applied_seq = tl_snapshot_seq(ctx.snapshot);
+    ctx.applied_seq = TL_MAX((tl_seq_t)1, tl_snapshot_seq(ctx.snapshot));
 
     tl_interval_t tomb = {50, 0, true, 1};
     tl_segment_t* seg = NULL;

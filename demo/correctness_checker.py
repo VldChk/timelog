@@ -1,30 +1,38 @@
 #!/usr/bin/env python3
 """
-Correctness Checker: Long-running chaotic test with shadow state verification.
+Timelog Correctness Checker V2.
 
-Maintains a Python-side shadow state, performs random inserts/deletes/queries
-against Timelog, and verifies every result. Any mismatch between engine and
-expected state is a potential bug.
-
-Usage:
-    py -V:3.13 demo/correctness_checker.py [--duration=3600] [--seed=42] [--verbose] [--log=PATH]
-
-Options:
-    --duration=N   Run for N seconds (default: 3600)
-    --seed=N       RNG seed for reproducibility (default: random)
-    --verbose      Print every operation
-    --log=PATH     JSONL audit trail (default: demo/correctness_log.jsonl)
+Chaotic long-run validator with dual-oracle verification, issue triage,
+and structured artifacts:
+  - ops.jsonl
+  - checks.jsonl
+  - issues.jsonl
+  - summary.json
+  - summary.md
+  - issues/<issue_id>/{report.md,evidence.json}
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
+import csv
+import gc
+import hashlib
 import json
+import math
 import random
+import subprocess
 import sys
 import time
+import traceback
+import weakref
+from collections import Counter, deque
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
+
 
 # ---------------------------------------------------------------------------
 # Ensure timelog is importable
@@ -32,7 +40,6 @@ from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO / "python"))
-# Try common build output dirs for the C extension
 for _candidate in [
     _REPO / "bindings" / "cpython" / "build-test" / "Release",
     _REPO / "bindings" / "cpython" / "build-test" / "Debug",
@@ -42,817 +49,2015 @@ for _candidate in [
     if _candidate.is_dir():
         sys.path.insert(0, str(_candidate))
 
-from timelog import Timelog, TimelogError  # noqa: E402
-from timelog._api import TL_TS_MIN, TL_TS_MAX  # noqa: E402
+from timelog import Timelog, TimelogBusyError, TimelogError  # noqa: E402
+from timelog._api import TL_TS_MAX, TL_TS_MIN, _coerce_ts  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Shadow State
-# ---------------------------------------------------------------------------
+DEFAULT_CSVS = [
+    str(Path("demo") / "order_book_less_ordered_clean.csv"),
+    str(Path("demo") / "order_book_more_ordered_clean.csv"),
+]
 
-class ShadowState:
-    """
-    Python-side truth: sorted (ts, seq_id) index + parallel object dict.
+ISSUE_STATUS_CONFIRMED = "CONFIRMED_ENGINE_BUG"
+ISSUE_STATUS_CHECKER = "CHECKER_BUG"
+ISSUE_STATUS_TRANSIENT = "UNCONFIRMED_TRANSIENT"
 
-    Does NOT track tombstones. Instead, the timestamp generator avoids
-    producing timestamps inside tombstoned ranges, so inserts and the
-    engine always agree on visibility.
-    """
 
-    __slots__ = ("_index", "_objects", "_next_id")
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+def _safe_git_commit() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(_REPO), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return out.strip() or None
+    except Exception:
+        return None
+
+
+def _canonicalize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (_canonicalize(k), _canonicalize(value[k]))
+                for k in sorted(value.keys(), key=lambda x: repr(x))
+            ),
+        )
+    if isinstance(value, list):
+        return ("list", tuple(_canonicalize(v) for v in value))
+    if isinstance(value, tuple):
+        return ("tuple", tuple(_canonicalize(v) for v in value))
+    if isinstance(value, set):
+        return ("set", tuple(sorted((_canonicalize(v) for v in value), key=repr)))
+    if isinstance(value, frozenset):
+        return ("frozenset", tuple(sorted((_canonicalize(v) for v in value), key=repr)))
+    if isinstance(value, bytes):
+        return ("bytes", value.hex())
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ("float", "nan")
+        if math.isinf(value):
+            return ("float", "+inf" if value > 0 else "-inf")
+        return ("float", format(value, ".17g"))
+    return value
+
+
+def _payload_digest(value: Any) -> str:
+    return hashlib.sha256(repr(_canonicalize(value)).encode("utf-8")).hexdigest()
+
+
+def _normalize_csv_row(row: dict[str, str]) -> dict[str, Any]:
+    int_fields = {"timestamp", "amount", "order_id"}
+    float_fields = {"ask_price", "bid_price", "commission"}
+    out: dict[str, Any] = {}
+    for k, raw in row.items():
+        if raw is None:
+            out[k] = None
+            continue
+        v = raw.strip()
+        if k in int_fields:
+            try:
+                out[k] = int(v)
+                continue
+            except ValueError:
+                pass
+        if k in float_fields:
+            try:
+                out[k] = float(v)
+                continue
+            except ValueError:
+                pass
+        out[k] = v
+    return out
+
+
+def _extract_rid_digest(obj: Any) -> tuple[int | None, str]:
+    if isinstance(obj, dict) and obj.get("__cc_v2") == 1 and isinstance(obj.get("rid"), int):
+        rid = int(obj["rid"])
+        digest = obj.get("payload_digest")
+        if isinstance(digest, str) and digest:
+            return rid, digest
+        return rid, _payload_digest(obj.get("payload"))
+    return None, _payload_digest(obj)
+
+
+@dataclass
+class RunConfig:
+    duration_seconds: int
+    seed: int
+    source_mode: str
+    csv_paths: list[str]
+    out_dir: str
+    min_batch: int
+    max_batch: int
+    maintenance: str
+    busy_policy: str
+    full_verify_interval_ops: int
+    full_verify_interval_seconds: int
+    checkpoint_interval_ops: int
+    continue_on_mismatch: bool
+    max_issues: int
+    verbose: bool
+    log_alias_path: str | None = None
+
+
+@dataclass
+class SourceRecord:
+    ts: int
+    payload: Any
+    src: str
+    cycle: int
+    source_file: str
+
+
+@dataclass
+class StoredRow:
+    rid: int
+    ts: int
+    obj: Any
+    payload_digest: str
+    src: str
+    cycle: int
+    source_file: str
+    insert_op: int
+    alive: bool = True
+    delete_op: int | None = None
+
+
+@dataclass
+class CheckContext:
+    query_kind: str
+    params: dict[str, Any]
+    description: str
+
+
+@dataclass
+class ComparisonResult:
+    ok: bool
+    reason: str
+    expected_n: int
+    got_n: int
+    expected_keys: list[tuple[int, int | None, str]] = field(default_factory=list)
+    got_keys: list[tuple[int, int | None, str]] = field(default_factory=list)
+    missing: list[tuple[int, int | None, str]] = field(default_factory=list)
+    extra: list[tuple[int, int | None, str]] = field(default_factory=list)
+
+
+@dataclass
+class IssueOutcome:
+    status: str
+    notes: list[str]
+    triage_records: dict[str, Any]
+
+
+class JsonlWriter:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "w", encoding="utf-8")
+
+    def write(self, record: dict[str, Any], flush: bool = False) -> None:
+        self._fh.write(json.dumps(record, default=str, ensure_ascii=True) + "\n")
+        if flush:
+            self._fh.flush()
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+        finally:
+            self._fh.close()
+
+
+class IssueRegistry:
+    def __init__(self, run_dir: Path, issues_writer: JsonlWriter, repro_cmd: str):
+        self.run_dir = run_dir
+        self.issues_writer = issues_writer
+        self.repro_cmd = repro_cmd
+        self.issues_dir = run_dir / "issues"
+        self.issues_dir.mkdir(parents=True, exist_ok=True)
+        self.count = 0
+        self.by_status: Counter[str] = Counter()
+        self.by_kind: Counter[str] = Counter()
+
+    def create_issue(
+        self,
+        *,
+        kind: str,
+        severity: str,
+        status: str,
+        op_index: int,
+        check_index: int,
+        title: str,
+        context: dict[str, Any],
+        evidence: dict[str, Any],
+    ) -> str:
+        self.count += 1
+        issue_id = f"ISSUE_{self.count:04d}"
+        now = _utc_now_iso()
+        issue = {
+            "issue_id": issue_id,
+            "t_utc": now,
+            "kind": kind,
+            "severity": severity,
+            "status": status,
+            "op_index": op_index,
+            "check_index": check_index,
+            "title": title,
+            "context": context,
+        }
+        self.issues_writer.write(issue, flush=True)
+        self.by_status[status] += 1
+        self.by_kind[kind] += 1
+
+        issue_path = self.issues_dir / issue_id
+        issue_path.mkdir(parents=True, exist_ok=True)
+
+        payload = {"issue": issue, "evidence": evidence, "repro_cmd": self.repro_cmd}
+        with open(issue_path / "evidence.json", "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=True, default=str)
+
+        report_lines = [
+            f"# {issue_id}: {title}",
+            "",
+            f"- Kind: `{kind}`",
+            f"- Severity: `{severity}`",
+            f"- Status: `{status}`",
+            f"- Operation index: `{op_index}`",
+            f"- Check index: `{check_index}`",
+            "",
+            "## Reproduction",
+            "```powershell",
+            self.repro_cmd,
+            "```",
+            "",
+            "## Context",
+            "```json",
+            json.dumps(context, indent=2, ensure_ascii=True, default=str),
+            "```",
+            "",
+            "## Evidence",
+            "```json",
+            json.dumps(evidence, indent=2, ensure_ascii=True, default=str),
+            "```",
+        ]
+        with open(issue_path / "report.md", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(report_lines) + "\n")
+        return issue_id
+
+
+class SyntheticSource:
+    def __init__(self, rng: random.Random, base_ts: int = 1_000_000):
+        self.rng = rng
+        self.cursor = base_ts
+        self.floor = base_ts
+        self.ooo_rate = 0.20
+        self.max_lookback = 50_000
+        self.total = 0
+        self.cycle = 0
+
+    def _tick_total(self) -> None:
+        self.total += 1
+        if self.total % 1_000_000 == 0:
+            self.cycle += 1
+
+    def _next_ts(self) -> int:
+        if self.rng.random() < self.ooo_rate and self.cursor > self.floor + 10:
+            max_lb = min(self.max_lookback, self.cursor - self.floor - 1)
+            if max_lb > 0:
+                ts = self.cursor - self.rng.randint(1, max_lb)
+                if TL_TS_MIN <= ts <= TL_TS_MAX:
+                    self._tick_total()
+                    return ts
+        nxt = self.cursor + self.rng.randint(1, 1000)
+        if nxt > TL_TS_MAX:
+            nxt = TL_TS_MAX - self.rng.randint(0, 100)
+        self.cursor = nxt
+        self._tick_total()
+        return self.cursor
+
+    def _next_payload(self) -> Any:
+        kind = self.rng.randint(0, 8)
+        if kind == 0:
+            return {"kind": "quote", "px": self.rng.random(), "sz": self.rng.randint(1, 10000)}
+        if kind == 1:
+            return {"kind": "trade", "side": self.rng.choice(["B", "S"]), "qty": self.rng.randint(1, 5000)}
+        if kind == 2:
+            return ["evt", self.rng.randint(-10_000, 10_000), self.rng.random()]
+        if kind == 3:
+            return ("tuple", self.rng.randint(0, 1_000_000))
+        if kind == 4:
+            return self.rng.randint(-2**31, 2**31 - 1)
+        if kind == 5:
+            return self.rng.random()
+        if kind == 6:
+            return None
+        if kind == 7:
+            return {"nested": {"a": self.rng.randint(0, 99), "b": [1, 2, 3]}, "ok": True}
+        return f"synthetic_{self.total}_{self.rng.randint(0, 1_000_000)}"
+
+    def next_records(self, count: int) -> list[SourceRecord]:
+        out: list[SourceRecord] = []
+        for _ in range(count):
+            out.append(
+                SourceRecord(
+                    ts=self._next_ts(),
+                    payload=self._next_payload(),
+                    src="syn",
+                    cycle=self.cycle,
+                    source_file="<synthetic>",
+                )
+            )
+        return out
+
+
+class CsvRollingSource:
+    def __init__(self, paths: list[Path]):
+        if not paths:
+            raise ValueError("CsvRollingSource requires at least one CSV")
+        self.paths = paths
+        self.file_idx = 0
+        self.file_handle = None
+        self.reader = None
+        self.global_cycle = 0
+        self.global_offset = 0
+        self.cycle_min_raw: int | None = None
+        self.cycle_max_raw: int | None = None
+        self.rows_in_cycle = 0
+        self.rows_emitted_in_cycle = 0
+
+    def close(self) -> None:
+        if self.file_handle is not None:
+            self.file_handle.close()
+            self.file_handle = None
+            self.reader = None
+
+    def _open_current_file(self) -> None:
+        self.close()
+        path = self.paths[self.file_idx]
+        self.file_handle = open(path, "r", encoding="utf-8", newline="")
+        self.reader = csv.DictReader(self.file_handle)
+
+    def _advance_file_or_cycle(self) -> None:
+        self.close()
+        self.file_idx += 1
+        if self.file_idx >= len(self.paths):
+            if self.rows_in_cycle == 0:
+                raise RuntimeError("CSV source produced no timestamp rows in a full cycle")
+            if self.rows_emitted_in_cycle == 0:
+                raise RuntimeError(
+                    "CSV source produced no in-range timestamps in a full cycle; "
+                    "offset likely exceeded int64 range"
+                )
+            self.file_idx = 0
+            span = 1
+            if self.cycle_min_raw is not None and self.cycle_max_raw is not None:
+                span = max(1, self.cycle_max_raw - self.cycle_min_raw + 1)
+            self.global_offset += span
+            self.global_cycle += 1
+            self.cycle_min_raw = None
+            self.cycle_max_raw = None
+            self.rows_in_cycle = 0
+            self.rows_emitted_in_cycle = 0
+        self._open_current_file()
+
+    def _next(self) -> SourceRecord:
+        if self.reader is None:
+            self._open_current_file()
+        while True:
+            assert self.reader is not None
+            try:
+                row = next(self.reader)
+            except StopIteration:
+                self._advance_file_or_cycle()
+                continue
+            raw_ts = row.get("timestamp")
+            if raw_ts is None:
+                continue
+            try:
+                ts_raw = int(raw_ts)
+            except ValueError:
+                continue
+            if self.cycle_min_raw is None or ts_raw < self.cycle_min_raw:
+                self.cycle_min_raw = ts_raw
+            if self.cycle_max_raw is None or ts_raw > self.cycle_max_raw:
+                self.cycle_max_raw = ts_raw
+            self.rows_in_cycle += 1
+            ts = ts_raw + self.global_offset
+            if ts < TL_TS_MIN or ts > TL_TS_MAX:
+                continue
+            self.rows_emitted_in_cycle += 1
+            return SourceRecord(
+                ts=ts,
+                payload=_normalize_csv_row(row),
+                src="csv",
+                cycle=self.global_cycle,
+                source_file=self.paths[self.file_idx].name,
+            )
+
+    def next_records(self, count: int) -> list[SourceRecord]:
+        return [self._next() for _ in range(count)]
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "global_cycle": self.global_cycle,
+            "global_offset": self.global_offset,
+            "rows_in_cycle": self.rows_in_cycle,
+            "current_file": self.paths[self.file_idx].name,
+        }
+
+
+class MixedSource:
+    def __init__(
+        self,
+        rng: random.Random,
+        synthetic: SyntheticSource,
+        csv_source: CsvRollingSource | None,
+        csv_weight: float = 0.7,
+    ):
+        self.rng = rng
+        self.synthetic = synthetic
+        self.csv_source = csv_source
+        self.csv_weight = csv_weight
+
+    def next_records(self, count: int) -> list[SourceRecord]:
+        if self.csv_source is None:
+            return self.synthetic.next_records(count)
+        if self.rng.random() < self.csv_weight:
+            return self.csv_source.next_records(count)
+        return self.synthetic.next_records(count)
+
+
+class ShadowFast:
     def __init__(self):
-        self._index: list[tuple[int, int]] = []  # sorted by (ts, seq_id)
-        self._objects: dict[int, object] = {}     # seq_id -> obj
-        self._next_id = 0
+        self._index: list[tuple[int, int]] = []  # (ts, rid)
+        self._live_rows: dict[int, StoredRow] = {}
 
-    def insert(self, ts: int, obj: object) -> None:
-        sid = self._next_id
-        self._next_id += 1
-        bisect.insort(self._index, (ts, sid))
-        self._objects[sid] = obj
+    def insert_rows(self, rows: list[StoredRow]) -> None:
+        for row in rows:
+            bisect.insort(self._index, (row.ts, row.rid))
+            self._live_rows[row.rid] = row
 
-    def extend(self, pairs: list[tuple[int, object]]) -> None:
-        new = []
-        for ts, obj in pairs:
-            sid = self._next_id
-            self._next_id += 1
-            new.append((ts, sid))
-            self._objects[sid] = obj
-        self._index.extend(new)
-        self._index.sort()
-
-    def delete_range(self, t1: int, t2: int) -> int:
-        lo = bisect.bisect_left(self._index, (t1,))
-        hi = bisect.bisect_left(self._index, (t2,))
-        removed = self._index[lo:hi]
+    def delete_range(self, t1: int, t2: int, op_index: int) -> list[StoredRow]:
+        lo = bisect.bisect_left(self._index, (t1, -1))
+        hi = bisect.bisect_left(self._index, (t2, -1))
+        doomed = self._index[lo:hi]
         del self._index[lo:hi]
-        for _, sid in removed:
-            del self._objects[sid]
-        return len(removed)
+        removed: list[StoredRow] = []
+        for _, rid in doomed:
+            row = self._live_rows.pop(rid, None)
+            if row is None:
+                continue
+            row.alive = False
+            row.delete_op = op_index
+            removed.append(row)
+        return removed
 
-    def delete_point(self, ts: int) -> int:
-        return self.delete_range(ts, ts + 1)
+    def query_range(self, t1: int, t2: int) -> list[StoredRow]:
+        lo = bisect.bisect_left(self._index, (t1, -1))
+        hi = bisect.bisect_left(self._index, (t2, -1))
+        out: list[StoredRow] = []
+        for _, rid in self._index[lo:hi]:
+            row = self._live_rows.get(rid)
+            if row is not None:
+                out.append(row)
+        return out
 
-    def cutoff(self, ts: int) -> int:
-        return self.delete_range(TL_TS_MIN, ts)
+    def query_since(self, t1: int) -> list[StoredRow]:
+        lo = bisect.bisect_left(self._index, (t1, -1))
+        out: list[StoredRow] = []
+        for _, rid in self._index[lo:]:
+            row = self._live_rows.get(rid)
+            if row is not None:
+                out.append(row)
+        return out
 
-    def query_all(self) -> list[tuple[int, object]]:
-        return [(ts, self._objects[sid]) for ts, sid in self._index]
+    def query_point(self, ts: int) -> list[StoredRow]:
+        lo = bisect.bisect_left(self._index, (ts, -1))
+        hi = bisect.bisect_right(self._index, (ts, 2**63))
+        out: list[StoredRow] = []
+        for _, rid in self._index[lo:hi]:
+            row = self._live_rows.get(rid)
+            if row is not None:
+                out.append(row)
+        return out
 
-    def query_range(self, t1: int, t2: int) -> list[tuple[int, object]]:
-        lo = bisect.bisect_left(self._index, (t1,))
-        hi = bisect.bisect_left(self._index, (t2,))
-        return [(ts, self._objects[sid]) for ts, sid in self._index[lo:hi]]
+    def query_all(self) -> list[StoredRow]:
+        return [self._live_rows[rid] for _, rid in self._index if rid in self._live_rows]
 
-    def query_point(self, ts: int) -> list[object]:
-        lo = bisect.bisect_left(self._index, (ts,))
-        hi = bisect.bisect_left(self._index, (ts + 1,))
-        return [self._objects[sid] for _, sid in self._index[lo:hi]]
-
-    def min_ts(self):
-        return self._index[0][0] if self._index else None
-
-    def max_ts(self):
-        return self._index[-1][0] if self._index else None
-
-    def __len__(self) -> int:
+    def live_count(self) -> int:
         return len(self._index)
 
-    def random_ts(self, rng: random.Random):
-        return rng.choice(self._index)[0] if self._index else None
+    def min_ts(self) -> int | None:
+        return self._index[0][0] if self._index else None
 
+    def max_ts(self) -> int | None:
+        return self._index[-1][0] if self._index else None
 
-# ---------------------------------------------------------------------------
-# Object Factory
-# ---------------------------------------------------------------------------
-
-class ObjectFactory:
-    """Generates diverse Python objects to stress handle encoding."""
-
-    def __init__(self, rng: random.Random):
-        self._rng = rng
-        self._counter = 0
-
-    def make(self) -> object:
-        self._counter += 1
-        kind = self._rng.randint(0, 6)
-        n = self._counter
-        if kind == 0:
-            return f"rec_{n}"
-        elif kind == 1:
-            return self._rng.randint(-10**9, 10**9)
-        elif kind == 2:
-            return (n, "data")
-        elif kind == 3:
-            return {"id": n, "v": self._rng.random()}
-        elif kind == 4:
+    def random_live_ts(self, rng: random.Random) -> int | None:
+        if not self._index:
             return None
-        elif kind == 5:
-            return [n, "x"]
-        else:
-            return self._rng.random()
+        return rng.choice(self._index)[0]
 
-    def make_batch(self, count: int) -> list[object]:
-        return [self.make() for _ in range(count)]
+    def next_ts(self, ts: int) -> int | None:
+        idx = bisect.bisect_right(self._index, (ts, 2**63))
+        if idx >= len(self._index):
+            return None
+        return self._index[idx][0]
+
+    def prev_ts(self, ts: int) -> int | None:
+        idx = bisect.bisect_left(self._index, (ts, -1)) - 1
+        if idx < 0:
+            return None
+        return self._index[idx][0]
 
 
-# ---------------------------------------------------------------------------
-# Timestamp Generator
-# ---------------------------------------------------------------------------
+class ShadowTruth:
+    def __init__(self):
+        self.events: list[tuple[Any, ...]] = []
 
-class TimestampGen:
-    """
-    Generates monotonically-increasing timestamps with ~15% OOO.
+    def record_insert(self, row: StoredRow) -> None:
+        self.events.append(("ins", row))
 
-    Maintains a sorted, non-overlapping tombstone interval set. OOO
-    lookback never generates timestamps inside any tombstoned range.
-    This avoids the known tombstone-reinsert scenario (by-design LSM
-    behavior) and focuses the checker on detecting real correctness bugs.
-    """
+    def record_delete(self, t1: int, t2: int, op_index: int) -> None:
+        self.events.append(("del", t1, t2, op_index))
 
-    def __init__(self, rng: random.Random, base: int = 1_000_000):
-        self._rng = rng
-        self._cursor = base
-        self._base = base
-        self._floor = base
-        self._ooo_rate = 0.15
-        self._max_lookback = 10_000
-        self._tombstones: list[tuple[int, int]] = []  # sorted [start, end)
-
-    @property
-    def cursor(self) -> int:
-        return self._cursor
-
-    def add_tombstone(self, t1: int, t2: int) -> None:
-        """Register a tombstone [t1, t2). Merges with existing intervals."""
-        if t1 >= t2:
-            return
-        merged_start = t1
-        merged_end = t2
-        new_tombs = []
-        for start, end in self._tombstones:
-            if end < t1 or start > t2:
-                new_tombs.append((start, end))
+    def replay_live(self) -> dict[int, StoredRow]:
+        live: dict[int, StoredRow] = {}
+        for ev in self.events:
+            if ev[0] == "ins":
+                row = ev[1]
+                live[row.rid] = row
             else:
-                merged_start = min(merged_start, start)
-                merged_end = max(merged_end, end)
-        new_tombs.append((merged_start, merged_end))
-        new_tombs.sort()
-        self._tombstones = new_tombs
-        # Also advance floor if needed
-        if t2 > self._floor:
-            self._floor = t2
+                _, t1, t2, _ = ev
+                doomed = [rid for rid, row in live.items() if t1 <= row.ts < t2]
+                for rid in doomed:
+                    live.pop(rid, None)
+        return live
 
-    def _is_in_tombstone(self, ts: int) -> bool:
-        """Check if ts falls inside any tombstone."""
-        if not self._tombstones:
-            return False
-        idx = bisect.bisect_right(self._tombstones, (ts, TL_TS_MAX)) - 1
-        if idx < 0:
-            return False
-        start, end = self._tombstones[idx]
-        return start <= ts < end
+    def query_range(self, t1: int, t2: int) -> list[StoredRow]:
+        rows = [row for row in self.replay_live().values() if t1 <= row.ts < t2]
+        rows.sort(key=lambda r: (r.ts, r.rid))
+        return rows
 
-    def _skip_past_tombstone(self, ts: int) -> int:
-        """If ts is inside a tombstone, return the tombstone's end; else ts."""
-        if not self._tombstones:
-            return ts
-        idx = bisect.bisect_right(self._tombstones, (ts, TL_TS_MAX)) - 1
-        if idx < 0:
-            return ts
-        start, end = self._tombstones[idx]
-        if start <= ts < end:
-            return end  # Skip to just past the tombstone
-        return ts
+    def query_since(self, t1: int) -> list[StoredRow]:
+        rows = [row for row in self.replay_live().values() if row.ts >= t1]
+        rows.sort(key=lambda r: (r.ts, r.rid))
+        return rows
 
-    def next(self) -> int:
-        if (self._rng.random() < self._ooo_rate
-                and self._cursor > self._floor + self._max_lookback):
-            max_lb = min(self._max_lookback, self._cursor - self._floor - 1)
-            if max_lb > 0:
-                lb = self._rng.randint(1, max_lb)
-                candidate = self._cursor - lb
-                if not self._is_in_tombstone(candidate):
-                    return candidate
-                # Fall through to forward generation if OOO hit a tombstone
-        gap = self._rng.randint(1, 100)
-        ts = self._cursor + gap
-        # Skip past any tombstone the cursor wandered into
-        ts = self._skip_past_tombstone(ts)
-        self._cursor = ts
-        return ts
+    def query_point(self, ts: int) -> list[StoredRow]:
+        rows = [row for row in self.replay_live().values() if row.ts == ts]
+        rows.sort(key=lambda r: (r.ts, r.rid))
+        return rows
 
-    def next_batch(self, count: int) -> list[int]:
-        return [self.next() for _ in range(count)]
+    def query_all(self) -> list[StoredRow]:
+        rows = list(self.replay_live().values())
+        rows.sort(key=lambda r: (r.ts, r.rid))
+        return rows
 
 
-# ---------------------------------------------------------------------------
-# Operation Log (JSONL)
-# ---------------------------------------------------------------------------
-
-class OperationLog:
-    """Append-only JSONL audit trail."""
-
-    def __init__(self, path: str | None):
-        self._file = None
-        if path:
-            self._file = open(path, "w", encoding="utf-8")
-        self._seq = 0
-
-    def log(self, **fields):
-        self._seq += 1
-        record = {"seq": self._seq, "t": time.time(), **fields}
-        if self._file:
-            self._file.write(json.dumps(record, default=str) + "\n")
-
-    def close(self):
-        if self._file:
-            self._file.flush()
-            self._file.close()
-            self._file = None
+def _rows_to_expected_keys(rows: list[StoredRow]) -> list[tuple[int, int | None, str]]:
+    return [(r.ts, r.rid, r.payload_digest) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Mismatch Error
-# ---------------------------------------------------------------------------
+def _records_to_engine_keys(records: list[tuple[int, Any]]) -> list[tuple[int, int | None, str]]:
+    out: list[tuple[int, int | None, str]] = []
+    for ts, obj in records:
+        rid, dg = _extract_rid_digest(obj)
+        out.append((int(ts), rid, dg))
+    return out
 
-class MismatchError(Exception):
-    """Raised on verification failure."""
-    pass
+
+def _compare_rows(
+    expected_rows: list[StoredRow],
+    got_records: list[tuple[int, Any]],
+) -> ComparisonResult:
+    expected_keys = _rows_to_expected_keys(expected_rows)
+    got_keys = _records_to_engine_keys(got_records)
+
+    for i in range(1, len(got_keys)):
+        if got_keys[i][0] < got_keys[i - 1][0]:
+            return ComparisonResult(
+                ok=False,
+                reason="ORDER_VIOLATION",
+                expected_n=len(expected_keys),
+                got_n=len(got_keys),
+                expected_keys=expected_keys,
+                got_keys=got_keys,
+            )
+
+    exp_counter = Counter(expected_keys)
+    got_counter = Counter(got_keys)
+    if exp_counter == got_counter:
+        return ComparisonResult(
+            ok=True,
+            reason="OK",
+            expected_n=len(expected_keys),
+            got_n=len(got_keys),
+            expected_keys=expected_keys,
+            got_keys=got_keys,
+        )
+
+    missing = list((exp_counter - got_counter).elements())[:20]
+    extra = list((got_counter - exp_counter).elements())[:20]
+    if missing and not extra:
+        reason = "MISSING_ROW"
+    elif extra and not missing:
+        reason = "PHANTOM_ROW"
+    else:
+        reason = "PAYLOAD_MISMATCH"
+    return ComparisonResult(
+        ok=False,
+        reason=reason,
+        expected_n=len(expected_keys),
+        got_n=len(got_keys),
+        expected_keys=expected_keys,
+        got_keys=got_keys,
+        missing=missing,
+        extra=extra,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Correctness Checker
-# ---------------------------------------------------------------------------
+class MismatchTriager:
+    def __init__(self, runner: "CorrectnessRunner"):
+        self.runner = runner
 
-class CorrectnessChecker:
-    """Orchestrator: runs random operations and verifies results."""
+    def _truth_expected(self, ctx: CheckContext) -> list[tuple[int, int | None, str]] | None:
+        kind = ctx.query_kind
+        p = ctx.params
+        if kind == "point":
+            ts = int(p["ts"])
+            return _rows_to_expected_keys(self.runner.shadow_truth.query_point(ts))
+        if kind in {"range", "slice_since", "slice_until", "slice_all", "full_scan", "all_sample"}:
+            if kind == "slice_since":
+                return _rows_to_expected_keys(self.runner.shadow_truth.query_since(int(p["t1"])))
+            elif kind == "slice_until":
+                t1, t2 = TL_TS_MIN, int(p["t2"])
+            elif kind in {"slice_all", "full_scan", "all_sample"}:
+                return _rows_to_expected_keys(self.runner.shadow_truth.query_all())
+            else:
+                t1, t2 = int(p["t1"]), int(p["t2"])
+            return _rows_to_expected_keys(self.runner.shadow_truth.query_range(t1, t2))
+        return None
 
-    # Operation weights
+    def triage(
+        self,
+        *,
+        ctx: CheckContext,
+        expected_rows: list[StoredRow],
+        engine_fetch: Callable[[], list[tuple[int, Any]]],
+        alt_fetch: Callable[[], list[tuple[int, Any]]] | None,
+        initial_got: list[tuple[int, Any]] | None,
+    ) -> IssueOutcome:
+        notes: list[str] = []
+        expected_fast = _rows_to_expected_keys(expected_rows)
+        expected_truth = self._truth_expected(ctx)
+        triage_records: dict[str, Any] = {
+            "expected_fast_n": len(expected_fast),
+            "expected_truth_n": None if expected_truth is None else len(expected_truth),
+            "truth_agrees": None,
+            "reruns": {},
+        }
+        if expected_truth is not None:
+            triage_records["truth_agrees"] = Counter(expected_fast) == Counter(expected_truth)
+            if not triage_records["truth_agrees"]:
+                notes.append("ShadowFast and ShadowTruth disagree")
+                return IssueOutcome(ISSUE_STATUS_CHECKER, notes, triage_records)
+
+        if initial_got is not None:
+            cmp_initial = _compare_rows(expected_rows, initial_got)
+            triage_records["reruns"]["initial"] = {
+                "reason": cmp_initial.reason,
+                "expected_n": cmp_initial.expected_n,
+                "got_n": cmp_initial.got_n,
+            }
+
+        try:
+            rerun = engine_fetch()
+            cmp_rerun = _compare_rows(expected_rows, rerun)
+            triage_records["reruns"]["same_query"] = {
+                "reason": cmp_rerun.reason,
+                "expected_n": cmp_rerun.expected_n,
+                "got_n": cmp_rerun.got_n,
+            }
+            if cmp_rerun.ok:
+                notes.append("mismatch disappeared on identical rerun")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["same_query"] = {"exception": repr(exc)}
+
+        if alt_fetch is not None:
+            try:
+                rerun_alt = alt_fetch()
+                cmp_alt = _compare_rows(expected_rows, rerun_alt)
+                triage_records["reruns"]["alternate_query"] = {
+                    "reason": cmp_alt.reason,
+                    "expected_n": cmp_alt.expected_n,
+                    "got_n": cmp_alt.got_n,
+                }
+                if cmp_alt.ok:
+                    notes.append("mismatch disappeared on alternate query")
+                    return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+            except Exception as exc:
+                triage_records["reruns"]["alternate_query"] = {"exception": repr(exc)}
+
+        self.runner._safe_maintenance_sweep("triage")
+        try:
+            rerun_after = engine_fetch()
+            cmp_after = _compare_rows(expected_rows, rerun_after)
+            triage_records["reruns"]["post_maintenance"] = {
+                "reason": cmp_after.reason,
+                "expected_n": cmp_after.expected_n,
+                "got_n": cmp_after.got_n,
+            }
+            if cmp_after.ok:
+                notes.append("mismatch disappeared after maintenance sweep")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["post_maintenance"] = {"exception": repr(exc)}
+
+        notes.append("mismatch persisted across reruns")
+        return IssueOutcome(ISSUE_STATUS_CONFIRMED, notes, triage_records)
+
+
+class CorrectnessRunner:
     WEIGHTS = [
-        ("extend_batch", 35),
-        ("append_single", 12),
-        ("setitem_single", 8),
-        ("query_point", 15),
-        ("query_range", 10),
-        ("query_slice", 5),
-        ("query_views", 3),
+        ("extend_batch", 30),
+        ("append_single", 10),
+        ("setitem_single", 5),
+        ("query_point_hot", 8),
+        ("query_point_random", 6),
+        ("query_range_small", 8),
+        ("query_range_wide", 5),
+        ("query_slice", 4),
+        ("query_all_sample", 2),
+        ("query_views", 2),
         ("delete_point", 4),
-        ("delete_range", 3),
-        ("cutoff", 2),
+        ("delete_range", 5),
+        ("cutoff", 3),
         ("flush", 2),
-        ("compact", 1),
+        ("compact", 2),
+        ("meta_probe", 4),
     ]
 
-    def __init__(self, seed: int, duration: int, verbose: bool, log_path: str | None):
-        self.seed = seed
-        self.duration = duration
-        self.verbose = verbose
-        self.rng = random.Random(seed)
-        self.shadow = ShadowState()
-        self.factory = ObjectFactory(self.rng)
-        self.tsgen = TimestampGen(self.rng)
-        self.oplog = OperationLog(log_path)
+    class _ProbeBox:
+        pass
+
+    def __init__(self, cfg: RunConfig):
+        self.cfg = cfg
+        self.rng = random.Random(cfg.seed)
+        self.git_commit = _safe_git_commit()
+        self.run_id = f"ccv2_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
+        self.run_dir = Path(cfg.out_dir) / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        ops_path = Path(cfg.log_alias_path) if cfg.log_alias_path else self.run_dir / "ops.jsonl"
+        self.ops_writer = JsonlWriter(ops_path)
+        self.checks_writer = JsonlWriter(self.run_dir / "checks.jsonl")
+        self.issues_writer = JsonlWriter(self.run_dir / "issues.jsonl")
+
+        self.repro_cmd = (
+            "py -V:3.13 demo/correctness_checker.py "
+            f"--duration-seconds={cfg.duration_seconds} "
+            f"--seed={cfg.seed} "
+            f"--source-mode={cfg.source_mode}"
+        )
+        self.issue_registry = IssueRegistry(self.run_dir, self.issues_writer, self.repro_cmd)
+
         self.log = Timelog(
-            maintenance="background",
-            busy_policy="flush",
+            maintenance=cfg.maintenance,
+            busy_policy=cfg.busy_policy,
             time_unit="ns",
         )
 
-        # Stats
-        self.ops = 0
+        csv_paths = [Path(p) if Path(p).is_absolute() else (_REPO / p) for p in cfg.csv_paths]
+        csv_paths = [p for p in csv_paths if p.exists()]
+        self.csv_source = CsvRollingSource(csv_paths) if csv_paths else None
+        self.synthetic_source = SyntheticSource(self.rng)
+        self.mixed_source = MixedSource(self.rng, self.synthetic_source, self.csv_source)
+
+        self.shadow_fast = ShadowFast()
+        self.shadow_truth = ShadowTruth()
+        self.triager = MismatchTriager(self)
+
+        self.rows_by_rid: dict[int, StoredRow] = {}
+        self.next_rid = 1
+        self.recent_insert_ts: deque[int] = deque(maxlen=50_000)
+        self.recent_delete_points: deque[int] = deque(maxlen=20_000)
+        self.recent_delete_ranges: deque[tuple[int, int]] = deque(maxlen=20_000)
+        self.boundary_max_seeded = False
+
+        self.op_index = 0
+        self.check_index = 0
         self.inserts = 0
         self.deletes = 0
         self.mismatches = 0
-        self.verifications = 0
+        self.full_verifies = 0
+        self.stop_reason: str | None = None
+        self.started_utc = _utc_now_iso()
 
-        # Build weighted choice list
-        self._choices = []
-        self._weights_list = []
-        for name, weight in self.WEIGHTS:
-            self._choices.append(name)
-            self._weights_list.append(weight)
+        self._choices = [name for name, _ in self.WEIGHTS]
+        self._weights = [w for _, w in self.WEIGHTS]
 
-    def run(self):
-        """Main loop."""
-        print(f"Correctness Checker v1.0 | seed={self.seed} | duration={self.duration}s")
-        print("=" * 64)
+        self.last_full_verify_mono = time.monotonic()
+        self.last_side_probe_mono = time.monotonic()
 
-        start = time.monotonic()
-        last_report = start
-        report_interval = 60  # seconds
+        self._write_run_header()
 
+    def _write_run_header(self) -> None:
+        self.ops_writer.write(
+            {
+                "op": "run_start",
+                "t_utc": self.started_utc,
+                "run_id": self.run_id,
+                "git_commit": self.git_commit,
+                "config": asdict(self.cfg),
+                "csv_source": None if self.csv_source is None else [str(p) for p in self.csv_source.paths],
+            },
+            flush=True,
+        )
+
+    def _close_all(self) -> None:
+        try:
+            if self.csv_source is not None:
+                self.csv_source.close()
+        except Exception:
+            pass
+        try:
+            self.log.flush()
+        except Exception:
+            pass
+        try:
+            self.log.close()
+        except Exception:
+            pass
+        self.ops_writer.close()
+        self.checks_writer.close()
+        self.issues_writer.close()
+
+    def run(self) -> int:
+        print(
+            "Timelog Correctness Checker V2 | "
+            f"seed={self.cfg.seed} | duration={self.cfg.duration_seconds}s | run_id={self.run_id}"
+        )
+        print("=" * 96)
+
+        started = time.monotonic()
+        last_progress = started
         try:
             while True:
-                elapsed = time.monotonic() - start
-                if elapsed >= self.duration:
+                elapsed = time.monotonic() - started
+                if elapsed >= self.cfg.duration_seconds or self.stop_reason is not None:
                     break
 
-                # Pick and execute a random operation
-                op_name = self.rng.choices(self._choices, self._weights_list, k=1)[0]
-                method = getattr(self, f"_op_{op_name}")
-                method()
-                self.ops += 1
+                self.op_index += 1
+                if self.op_index % 500 == 0:
+                    self._boundary_probe()
 
-                # Periodic full verification
-                if self.ops % 100 == 0:
-                    self._full_verify()
-
-                # Progress report
-                now = time.monotonic()
-                if now - last_report >= report_interval:
-                    elapsed_s = int(now - start)
-                    n = len(self.shadow)
-                    print(f"  [{elapsed_s}s]  {self.ops} ops | {n} records | {self.mismatches} mismatches")
-                    self.oplog.log(
-                        op="progress",
-                        elapsed=elapsed_s,
-                        ops=self.ops,
-                        records=n,
-                        inserts=self.inserts,
-                        deletes=self.deletes,
-                        mismatches=self.mismatches,
+                op_name = self._pick_operation()
+                t0 = time.perf_counter_ns()
+                try:
+                    getattr(self, f"_op_{op_name}")()
+                    ok = True
+                    err = None
+                except Exception as exc:
+                    ok = False
+                    err = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                    self._register_runtime_issue(
+                        kind="CHECKER_INCONSISTENCY",
+                        title=f"operation crashed: {op_name}",
+                        evidence={
+                            "operation": op_name,
+                            "exception": err,
+                            "traceback": traceback.format_exc(),
+                        },
+                        severity="HIGH",
+                        status=ISSUE_STATUS_CHECKER,
                     )
-                    last_report = now
+                self.ops_writer.write(
+                    {
+                        "op": "operation",
+                        "op_index": self.op_index,
+                        "name": op_name,
+                        "ok": ok,
+                        "error": err,
+                        "latency_ns": time.perf_counter_ns() - t0,
+                        "live_rows": self.shadow_fast.live_count(),
+                        "inserts": self.inserts,
+                        "deletes": self.deletes,
+                        "issues": self.issue_registry.count,
+                    }
+                )
 
-        except MismatchError as e:
-            print(f"\nFATAL MISMATCH: {e}")
-            self.oplog.log(op="FATAL", error=str(e))
-            raise
+                now = time.monotonic()
+                if (
+                    self.op_index % self.cfg.full_verify_interval_ops == 0
+                    or now - self.last_full_verify_mono >= self.cfg.full_verify_interval_seconds
+                ):
+                    self._full_verify()
+                    self.last_full_verify_mono = now
+
+                if self.op_index % self.cfg.checkpoint_interval_ops == 0:
+                    self._checkpoint()
+
+                if now - self.last_side_probe_mono >= 600:
+                    self._side_probes()
+                    self.last_side_probe_mono = now
+
+                if now - last_progress >= 30:
+                    print(
+                        f"[{int(now-started):5d}s] "
+                        f"ops={self.op_index} live={self.shadow_fast.live_count()} "
+                        f"inserts={self.inserts} deletes={self.deletes} "
+                        f"issues={self.issue_registry.count}"
+                    )
+                    last_progress = now
+
+                if self.issue_registry.count >= self.cfg.max_issues:
+                    self.stop_reason = "max_issues_reached"
+
+            self._finalize_summary(started)
+            return 0 if self.issue_registry.by_status[ISSUE_STATUS_CONFIRMED] == 0 else 2
         finally:
-            elapsed_s = int(time.monotonic() - start)
-            print("=" * 64)
-            print(
-                f"SUMMARY: {self.ops} ops | {self.inserts} inserts | "
-                f"{self.deletes} deletes | {self.mismatches} MISMATCHES"
+            self._close_all()
+
+    def _pick_operation(self) -> str:
+        if self.shadow_fast.live_count() == 0:
+            return self.rng.choice(["extend_batch", "append_single", "setitem_single", "flush", "meta_probe"])
+        return self.rng.choices(self._choices, self._weights, k=1)[0]
+
+    def _checkpoint(self) -> None:
+        self._handle_drop_health_probe()
+        self.ops_writer.flush()
+        self.checks_writer.flush()
+        self.issues_writer.flush()
+        self.ops_writer.write(
+            {
+                "op": "checkpoint",
+                "op_index": self.op_index,
+                "live_rows": self.shadow_fast.live_count(),
+                "issues": self.issue_registry.count,
+                "csv_stats": None if self.csv_source is None else self.csv_source.stats(),
+            },
+            flush=True,
+        )
+
+    def _source_next_records(self, count: int) -> list[SourceRecord]:
+        if self.cfg.source_mode == "synthetic":
+            return self.synthetic_source.next_records(count)
+        if self.cfg.source_mode == "csv":
+            if self.csv_source is None:
+                return self.synthetic_source.next_records(count)
+            return self.csv_source.next_records(count)
+        return self.mixed_source.next_records(count)
+
+    def _choose_reinsert_ts(self) -> int | None:
+        p = self.rng.random()
+        if p < 0.10 and self.recent_delete_points:
+            return self.rng.choice(self.recent_delete_points)
+        if p < 0.30 and self.recent_delete_ranges:
+            t1, t2 = self.rng.choice(self.recent_delete_ranges)
+            if t1 < t2:
+                return self.rng.randint(t1, t2 - 1)
+        return None
+
+    def _bounded_ts(self, ts: int) -> int:
+        if ts < TL_TS_MIN:
+            return TL_TS_MIN
+        if ts > TL_TS_MAX:
+            return TL_TS_MAX
+        return ts
+
+    def _make_stored_rows(self, src_records: list[SourceRecord]) -> list[StoredRow]:
+        out: list[StoredRow] = []
+        for src in src_records:
+            ts = _coerce_ts(self._bounded_ts(src.ts))
+            forced_ts = self._choose_reinsert_ts()
+            if forced_ts is not None:
+                ts = _coerce_ts(self._bounded_ts(forced_ts))
+            rid = self.next_rid
+            self.next_rid += 1
+            digest = _payload_digest(src.payload)
+            obj = {
+                "__cc_v2": 1,
+                "rid": rid,
+                "src": src.src,
+                "cycle": src.cycle,
+                "payload_digest": digest,
+                "payload": src.payload,
+            }
+            row = StoredRow(
+                rid=rid,
+                ts=ts,
+                obj=obj,
+                payload_digest=digest,
+                src=src.src,
+                cycle=src.cycle,
+                source_file=src.source_file,
+                insert_op=self.op_index,
             )
-            print(f"Duration: {elapsed_s}s | Verifications: {self.verifications}")
-            print("=" * 64)
-            self.oplog.log(
-                op="summary",
-                ops=self.ops,
-                inserts=self.inserts,
-                deletes=self.deletes,
-                mismatches=self.mismatches,
-                verifications=self.verifications,
-                elapsed=elapsed_s,
-            )
-            self.oplog.close()
-            self.log.flush()
-            self.log.close()
+            out.append(row)
+            self.rows_by_rid[rid] = row
+        return out
+
+    def _oracle_insert(self, rows: list[StoredRow]) -> None:
+        self.shadow_fast.insert_rows(rows)
+        for row in rows:
+            self.shadow_truth.record_insert(row)
+            self.recent_insert_ts.append(row.ts)
+
+    def _oracle_delete_range(self, t1: int, t2: int) -> list[StoredRow]:
+        removed = self.shadow_fast.delete_range(t1, t2, self.op_index)
+        self.shadow_truth.record_delete(t1, t2, self.op_index)
+        self.recent_delete_ranges.append((t1, t2))
+        return removed
 
     # ------------------------------------------------------------------
     # Write operations
     # ------------------------------------------------------------------
 
-    def _op_extend_batch(self):
-        count = self.rng.randint(10, 1000)
-        timestamps = self.tsgen.next_batch(count)
-        objects = self.factory.make_batch(count)
-        pairs = list(zip(timestamps, objects))
-
-        # Pick API pattern
-        pattern = self.rng.choice(["pairs", "dual_list", "iter_pairs"])
-        if pattern == "pairs":
-            self.log.extend(pairs)
-        elif pattern == "dual_list":
-            self.log.extend(timestamps, objects)
-        else:
-            self.log.extend(iter(pairs))
-
-        self.shadow.extend(pairs)
-        self.inserts += count
-
-        if self.verbose:
-            print(f"  extend({count}, pattern={pattern})")
-        self.oplog.log(op="extend", count=count, pattern=pattern)
-
-    def _op_append_single(self):
-        ts = self.tsgen.next()
-        obj = self.factory.make()
-
-        # Pick API pattern
-        pattern = self.rng.choice(["kwarg", "positional"])
-        if pattern == "kwarg":
-            self.log.append(obj, ts=ts)
-        else:
-            self.log.append(ts, obj)
-
-        self.shadow.insert(ts, obj)
-        self.inserts += 1
-
-        if self.verbose:
-            print(f"  append(ts={ts}, pattern={pattern})")
-        self.oplog.log(op="append", ts=ts, pattern=pattern)
-
-    def _op_setitem_single(self):
-        ts = self.tsgen.next()
-        obj = self.factory.make()
-        self.log[ts] = obj
-        self.shadow.insert(ts, obj)
-        self.inserts += 1
-
-        if self.verbose:
-            print(f"  setitem(ts={ts})")
-        self.oplog.log(op="setitem", ts=ts)
-
-    # ------------------------------------------------------------------
-    # Query operations (with verification)
-    # ------------------------------------------------------------------
-
-    def _op_query_point(self):
-        if not self.shadow:
-            return
-        ts = self.shadow.random_ts(self.rng)
-        if ts is None:
-            return
-
-        got = self.log[ts]
-        expected = self.shadow.query_point(ts)
-
-        # Compare as multisets via str representation (handles dicts/lists)
-        got_sorted = sorted(str(o) for o in got)
-        exp_sorted = sorted(str(o) for o in expected)
-        if got_sorted != exp_sorted:
-            self.mismatches += 1
-            msg = (
-                f"Point query mismatch at ts={ts}: "
-                f"expected {len(expected)} records, got {len(got)}\n"
-                f"  expected: {expected[:10]}\n"
-                f"  got:      {got[:10]}"
-            )
-            self.oplog.log(
-                op="MISMATCH", type="point", ts=ts,
-                expected_n=len(expected), got_n=len(got),
-            )
-            raise MismatchError(msg)
-
-        if self.verbose:
-            print(f"  query_point(ts={ts}) -> {len(got)} records OK")
-        self.oplog.log(op="verify", ok=True, type="point", ts=ts, n=len(got))
-
-    def _op_query_range(self):
-        if not self.shadow:
-            return
-        mn, mx = self.shadow.min_ts(), self.shadow.max_ts()
-        if mn is None:
-            return
-        t1 = self.rng.randint(mn, mx)
-        width = self.rng.randint(1, max(1, (mx - mn) // 4))
-        t2 = t1 + width
-
-        got = list(self.log[t1:t2])
-        expected = self.shadow.query_range(t1, t2)
-
-        self._compare_records(got, expected, f"range [{t1}, {t2})")
-
-        if self.verbose:
-            print(f"  query_range([{t1}, {t2})) -> {len(got)} records OK")
-        self.oplog.log(op="verify", ok=True, type="range", t1=t1, t2=t2, n=len(got))
-
-    def _op_query_slice(self):
-        if not self.shadow:
-            return
-        mn, mx = self.shadow.min_ts(), self.shadow.max_ts()
-        if mn is None:
-            return
-
-        # Pick slice variant
-        variant = self.rng.choice(["since", "until", "all"])
-        if variant == "since":
-            t1 = self.rng.randint(mn, mx)
-            got = list(self.log[t1:])
-            expected = self.shadow.query_range(t1, TL_TS_MAX)
-            desc = f"[{t1}:]"
-        elif variant == "until":
-            t2 = self.rng.randint(mn, mx)
-            got = list(self.log[:t2])
-            expected = self.shadow.query_range(TL_TS_MIN, t2)
-            desc = f"[:{t2}]"
-        else:
-            got = list(self.log[:])
-            expected = self.shadow.query_all()
-            desc = "[:]"
-
-        self._compare_records(got, expected, f"slice {desc}")
-
-        if self.verbose:
-            print(f"  query_slice({desc}) -> {len(got)} records OK")
-        self.oplog.log(op="verify", ok=True, type="slice", variant=variant, n=len(got))
-
-    def _op_query_views(self):
-        """Verify PageSpan output after flushing."""
-        if not self.shadow:
-            return
-        mn, mx = self.shadow.min_ts(), self.shadow.max_ts()
-        if mn is None:
-            return
-
-        # Flush to ensure memtable data is in segments
-        self.log.flush()
-
-        t1 = self.rng.randint(mn, mx)
-        width = self.rng.randint(1, max(1, (mx - mn) // 4))
-        t2 = t1 + width
-
-        expected = self.shadow.query_range(t1, t2)
-
-        # Collect records from PageSpans
-        got = []
+    def _op_extend_batch(self) -> None:
+        count = self.rng.randint(self.cfg.min_batch, self.cfg.max_batch)
+        rows = self._make_stored_rows(self._source_next_records(count))
+        pairs = [(r.ts, r.obj) for r in rows]
+        pattern = self.rng.choice(["pairs", "dual", "iter"])
+        busy = False
         try:
-            for span in self.log.views(t1, t2):
-                ts_view = span.timestamps
-                objs_view = span.objects
-                for i in range(len(ts_view)):
-                    got.append((int(ts_view[i]), objs_view[i]))
-        except Exception as e:
-            # Views may not be available in all states; log and skip
-            if self.verbose:
-                print(f"  query_views: {e}")
-            self.oplog.log(op="views_error", error=str(e))
-            return
+            if pattern == "pairs":
+                self.log.extend(pairs)
+            elif pattern == "dual":
+                self.log.extend([r.ts for r in rows], [r.obj for r in rows])
+            else:
+                self.log.extend(iter(pairs))
+        except TimelogBusyError:
+            busy = True
+        self._oracle_insert(rows)
+        self.inserts += len(rows)
+        self.ops_writer.write(
+            {
+                "op": "extend_batch",
+                "op_index": self.op_index,
+                "count": len(rows),
+                "pattern": pattern,
+                "busy": busy,
+            }
+        )
+        self._post_insert_probe(rows)
 
-        self._compare_records(got, expected, f"views [{t1}, {t2})")
+    def _op_append_single(self) -> None:
+        row = self._make_stored_rows(self._source_next_records(1))[0]
+        pattern = self.rng.choice(["kwarg", "positional"])
+        busy = False
+        try:
+            if pattern == "kwarg":
+                self.log.append(row.obj, ts=row.ts)
+            else:
+                self.log.append(row.ts, row.obj)
+        except TimelogBusyError:
+            busy = True
+        self._oracle_insert([row])
+        self.inserts += 1
+        self.ops_writer.write(
+            {"op": "append_single", "op_index": self.op_index, "ts": row.ts, "rid": row.rid, "busy": busy}
+        )
+        self._post_insert_probe([row])
 
-        if self.verbose:
-            print(f"  query_views([{t1}, {t2})) -> {len(got)} records OK")
-        self.oplog.log(op="verify", ok=True, type="views", t1=t1, t2=t2, n=len(got))
+    def _op_setitem_single(self) -> None:
+        row = self._make_stored_rows(self._source_next_records(1))[0]
+        busy = False
+        try:
+            self.log[row.ts] = row.obj
+        except TimelogBusyError:
+            busy = True
+        self._oracle_insert([row])
+        self.inserts += 1
+        self.ops_writer.write(
+            {"op": "setitem_single", "op_index": self.op_index, "ts": row.ts, "rid": row.rid, "busy": busy}
+        )
+        self._post_insert_probe([row])
 
     # ------------------------------------------------------------------
     # Delete operations
     # ------------------------------------------------------------------
 
-    def _op_delete_point(self):
-        if not self.shadow:
-            return
-        ts = self.shadow.random_ts(self.rng)
+    def _pick_delete_point_ts(self) -> int | None:
+        if self.shadow_fast.live_count() == 0:
+            return None
+        candidates = [ts for ts in self.recent_insert_ts if ts < TL_TS_MAX]
+        if candidates and self.rng.random() < 0.5:
+            return self.rng.choice(candidates)
+        for _ in range(16):
+            ts = self.shadow_fast.random_live_ts(self.rng)
+            if ts is None:
+                return None
+            if ts < TL_TS_MAX:
+                return ts
+        return None
+
+    def _op_delete_point(self) -> None:
+        ts = self._pick_delete_point_ts()
         if ts is None:
             return
-
-        # Pick API pattern
         pattern = self.rng.choice(["delete", "delitem"])
-        if pattern == "delete":
-            self.log.delete(ts)
-        else:
-            del self.log[ts]
+        busy = False
+        try:
+            if pattern == "delete":
+                self.log.delete(ts)
+            else:
+                del self.log[ts]
+        except TimelogBusyError:
+            busy = True
+        removed = self._oracle_delete_range(ts, ts + 1 if ts < TL_TS_MAX else TL_TS_MAX)
+        self.recent_delete_points.append(ts)
+        self.deletes += len(removed)
+        self.ops_writer.write(
+            {
+                "op": "delete_point",
+                "op_index": self.op_index,
+                "ts": ts,
+                "removed": len(removed),
+                "pattern": pattern,
+                "busy": busy,
+            }
+        )
+        self._post_delete_probe(removed)
 
-        removed = self.shadow.delete_point(ts)
-        self.tsgen.add_tombstone(ts, ts + 1)
-        self.deletes += removed
-
-        if self.verbose:
-            print(f"  delete_point(ts={ts}, pattern={pattern}) -> {removed} removed")
-        self.oplog.log(op="delete_point", ts=ts, removed=removed, pattern=pattern)
-
-    def _op_delete_range(self):
-        if not self.shadow:
+    def _op_delete_range(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
             return
-        mn, mx = self.shadow.min_ts(), self.shadow.max_ts()
-        if mn is None:
+        t1 = mn if mn == mx else self.rng.randint(mn, mx)
+        span = max(1, mx - mn)
+        width = self.rng.randint(1, max(1, span // 20))
+        t2 = self._bounded_ts(t1 + width)
+        if t2 <= t1:
+            t2 = t1 + 1 if t1 < TL_TS_MAX else TL_TS_MAX
+        pattern = self.rng.choice(["delete", "delitem"])
+        busy = False
+        try:
+            if pattern == "delete":
+                self.log.delete(t1, t2)
+            else:
+                del self.log[t1:t2]
+        except TimelogBusyError:
+            busy = True
+        removed = self._oracle_delete_range(t1, t2)
+        self.deletes += len(removed)
+        self.ops_writer.write(
+            {
+                "op": "delete_range",
+                "op_index": self.op_index,
+                "t1": t1,
+                "t2": t2,
+                "removed": len(removed),
+                "pattern": pattern,
+                "busy": busy,
+            }
+        )
+        self._post_delete_probe(removed)
+
+    def _op_cutoff(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
+            return
+        cutoff = mn if mn == mx else self.rng.randint(mn, mn + max(1, (mx - mn) * 3 // 10))
+        busy = False
+        try:
+            self.log.cutoff(cutoff)
+        except TimelogBusyError:
+            busy = True
+        removed = self._oracle_delete_range(TL_TS_MIN, cutoff)
+        self.deletes += len(removed)
+        self.ops_writer.write(
+            {"op": "cutoff", "op_index": self.op_index, "cutoff": cutoff, "removed": len(removed), "busy": busy}
+        )
+        self._post_delete_probe(removed)
+
+    # ------------------------------------------------------------------
+    # Query operations
+    # ------------------------------------------------------------------
+
+    def _op_query_point_hot(self) -> None:
+        if not self.recent_insert_ts:
+            return
+        self._verify_point(self.rng.choice(self.recent_insert_ts), "query_point_hot")
+
+    def _op_query_point_random(self) -> None:
+        ts = self.shadow_fast.random_live_ts(self.rng)
+        if ts is None:
+            return
+        self._verify_point(ts, "query_point_random")
+
+    def _op_query_range_small(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
             return
         t1 = self.rng.randint(mn, mx)
-        width = self.rng.randint(1, max(1, (mx - mn) // 10))
-        t2 = t1 + width
+        width = self.rng.randint(1, max(1, max(1, mx - mn) // 100))
+        t2 = self._bounded_ts(t1 + width)
+        if t2 <= t1:
+            t2 = t1 + 1 if t1 < TL_TS_MAX else TL_TS_MAX
+        self._verify_range(t1, t2, "query_range_small")
 
-        # Pick API pattern
-        pattern = self.rng.choice(["delete", "delitem"])
-        if pattern == "delete":
-            self.log.delete(t1, t2)
-        else:
-            del self.log[t1:t2]
-
-        removed = self.shadow.delete_range(t1, t2)
-        self.tsgen.add_tombstone(t1, t2)
-        self.deletes += removed
-
-        if self.verbose:
-            print(f"  delete_range([{t1}, {t2}), pattern={pattern}) -> {removed} removed")
-        self.oplog.log(op="delete_range", t1=t1, t2=t2, removed=removed, pattern=pattern)
-
-    def _op_cutoff(self):
-        if not self.shadow:
+    def _op_query_range_wide(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
             return
-        mn, mx = self.shadow.min_ts(), self.shadow.max_ts()
-        if mn is None:
+        t1 = self.rng.randint(mn, mx)
+        span = max(1, mx - mn)
+        width = self.rng.randint(max(1, span // 20), max(1, span // 2))
+        t2 = self._bounded_ts(t1 + width)
+        if t2 <= t1:
+            t2 = t1 + 1 if t1 < TL_TS_MAX else TL_TS_MAX
+        self._verify_range(t1, t2, "query_range_wide")
+
+    def _op_query_slice(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
             return
-        # Only cutoff in lower 30% to avoid wiping everything
-        cutoff_max = mn + max(1, (mx - mn) * 3 // 10)
-        ts = self.rng.randint(mn, cutoff_max)
-
-        self.log.cutoff(ts)
-        removed = self.shadow.cutoff(ts)
-        self.tsgen.add_tombstone(TL_TS_MIN, ts)
-        self.deletes += removed
-
-        if self.verbose:
-            print(f"  cutoff(ts={ts}) -> {removed} removed")
-        self.oplog.log(op="cutoff", ts=ts, removed=removed)
-
-    # ------------------------------------------------------------------
-    # Maintenance operations
-    # ------------------------------------------------------------------
-
-    def _op_flush(self):
-        self.log.flush()
-        if self.verbose:
-            print("  flush()")
-        self.oplog.log(op="flush")
-
-    def _op_compact(self):
-        try:
-            self.log.compact()
-        except TimelogError:
-            pass  # Nothing to compact
-        if self.verbose:
-            print("  compact()")
-        self.oplog.log(op="compact")
-
-    # ------------------------------------------------------------------
-    # Verification
-    # ------------------------------------------------------------------
-
-    def _full_verify(self):
-        """Full verification cycle: scan + min/max + len + validate."""
-        self.verifications += 1
-
-        # Full scan
-        got = list(self.log)
-        expected = self.shadow.query_all()
-        self._compare_records(got, expected, "full_scan")
-
-        # min_ts / max_ts via iteration
-        if self.shadow:
-            exp_min = self.shadow.min_ts()
-            exp_max = self.shadow.max_ts()
-            if got:
-                got_min = got[0][0]
-                got_max = got[-1][0]
-                if got_min != exp_min:
-                    self.mismatches += 1
-                    msg = f"min_ts mismatch: expected {exp_min}, got {got_min}"
-                    self.oplog.log(op="MISMATCH", type="min_ts",
-                                   expected=exp_min, got=got_min)
-                    raise MismatchError(msg)
-                if got_max != exp_max:
-                    self.mismatches += 1
-                    msg = f"max_ts mismatch: expected {exp_max}, got {got_max}"
-                    self.oplog.log(op="MISMATCH", type="max_ts",
-                                   expected=exp_max, got=got_max)
-                    raise MismatchError(msg)
-
-        # len() — approximate, warn only
-        engine_len = len(self.log)
-        shadow_len = len(self.shadow)
-        if shadow_len > 0:
-            delta_pct = abs(engine_len - shadow_len) / shadow_len * 100
-            if delta_pct > 5:
-                if self.verbose:
-                    print(
-                        f"  WARNING: len mismatch: engine={engine_len} "
-                        f"shadow={shadow_len} ({delta_pct:.1f}%)"
-                    )
-                self.oplog.log(
-                    op="len_warning", engine=engine_len,
-                    shadow=shadow_len, delta_pct=round(delta_pct, 1),
-                )
-
-        # validate() — C-level invariant checks
-        try:
-            self.log.validate()
-        except TimelogError as e:
-            self.mismatches += 1
-            self.oplog.log(op="MISMATCH", type="validate", error=str(e))
-            raise MismatchError(f"validate() failed: {e}") from e
-
-        # Log stats
-        self.oplog.log(
-            op="verify_full", ok=True,
-            records=len(self.shadow),
-            ops=self.ops,
+        variant = self.rng.choice(["since", "until", "all"])
+        if variant == "since":
+            t1 = self.rng.randint(mn, mx)
+            self._run_row_check(
+                ctx=CheckContext("slice_since", {"t1": t1}, f"slice[{t1}:]"),
+                expected_rows=self.shadow_fast.query_since(t1),
+                engine_fetch=lambda: list(self.log[t1:]),
+                alt_fetch=lambda: list(self.log.since(t1)),
+            )
+            return
+        if variant == "until":
+            t2 = self.rng.randint(mn, mx)
+            self._run_row_check(
+                ctx=CheckContext("slice_until", {"t2": t2}, f"slice[:{t2}]"),
+                expected_rows=self.shadow_fast.query_range(TL_TS_MIN, t2),
+                engine_fetch=lambda: list(self.log[:t2]),
+                alt_fetch=lambda: list(self.log.until(t2)),
+            )
+            return
+        self._run_row_check(
+            ctx=CheckContext("slice_all", {}, "slice[:]"),
+            expected_rows=self.shadow_fast.query_all(),
+            engine_fetch=lambda: list(self.log[:]),
+            alt_fetch=lambda: list(self.log.all()),
         )
 
-    @staticmethod
-    def _group_by_ts(records):
-        """Group records into runs of equal timestamps."""
-        groups = []
-        i = 0
-        while i < len(records):
-            ts = records[i][0]
-            j = i + 1
-            while j < len(records) and records[j][0] == ts:
-                j += 1
-            groups.append((ts, records[i:j]))
-            i = j
-        return groups
+    def _op_query_all_sample(self) -> None:
+        self._run_row_check(
+            ctx=CheckContext("all_sample", {}, "iter_all"),
+            expected_rows=self.shadow_fast.query_all(),
+            engine_fetch=lambda: list(self.log),
+            alt_fetch=lambda: list(self.log[:]),
+        )
 
-    def _compare_records(
+    def _op_query_views(self) -> None:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
+            return
+        self._safe_flush("views_pre_flush")
+        t1 = self.rng.randint(mn, mx)
+        width = self.rng.randint(1, max(1, max(1, mx - mn) // 10))
+        t2 = self._bounded_ts(t1 + width)
+        if t2 <= t1:
+            t2 = t1 + 1 if t1 < TL_TS_MAX else TL_TS_MAX
+
+        self._verify_range(t1, t2, "query_views_logical_range")
+        logical_counter = Counter(_rows_to_expected_keys(self.shadow_fast.query_range(t1, t2)))
+        ctx = CheckContext("range", {"t1": t1, "t2": t2}, f"views subset [{t1},{t2})")
+
+        try:
+            view_rows = self._collect_views_records(t1, t2)
+        except Exception as exc:
+            self._register_runtime_issue(
+                kind="VIEWS_CONTRACT",
+                title="views() raised unexpected exception",
+                evidence={"exception": repr(exc), "traceback": traceback.format_exc(), "context": asdict(ctx)},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+            return
+
+        view_counter = Counter(_records_to_engine_keys(view_rows))
+        missing = list((logical_counter - view_counter).elements())[:20]
+        self.check_index += 1
+        if missing:
+            self.checks_writer.write(
+                {
+                    "check_index": self.check_index,
+                    "op_index": self.op_index,
+                    "kind": "views_subset",
+                    "ok": False,
+                    "missing_sample": missing,
+                    "context": asdict(ctx),
+                },
+                flush=True,
+            )
+            self._register_runtime_issue(
+                kind="VIEWS_CONTRACT",
+                title="views missing logical rows",
+                evidence={"context": asdict(ctx), "missing_sample": missing},
+                severity="HIGH",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+            return
+        self.checks_writer.write(
+            {
+                "check_index": self.check_index,
+                "op_index": self.op_index,
+                "kind": "views_subset",
+                "ok": True,
+                "context": asdict(ctx),
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Maintenance / meta operations
+    # ------------------------------------------------------------------
+
+    def _op_flush(self) -> None:
+        self._safe_flush("op_flush")
+
+    def _op_compact(self) -> None:
+        self._safe_compact("op_compact")
+
+    def _op_meta_probe(self) -> None:
+        self.check_index += 1
+        ok = True
+        errs: list[str] = []
+        exp_min, exp_max = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        got_min, got_max = self.log.min_ts(), self.log.max_ts()
+        if got_min != exp_min:
+            ok = False
+            errs.append(f"min_ts mismatch: expected={exp_min} got={got_min}")
+        if got_max != exp_max:
+            ok = False
+            errs.append(f"max_ts mismatch: expected={exp_max} got={got_max}")
+
+        ts = self.shadow_fast.random_live_ts(self.rng)
+        if ts is not None:
+            exp_next, exp_prev = self.shadow_fast.next_ts(ts), self.shadow_fast.prev_ts(ts)
+            got_next, got_prev = self.log.next_ts(ts), self.log.prev_ts(ts)
+            if got_next != exp_next:
+                ok = False
+                errs.append(f"next_ts mismatch at {ts}: expected={exp_next} got={got_next}")
+            if got_prev != exp_prev:
+                ok = False
+                errs.append(f"prev_ts mismatch at {ts}: expected={exp_prev} got={got_prev}")
+
+        try:
+            self.log.validate()
+        except Exception as exc:
+            ok = False
+            errs.append(f"validate() failed: {exc!r}")
+
+        self.checks_writer.write(
+            {
+                "check_index": self.check_index,
+                "op_index": self.op_index,
+                "kind": "meta_probe",
+                "ok": ok,
+                "errors": errs,
+                "expected_min": exp_min,
+                "expected_max": exp_max,
+                "got_min": got_min,
+                "got_max": got_max,
+            },
+            flush=not ok,
+        )
+        if not ok:
+            self._register_runtime_issue(
+                kind="VALIDATE_FAILURE",
+                title="meta probe failed",
+                evidence={"errors": errs},
+                severity="HIGH",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+
+    # ------------------------------------------------------------------
+    # Verification core
+    # ------------------------------------------------------------------
+
+    def _verify_point(self, ts: int, tag: str) -> None:
+        self._run_row_check(
+            ctx=CheckContext("point", {"ts": ts}, f"{tag} ts={ts}"),
+            expected_rows=self.shadow_fast.query_point(ts),
+            engine_fetch=lambda: [(ts, obj) for obj in self.log[ts]],
+            alt_fetch=lambda: list(self.log.point(ts)),
+        )
+
+    def _verify_range(self, t1: int, t2: int, tag: str) -> None:
+        self._run_row_check(
+            ctx=CheckContext("range", {"t1": t1, "t2": t2}, f"{tag} [{t1},{t2})"),
+            expected_rows=self.shadow_fast.query_range(t1, t2),
+            engine_fetch=lambda: list(self.log[t1:t2]),
+            alt_fetch=lambda: list(self.log.range(t1, t2)),
+        )
+
+    def _run_row_check(
         self,
-        got: list[tuple[int, object]],
-        expected: list[tuple[int, object]],
-        context: str,
-    ):
-        """
-        Compare engine output to shadow state, raise on mismatch.
-
-        Records at the same timestamp are compared as multisets since the
-        merge iterator may return them in a different order than insertion
-        order (different OOO components have different tie-break ordering).
-        """
-        if len(got) != len(expected):
-            self.mismatches += 1
-            msg = (
-                f"{context}: count mismatch: expected {len(expected)}, "
-                f"got {len(got)}"
+        *,
+        ctx: CheckContext,
+        expected_rows: list[StoredRow],
+        engine_fetch: Callable[[], list[tuple[int, Any]]],
+        alt_fetch: Callable[[], list[tuple[int, Any]]] | None,
+    ) -> None:
+        self.check_index += 1
+        initial_got = None
+        try:
+            initial_got = engine_fetch()
+            cmp = _compare_rows(expected_rows, initial_got)
+        except Exception as exc:
+            self._register_runtime_issue(
+                kind="CHECKER_INCONSISTENCY",
+                title=f"engine fetch crashed during check: {ctx.description}",
+                evidence={"exception": repr(exc), "traceback": traceback.format_exc(), "context": asdict(ctx)},
+                severity="HIGH",
+                status=ISSUE_STATUS_CHECKER,
             )
-            # Show first differing region
-            for i, (g, e) in enumerate(zip(got, expected)):
-                if g[0] != e[0]:
-                    msg += f"\n  First ts diff at index {i}: got_ts={g[0]}, expected_ts={e[0]}"
-                    break
-            if len(got) > len(expected):
-                msg += f"\n  Extra got[{len(expected)}]: {got[len(expected)]}"
-            elif len(expected) > len(got):
-                msg += f"\n  Missing expected[{len(got)}]: {expected[len(got)]}"
-            self.oplog.log(
-                op="MISMATCH", type=context,
-                expected_n=len(expected), got_n=len(got),
+            return
+
+        if cmp.ok:
+            self.checks_writer.write(
+                {
+                    "check_index": self.check_index,
+                    "op_index": self.op_index,
+                    "kind": ctx.query_kind,
+                    "ok": True,
+                    "reason": cmp.reason,
+                    "expected_n": cmp.expected_n,
+                    "got_n": cmp.got_n,
+                    "context": asdict(ctx),
+                }
             )
-            raise MismatchError(msg)
+            return
 
-        # Group by timestamp and compare multisets within each group
-        got_groups = self._group_by_ts(got)
-        exp_groups = self._group_by_ts(expected)
+        self.mismatches += 1
+        outcome = self.triager.triage(
+            ctx=ctx,
+            expected_rows=expected_rows,
+            engine_fetch=engine_fetch,
+            alt_fetch=alt_fetch,
+            initial_got=initial_got,
+        )
+        severity = "CRITICAL" if outcome.status == ISSUE_STATUS_CONFIRMED else "HIGH"
+        issue_id = self.issue_registry.create_issue(
+            kind=cmp.reason,
+            severity=severity,
+            status=outcome.status,
+            op_index=self.op_index,
+            check_index=self.check_index,
+            title=f"{cmp.reason} in {ctx.description}",
+            context=asdict(ctx),
+            evidence={
+                "comparison": {
+                    "reason": cmp.reason,
+                    "expected_n": cmp.expected_n,
+                    "got_n": cmp.got_n,
+                    "missing_sample": cmp.missing,
+                    "extra_sample": cmp.extra,
+                },
+                "triage": {"notes": outcome.notes, "records": outcome.triage_records},
+            },
+        )
+        self.checks_writer.write(
+            {
+                "check_index": self.check_index,
+                "op_index": self.op_index,
+                "kind": ctx.query_kind,
+                "ok": False,
+                "issue_id": issue_id,
+                "status": outcome.status,
+                "reason": cmp.reason,
+                "context": asdict(ctx),
+            },
+            flush=True,
+        )
+        if outcome.status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
+            self.stop_reason = f"{outcome.status}:{issue_id}"
 
-        if len(got_groups) != len(exp_groups):
-            self.mismatches += 1
-            msg = (
-                f"{context}: timestamp group count mismatch: "
-                f"expected {len(exp_groups)} groups, got {len(got_groups)} groups"
+    def _full_verify(self) -> None:
+        self.full_verifies += 1
+        self._run_row_check(
+            ctx=CheckContext("full_scan", {}, "periodic full scan"),
+            expected_rows=self.shadow_fast.query_all(),
+            engine_fetch=lambda: list(self.log),
+            alt_fetch=lambda: list(self.log[:]),
+        )
+
+        engine_len = len(self.log)
+        shadow_len = self.shadow_fast.live_count()
+        if shadow_len > 0:
+            delta_pct = abs(engine_len - shadow_len) / shadow_len * 100.0
+            if delta_pct > 5.0:
+                self.checks_writer.write(
+                    {
+                        "check_index": self.check_index,
+                        "op_index": self.op_index,
+                        "kind": "len_warning",
+                        "ok": True,
+                        "engine_len": engine_len,
+                        "shadow_len": shadow_len,
+                        "delta_pct": round(delta_pct, 2),
+                    }
+                )
+        self._op_meta_probe()
+
+    # ------------------------------------------------------------------
+    # Post-op probes
+    # ------------------------------------------------------------------
+
+    def _post_insert_probe(self, rows: list[StoredRow]) -> None:
+        for row in rows[: min(3, len(rows))]:
+            self._verify_point(row.ts, "post_insert_hot")
+
+    def _post_delete_probe(self, removed: list[StoredRow]) -> None:
+        for row in removed[: min(3, len(removed))]:
+            self._run_row_check(
+                ctx=CheckContext("point", {"ts": row.ts}, f"post_delete_absence ts={row.ts} rid={row.rid}"),
+                expected_rows=self.shadow_fast.query_point(row.ts),
+                engine_fetch=lambda ts=row.ts: [(ts, obj) for obj in self.log[ts]],
+                alt_fetch=lambda ts=row.ts: list(self.log.point(ts)),
             )
-            self.oplog.log(op="MISMATCH", type=context)
-            raise MismatchError(msg)
 
-        for (g_ts, g_recs), (e_ts, e_recs) in zip(got_groups, exp_groups):
-            if g_ts != e_ts:
-                self.mismatches += 1
-                msg = (
-                    f"{context}: timestamp mismatch: "
-                    f"expected ts={e_ts}, got ts={g_ts}"
+    # ------------------------------------------------------------------
+    # Views and side probes
+    # ------------------------------------------------------------------
+
+    def _collect_views_records(self, t1: int, t2: int) -> list[tuple[int, Any]]:
+        out: list[tuple[int, Any]] = []
+        with self.log.views(t1, t2) as spans:
+            for span in spans:
+                try:
+                    ts_view = span.timestamps
+                    objs = span.objects()
+                    prev_ts = None
+                    for i in range(len(ts_view)):
+                        ts = int(ts_view[i])
+                        if ts < t1 or ts >= t2:
+                            raise AssertionError(f"views timestamp out of range: ts={ts}")
+                        if prev_ts is not None and ts < prev_ts:
+                            raise AssertionError("views span timestamp order violation")
+                        prev_ts = ts
+                        out.append((ts, objs[i]))
+                finally:
+                    try:
+                        span.close()
+                    except Exception:
+                        pass
+        return out
+
+    def _views_exact_side_probe(self) -> None:
+        tl = Timelog(maintenance="disabled", busy_policy="flush", time_unit="ns")
+        try:
+            base = self.rng.randint(1_000_000, 9_000_000)
+            pairs = []
+            for i in range(300):
+                ts = base + i * self.rng.randint(1, 10)
+                pairs.append((ts, {"probe": "views_exact", "i": i, "rnd": self.rng.randint(0, 999)}))
+            tl.extend(pairs)
+            tl.flush()
+            t1 = base + 20
+            t2 = base + 1500
+
+            # Explicit iterator lifecycle to avoid lingering snapshots.
+            with tl.range(t1, t2) as it:
+                logical = list(it)
+
+            views: list[tuple[int, Any]] = []
+            with tl.views(t1, t2) as spans:
+                for span in spans:
+                    ts_copy = None
+                    objs = None
+                    try:
+                        # Use copied timestamps (not memoryview) so no exported buffer
+                        # can block span close.
+                        ts_copy = span.copy_timestamps()
+                        objs = span.objects()
+                        for i, ts in enumerate(ts_copy):
+                            views.append((int(ts), objs[i]))
+                    finally:
+                        ts_copy = None
+                        objs = None
+                        try:
+                            span.close()
+                        except Exception:
+                            pass
+
+            lc = Counter((ts, _payload_digest(obj)) for ts, obj in logical)
+            vc = Counter((ts, _payload_digest(obj)) for ts, obj in views)
+            if lc != vc:
+                self._register_runtime_issue(
+                    kind="VIEWS_CONTRACT",
+                    title="views exact side probe mismatch (no-delete)",
+                    evidence={
+                        "logical_n": len(logical),
+                        "views_n": len(views),
+                        "missing_sample": list((lc - vc).elements())[:20],
+                        "extra_sample": list((vc - lc).elements())[:20],
+                    },
+                    severity="HIGH",
+                    status=ISSUE_STATUS_CONFIRMED,
                 )
-                self.oplog.log(op="MISMATCH", type=context,
-                               expected_ts=e_ts, got_ts=g_ts)
-                raise MismatchError(msg)
-            if len(g_recs) != len(e_recs):
-                self.mismatches += 1
-                msg = (
-                    f"{context}: count mismatch at ts={g_ts}: "
-                    f"expected {len(e_recs)}, got {len(g_recs)}"
-                )
-                self.oplog.log(op="MISMATCH", type=context, ts=g_ts,
-                               expected_n=len(e_recs), got_n=len(g_recs))
-                raise MismatchError(msg)
-            # Compare as multisets using str repr
-            got_objs = sorted(str(r[1]) for r in g_recs)
-            exp_objs = sorted(str(r[1]) for r in e_recs)
-            if got_objs != exp_objs:
-                self.mismatches += 1
-                msg = (
-                    f"{context}: object mismatch at ts={g_ts}: "
-                    f"expected {exp_objs[:5]}, got {got_objs[:5]}"
-                )
-                self.oplog.log(op="MISMATCH", type=context, ts=g_ts)
-                raise MismatchError(msg)
+        finally:
+            gc.collect()
+            tl.close()
+
+    def _lifecycle_side_probe(self) -> None:
+        box = self._ProbeBox()
+        ref = weakref.ref(box)
+        tl = Timelog(maintenance="disabled", busy_policy="flush", time_unit="ns")
+        tl.append(123, box)
+        del box
+        tl.close()
+
+        errs: list[str] = []
+        for name, fn in [
+            ("append", lambda: tl.append(124, {"x": 1})),
+            ("flush", lambda: tl.flush()),
+            ("compact", lambda: tl.compact()),
+            ("range", lambda: list(tl[0:10])),
+        ]:
+            try:
+                fn()
+                errs.append(f"{name} did not raise on closed")
+            except TimelogError:
+                pass
+            except Exception as exc:
+                errs.append(f"{name} raised wrong exception: {exc!r}")
+
+        for _ in range(3):
+            gc.collect()
+        if ref() is not None:
+            errs.append("object retained after close + gc")
+
+        if errs:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="lifecycle side probe failures",
+                evidence={"errors": errs},
+                severity="HIGH",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+
+        tl2 = Timelog(maintenance="disabled", busy_policy="flush", time_unit="ns")
+        tl2.append(1, {"probe": "close_after_flush"})
+        tl2.flush()
+        tl2.close()
+
+    def _gc_cycle_side_probe(self) -> None:
+        wr = None
+        try:
+            tl = Timelog(maintenance="disabled", busy_policy="flush", time_unit="ns")
+            wr = weakref.ref(tl)
+            holder = []
+            holder.append(tl)
+            tl.append(1, holder)
+            del holder
+            del tl
+        except Exception as exc:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="gc side probe setup failed",
+                evidence={"exception": repr(exc), "traceback": traceback.format_exc()},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_TRANSIENT,
+            )
+            return
+        for _ in range(5):
+            gc.collect()
+        if wr is not None and wr() is not None:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="gc cycle side probe did not collect timelog cycle",
+                evidence={},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_TRANSIENT,
+            )
+
+    def _handle_drop_health_probe(self) -> None:
+        try:
+            retired_q = int(getattr(self.log, "retired_queue_len", 0))
+            alloc_failures = int(getattr(self.log, "alloc_failures", 0))
+        except Exception:
+            return
+        self.ops_writer.write(
+            {
+                "op": "drop_health",
+                "op_index": self.op_index,
+                "retired_queue_len": retired_q,
+                "alloc_failures": alloc_failures,
+            }
+        )
+        if alloc_failures > 0:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="alloc_failures > 0",
+                evidence={"alloc_failures": alloc_failures, "retired_queue_len": retired_q},
+                severity="HIGH",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+
+    def _side_probes(self) -> None:
+        self.ops_writer.write({"op": "side_probes_start", "op_index": self.op_index}, flush=True)
+        try:
+            self._views_exact_side_probe()
+        except Exception:
+            self._register_runtime_issue(
+                kind="VIEWS_CONTRACT",
+                title="views exact side probe crashed",
+                evidence={"traceback": traceback.format_exc()},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_CHECKER,
+            )
+        try:
+            self._lifecycle_side_probe()
+        except Exception:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="lifecycle side probe crashed",
+                evidence={"traceback": traceback.format_exc()},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_CHECKER,
+            )
+        try:
+            self._gc_cycle_side_probe()
+        except Exception:
+            self._register_runtime_issue(
+                kind="LIFECYCLE_CONTRACT",
+                title="gc side probe crashed",
+                evidence={"traceback": traceback.format_exc()},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_CHECKER,
+            )
+
+    # ------------------------------------------------------------------
+    # Boundary and safe maintenance
+    # ------------------------------------------------------------------
+
+    def _boundary_probe(self) -> None:
+        self.ops_writer.write({"op": "boundary_probe_start", "op_index": self.op_index}, flush=True)
+        # TL_TS_MIN
+        rid_min = self.next_rid
+        self.next_rid += 1
+        row_min = StoredRow(
+            rid=rid_min,
+            ts=TL_TS_MIN,
+            obj={"__cc_v2": 1, "rid": rid_min, "src": "boundary", "cycle": 0,
+                 "payload_digest": _payload_digest("tl_ts_min"), "payload": "tl_ts_min"},
+            payload_digest=_payload_digest("tl_ts_min"),
+            src="boundary",
+            cycle=0,
+            source_file="<boundary>",
+            insert_op=self.op_index,
+        )
+        try:
+            self.log.append(row_min.ts, row_min.obj)
+        except TimelogBusyError:
+            pass
+        self._oracle_insert([row_min])
+        self.inserts += 1
+        self._verify_point(TL_TS_MIN, "boundary_tl_ts_min")
+
+        # TL_TS_MAX (seed once; point-delete at TL_TS_MAX is intentionally unsupported)
+        if not self.boundary_max_seeded:
+            rid_max = self.next_rid
+            self.next_rid += 1
+            row_max = StoredRow(
+                rid=rid_max,
+                ts=TL_TS_MAX,
+                obj={"__cc_v2": 1, "rid": rid_max, "src": "boundary", "cycle": 0,
+                     "payload_digest": _payload_digest("tl_ts_max"), "payload": "tl_ts_max"},
+                payload_digest=_payload_digest("tl_ts_max"),
+                src="boundary",
+                cycle=0,
+                source_file="<boundary>",
+                insert_op=self.op_index,
+            )
+            try:
+                self.log.append(row_max.ts, row_max.obj)
+            except TimelogBusyError:
+                pass
+            self._oracle_insert([row_max])
+            self.inserts += 1
+            self.boundary_max_seeded = True
+        self._verify_point(TL_TS_MAX, "boundary_tl_ts_max")
+
+        raised = False
+        try:
+            self.log.delete(TL_TS_MAX)
+        except ValueError:
+            raised = True
+        except Exception as exc:
+            raised = True
+            self._register_runtime_issue(
+                kind="BOUNDARY_CONTRACT",
+                title="unexpected exception on delete(TL_TS_MAX)",
+                evidence={"exception": repr(exc)},
+                severity="MEDIUM",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+        if not raised:
+            self._register_runtime_issue(
+                kind="BOUNDARY_CONTRACT",
+                title="delete(TL_TS_MAX) did not raise ValueError",
+                evidence={},
+                severity="HIGH",
+                status=ISSUE_STATUS_CONFIRMED,
+            )
+
+    def _safe_flush(self, tag: str) -> None:
+        try:
+            self.log.flush()
+            self.ops_writer.write({"op": "flush", "op_index": self.op_index, "tag": tag, "ok": True})
+        except TimelogError as exc:
+            self.ops_writer.write({"op": "flush", "op_index": self.op_index, "tag": tag, "ok": False, "error": repr(exc)})
+
+    def _safe_compact(self, tag: str) -> None:
+        try:
+            self.log.compact()
+            self.ops_writer.write({"op": "compact", "op_index": self.op_index, "tag": tag, "ok": True})
+        except TimelogError as exc:
+            self.ops_writer.write({"op": "compact", "op_index": self.op_index, "tag": tag, "ok": False, "error": repr(exc)})
+
+    def _safe_maintenance_sweep(self, tag: str) -> None:
+        self._safe_flush(f"{tag}:flush")
+        self._safe_compact(f"{tag}:compact")
+        try:
+            self.log.validate()
+            self.ops_writer.write({"op": "validate", "op_index": self.op_index, "tag": tag, "ok": True})
+        except TimelogError as exc:
+            self.ops_writer.write({"op": "validate", "op_index": self.op_index, "tag": tag, "ok": False, "error": repr(exc)})
+
+    # ------------------------------------------------------------------
+    # Issue and summary
+    # ------------------------------------------------------------------
+
+    def _register_runtime_issue(
+        self,
+        *,
+        kind: str,
+        title: str,
+        evidence: dict[str, Any],
+        severity: str,
+        status: str,
+    ) -> None:
+        issue_id = self.issue_registry.create_issue(
+            kind=kind,
+            severity=severity,
+            status=status,
+            op_index=self.op_index,
+            check_index=self.check_index,
+            title=title,
+            context={"op_index": self.op_index, "check_index": self.check_index},
+            evidence=evidence,
+        )
+        if status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
+            self.stop_reason = f"{status}:{issue_id}"
+
+    def _finalize_summary(self, started: float) -> None:
+        ended_utc = _utc_now_iso()
+        elapsed_s = int(time.monotonic() - started)
+        summary = {
+            "run_id": self.run_id,
+            "started_utc": self.started_utc,
+            "ended_utc": ended_utc,
+            "elapsed_seconds": elapsed_s,
+            "git_commit": self.git_commit,
+            "config": asdict(self.cfg),
+            "stats": {
+                "ops": self.op_index,
+                "checks": self.check_index,
+                "inserts": self.inserts,
+                "deletes": self.deletes,
+                "live_rows": self.shadow_fast.live_count(),
+                "full_verifies": self.full_verifies,
+                "mismatches": self.mismatches,
+                "issues_total": self.issue_registry.count,
+                "issues_by_status": dict(self.issue_registry.by_status),
+                "issues_by_kind": dict(self.issue_registry.by_kind),
+                "stop_reason": self.stop_reason,
+            },
+            "artifact_paths": {
+                "run_dir": str(self.run_dir),
+                "ops_jsonl": str(self.ops_writer.path),
+                "checks_jsonl": str(self.checks_writer.path),
+                "issues_jsonl": str(self.issues_writer.path),
+                "issues_dir": str(self.issue_registry.issues_dir),
+            },
+            "csv_source": None if self.csv_source is None else self.csv_source.stats(),
+        }
+        with open(self.run_dir / "summary.json", "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2, ensure_ascii=True, default=str)
+
+        md = [
+            "# Timelog Correctness Checker V2 Summary",
+            "",
+            f"- Run ID: `{self.run_id}`",
+            f"- Started (UTC): `{self.started_utc}`",
+            f"- Ended (UTC): `{ended_utc}`",
+            f"- Elapsed: `{elapsed_s}s`",
+            f"- Git commit: `{self.git_commit}`",
+            "",
+            "## Totals",
+            "",
+            f"- Operations: `{self.op_index}`",
+            f"- Checks: `{self.check_index}`",
+            f"- Inserts: `{self.inserts}`",
+            f"- Deletes: `{self.deletes}`",
+            f"- Live rows: `{self.shadow_fast.live_count()}`",
+            f"- Full verifies: `{self.full_verifies}`",
+            f"- Mismatches: `{self.mismatches}`",
+            f"- Issues: `{self.issue_registry.count}`",
+            f"- Stop reason: `{self.stop_reason}`",
+            "",
+            "## Issues by Status",
+            "",
+        ]
+        for k, v in sorted(self.issue_registry.by_status.items()):
+            md.append(f"- `{k}`: `{v}`")
+        md += ["", "## Issues by Kind", ""]
+        for k, v in sorted(self.issue_registry.by_kind.items()):
+            md.append(f"- `{k}`: `{v}`")
+        md += ["", "## Reproduction Command", "", "```powershell", self.repro_cmd, "```", ""]
+        with open(self.run_dir / "summary.md", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(md) + "\n")
+
+        self.ops_writer.write({"op": "run_end", "t_utc": ended_utc, "summary": summary["stats"]}, flush=True)
+
+        print("=" * 96)
+        print(
+            "SUMMARY: "
+            f"ops={self.op_index} checks={self.check_index} inserts={self.inserts} "
+            f"deletes={self.deletes} issues={self.issue_registry.count} "
+            f"confirmed={self.issue_registry.by_status[ISSUE_STATUS_CONFIRMED]}"
+        )
+        print(f"Artifacts: {self.run_dir}")
+        print("=" * 96)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
+def _parse_args() -> RunConfig:
     parser = argparse.ArgumentParser(
-        description="Timelog Correctness Checker: chaotic test with shadow verification"
+        description="Timelog Correctness Checker V2 (chaotic, oracle-backed validator)"
     )
-    parser.add_argument("--duration", type=int, default=3600,
-                        help="Run duration in seconds (default: 3600)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="RNG seed (default: random)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print every operation")
-    parser.add_argument("--log", type=str, default="demo/correctness_log.jsonl",
-                        help="JSONL log path (default: demo/correctness_log.jsonl)")
+    parser.add_argument("--duration-seconds", type=int, default=3600)
+    parser.add_argument("--duration", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--source-mode", choices=["synthetic", "csv", "mixed"], default="mixed")
+    parser.add_argument("--csv", action="append", default=None,
+                        help="CSV file path (repeatable). Default: two demo files.")
+    parser.add_argument("--out-dir", type=str, default="demo/correctness_runs")
+    parser.add_argument("--min-batch", type=int, default=1)
+    parser.add_argument("--max-batch", type=int, default=10_000)
+    parser.add_argument("--maintenance", choices=["background", "disabled"], default="background")
+    parser.add_argument("--busy-policy", choices=["raise", "silent", "flush"], default="flush")
+    parser.add_argument("--full-verify-interval-ops", type=int, default=200)
+    parser.add_argument("--full-verify-interval-seconds", type=int, default=30)
+    parser.add_argument("--checkpoint-interval-ops", type=int, default=1000)
+    parser.add_argument("--continue-on-mismatch", action="store_true")
+    parser.add_argument("--max-issues", type=int, default=100)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--log", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
+    duration = args.duration if args.duration is not None else args.duration_seconds
+    if duration <= 0:
+        raise SystemExit("--duration-seconds must be positive")
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
+    min_batch = max(1, args.min_batch)
+    max_batch = max(min_batch, args.max_batch)
+    csv_paths = args.csv if args.csv is not None else DEFAULT_CSVS
 
-    checker = CorrectnessChecker(
+    return RunConfig(
+        duration_seconds=duration,
         seed=seed,
-        duration=args.duration,
+        source_mode=args.source_mode,
+        csv_paths=csv_paths,
+        out_dir=args.out_dir,
+        min_batch=min_batch,
+        max_batch=max_batch,
+        maintenance=args.maintenance,
+        busy_policy=args.busy_policy,
+        full_verify_interval_ops=max(1, args.full_verify_interval_ops),
+        full_verify_interval_seconds=max(1, args.full_verify_interval_seconds),
+        checkpoint_interval_ops=max(1, args.checkpoint_interval_ops),
+        continue_on_mismatch=args.continue_on_mismatch,
+        max_issues=max(1, args.max_issues),
         verbose=args.verbose,
-        log_path=args.log,
+        log_alias_path=args.log,
     )
-    checker.run()
+
+
+def main() -> int:
+    cfg = _parse_args()
+    runner = CorrectnessRunner(cfg)
+    return runner.run()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

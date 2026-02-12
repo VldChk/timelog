@@ -13,7 +13,7 @@
  * the exact timestamp.
  *
  * Algorithm (Read Path LLD Section 8):
- * 1. Tombstone check: if any tombstone covers ts, return empty immediately
+ * 1. Tombstone watermark check: tomb_seq(ts) compared per row watermark
  * 2. L1 lookup: binary search window, catalog, page for ts
  * 3. L0 lookup: scan overlapping segments with binary search
  * 4. Memview lookup: binary search active_run, OOO head, OOO runs, sealed memruns
@@ -53,8 +53,8 @@ typedef struct tl_point_result {
  * Finds all visible records with record.ts == ts in the snapshot.
  * Uses direct binary search on each component (no K-way merge).
  *
- * If any tombstone covers ts, returns empty result (not an error).
- * This is correct: the timestamp is deleted.
+ * Records are filtered using watermark semantics:
+ * a row is deleted only when tomb_seq(ts) > row_watermark.
  *
  * @param result  Output result (caller-allocated, zero-initialized)
  * @param snap    Snapshot to search

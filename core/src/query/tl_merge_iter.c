@@ -72,21 +72,20 @@ static bool source_done(const tl_iter_source_t* src) {
  * Seek a source iterator to target timestamp.
  * After seek, caller should call source_next to get the first record >= target.
  */
-static void source_seek(tl_iter_source_t* src, tl_ts_t target) {
+static tl_status_t source_seek(tl_iter_source_t* src, tl_ts_t target) {
     if (src->kind == TL_ITER_SEGMENT) {
         tl_segment_iter_seek(&src->iter.segment, target);
-        return;
+        return TL_OK;
     }
     if (src->kind == TL_ITER_MEMRUN) {
-        tl_memrun_iter_seek(&src->iter.memrun, target);
-        return;
+        return tl_memrun_iter_seek(&src->iter.memrun, target);
     }
     if (src->kind == TL_ITER_ACTIVE) {
-        tl_active_iter_seek(&src->iter.active, target);
-        return;
+        return tl_active_iter_seek(&src->iter.active, target);
     }
     /* Should never reach here - all enum values handled above */
     TL_ASSERT(false && "Invalid source kind");
+    return TL_EINVAL;
 }
 
 #ifdef _MSC_VER
@@ -369,7 +368,13 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         tl_iter_source_t* src = (tl_iter_source_t*)popped.iter;
 
         /* Seek this source to target */
-        source_seek(src, target);
+        tl_status_t seek_st = source_seek(src, target);
+        if (seek_st != TL_OK) {
+            it->error = seek_st;
+            it->done = true;
+            tl_heap_clear(&it->heap);
+            return;
+        }
 
         /* Check if source is exhausted after seek */
         if (source_done(src)) {

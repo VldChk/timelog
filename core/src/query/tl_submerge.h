@@ -90,7 +90,7 @@ tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out,
 /**
  * Seek to first record with ts >= target (forward-only).
  */
-void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target);
+tl_status_t tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target);
 
 /**
  * Check if merge is exhausted.

@@ -1,0 +1,73 @@
+{"seq": 1, "t": 1770219109.528215, "op": "extend", "count": 291, "pattern": "iter_pairs"}
+{"seq": 2, "t": 1770219109.5328028, "op": "extend", "count": 304, "pattern": "dual_list"}
+{"seq": 3, "t": 1770219109.5328963, "op": "delete_point", "ts": 1007692, "removed": 1, "pattern": "delete"}
+{"seq": 4, "t": 1770219109.5330946, "op": "verify", "ok": true, "type": "range", "t1": 1016688, "t2": 1018525, "n": 43}
+{"seq": 5, "t": 1770219109.5336318, "op": "extend", "count": 215, "pattern": "iter_pairs"}
+{"seq": 6, "t": 1770219109.533681, "op": "delete_range", "t1": 1031685, "t2": 1034386, "removed": 48, "pattern": "delitem"}
+{"seq": 7, "t": 1770219109.5350058, "op": "extend", "count": 554, "pattern": "iter_pairs"}
+{"seq": 8, "t": 1770219109.5368693, "op": "extend", "count": 844, "pattern": "pairs"}
+{"seq": 9, "t": 1770219109.5369422, "op": "append", "ts": 1101169, "pattern": "kwarg"}
+{"seq": 10, "t": 1770219109.536992, "op": "verify", "ok": true, "type": "point", "ts": 1042070, "n": 1}
+{"seq": 11, "t": 1770219109.5377662, "op": "extend", "count": 352, "pattern": "dual_list"}
+{"seq": 12, "t": 1770219109.5378056, "op": "append", "ts": 1109160, "pattern": "kwarg"}
+{"seq": 13, "t": 1770219109.5378547, "op": "flush"}
+{"seq": 14, "t": 1770219109.5378857, "op": "verify", "ok": true, "type": "point", "ts": 1058779, "n": 1}
+{"seq": 15, "t": 1770219109.5449028, "op": "verify", "ok": true, "type": "slice", "variant": "all", "n": 2513}
+{"seq": 16, "t": 1770219109.5451562, "op": "append", "ts": 1117057, "pattern": "kwarg"}
+{"seq": 17, "t": 1770219109.5451872, "op": "setitem", "ts": 1117110}
+{"seq": 18, "t": 1770219109.5452049, "op": "append", "ts": 1117143, "pattern": "positional"}
+{"seq": 19, "t": 1770219109.5452378, "op": "verify", "ok": true, "type": "point", "ts": 1096137, "n": 1}
+{"seq": 20, "t": 1770219109.5481691, "op": "extend", "count": 768, "pattern": "dual_list"}
+{"seq": 21, "t": 1770219109.5501542, "op": "extend", "count": 979, "pattern": "iter_pairs"}
+{"seq": 22, "t": 1770219109.5503516, "op": "views_error", "error": "'builtin_function_or_method' object is not subscriptable"}
+{"seq": 23, "t": 1770219109.5504045, "op": "append", "ts": 1191641, "pattern": "kwarg"}
+{"seq": 24, "t": 1770219109.5510807, "op": "extend", "count": 310, "pattern": "dual_list"}
+{"seq": 25, "t": 1770219109.5524049, "op": "verify", "ok": true, "type": "range", "t1": 1044200, "t2": 1065353, "n": 480}
+{"seq": 26, "t": 1770219109.5529525, "op": "extend", "count": 204, "pattern": "iter_pairs"}
+{"seq": 27, "t": 1770219109.5529957, "op": "verify", "ok": true, "type": "point", "ts": 1136082, "n": 1}
+{"seq": 28, "t": 1770219109.553071, "op": "delete_range", "t1": 1153343, "t2": 1172084, "removed": 442, "pattern": "delete"}
+{"seq": 29, "t": 1770219109.5530946, "op": "append", "ts": 1205510, "pattern": "positional"}
+{"seq": 30, "t": 1770219109.5531182, "op": "delete_point", "ts": 1035069, "removed": 1, "pattern": "delitem"}
+{"seq": 31, "t": 1770219109.5534992, "op": "extend", "count": 148, "pattern": "iter_pairs"}
+{"seq": 32, "t": 1770219109.553529, "op": "delete_point", "ts": 1063967, "removed": 1, "pattern": "delitem"}
+{"seq": 33, "t": 1770219109.5547714, "op": "extend", "count": 559, "pattern": "iter_pairs"}
+{"seq": 34, "t": 1770219109.5548196, "op": "delete_range", "t1": 1063249, "t2": 1064697, "removed": 30, "pattern": "delitem"}
+{"seq": 35, "t": 1770219109.5548546, "op": "verify", "ok": true, "type": "point", "ts": 1217754, "n": 2}
+{"seq": 36, "t": 1770219109.5564559, "op": "extend", "count": 785, "pattern": "dual_list"}
+{"seq": 37, "t": 1770219109.5569472, "op": "extend", "count": 186, "pattern": "iter_pairs"}
+{"seq": 38, "t": 1770219109.556992, "op": "verify", "ok": true, "type": "point", "ts": 1138621, "n": 1}
+{"seq": 39, "t": 1770219109.5570168, "op": "verify", "ok": true, "type": "point", "ts": 1090055, "n": 1}
+{"seq": 40, "t": 1770219109.5570343, "op": "verify", "ok": true, "type": "point", "ts": 1024944, "n": 1}
+{"seq": 41, "t": 1770219109.5581913, "op": "extend", "count": 412, "pattern": "dual_list"}
+{"seq": 42, "t": 1770219109.5596645, "op": "extend", "count": 703, "pattern": "dual_list"}
+{"seq": 43, "t": 1770219109.561066, "op": "extend", "count": 586, "pattern": "dual_list"}
+{"seq": 44, "t": 1770219109.561183, "op": "delete_range", "t1": 1241289, "t2": 1265935, "removed": 577, "pattern": "delete"}
+{"seq": 45, "t": 1770219109.563434, "op": "extend", "count": 459, "pattern": "pairs"}
+{"seq": 46, "t": 1770219109.5656679, "op": "extend", "count": 875, "pattern": "iter_pairs"}
+{"seq": 47, "t": 1770219109.565734, "op": "compact"}
+{"seq": 48, "t": 1770219109.5668583, "op": "extend", "count": 431, "pattern": "iter_pairs"}
+{"seq": 49, "t": 1770219109.5717993, "op": "verify", "ok": true, "type": "range", "t1": 1255106, "t2": 1339671, "n": 1708}
+{"seq": 50, "t": 1770219109.5729027, "op": "extend", "count": 315, "pattern": "pairs"}
+{"seq": 51, "t": 1770219109.5729482, "op": "append", "ts": 1447466, "pattern": "kwarg"}
+{"seq": 52, "t": 1770219109.5773697, "op": "verify", "ok": true, "type": "range", "t1": 1373269, "t2": 1475646, "n": 1708}
+{"seq": 53, "t": 1770219109.5800183, "op": "extend", "count": 556, "pattern": "iter_pairs"}
+{"seq": 54, "t": 1770219109.5856493, "op": "verify", "ok": true, "type": "range", "t1": 1360060, "t2": 1439742, "n": 1855}
+{"seq": 55, "t": 1770219109.5858796, "op": "append", "ts": 1470690, "pattern": "positional"}
+{"seq": 56, "t": 1770219109.5925188, "op": "verify", "ok": true, "type": "range", "t1": 1002533, "t2": 1112304, "n": 2350}
+{"seq": 57, "t": 1770219109.5927265, "op": "setitem", "ts": 1470789}
+{"seq": 58, "t": 1770219109.6039958, "op": "verify", "ok": true, "type": "slice", "variant": "until", "n": 3354}
+{"seq": 59, "t": 1770219109.6043038, "op": "verify", "ok": true, "type": "point", "ts": 1038377, "n": 1}
+{"seq": 60, "t": 1770219109.6066754, "op": "verify", "ok": true, "type": "range", "t1": 1273153, "t2": 1312249, "n": 896}
+{"seq": 61, "t": 1770219109.6067574, "op": "verify", "ok": true, "type": "point", "ts": 1328045, "n": 1}
+{"seq": 62, "t": 1770219109.6067858, "op": "setitem", "ts": 1466318}
+{"seq": 63, "t": 1770219109.6068966, "op": "verify", "ok": true, "type": "point", "ts": 1414770, "n": 1}
+{"seq": 64, "t": 1770219109.6092346, "op": "extend", "count": 988, "pattern": "pairs"}
+{"seq": 65, "t": 1770219109.6096125, "op": "views_error", "error": "'builtin_function_or_method' object is not subscriptable"}
+{"seq": 66, "t": 1770219109.6109214, "op": "verify", "ok": true, "type": "range", "t1": 1348169, "t2": 1368164, "n": 471}
+{"seq": 67, "t": 1770219109.610975, "op": "append", "ts": 1513443, "pattern": "positional"}
+{"seq": 68, "t": 1770219109.6110046, "op": "verify", "ok": true, "type": "point", "ts": 1397780, "n": 1}
+{"seq": 69, "t": 1770219109.614723, "op": "extend", "count": 598, "pattern": "pairs"}
+{"seq": 70, "t": 1770219109.6168873, "op": "extend", "count": 701, "pattern": "iter_pairs"}
+{"seq": 71, "t": 1770219109.6210036, "op": "MISMATCH", "type": "slice [:]", "expected_n": 12035, "got_n": 12028}
+{"seq": 72, "t": 1770219109.62105, "op": "FATAL", "error": "slice [:]: count mismatch: expected 12035, got 12028\n  First ts diff at index 3634: got_ts=1184192, expected_ts=1184179\n  Missing expected[12028]: (1570574, 0.44726224037063034)"}
+{"seq": 73, "t": 1770219109.621073, "op": "summary", "ops": 71, "inserts": 13135, "deletes": 1100, "mismatches": 1, "verifications": 0, "elapsed": 0}

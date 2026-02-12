@@ -119,6 +119,18 @@ class TestCoercion:
         with pytest.raises(TypeError):
             _coerce_ts("123")
 
+    def test_coerce_int64_bounds_checked(self):
+        """Values outside signed int64 range must raise OverflowError."""
+        from timelog._api import _coerce_ts, TL_TS_MIN, TL_TS_MAX
+
+        assert _coerce_ts(TL_TS_MIN) == TL_TS_MIN
+        assert _coerce_ts(TL_TS_MAX) == TL_TS_MAX
+
+        with pytest.raises(OverflowError, match="outside int64 range"):
+            _coerce_ts(TL_TS_MIN - 1)
+        with pytest.raises(OverflowError, match="outside int64 range"):
+            _coerce_ts(TL_TS_MAX + 1)
+
 
 # =============================================================================
 # Category 4: Slicing

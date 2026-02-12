@@ -226,6 +226,8 @@ static int cmp_recseq_pair(const void* a, const void* b) {
     if (ra->rec.ts > rb->rec.ts) return 1;
     if (ra->rec.handle < rb->rec.handle) return -1;
     if (ra->rec.handle > rb->rec.handle) return 1;
+    if (ra->seq < rb->seq) return -1;
+    if (ra->seq > rb->seq) return 1;
     return 0;
 }
 

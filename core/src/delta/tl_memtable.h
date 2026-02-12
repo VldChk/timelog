@@ -265,6 +265,18 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
                               tl_seq_t applied_seq);
 
 /**
+ * Extended seal API: optionally collect tombstone-dropped records that became
+ * unreachable during mandatory head flush / active-run filtering.
+ *
+ * Ownership: caller owns *out_dropped and must free with tl__free(mt->alloc, ...).
+ * Pass NULL outputs to skip collection.
+ */
+tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
+                                 tl_seq_t applied_seq,
+                                 tl_record_t** out_dropped,
+                                 size_t* out_dropped_len);
+
+/**
  * Check if active state is empty (no records, no tombstones).
  */
 bool tl_memtable_is_active_empty(const tl_memtable_t* mt);

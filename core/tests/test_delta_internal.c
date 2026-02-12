@@ -1178,6 +1178,49 @@ TEST_DECLARE(delta_memtable_seal_basic) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(delta_memtable_seal_ex_collects_tomb_drops) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 4));
+
+    /* One in-order and one OOO record, then a newer tombstone that covers both. */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 10)); /* run */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 5, 5));   /* OOO head */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 15));
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal_ex(&mt, &mu, NULL, delta_next_seq(),
+                                                  &dropped, &dropped_len));
+    TEST_ASSERT_EQ(2, dropped_len);
+
+    bool saw_5 = false;
+    bool saw_10 = false;
+    for (size_t i = 0; i < dropped_len; i++) {
+        if (dropped[i].ts == 5 && dropped[i].handle == 5) {
+            saw_5 = true;
+        }
+        if (dropped[i].ts == 10 && dropped[i].handle == 10) {
+            saw_10 = true;
+        }
+    }
+    TEST_ASSERT(saw_5);
+    TEST_ASSERT(saw_10);
+
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
 TEST_DECLARE(delta_memtable_seal_preserves_on_ebusy) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -2037,6 +2080,580 @@ TEST_DECLARE(delta_flush_build_tombstone_only) {
 }
 
 /*===========================================================================
+ * Flush Tombstone Filtering Tests (Internal API)
+ *
+ * These test the ctx.tombs filtering path in tl_flush_build (tl_flush.c:260-298).
+ * The K-way merge checks each record against ctx.tombs via cursor.
+ * Filtering semantics: tomb_seq > watermark → drop (strict greater-than).
+ *===========================================================================*/
+
+/**
+ * Helper: collect all records from a segment into an array.
+ * Caller must free the returned array with tl__free.
+ */
+static tl_record_t* collect_segment_records(tl_alloc_ctx_t* alloc,
+                                             const tl_segment_t* seg,
+                                             size_t* out_len) {
+    *out_len = 0;
+    if (seg == NULL || seg->record_count == 0) {
+        return NULL;
+    }
+
+    tl_record_t* recs = TL_NEW_ARRAY(alloc, tl_record_t, (size_t)seg->record_count);
+    if (recs == NULL) {
+        return NULL;
+    }
+
+    const tl_page_catalog_t* cat = tl_segment_catalog(seg);
+    size_t idx = 0;
+    for (uint32_t p = 0; p < cat->n_pages; p++) {
+        const tl_page_t* page = cat->pages[p].page;
+        for (uint32_t r = 0; r < page->count; r++) {
+            tl_page_get_record(page, r, &recs[idx]);
+            idx++;
+        }
+    }
+    *out_len = idx;
+    return recs;
+}
+
+/*---------------------------------------------------------------------------
+ * Test 1: ctx.tombs filters covered records during flush merge.
+ *
+ * Setup: 4 records in main run at ts={10,20,30,40}.
+ *        ctx.tombs = [15, 35) with max_seq=5.
+ *        mr->applied_seq=3 (< 5, so tomb is newer → records dropped).
+ *
+ * Expected: records at ts=20,30 are covered by [15,35) and dropped.
+ *           Segment has 2 records (ts=10,40). dropped_len=2.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_ctx_tombs_filter_records) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 4);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+    run[2] = (tl_record_t){.ts = 30, .handle = 3};
+    run[3] = (tl_record_t){.ts = 40, .handle = 4};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 4, NULL, NULL, 0, &mr));
+
+    /* Override applied_seq to a known value (test wrapper auto-generates it) */
+    mr->applied_seq = 3;
+
+    /* ctx.tombs: [15, 35) with max_seq=5 — newer than watermark 3 */
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 15, .end = 35, .end_unbounded = false, .max_seq = 5}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 5,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* Verify segment: 2 surviving records */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(2, (size_t)seg->record_count);
+    TEST_ASSERT_EQ(10, seg->min_ts);
+
+    size_t seg_len = 0;
+    tl_record_t* seg_recs = collect_segment_records(&alloc, seg, &seg_len);
+    TEST_ASSERT_EQ(2, seg_len);
+    TEST_ASSERT_EQ(10, seg_recs[0].ts);
+    TEST_ASSERT_EQ(1, (int)seg_recs[0].handle);
+    TEST_ASSERT_EQ(40, seg_recs[1].ts);
+    TEST_ASSERT_EQ(4, (int)seg_recs[1].handle);
+    tl__free(&alloc, seg_recs);
+
+    /* Verify dropped: 2 records at ts=20,30 */
+    TEST_ASSERT_EQ(2, dropped_len);
+    TEST_ASSERT_EQ(20, dropped[0].ts);
+    TEST_ASSERT_EQ(2, (int)dropped[0].handle);
+    TEST_ASSERT_EQ(30, dropped[1].ts);
+    TEST_ASSERT_EQ(3, (int)dropped[1].handle);
+
+    tl_segment_release(seg);
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 2: Watermark tie semantics — tomb_seq == watermark → record KEPT.
+ *
+ * Setup: 3 records at ts={100,200,300}.
+ *        ctx.tombs = [0, 400) with max_seq=7.
+ *        mr->applied_seq=7 (TIE: 7 <= 7, so records survive).
+ *
+ * Expected: all 3 records survive. 0 dropped.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_watermark_tie_preserves_records) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 3);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 100, .handle = 10};
+    run[1] = (tl_record_t){.ts = 200, .handle = 20};
+    run[2] = (tl_record_t){.ts = 300, .handle = 30};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 3, NULL, NULL, 0, &mr));
+    mr->applied_seq = 7;  /* TIE with tomb max_seq */
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 0, .end = 400, .end_unbounded = false, .max_seq = 7}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 7,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* All records kept — tie semantics */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(3, (size_t)seg->record_count);
+    TEST_ASSERT_EQ(0, dropped_len);
+
+    tl_segment_release(seg);
+    if (dropped != NULL) tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 3: Newer tombstone drops all records when tomb_seq > watermark.
+ *
+ * Setup: 3 records at ts={100,200,300}.
+ *        ctx.tombs = [0, 400) with max_seq=7.
+ *        mr->applied_seq=6 (< 7, so tomb is NEWER → all dropped).
+ *        No mr->tombs, so no tombstone-only segment built.
+ *
+ * Expected: out_seg=NULL (no records, no mr->tombs). 3 dropped.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_newer_tomb_drops_all) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 3);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 100, .handle = 10};
+    run[1] = (tl_record_t){.ts = 200, .handle = 20};
+    run[2] = (tl_record_t){.ts = 300, .handle = 30};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 3, NULL, NULL, 0, &mr));
+    mr->applied_seq = 6;  /* tomb_seq(7) > watermark(6) → drops */
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 0, .end = 400, .end_unbounded = false, .max_seq = 7}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 7,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* No records survive, no mr->tombs → NULL segment */
+    TEST_ASSERT_NULL(seg);
+    TEST_ASSERT_EQ(3, dropped_len);
+    TEST_ASSERT_EQ(100, dropped[0].ts);
+    TEST_ASSERT_EQ(200, dropped[1].ts);
+    TEST_ASSERT_EQ(300, dropped[2].ts);
+
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 4: Per-source watermark filtering.
+ *
+ * Each flush source (main run, each OOO run) has its own watermark.
+ * The same ctx.tombs may drop OOO records but keep main run records.
+ *
+ * Setup:
+ *   Main run: ts=100 h=1, applied_seq=10 (watermark=10)
+ *   OOO run:  ts=200 h=2, applied_seq=3  (watermark=3)
+ *   ctx.tombs = [0, 300) with max_seq=8.
+ *
+ * For main run record (ts=100): tomb_seq=8, watermark=10 → 8<=10 → KEPT.
+ * For OOO run record (ts=200):  tomb_seq=8, watermark=3  → 8>3  → DROPPED.
+ *
+ * Expected: 1 record in segment (ts=100), 1 dropped (ts=200).
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_per_source_watermark_filtering) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    /* Main run: 1 record */
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 1);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 100, .handle = 1};
+
+    /* OOO run: 1 record with low watermark */
+    tl_record_t* ooo_recs = TL_NEW_ARRAY(&alloc, tl_record_t, 1);
+    TEST_ASSERT_NOT_NULL(ooo_recs);
+    ooo_recs[0] = (tl_record_t){.ts = 200, .handle = 2};
+
+    /* Create OOO run directly (not via make_ooo_runset) to control applied_seq */
+    tl_ooorun_t* ooo_run = NULL;
+    TEST_ASSERT_STATUS(TL_OK,
+        tl_ooorun_create(&alloc, ooo_recs, 1, /*applied_seq=*/3, /*gen=*/1, &ooo_run));
+
+    tl_ooorun_t* runs_arr[1] = { ooo_run };
+    tl_ooorunset_t* ooo_runs = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_ooorunset_create(&alloc, runs_arr, 1, &ooo_runs));
+    tl_ooorun_release(ooo_run);  /* runset holds its own ref */
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK,
+        tl_memrun_create(&alloc, run, 1, ooo_runs, NULL, 0, &mr));
+    mr->applied_seq = 10;  /* Main run watermark */
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 0, .end = 300, .end_unbounded = false, .max_seq = 8}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 10,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* Main run record kept (8<=10), OOO record dropped (8>3) */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(1, (size_t)seg->record_count);
+    TEST_ASSERT_EQ(100, seg->min_ts);
+
+    size_t seg_len = 0;
+    tl_record_t* seg_recs = collect_segment_records(&alloc, seg, &seg_len);
+    TEST_ASSERT_EQ(1, seg_len);
+    TEST_ASSERT_EQ(100, seg_recs[0].ts);
+    TEST_ASSERT_EQ(1, (int)seg_recs[0].handle);
+    tl__free(&alloc, seg_recs);
+
+    /* 1 dropped: the OOO record */
+    TEST_ASSERT_EQ(1, dropped_len);
+    TEST_ASSERT_EQ(200, dropped[0].ts);
+    TEST_ASSERT_EQ(2, (int)dropped[0].handle);
+
+    tl_segment_release(seg);
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 5: Multiple tombstones with cursor advancement.
+ *
+ * Verifies the cursor-based tombstone scan correctly advances across
+ * multiple disjoint tombstones during the K-way merge.
+ *
+ * Setup: 6 records at ts={5, 15, 25, 35, 45, 55}.
+ *        ctx.tombs = [10,20) max_seq=5, [30,40) max_seq=5.
+ *        mr->applied_seq=3 (< 5, so both tombs are newer).
+ *
+ * Expected:
+ *   ts=5:  not covered → KEPT
+ *   ts=15: in [10,20) → DROPPED
+ *   ts=25: not covered → KEPT
+ *   ts=35: in [30,40) → DROPPED
+ *   ts=45: not covered → KEPT
+ *   ts=55: not covered → KEPT
+ *   Segment: 4 records. Dropped: 2.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_multiple_tombs_cursor_advance) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 6);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 5,  .handle = 1};
+    run[1] = (tl_record_t){.ts = 15, .handle = 2};
+    run[2] = (tl_record_t){.ts = 25, .handle = 3};
+    run[3] = (tl_record_t){.ts = 35, .handle = 4};
+    run[4] = (tl_record_t){.ts = 45, .handle = 5};
+    run[5] = (tl_record_t){.ts = 55, .handle = 6};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 6, NULL, NULL, 0, &mr));
+    mr->applied_seq = 3;
+
+    tl_interval_t ctx_tombs_arr[2] = {
+        {.start = 10, .end = 20, .end_unbounded = false, .max_seq = 5},
+        {.start = 30, .end = 40, .end_unbounded = false, .max_seq = 5}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 2};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 5,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* 4 records survive */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(4, (size_t)seg->record_count);
+
+    size_t seg_len = 0;
+    tl_record_t* seg_recs = collect_segment_records(&alloc, seg, &seg_len);
+    TEST_ASSERT_EQ(4, seg_len);
+    TEST_ASSERT_EQ(5,  seg_recs[0].ts);
+    TEST_ASSERT_EQ(25, seg_recs[1].ts);
+    TEST_ASSERT_EQ(45, seg_recs[2].ts);
+    TEST_ASSERT_EQ(55, seg_recs[3].ts);
+    tl__free(&alloc, seg_recs);
+
+    /* 2 records dropped */
+    TEST_ASSERT_EQ(2, dropped_len);
+    TEST_ASSERT_EQ(15, dropped[0].ts);
+    TEST_ASSERT_EQ(35, dropped[1].ts);
+
+    tl_segment_release(seg);
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 6: collect_drops=false skips dropped record collection.
+ *
+ * Same scenario as Test 1 but with collect_drops=false.
+ * Records are still filtered, but dropped array stays empty.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_collect_drops_false) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 4);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+    run[2] = (tl_record_t){.ts = 30, .handle = 3};
+    run[3] = (tl_record_t){.ts = 40, .handle = 4};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 4, NULL, NULL, 0, &mr));
+    mr->applied_seq = 3;
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 15, .end = 35, .end_unbounded = false, .max_seq = 5}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 5,
+        .tombs = ctx_tombs,
+        .collect_drops = false  /* <-- key difference */
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* Records still filtered — only 2 survive */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(2, (size_t)seg->record_count);
+
+    /* But dropped array is empty because collect_drops=false */
+    TEST_ASSERT_EQ(0, dropped_len);
+    TEST_ASSERT_NULL(dropped);
+
+    tl_segment_release(seg);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 7: Unbounded tombstone [start, +inf) drops all records >= start.
+ *
+ * Setup: 4 records at ts={10,20,30,40}.
+ *        ctx.tombs = [25, +inf) with max_seq=5.
+ *        mr->applied_seq=3.
+ *
+ * Expected: ts=30,40 dropped (>= 25). ts=10,20 kept. Segment has 2.
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_unbounded_tombstone) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 4);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+    run[2] = (tl_record_t){.ts = 30, .handle = 3};
+    run[3] = (tl_record_t){.ts = 40, .handle = 4};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 4, NULL, NULL, 0, &mr));
+    mr->applied_seq = 3;
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 25, .end = 0, .end_unbounded = true, .max_seq = 5}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 5,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* 2 records survive (ts=10,20) */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(2, (size_t)seg->record_count);
+
+    size_t seg_len = 0;
+    tl_record_t* seg_recs = collect_segment_records(&alloc, seg, &seg_len);
+    TEST_ASSERT_EQ(2, seg_len);
+    TEST_ASSERT_EQ(10, seg_recs[0].ts);
+    TEST_ASSERT_EQ(20, seg_recs[1].ts);
+    tl__free(&alloc, seg_recs);
+
+    /* 2 dropped */
+    TEST_ASSERT_EQ(2, dropped_len);
+    TEST_ASSERT_EQ(30, dropped[0].ts);
+    TEST_ASSERT_EQ(40, dropped[1].ts);
+
+    tl_segment_release(seg);
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*---------------------------------------------------------------------------
+ * Test 8: Record exactly at tombstone boundary — half-open [start, end).
+ *
+ * Verifies half-open semantics: start is included, end is excluded.
+ *
+ * Setup: 4 records at ts={10, 20, 30, 40}.
+ *        ctx.tombs = [20, 30) with max_seq=5.
+ *        mr->applied_seq=3.
+ *
+ * Expected: ts=20 dropped (20 >= 20 and 20 < 30).
+ *           ts=30 KEPT (30 is NOT < 30, it's at the exclusive end).
+ *           Segment: 3 records (ts=10,30,40). Dropped: 1 (ts=20).
+ *---------------------------------------------------------------------------*/
+TEST_DECLARE(delta_flush_tombstone_half_open_boundary) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 4);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+    run[2] = (tl_record_t){.ts = 30, .handle = 3};
+    run[3] = (tl_record_t){.ts = 40, .handle = 4};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 4, NULL, NULL, 0, &mr));
+    mr->applied_seq = 3;
+
+    tl_interval_t ctx_tombs_arr[1] = {
+        {.start = 20, .end = 30, .end_unbounded = false, .max_seq = 5}
+    };
+    tl_intervals_imm_t ctx_tombs = {.data = ctx_tombs_arr, .len = 1};
+
+    tl_flush_ctx_t ctx = {
+        .alloc = &alloc,
+        .target_page_bytes = 64 * 1024,
+        .generation = 1,
+        .applied_seq = 5,
+        .tombs = ctx_tombs,
+        .collect_drops = true
+    };
+
+    tl_segment_t* seg = NULL;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
+
+    /* 3 survive: ts=10 (before tomb), ts=30 (at exclusive end), ts=40 */
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT_EQ(3, (size_t)seg->record_count);
+
+    size_t seg_len = 0;
+    tl_record_t* seg_recs = collect_segment_records(&alloc, seg, &seg_len);
+    TEST_ASSERT_EQ(3, seg_len);
+    TEST_ASSERT_EQ(10, seg_recs[0].ts);
+    TEST_ASSERT_EQ(30, seg_recs[1].ts);
+    TEST_ASSERT_EQ(40, seg_recs[2].ts);
+    tl__free(&alloc, seg_recs);
+
+    /* 1 dropped at ts=20 (inclusive start) */
+    TEST_ASSERT_EQ(1, dropped_len);
+    TEST_ASSERT_EQ(20, dropped[0].ts);
+
+    tl_segment_release(seg);
+    tl__free(&alloc, dropped);
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+/*===========================================================================
  * Debug Validation Tests (Internal API)
  *
  * These validation functions are only available in debug builds.
@@ -2404,7 +3021,7 @@ TEST_DECLARE(delta_flush_build_run_ooo_overflow) {
         .alloc = &alloc,
         .target_page_bytes = TL_DEFAULT_TARGET_PAGE_BYTES,
         .generation = 1,
-        .applied_seq = 0,
+        .applied_seq = 1,
         .collect_drops = false
     };
 
@@ -2565,6 +3182,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_insert_tombstone_updates_epoch);
     RUN_TEST(delta_memtable_seal_empty_noop);
     RUN_TEST(delta_memtable_seal_basic);
+    RUN_TEST(delta_memtable_seal_ex_collects_tomb_drops);
     RUN_TEST(delta_memtable_seal_transfers_multiple_runs);
     RUN_TEST(delta_memtable_seal_preserves_on_ebusy);
     RUN_TEST(delta_memtable_should_seal_bytes);
@@ -2592,10 +3210,18 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_kmerge_iter_propagates_source_error);
 #endif
 
-    /* Flush tests (3 tests) */
+    /* Flush tests (3 base + 8 tombstone filtering) */
     RUN_TEST(delta_flush_build_records_only);
     RUN_TEST(delta_flush_build_with_tombstones);
     RUN_TEST(delta_flush_build_tombstone_only);
+    RUN_TEST(delta_flush_ctx_tombs_filter_records);
+    RUN_TEST(delta_flush_watermark_tie_preserves_records);
+    RUN_TEST(delta_flush_newer_tomb_drops_all);
+    RUN_TEST(delta_flush_per_source_watermark_filtering);
+    RUN_TEST(delta_flush_multiple_tombs_cursor_advance);
+    RUN_TEST(delta_flush_collect_drops_false);
+    RUN_TEST(delta_flush_unbounded_tombstone);
+    RUN_TEST(delta_flush_tombstone_half_open_boundary);
 
 #ifdef TL_DEBUG
     /* Debug validation tests (3 tests) */

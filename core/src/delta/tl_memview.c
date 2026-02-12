@@ -1,4 +1,5 @@
 #include "tl_memview.h"
+#include "../internal/tl_refcount.h"
 #include "../internal/tl_range.h"
 #include "../internal/tl_locks.h"
 #include "../internal/tl_records.h"
@@ -611,14 +612,10 @@ void tl_memview_shared_release(tl_memview_shared_t* mv) {
         return;
     }
 
-    uint32_t old = tl_atomic_fetch_sub_u32(&mv->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
-
-    if (old == 1) {
-        tl_atomic_fence(TL_MO_ACQUIRE);
+    TL_REFCOUNT_RELEASE(&mv->refcnt, {
         tl_memview_destroy(&mv->view);
         tl__free(mv->view.alloc, mv);
-    }
+    }, "memview double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================

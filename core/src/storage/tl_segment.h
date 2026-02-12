@@ -31,7 +31,7 @@ typedef enum tl_segment_level {
  * Invariants:
  * - Intervals are sorted by start
  * - Non-overlapping
- * - Coalesced (no adjacent intervals)
+ * - Coalesced (no adjacent intervals with equal max_seq)
  *===========================================================================*/
 
 typedef struct tl_tombstones {
@@ -83,7 +83,25 @@ typedef struct tl_segment {
     /* Level and generation */
     uint32_t  level;            /* tl_segment_level_t */
     uint32_t  generation;       /* Monotonic generation counter (diagnostics) */
-    tl_seq_t  applied_seq;      /* Tombstone watermark applied to this segment */
+    /*
+     * Tombstone watermark applied to this segment.
+     *
+     * CONTRACT: For immutable source S with S.applied_seq = X, all
+     * tombstones with seq <= X were physically applied to S's records
+     * at build time. Surviving records have either:
+     *   - tomb_seq <= X: tombstone already applied, record survived
+     *   - tomb_seq > X:  tombstone newer, must be checked at query time
+     *
+     * INVARIANT: applied_seq >= max(tombstones[i].max_seq) for all
+     * tombstones stored in this segment.
+     *
+     * INVARIANT: For L0 segments produced in order, applied_seq is
+     * non-decreasing with generation (flush assigns op_seq at seal time).
+     *
+     * CRITICAL: During flush, applied_seq and the tombstone set MUST come
+     * from the same snapshot to preserve the watermark guarantee.
+     */
+    tl_seq_t  applied_seq;
 
     /* Window bounds (L1 only, 0 for L0) */
     tl_ts_t   window_start;     /* Inclusive start (L1 only) */

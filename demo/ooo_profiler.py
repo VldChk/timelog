@@ -480,7 +480,8 @@ def profile_ingestion(
                 state.busy_events += 1
                 if allow_busy_exceptions:
                     raise
-                # Record inserted; flush to relieve pressure and continue.
+                # extend() committed; do not retry this batch.
+                # Flush only to relieve pressure for future batches.
                 flush_start = time.perf_counter_ns()
                 log.flush()
                 flush_end = time.perf_counter_ns()
@@ -547,7 +548,16 @@ def profile_ingestion(
     # Final partial batch
     if batch:
         batch_start = time.perf_counter_ns()
-        log.extend(batch)
+        try:
+            log.extend(batch)
+        except TimelogBusyError:
+            state.busy_events += 1
+            if allow_busy_exceptions:
+                raise
+            flush_start = time.perf_counter_ns()
+            log.flush()
+            flush_end = time.perf_counter_ns()
+            state.flush_times_ms.append((flush_end - flush_start) / 1e6)
         batch_end = time.perf_counter_ns()
 
         state.total_records += len(batch)

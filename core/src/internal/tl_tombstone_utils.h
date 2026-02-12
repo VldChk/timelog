@@ -19,6 +19,8 @@ tl_tombstones_add_intervals(tl_intervals_t* accum,
         return TL_OK;
     }
 
+    size_t first = tombs.len;
+    size_t last = tombs.len;
     for (size_t i = 0; i < tombs.len; i++) {
         const tl_interval_t* interval = &tombs.data[i];
 
@@ -26,23 +28,37 @@ tl_tombstones_add_intervals(tl_intervals_t* accum,
         tl_ts_t int_max = interval->end_unbounded ? TL_TS_MAX : interval->end - 1;
         if (!tl_range_overlaps(interval->start, int_max,
                                t1, t2, t2_unbounded)) {
+            if (!t2_unbounded && interval->start >= t2) {
+                break;
+            }
             continue;
         }
 
-        tl_status_t st;
-        if (interval->end_unbounded) {
-            st = tl_intervals_insert_unbounded(accum, interval->start,
-                                               interval->max_seq);
-        } else {
-            st = tl_intervals_insert(accum, interval->start, interval->end,
-                                     interval->max_seq);
+        if (first == tombs.len) {
+            first = i;
         }
-
-        if (st != TL_OK) {
-            return st;
-        }
+        last = i;
     }
 
+    if (first == tombs.len) {
+        return TL_OK;
+    }
+
+    tl_intervals_imm_t filtered = {
+        .data = &tombs.data[first],
+        .len = (last - first) + 1
+    };
+
+    tl_intervals_t merged;
+    tl_intervals_init(&merged, accum->alloc);
+    tl_status_t st = tl_intervals_union_imm(&merged, tl_intervals_as_imm(accum), filtered);
+    if (st != TL_OK) {
+        tl_intervals_destroy(&merged);
+        return st;
+    }
+
+    tl_intervals_destroy(accum);
+    *accum = merged;
     return TL_OK;
 }
 

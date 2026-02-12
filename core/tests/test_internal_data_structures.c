@@ -404,6 +404,27 @@ TEST_DECLARE(ds_recvec_destroy_idempotent) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(ds_recvec_sort_with_seqs_tie_breaker) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+    tl_recvec_t rv;
+    tl_recvec_init(&rv, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 100, 7));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 100, 7));
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 100, 7));
+
+    tl_seq_t seqs[3] = {9, 1, 5};
+    TEST_ASSERT_STATUS(TL_OK, tl_recvec_sort_with_seqs(&rv, seqs));
+
+    TEST_ASSERT_EQ(1, seqs[0]);
+    TEST_ASSERT_EQ(5, seqs[1]);
+    TEST_ASSERT_EQ(9, seqs[2]);
+
+    tl_recvec_destroy(&rv);
+    tl__alloc_destroy(&alloc);
+}
+
 /*===========================================================================
  * Interval Set Tests (24 tests, 1 debug-only)
  *===========================================================================*/
@@ -670,6 +691,85 @@ TEST_DECLARE(ds_intervals_union_max_seq) {
     TEST_ASSERT_EQ(25, tl_intervals_get(&out, 1)->start);
     TEST_ASSERT_EQ(75, tl_intervals_get(&out, 1)->end);
     TEST_ASSERT_EQ(7, tl_intervals_get(&out, 1)->max_seq);
+
+    tl_intervals_destroy(&out);
+    tl_intervals_destroy(&b);
+    tl_intervals_destroy(&a);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_union_ts_max_unbounded_start) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t a, b, out;
+    tl_intervals_init(&a, &alloc);
+    tl_intervals_init(&b, &alloc);
+    tl_intervals_init(&out, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_unbounded_seq(&a, TL_TS_MAX, 5));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_union(&out, &a, &b));
+
+    TEST_ASSERT_EQ(1, tl_intervals_len(&out));
+    TEST_ASSERT_EQ(TL_TS_MAX, tl_intervals_get(&out, 0)->start);
+    TEST_ASSERT(tl_intervals_get(&out, 0)->end_unbounded);
+    TEST_ASSERT_EQ(5, tl_intervals_get(&out, 0)->max_seq);
+
+    tl_intervals_destroy(&out);
+    tl_intervals_destroy(&b);
+    tl_intervals_destroy(&a);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_union_bounded_at_ts_max_preserved) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t a, b, out;
+    tl_intervals_init(&a, &alloc);
+    tl_intervals_init(&b, &alloc);
+    tl_intervals_init(&out, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&a, TL_TS_MAX - 2, TL_TS_MAX, 7));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_unbounded_seq(&b, TL_TS_MAX, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_union(&out, &a, &b));
+
+    TEST_ASSERT_EQ(2, tl_intervals_len(&out));
+    TEST_ASSERT_EQ(TL_TS_MAX - 2, tl_intervals_get(&out, 0)->start);
+    TEST_ASSERT_EQ(TL_TS_MAX, tl_intervals_get(&out, 0)->end);
+    TEST_ASSERT(!tl_intervals_get(&out, 0)->end_unbounded);
+    TEST_ASSERT_EQ(7, tl_intervals_get(&out, 0)->max_seq);
+    TEST_ASSERT_EQ(TL_TS_MAX, tl_intervals_get(&out, 1)->start);
+    TEST_ASSERT(tl_intervals_get(&out, 1)->end_unbounded);
+    TEST_ASSERT_EQ(3, tl_intervals_get(&out, 1)->max_seq);
+
+    tl_intervals_destroy(&out);
+    tl_intervals_destroy(&b);
+    tl_intervals_destroy(&a);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(ds_intervals_union_ts_max_seq_piecewise) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_intervals_t a, b, out;
+    tl_intervals_init(&a, &alloc);
+    tl_intervals_init(&b, &alloc);
+    tl_intervals_init(&out, &alloc);
+
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_seq(&a, TL_TS_MAX - 2, TL_TS_MAX, 2));
+    TEST_ASSERT_STATUS(TL_OK, intervals_insert_unbounded_seq(&b, TL_TS_MAX - 1, 9));
+    TEST_ASSERT_STATUS(TL_OK, tl_intervals_union(&out, &a, &b));
+
+    TEST_ASSERT_EQ(2, tl_intervals_len(&out));
+    TEST_ASSERT_EQ(TL_TS_MAX - 2, tl_intervals_get(&out, 0)->start);
+    TEST_ASSERT_EQ(TL_TS_MAX - 1, tl_intervals_get(&out, 0)->end);
+    TEST_ASSERT(!tl_intervals_get(&out, 0)->end_unbounded);
+    TEST_ASSERT_EQ(2, tl_intervals_get(&out, 0)->max_seq);
+    TEST_ASSERT_EQ(TL_TS_MAX - 1, tl_intervals_get(&out, 1)->start);
+    TEST_ASSERT(tl_intervals_get(&out, 1)->end_unbounded);
+    TEST_ASSERT_EQ(9, tl_intervals_get(&out, 1)->max_seq);
 
     tl_intervals_destroy(&out);
     tl_intervals_destroy(&b);
@@ -1338,6 +1438,7 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_recvec_insert_invalid_idx);
     RUN_TEST(ds_recvec_shrink_to_fit_empty);
     RUN_TEST(ds_recvec_destroy_idempotent);
+    RUN_TEST(ds_recvec_sort_with_seqs_tie_breaker);
 
     /* Math helper tests */
     RUN_TEST(ds_math_overflow_i64);
@@ -1356,6 +1457,9 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_intervals_unbounded);
     RUN_TEST(ds_intervals_union_basic);
     RUN_TEST(ds_intervals_union_max_seq);
+    RUN_TEST(ds_intervals_union_ts_max_unbounded_start);
+    RUN_TEST(ds_intervals_union_bounded_at_ts_max_preserved);
+    RUN_TEST(ds_intervals_union_ts_max_seq_piecewise);
     RUN_TEST(ds_intervals_clip);
     RUN_TEST(ds_intervals_clip_removes_outside);
     RUN_TEST(ds_intervals_clip_lower_removes_before);

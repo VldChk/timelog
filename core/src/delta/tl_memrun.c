@@ -1,4 +1,5 @@
 #include "tl_memrun.h"
+#include "../internal/tl_refcount.h"
 
 /*===========================================================================
  * Bounds Computation (M-11: Public for reuse)
@@ -183,14 +184,7 @@ void tl_memrun_release(tl_memrun_t* mr) {
         return;
     }
 
-    /* Release ordering: ensure all prior writes are visible before potential destruction */
-    uint32_t old = tl_atomic_fetch_sub_u32(&mr->refcnt, 1, TL_MO_RELEASE);
-
-    if (old == 1) {
-        /* Acquire fence: synchronize with all releasers before destruction */
-        tl_atomic_fence(TL_MO_ACQUIRE);
-
-        /* Free owned arrays */
+    TL_REFCOUNT_RELEASE(&mr->refcnt, {
         if (mr->run != NULL) {
             tl__free(mr->alloc, mr->run);
         }
@@ -200,10 +194,8 @@ void tl_memrun_release(tl_memrun_t* mr) {
         if (mr->tombs != NULL) {
             tl__free(mr->alloc, mr->tombs);
         }
-
-        /* Free memrun struct */
         tl__free(mr->alloc, mr);
-    }
+    }, "memrun double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================

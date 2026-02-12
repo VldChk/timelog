@@ -470,42 +470,83 @@ static tl_status_t intervals_union_impl(tl_intervals_t* out,
 
     size_t ia = 0;
     size_t ib = 0;
+
+    bool active_a = false;
+    bool active_b = false;
+    bool end_unbounded_a = false;
+    bool end_unbounded_b = false;
     tl_seq_t val_a = 0;
     tl_seq_t val_b = 0;
-    tl_ts_t end_a = TL_TS_MAX;
-    tl_ts_t end_b = TL_TS_MAX;
+    tl_ts_t end_a = 0;
+    tl_ts_t end_b = 0;
 
-    tl_ts_t next_start_a = (ia < a_len) ? a[ia].start : TL_TS_MAX;
-    tl_ts_t next_start_b = (ib < b_len) ? b[ib].start : TL_TS_MAX;
-
-    tl_ts_t pos = TL_MIN(next_start_a, next_start_b);
-    if (pos == TL_TS_MAX) {
+    bool has_pos = false;
+    tl_ts_t pos = 0;
+    if (ia < a_len) {
+        pos = a[ia].start;
+        has_pos = true;
+    }
+    if (ib < b_len) {
+        if (!has_pos || b[ib].start < pos) {
+            pos = b[ib].start;
+        }
+        has_pos = true;
+    }
+    if (!has_pos) {
         return TL_OK;
     }
 
     for (;;) {
         if (ia < a_len && a[ia].start == pos) {
+            active_a = true;
+            end_unbounded_a = a[ia].end_unbounded;
             val_a = a[ia].max_seq;
-            end_a = a[ia].end_unbounded ? TL_TS_MAX : a[ia].end;
+            end_a = a[ia].end;
             ia++;
         }
         if (ib < b_len && b[ib].start == pos) {
+            active_b = true;
+            end_unbounded_b = b[ib].end_unbounded;
             val_b = b[ib].max_seq;
-            end_b = b[ib].end_unbounded ? TL_TS_MAX : b[ib].end;
+            end_b = b[ib].end;
             ib++;
         }
 
-        next_start_a = (ia < a_len) ? a[ia].start : TL_TS_MAX;
-        next_start_b = (ib < b_len) ? b[ib].start : TL_TS_MAX;
-        tl_ts_t next_end_a = (val_a != 0) ? end_a : TL_TS_MAX;
-        tl_ts_t next_end_b = (val_b != 0) ? end_b : TL_TS_MAX;
+        bool has_next = false;
+        tl_ts_t next = 0;
 
-        tl_ts_t next = TL_MIN(TL_MIN(next_start_a, next_start_b),
-                               TL_MIN(next_end_a, next_end_b));
+        if (ia < a_len) {
+            next = a[ia].start;
+            has_next = true;
+        }
+        if (ib < b_len) {
+            if (!has_next || b[ib].start < next) {
+                next = b[ib].start;
+            }
+            has_next = true;
+        }
+        if (active_a && !end_unbounded_a) {
+            if (!has_next || end_a < next) {
+                next = end_a;
+            }
+            has_next = true;
+        }
+        if (active_b && !end_unbounded_b) {
+            if (!has_next || end_b < next) {
+                next = end_b;
+            }
+            has_next = true;
+        }
 
-        tl_seq_t max_seq = TL_MAX(val_a, val_b);
+        tl_seq_t max_seq = 0;
+        if (active_a && val_a > max_seq) {
+            max_seq = val_a;
+        }
+        if (active_b && val_b > max_seq) {
+            max_seq = val_b;
+        }
 
-        if (next == TL_TS_MAX) {
+        if (!has_next) {
             if (max_seq > 0) {
                 tl_status_t st = intervals_append(out, pos, 0, true, max_seq);
                 if (st != TL_OK) {
@@ -523,13 +564,17 @@ static tl_status_t intervals_union_impl(tl_intervals_t* out,
         }
 
         pos = next;
-        if (pos == next_end_a) {
+        if (active_a && !end_unbounded_a && pos == end_a) {
+            active_a = false;
             val_a = 0;
-            end_a = TL_TS_MAX;
+            end_a = 0;
+            end_unbounded_a = false;
         }
-        if (pos == next_end_b) {
+        if (active_b && !end_unbounded_b && pos == end_b) {
+            active_b = false;
             val_b = 0;
-            end_b = TL_TS_MAX;
+            end_b = 0;
+            end_unbounded_b = false;
         }
     }
 

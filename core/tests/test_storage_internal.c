@@ -38,9 +38,10 @@ static tl_status_t test_segment_build_l0(tl_alloc_ctx_t* alloc,
                                           size_t target_page_bytes,
                                           uint32_t generation,
                                           tl_segment_t** out) {
+    tl_seq_t applied_seq = (generation == 0) ? 1 : (tl_seq_t)generation;
     return tl_segment_build_l0(alloc, records, record_count,
                                tombstones, tombstones_len,
-                               target_page_bytes, generation, 0, out);
+                               target_page_bytes, generation, applied_seq, out);
 }
 
 static tl_status_t test_segment_build_l1(tl_alloc_ctx_t* alloc,
@@ -52,9 +53,10 @@ static tl_status_t test_segment_build_l1(tl_alloc_ctx_t* alloc,
                                           bool window_end_unbounded,
                                           uint32_t generation,
                                           tl_segment_t** out) {
+    tl_seq_t applied_seq = (generation == 0) ? 1 : (tl_seq_t)generation;
     return tl_segment_build_l1(alloc, records, record_count,
                                target_page_bytes, window_start, window_end,
-                               window_end_unbounded, generation, 0, out);
+                               window_end_unbounded, generation, applied_seq, out);
 }
 
 #define tl_segment_build_l0 test_segment_build_l0
@@ -1579,6 +1581,64 @@ TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_interval) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_seq_contract) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[1] = {{10, 1}};
+    tl_segment_t* seg = NULL;
+
+    /* max_seq must be > 0 */
+    tl_interval_t zero_seq[1] = {{20, 30, false, 0}};
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 1,
+                                                       zero_seq, 1,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    /* max_seq must be <= applied_seq (wrapper maps generation->applied_seq) */
+    tl_interval_t over_seq[1] = {{20, 30, false, 2}};
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 1,
+                                                       over_seq, 1,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_order_contract) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[1] = {{10, 1}};
+    tl_segment_t* seg = NULL;
+
+    /* Unsorted intervals must be rejected */
+    tl_interval_t unsorted[2] = {
+        {30, 40, false, 1},
+        {20, 25, false, 1}
+    };
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 1,
+                                                       unsorted, 2,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    /* Adjacent same-seq intervals must be coalesced before build */
+    tl_interval_t not_coalesced[2] = {
+        {20, 30, false, 1},
+        {30, 40, false, 1}
+    };
+    TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 1,
+                                                       not_coalesced, 2,
+                                                       TL_DEFAULT_TARGET_PAGE_BYTES,
+                                                       1, &seg));
+    TEST_ASSERT_NULL(seg);
+
+    tl__alloc_destroy(&alloc);
+}
+
 /**
  * T-08: Very small target_page_bytes should clamp to minimum page rows.
  * Building a segment with target_page_bytes=1 should still produce valid
@@ -1824,6 +1884,8 @@ void run_storage_internal_tests(void) {
 
     /* Edge case tests (T-03, T-08) */
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_interval);
+    RUN_TEST(storage_segment_build_l0_invalid_tombstone_seq_contract);
+    RUN_TEST(storage_segment_build_l0_invalid_tombstone_order_contract);
     RUN_TEST(storage_segment_build_small_page_bytes_clamped);
 
 #ifdef TL_DEBUG

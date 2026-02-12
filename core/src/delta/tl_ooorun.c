@@ -1,4 +1,5 @@
 #include "tl_ooorun.h"
+#include "../internal/tl_refcount.h"
 
 /*===========================================================================
  * Run Lifecycle
@@ -61,14 +62,10 @@ void tl_ooorun_release(tl_ooorun_t* run) {
         return;
     }
 
-    uint32_t old = tl_atomic_fetch_sub_u32(&run->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
-
-    if (old == 1) {
-        tl_atomic_fence(TL_MO_ACQUIRE);
+    TL_REFCOUNT_RELEASE(&run->refcnt, {
         tl__free(run->alloc, run->records);
         tl__free(run->alloc, run);
-    }
+    }, "ooorun double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================
@@ -197,14 +194,10 @@ void tl_ooorunset_release(tl_ooorunset_t* set) {
         return;
     }
 
-    uint32_t old = tl_atomic_fetch_sub_u32(&set->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
-
-    if (old == 1) {
-        tl_atomic_fence(TL_MO_ACQUIRE);
+    TL_REFCOUNT_RELEASE(&set->refcnt, {
         for (size_t i = 0; i < set->count; i++) {
             tl_ooorun_release(set->runs[i]);
         }
         tl__free(set->alloc, set);
-    }
+    }, "ooorunset double-release: refcnt was 0 before decrement");
 }

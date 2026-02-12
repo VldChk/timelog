@@ -305,8 +305,9 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         /* Priority for memruns: base at segment max gen + index */
         uint32_t base_priority = 0;
         if (tl_manifest_l0_count(manifest) > 0) {
-            base_priority = tl_manifest_l0_get(manifest,
-                                tl_manifest_l0_count(manifest) - 1)->generation + 1;
+            uint32_t newest_gen = tl_manifest_l0_get(
+                manifest, tl_manifest_l0_count(manifest) - 1)->generation;
+            base_priority = (newest_gen == UINT32_MAX) ? UINT32_MAX : (newest_gen + 1);
         }
 
         /*
@@ -315,7 +316,9 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
          * This preserves relative ordering within the valid range.
          */
         uint32_t priority;
-        if (base_priority > UINT32_MAX - (uint32_t)i) {
+        if (i > UINT32_MAX) {
+            priority = UINT32_MAX;
+        } else if (base_priority > UINT32_MAX - (uint32_t)i) {
             priority = UINT32_MAX;  /* Saturate on overflow */
         } else {
             priority = base_priority + (uint32_t)i;

@@ -552,9 +552,7 @@ void tl_close(tl_timelog_t* tl) {
     tl_status_t stop_st = tl_maint_stop(tl);
     if (stop_st == TL_EINTERNAL) {
         TL_LOG_ERROR("tl_close: worker join failed, aborting to prevent corruption");
-        TL_ASSERT_MSG(false, "tl_maint_stop() join failed during tl_close()");
-        /* If assertions disabled in release, abort anyway */
-        abort();
+        abort();  /* Worker thread may still be running; must not proceed */
     }
 
     /* Mark as closed (prevents further operations) */
@@ -611,6 +609,52 @@ void tl_close(tl_timelog_t* tl) {
 /* Forward declaration for deferred signaling (defined in maintenance section) */
 static void tl__maint_request_flush(tl_timelog_t* tl);
 
+static void tl__emit_drop_callbacks(tl_timelog_t* tl,
+                                    tl_record_t* dropped,
+                                    size_t dropped_len) {
+    if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
+        for (size_t i = 0; i < dropped_len; i++) {
+            tl->config.on_drop_handle(tl->config.on_drop_ctx,
+                                      dropped[i].ts,
+                                      dropped[i].handle);
+        }
+    }
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
+    }
+}
+
+static tl_status_t tl__next_op_seq(tl_timelog_t* tl, tl_seq_t* out) {
+    TL_ASSERT(tl != NULL);
+    TL_ASSERT(out != NULL);
+    if (tl->op_seq == UINT64_MAX) {
+        return TL_EOVERFLOW;
+    }
+    tl->op_seq++;
+    *out = tl->op_seq;
+    return TL_OK;
+}
+
+static bool tl__inc_ts_safe(tl_ts_t ts, tl_ts_t* next) {
+    TL_ASSERT(next != NULL);
+    if (ts == TL_TS_MAX) {
+        return false;
+    }
+    *next = ts + 1;
+    return true;
+}
+
+static void tl__range_end_from_inclusive_max(tl_ts_t max_inclusive,
+                                              tl_ts_t* t2,
+                                              bool* t2_unbounded) {
+    TL_ASSERT(t2 != NULL);
+    TL_ASSERT(t2_unbounded != NULL);
+    *t2_unbounded = !tl__inc_ts_safe(max_inclusive, t2);
+    if (*t2_unbounded) {
+        *t2 = 0;
+    }
+}
+
 /**
  * Handle sealing with backpressure after a successful write.
  *
@@ -627,8 +671,14 @@ static void tl__maint_request_flush(tl_timelog_t* tl);
  *         TL_EBUSY if backpressure occurred (write succeeded, do not retry)
  */
 static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
-                                                  bool* need_signal) {
+                                                  bool* need_signal,
+                                                  tl_record_t** out_dropped,
+                                                  size_t* out_dropped_len) {
     *need_signal = false;
+    if (out_dropped != NULL && out_dropped_len != NULL) {
+        *out_dropped = NULL;
+        *out_dropped_len = 0;
+    }
 
     /* Check if seal is needed */
     if (!tl_memtable_should_seal(&tl->memtable)) {
@@ -643,15 +693,29 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     }
 
     /* Try to seal (no signal: seal GROWS queue, not frees space) */
-    tl_status_t seal_st = tl_memtable_seal(&tl->memtable,
-                                            &tl->memtable_mu,
-                                            NULL,
-                                            tl->op_seq);
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    tl_status_t seal_st = tl_memtable_seal_ex(&tl->memtable,
+                                               &tl->memtable_mu,
+                                               NULL,
+                                               tl->op_seq,
+                                               &dropped,
+                                               &dropped_len);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
         *need_signal = true;
+        if (out_dropped != NULL && out_dropped_len != NULL) {
+            *out_dropped = dropped;
+            *out_dropped_len = dropped_len;
+        } else if (dropped != NULL) {
+            tl__free(&tl->alloc, dropped);
+        }
         return TL_OK;
+    }
+
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
     }
 
     if (seal_st != TL_EBUSY) {
@@ -692,15 +756,29 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     }
 
     /* Retry seal now that we have space (no signal: seal GROWS queue) */
-    seal_st = tl_memtable_seal(&tl->memtable,
-                                &tl->memtable_mu,
-                                NULL,
-                                tl->op_seq);
+    dropped = NULL;
+    dropped_len = 0;
+    seal_st = tl_memtable_seal_ex(&tl->memtable,
+                                   &tl->memtable_mu,
+                                   NULL,
+                                   tl->op_seq,
+                                   &dropped,
+                                   &dropped_len);
     if (seal_st == TL_OK) {
         /* Seal succeeded - signal needed (deferred until after unlock) */
         tl_atomic_inc_u64(&tl->seals_total);
         *need_signal = true;
+        if (out_dropped != NULL && out_dropped_len != NULL) {
+            *out_dropped = dropped;
+            *out_dropped_len = dropped_len;
+        } else if (dropped != NULL) {
+            tl__free(&tl->alloc, dropped);
+        }
         return TL_OK;
+    }
+
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
     }
 
     /* Seal failed after write succeeded. Return TL_EBUSY to signal backpressure.
@@ -728,12 +806,19 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     }
 
     bool need_signal = false;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
     /* Insert into memtable */
-    tl_seq_t seq = ++tl->op_seq;
+    tl_seq_t seq = 0;
+    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
+    if (seq_st != TL_OK) {
+        TL_UNLOCK_WRITER(tl);
+        return seq_st;
+    }
     tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle, seq);
     if (insert_st != TL_OK && insert_st != TL_EBUSY) {
         TL_UNLOCK_WRITER(tl);
@@ -741,7 +826,8 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal);
+    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal,
+                                                        &dropped, &dropped_len);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -749,6 +835,7 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     if (need_signal) {
         tl__maint_request_flush(tl);
     }
+    tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
     if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
         return TL_EBUSY;
@@ -773,12 +860,19 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     }
 
     bool need_signal = false;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
     /* Insert batch into memtable */
-    tl_seq_t seq = ++tl->op_seq;
+    tl_seq_t seq = 0;
+    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
+    if (seq_st != TL_OK) {
+        TL_UNLOCK_WRITER(tl);
+        return seq_st;
+    }
     tl_status_t insert_st = tl_memtable_insert_batch(&tl->memtable, records, n,
                                                       flags, seq);
     if (insert_st != TL_OK && insert_st != TL_EBUSY) {
@@ -794,7 +888,8 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal);
+    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal,
+                                                        &dropped, &dropped_len);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -802,6 +897,7 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     if (need_signal) {
         tl__maint_request_flush(tl);
     }
+    tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
     if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
         return TL_EBUSY;
@@ -830,12 +926,19 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
 
     tl_status_t st;
     bool need_signal = false;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
     /* Insert tombstone into memtable */
-    tl_seq_t seq = ++tl->op_seq;
+    tl_seq_t seq = 0;
+    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
+    if (seq_st != TL_OK) {
+        TL_UNLOCK_WRITER(tl);
+        return seq_st;
+    }
     st = tl_memtable_insert_tombstone(&tl->memtable, t1, t2, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
@@ -843,7 +946,7 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    st = handle_seal_with_backpressure(tl, &need_signal);
+    st = handle_seal_with_backpressure(tl, &need_signal, &dropped, &dropped_len);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -851,6 +954,7 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     if (need_signal) {
         tl__maint_request_flush(tl);
     }
+    tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
     return st;
 }
@@ -865,12 +969,23 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
 
     tl_status_t st;
     bool need_signal = false;
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+
+    if (cutoff == TL_TS_MIN) {
+        return TL_OK;
+    }
 
     /* Acquire writer lock */
     TL_LOCK_WRITER(tl);
 
-    /* Insert unbounded tombstone [TL_TS_MIN, cutoff) */
-    tl_seq_t seq = ++tl->op_seq;
+    /* Insert tombstone [TL_TS_MIN, cutoff) */
+    tl_seq_t seq = 0;
+    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
+    if (seq_st != TL_OK) {
+        TL_UNLOCK_WRITER(tl);
+        return seq_st;
+    }
     st = tl_memtable_insert_tombstone(&tl->memtable, TL_TS_MIN, cutoff, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
@@ -878,7 +993,7 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     }
 
     /* Handle seal with backpressure (deferred signaling) */
-    st = handle_seal_with_backpressure(tl, &need_signal);
+    st = handle_seal_with_backpressure(tl, &need_signal, &dropped, &dropped_len);
 
     TL_UNLOCK_WRITER(tl);
 
@@ -886,6 +1001,7 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     if (need_signal) {
         tl__maint_request_flush(tl);
     }
+    tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
     return st;
 }
@@ -1073,8 +1189,9 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
 
     tl_ts_t min_ts = tl_memrun_min_ts(mr);
     tl_ts_t max_ts = tl_memrun_max_ts(mr);
-    bool t2_unbounded = (max_ts == TL_TS_MAX);
-    tl_ts_t t2 = t2_unbounded ? 0 : (max_ts + 1);
+    tl_ts_t t2 = 0;
+    bool t2_unbounded = false;
+    tl__range_end_from_inclusive_max(max_ts, &t2, &t2_unbounded);
 
     st = tl_snapshot_collect_tombstones(snap, &tombs,
                                         min_ts, t2, t2_unbounded);
@@ -1581,14 +1698,10 @@ tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
         return TL_EINVAL;
     }
 
-    /* [ts, ts+1) - but guard against overflow */
-    if (ts == TL_TS_MAX) {
-        /* ts+1 would overflow, use unbounded with post-filter */
-        /* For simplicity, create [ts, +inf) and filter will naturally stop */
-        return iter_create_internal((tl_snapshot_t*)snap, ts, 0, true, out);
-    }
-
-    return iter_create_internal((tl_snapshot_t*)snap, ts, ts + 1, false, out);
+    tl_ts_t t2 = 0;
+    bool t2_unbounded = false;
+    tl__range_end_from_inclusive_max(ts, &t2, &t2_unbounded);
+    return iter_create_internal((tl_snapshot_t*)snap, ts, t2, t2_unbounded, out);
 }
 
 tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
@@ -1799,14 +1912,14 @@ tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
         return TL_EOF;
     }
 
-    /* Guard against overflow */
-    if (ts == TL_TS_MAX) {
+    tl_ts_t next = 0;
+    if (!tl__inc_ts_safe(ts, &next)) {
         return TL_EOF;
     }
 
     /* Create iterator starting at ts+1 */
     tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_since(snap, ts + 1, &it);
+    tl_status_t st = tl_iter_since(snap, next, &it);
     if (st != TL_OK) {
         return st;
     }

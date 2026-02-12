@@ -76,9 +76,22 @@ typedef struct tl_compact_ctx {
     tl_snapshot_t*      snapshot;        /* Pinned snapshot (for tombs + seq) */
     tl_seq_t            applied_seq;     /* Tombstone watermark for outputs */
 
-    /* Effective tombstone set */
-    tl_intervals_t      tombs;           /* Union of all tombstones (unclipped) */
-    tl_intervals_t      tombs_clipped;   /* Tombstones clipped to output range */
+    /* Effective tombstone sets (M-10: two distinct sets with different purposes)
+     *
+     * tombs:         Union of tombstones from INPUT segments only (unclipped).
+     *                Used for: residual tombstone computation (tombstones that
+     *                extend beyond the merged output window range).
+     *
+     * tombs_clipped: Tombstones from snapshot (global), clipped to output
+     *                window range [first_window_start, last_window_end).
+     *                Used for: record filtering during the K-way merge.
+     *
+     * Using the wrong set causes incorrect results:
+     * - tombs_clipped for residuals → misses tombstones outside window
+     * - tombs for filtering → applies tombstones from outside compaction scope
+     */
+    tl_intervals_t      tombs;           /* From input segments, unclipped */
+    tl_intervals_t      tombs_clipped;   /* From snapshot, clipped to output range */
 
     /* Output segments */
     tl_segment_t**      output_l1;       /* New L1 segments */

@@ -29,8 +29,13 @@ typedef struct tl_flush_ctx {
     tl_alloc_ctx_t* alloc;              /* Allocator */
     size_t          target_page_bytes;  /* Page size target */
     uint32_t        generation;         /* Generation for L0 segment */
-    tl_seq_t        applied_seq;        /* Tombstone watermark for output */
-    tl_intervals_imm_t tombs;           /* Tombstone fragments for filtering */
+    tl_seq_t        applied_seq;        /* Output segment watermark.
+                                         * Must satisfy: applied_seq >= max(ctx->tombs.max_seq). */
+    tl_intervals_imm_t tombs;           /* Snapshot-visible tombstones clipped to
+                                         * memrun bounds, used only for record
+                                         * filtering during merge. This is NOT
+                                         * the same set as mr->tombs persisted
+                                         * into the output L0 segment. */
     bool            collect_drops;      /* Collect dropped records */
 } tl_flush_ctx_t;
 

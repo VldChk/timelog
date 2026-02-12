@@ -17,14 +17,17 @@
  * The snapshot is completely immutable after acquisition and can be used
  * for queries without holding any locks.
  *
- * Acquisition Protocol (from Software Design Spec Section 4.2):
+ * Acquisition Protocol:
  * 1. Lock writer_mu
- * 2. Read seqlock (must be even)
- * 3. Acquire manifest reference
- * 4. Capture memview (locks memtable_mu internally)
- * 5. Read seqlock again
- * 6. Unlock writer_mu
- * 7. If seq1 != seq2 OR seq1 is odd: retry
+ * 2. Acquire manifest reference
+ * 3. Capture or reuse memview snapshot (captures under memtable_mu as needed)
+ * 4. Capture op_seq watermark
+ * 5. Unlock writer_mu
+ * 6. Sort fresh OOO head outside writer_mu, then cache if epoch still matches
+ *
+ * Consistency model:
+ * - writer_mu serializes publish and snapshot capture
+ * - no seqlock retry loop is required in the current implementation
  *
  * Thread Safety:
  * - Acquisition requires internal locking (handled automatically)
@@ -169,7 +172,7 @@ void tl_snapshot_iter_destroyed(tl_snapshot_t* snap);
  * Internal snapshot acquisition.
  * Called from tl_snapshot_acquire in tl_timelog.c.
  *
- * This function implements the seqlock protocol for snapshot consistency.
+ * This function implements snapshot acquisition under writer_mu.
  * The caller (tl_snapshot_acquire in timelog.h) validates tl != NULL and
  * tl->is_open.
  *

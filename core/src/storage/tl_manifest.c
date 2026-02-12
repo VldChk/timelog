@@ -1,4 +1,5 @@
 #include "tl_manifest.h"
+#include "../internal/tl_refcount.h"
 #include <stdlib.h>  /* qsort */
 
 /*===========================================================================
@@ -78,13 +79,9 @@ void tl_manifest_release(tl_manifest_t* m) {
         return;
     }
 
-    uint32_t old = tl_atomic_fetch_sub_u32(&m->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
-
-    if (old == 1) {
-        tl_atomic_fence(TL_MO_ACQUIRE);
-        manifest_destroy(m);
-    }
+    TL_REFCOUNT_RELEASE(&m->refcnt,
+                        manifest_destroy(m),
+                        "manifest double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================
@@ -136,7 +133,7 @@ size_t tl_manifest_l1_find_first_overlap(const tl_manifest_t* m, tl_ts_t t1) {
 
 void tl_manifest_builder_init(tl_manifest_builder_t* mb,
                                tl_alloc_ctx_t* alloc,
-                               tl_manifest_t* base) {
+                               const tl_manifest_t* base) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(alloc != NULL);
 
@@ -331,8 +328,8 @@ static int compare_l1_by_window_start(const void* a, const void* b) {
  * - Removal list contains duplicates
  *===========================================================================*/
 
-static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
-                                      tl_segment_t** remove_arr, size_t remove_len) {
+static tl_status_t validate_removals(tl_segment_t* const* base_arr, uint32_t base_len,
+                                      tl_segment_t* const* remove_arr, size_t remove_len) {
     /* Check each removal exists in base exactly once */
     for (size_t i = 0; i < remove_len; i++) {
         const tl_segment_t* target = remove_arr[i];
@@ -361,7 +358,7 @@ static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
 }
 
 /* Check if a segment pointer exists in an array. */
-static bool list_contains(tl_segment_t** arr, size_t len, const tl_segment_t* seg) {
+static bool list_contains(tl_segment_t* const* arr, size_t len, const tl_segment_t* seg) {
     for (size_t i = 0; i < len; i++) {
         if (arr[i] == seg) {
             return true;
@@ -428,8 +425,8 @@ static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
  * Count how many segments from base survive removal.
  * Caller must have already validated that removals are a valid subset.
  */
-static size_t count_kept(tl_segment_t** base_arr, uint32_t base_len,
-                          tl_segment_t** remove_arr, size_t remove_len) {
+static size_t count_kept(tl_segment_t* const* base_arr, uint32_t base_len,
+                          tl_segment_t* const* remove_arr, size_t remove_len) {
     size_t kept = 0;
     for (uint32_t i = 0; i < base_len; i++) {
         if (!is_in_removal_set(base_arr[i], remove_arr, remove_len)) {
@@ -544,9 +541,9 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     if (new_l0_count > 0) {
         if (mb->base != NULL) {
             for (uint32_t i = 0; i < mb->base->n_l0; i++) {
-                tl_segment_t* seg = mb->base->l0[i];
+                const tl_segment_t* seg = mb->base->l0[i];
                 if (!is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len)) {
-                    m->l0[m->n_l0++] = tl_segment_acquire(seg);
+                    m->l0[m->n_l0++] = tl_segment_acquire((tl_segment_t*)seg);
                 }
             }
         }
@@ -561,9 +558,9 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     if (new_l1_count > 0) {
         if (mb->base != NULL) {
             for (uint32_t i = 0; i < mb->base->n_l1; i++) {
-                tl_segment_t* seg = mb->base->l1[i];
+                const tl_segment_t* seg = mb->base->l1[i];
                 if (!is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
-                    m->l1[m->n_l1++] = tl_segment_acquire(seg);
+                    m->l1[m->n_l1++] = tl_segment_acquire((tl_segment_t*)seg);
                 }
             }
         }
@@ -658,6 +655,10 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
 
         /* Level check */
         if (m->l0[i]->level != TL_SEG_L0) {
+            return false;
+        }
+
+        if (i > 0 && m->l0[i]->generation < m->l0[i - 1]->generation) {
             return false;
         }
 

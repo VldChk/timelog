@@ -204,21 +204,6 @@ static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
     if (add.len == 0) {
         return TL_OK;  /* Nothing to add */
     }
-    if (tl_intervals_is_empty(accum)) {
-        /* First set - just copy */
-        for (size_t i = 0; i < add.len; i++) {
-            tl_status_t st;
-            if (add.data[i].end_unbounded) {
-                st = tl_intervals_insert_unbounded(accum, add.data[i].start,
-                                                   add.data[i].max_seq);
-            } else {
-                st = tl_intervals_insert(accum, add.data[i].start, add.data[i].end,
-                                         add.data[i].max_seq);
-            }
-            if (st != TL_OK) return st;
-        }
-        return TL_OK;
-    }
 
     /* Union into temp, then swap */
     tl_intervals_t temp;
@@ -252,8 +237,12 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         const tl_segment_t* seg = tl_manifest_l0_get(m, i);
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            /* Use safe union helper - ignore errors for this heuristic */
-            tl__tombs_union_into(&tombs, seg_tombs, (tl_alloc_ctx_t*)&tl->alloc);
+            tl_status_t union_st = tl__tombs_union_into(&tombs, seg_tombs,
+                                                        (tl_alloc_ctx_t*)&tl->alloc);
+            if (union_st != TL_OK) {
+                tl_intervals_destroy(&tombs);
+                return 1.0;
+            }
         }
     }
 
@@ -566,6 +555,46 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
     return TL_OK;
 }
 
+static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
+    size_t est = 0;
+
+    if (seg->record_count > SIZE_MAX / sizeof(tl_record_t)) {
+        return SIZE_MAX;
+    }
+    est = (size_t)seg->record_count * sizeof(tl_record_t);
+
+    if (seg->page_count > SIZE_MAX / sizeof(tl_page_meta_t)) {
+        return SIZE_MAX;
+    }
+    size_t page_meta_bytes = (size_t)seg->page_count * sizeof(tl_page_meta_t);
+    if (est > SIZE_MAX - page_meta_bytes) {
+        return SIZE_MAX;
+    }
+    est += page_meta_bytes;
+
+    if (seg->tombstones != NULL) {
+        if (seg->tombstones->n > SIZE_MAX / sizeof(tl_interval_t)) {
+            return SIZE_MAX;
+        }
+        size_t tomb_bytes = (size_t)seg->tombstones->n * sizeof(tl_interval_t);
+        if (est > SIZE_MAX - tomb_bytes) {
+            return SIZE_MAX;
+        }
+        est += tomb_bytes;
+        if (est > SIZE_MAX - sizeof(tl_tombstones_t)) {
+            return SIZE_MAX;
+        }
+        est += sizeof(tl_tombstones_t);
+    }
+
+    if (est > SIZE_MAX - sizeof(tl_segment_t)) {
+        return SIZE_MAX;
+    }
+    est += sizeof(tl_segment_t);
+
+    return est;
+}
+
 /**
  * Greedy L0 selection (original algorithm).
  *
@@ -658,11 +687,7 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
         size_t seg_bytes = 0;
         bool bytes_exceed = false;
         if (target_bytes > 0) {
-            if (seg->record_count > SIZE_MAX / sizeof(tl_record_t)) {
-                seg_bytes = SIZE_MAX;
-            } else {
-                seg_bytes = (size_t)seg->record_count * sizeof(tl_record_t);
-            }
+            seg_bytes = tl__segment_estimate_bytes(seg);
 
             if (seg_bytes > SIZE_MAX - est_bytes) {
                 bytes_exceed = true;
@@ -770,37 +795,60 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
  *===========================================================================*/
 
 /**
- * Ensure output_l1 array has capacity for at least one more segment.
- * Grows the array geometrically (2x) when needed.
+ * Grow a dynamic array to satisfy required element capacity.
+ *
+ * Uses shared growth policy helpers and optionally zeroes the newly exposed tail.
  */
-static tl_status_t tl__ensure_output_capacity(tl_compact_ctx_t* ctx) {
-    if (ctx->output_l1_len < ctx->output_l1_cap) {
-        return TL_OK;  /* Already have space */
+static tl_status_t tl__grow_array(tl_alloc_ctx_t* alloc,
+                                   void** arr,
+                                   size_t* cap,
+                                   size_t required,
+                                   size_t elem_size,
+                                   size_t min_cap,
+                                   bool zero_new) {
+    TL_ASSERT(alloc != NULL);
+    TL_ASSERT(arr != NULL);
+    TL_ASSERT(cap != NULL);
+    TL_ASSERT(elem_size > 0);
+    TL_ASSERT(min_cap > 0);
+
+    if (*cap >= required) {
+        return TL_OK;
     }
 
-    /* Grow capacity: start at 16, then double */
-    size_t new_cap = (ctx->output_l1_cap == 0) ? 16 : ctx->output_l1_cap * 2;
-
-    /* Overflow guard: check that new_cap * sizeof(ptr) doesn't wrap */
-    if (new_cap > SIZE_MAX / sizeof(tl_segment_t*)) {
+    size_t old_cap = *cap;
+    size_t new_cap = tl__grow_capacity(old_cap, required, min_cap);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, elem_size)) {
         return TL_EOVERFLOW;
     }
 
-    tl_segment_t** new_arr = (tl_segment_t**)tl__realloc(ctx->alloc,
-                                                          (void*)ctx->output_l1,
-                                                          new_cap * sizeof(tl_segment_t*));
+    void* new_arr = tl__realloc(alloc, *arr, new_cap * elem_size);
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
 
-    /* Zero out the new portion */
-    for (size_t i = ctx->output_l1_cap; i < new_cap; i++) {
-        new_arr[i] = NULL;
+    if (zero_new && new_cap > old_cap) {
+        memset((char*)new_arr + (old_cap * elem_size), 0,
+               (new_cap - old_cap) * elem_size);
     }
 
-    ctx->output_l1 = new_arr;
-    ctx->output_l1_cap = new_cap;
+    *arr = new_arr;
+    *cap = new_cap;
     return TL_OK;
+}
+
+/**
+ * Ensure output_l1 array has capacity for at least one more segment.
+ * Grows the array geometrically (2x) when needed.
+ */
+static tl_status_t tl__ensure_output_capacity(tl_compact_ctx_t* ctx) {
+    return tl__grow_array(ctx->alloc,
+                          (void**)&ctx->output_l1,
+                          &ctx->output_l1_cap,
+                          ctx->output_l1_len + 1,
+                          sizeof(tl_segment_t*),
+                          16,
+                          true);
 }
 
 /**
@@ -810,23 +858,15 @@ static tl_status_t tl__ensure_output_capacity(tl_compact_ctx_t* ctx) {
 static tl_status_t tl__push_dropped_record(tl_compact_ctx_t* ctx,
                                             tl_ts_t ts,
                                             tl_handle_t handle) {
-    /* Ensure capacity */
-    if (ctx->dropped_len >= ctx->dropped_cap) {
-        size_t new_cap = (ctx->dropped_cap == 0) ? 64 : ctx->dropped_cap * 2;
-
-        /* Overflow guard */
-        if (new_cap > SIZE_MAX / sizeof(tl_record_t)) {
-            return TL_EOVERFLOW;
-        }
-
-        tl_record_t* new_arr = tl__realloc(ctx->alloc, ctx->dropped_records,
-                                            new_cap * sizeof(tl_record_t));
-        if (new_arr == NULL) {
-            return TL_ENOMEM;
-        }
-
-        ctx->dropped_records = new_arr;
-        ctx->dropped_cap = new_cap;
+    tl_status_t st = tl__grow_array(ctx->alloc,
+                                    (void**)&ctx->dropped_records,
+                                    &ctx->dropped_cap,
+                                    ctx->dropped_len + 1,
+                                    sizeof(tl_record_t),
+                                    64,
+                                    false);
+    if (st != TL_OK) {
+        return st;
     }
 
     /* Append record */
@@ -1001,6 +1041,9 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
 
 tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
     tl_status_t st;
+    if (ctx->applied_seq == 0) {
+        return TL_EINVAL;
+    }
 
     /* ===================================================================
      * Step 1: Build effective tombstone set
@@ -1028,6 +1071,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
             st = tl__tombs_union_into(&ctx->tombs, seg_tombs, ctx->alloc);
             if (st != TL_OK) return st;
+        }
+    }
+    for (size_t i = 0; i < tl_intervals_len(&ctx->tombs); i++) {
+        if (tl_intervals_get(&ctx->tombs, i)->max_seq > ctx->applied_seq) {
+            return TL_EINVAL;
         }
     }
 
@@ -1060,6 +1108,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             tl_intervals_clip(&ctx->tombs_clipped, first_start, last_end);
         } else {
             tl_intervals_clip_lower(&ctx->tombs_clipped, first_start);
+        }
+    }
+    for (size_t i = 0; i < tl_intervals_len(&ctx->tombs_clipped); i++) {
+        if (tl_intervals_get(&ctx->tombs_clipped, i)->max_seq > ctx->applied_seq) {
+            return TL_EINVAL;
         }
     }
 
@@ -1169,7 +1222,9 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
     while (!tl_heap_is_empty(&heap)) {
         tl_heap_entry_t min_entry;
         st = tl_heap_pop(&heap, &min_entry);
-        if (st != TL_OK) break;
+        if (st != TL_OK) {
+            goto cleanup;
+        }
 
         /* Refill heap from the source that provided this record */
         tl_segment_iter_t* source_iter = (tl_segment_iter_t*)min_entry.iter;
@@ -1298,8 +1353,7 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
                                                    tl_manifest_t** out) {
     tl_status_t st;
     tl_manifest_builder_t builder;
-    /* Cast away const - builder init doesn't modify base, only copies pointers */
-    tl_manifest_builder_init(&builder, ctx->alloc, (tl_manifest_t*)base);
+    tl_manifest_builder_init(&builder, ctx->alloc, base);
 
     /* Queue removal of input L0 segments */
     for (size_t i = 0; i < ctx->input_l0_len; i++) {

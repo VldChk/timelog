@@ -90,9 +90,13 @@ tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
     tl_record_t rec;
     tl_seq_t watermark = 0;
     tl_status_t st = tl_submerge_next(&it->merge, &rec, &watermark);
-    if (st != TL_OK) {
+    if (st == TL_EOF) {
         it->done = true;
         return TL_EOF;
+    }
+    if (st != TL_OK) {
+        it->done = true;
+        return st;
     }
 
     if (out != NULL) {
@@ -105,22 +109,27 @@ tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
     return TL_OK;
 }
 
-void tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target) {
+tl_status_t tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target) {
     TL_ASSERT(it != NULL);
 
     if (it->done) {
-        return;
+        return TL_OK;
     }
 
     if (target <= it->t1) {
-        return;
+        return TL_OK;
     }
 
     if (!it->t2_unbounded && target >= it->t2) {
         it->done = true;
-        return;
+        return TL_OK;
     }
 
-    tl_submerge_seek(&it->merge, target);
+    tl_status_t st = tl_submerge_seek(&it->merge, target);
+    if (st != TL_OK) {
+        it->done = true;
+        return st;
+    }
     it->done = tl_submerge_done(&it->merge);
+    return TL_OK;
 }

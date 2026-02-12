@@ -27,6 +27,17 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out) {
         return TL_EOF;
     }
 
+    if (it->tomb_cursor.len == 0) {
+        tl_seq_t watermark = 0;
+        tl_status_t st = tl_kmerge_iter_next(it->merge, out, &watermark);
+        if (st == TL_EOF) {
+            it->done = true;
+        } else if (st != TL_OK) {
+            it->done = true;
+        }
+        return st;
+    }
+
     /* Loop until we find a visible record or exhaust the merge iterator */
     for (;;) {
         /* Fetch next record from merge iterator */

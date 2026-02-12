@@ -226,7 +226,8 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  *
  * THREADING:
  * - May be called from the maintenance worker thread (background mode)
- * - May be called from the thread invoking tl_maint_step() (manual mode)
+ * - May be called from the thread invoking tl_maint_step(), tl_flush(),
+ *   or any API path that publishes physical drops
  *
  * Treat this as a "retire" notification, not a "free now" signal.
  *
@@ -240,13 +241,9 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
  * - Immediately freeing user payload in this callback
  *
  * The callback is invoked after manifest publish completes, without holding
- * locks. It must not call back into timelog APIs. If compaction fails before
- * publish, no callbacks are invoked for that compaction attempt.
- *
- * THREAD SAFETY:
- * - May be called from the maintenance worker thread (background mode)
- * - May be called from the thread that invokes tl_maint_step() (manual mode)
- * - Must be thread-safe if timelog is accessed from multiple threads
+ * timelog internal locks. It must not call back into timelog APIs.
+ * If compaction/flush/seal fails before publish/commit, callbacks from that
+ * attempt are not emitted.
  *
  * LIFETIME (H-05 contract clarification):
  * - Caller retains ownership of handles not covered by tombstones
@@ -354,9 +351,9 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  * @param tl Instance to close (NULL is safe)
  *
  * DATA LOSS WARNING:
- * tl_close() does NOT flush unflushed records from the memtable.
+ * tl_close() does NOT flush/materialize unflushed records from the memtable.
  * Any records appended after the last tl_flush() call will be dropped.
- * To persist all data before close:
+ * To materialize all data before close:
  *   tl_flush(tl);   // Flush remaining memtable records
  *   tl_close(tl);   // Now safe to close
  *
@@ -410,10 +407,17 @@ typedef enum tl_append_flags {
 
 TL_API tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
 
+/*
+ * Batch sequencing contract:
+ * a single internal operation sequence is assigned to the whole batch.
+ */
 TL_API tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                                    size_t n, uint32_t flags);
 
-/* Delete range [t1, t2). Unbounded delete-to-infinity is not exposed publicly. */
+/*
+ * Delete range [t1, t2). Unbounded delete-to-infinity is not exposed publicly.
+ * Note: half-open ranges cannot represent a single-point delete at TL_TS_MAX.
+ */
 TL_API tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
 
 /* Delete [MIN_TS, cutoff) */
@@ -461,7 +465,7 @@ TL_API tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
 
 /*
  * Iterate all records with timestamp == ts (range form with overflow guard).
- * If any tombstone in the snapshot covers ts, the iterator is empty.
+ * A row is filtered only when max_tombstone_seq(ts) > row_watermark.
  */
 TL_API tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);
@@ -469,8 +473,8 @@ TL_API tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
 /**
  * Create an iterator over all records with timestamp == ts.
  *
- * Duplicates are returned; tie order is unspecified. If any tombstone in the
- * snapshot covers ts, the iterator is empty.
+ * Duplicates are returned; tie order is unspecified.
+ * A row is filtered only when max_tombstone_seq(ts) > row_watermark.
  */
 TL_API tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);

@@ -84,8 +84,9 @@ tl_status_t tl_active_iter_next(tl_active_iter_t* it, tl_record_t* out,
  *
  * @param it     Iterator
  * @param target Target timestamp
+ * @return TL_OK on success, TL_ENOMEM on internal heap growth failure
  */
-void tl_active_iter_seek(tl_active_iter_t* it, tl_ts_t target);
+tl_status_t tl_active_iter_seek(tl_active_iter_t* it, tl_ts_t target);
 
 /*===========================================================================
  * State Queries

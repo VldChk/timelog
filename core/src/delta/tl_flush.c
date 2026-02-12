@@ -90,6 +90,16 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     TL_ASSERT(out_seg != NULL);
     TL_ASSERT(out_dropped != NULL);
     TL_ASSERT(out_dropped_len != NULL);
+    TL_ASSERT(ctx->applied_seq > 0);
+
+    if (ctx->applied_seq == 0) {
+        return TL_EINVAL;
+    }
+    for (size_t i = 0; i < ctx->tombs.len; i++) {
+        if (ctx->tombs.data[i].max_seq > ctx->applied_seq) {
+            return TL_EINVAL;
+        }
+    }
 
     *out_seg = NULL;
     *out_dropped = NULL;
@@ -254,6 +264,8 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         if (ctx->tombs.len > 0) {
             tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, top->ts);
         }
+        /* Tie semantics: tomb_seq == watermark → record kept (strict >).
+         * The tombstone was already applied at build time and this record survived. */
         if (tomb_seq <= top->watermark) {
             merged[i].ts = top->ts;
             merged[i].handle = top->handle;

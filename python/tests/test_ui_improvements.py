@@ -226,11 +226,11 @@ class TestPointAccess:
         with Timelog() as log:
             assert log[999] == []
 
-    def test_getitem_ts_max_raises(self):
-        """Point query at TL_TS_MAX raises ValueError (overflow guard)."""
+    def test_getitem_ts_max_works(self):
+        """Point query at TL_TS_MAX delegates to C point path."""
         with Timelog() as log:
-            with pytest.raises(ValueError, match="TL_TS_MAX"):
-                log[TL_TS_MAX]
+            log[TL_TS_MAX] = "edge"
+            assert log[TL_TS_MAX] == ["edge"]
 
 
 class TestIteratorView:
@@ -458,11 +458,12 @@ class TestInsertOnError:
             with pytest.raises(ValueError, match="expects"):
                 log.extend([(100, "a"), 42, (200, "b")], insert_on_error=True)
 
-    def test_streaming_skips_below_min_ts(self):
-        """insert_on_error=True skips below min_ts rather than raising."""
+    def test_streaming_below_min_ts_raises(self):
+        """insert_on_error=True does not swallow min_ts validation errors."""
         with Timelog(min_ts=50) as log:
-            log.extend([(10, "a"), (60, "b")], insert_on_error=True)
-            assert list(log) == [(60, "b")]
+            with pytest.raises(ValueError, match="below min_ts"):
+                log.extend([(10, "a"), (60, "b")], insert_on_error=True)
+            assert list(log) == []
 
     def test_atomic_with_min_ts(self):
         """insert_on_error=False + min_ts rejects entire batch."""
@@ -544,8 +545,8 @@ class TestNowTs:
 
 class TestConstants:
     def test_tl_ts_min(self):
-        """TL_TS_MIN is INT64_MIN + 1."""
-        assert TL_TS_MIN == -(2**63) + 1
+        """TL_TS_MIN is INT64_MIN."""
+        assert TL_TS_MIN == -(2**63)
 
     def test_tl_ts_max(self):
         """TL_TS_MAX is INT64_MAX."""

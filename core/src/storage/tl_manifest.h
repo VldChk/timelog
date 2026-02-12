@@ -105,7 +105,7 @@ TL_INLINE uint32_t tl_manifest_refcnt(const tl_manifest_t* m) {
 
 typedef struct tl_manifest_builder {
     tl_alloc_ctx_t* alloc;
-    tl_manifest_t*  base;           /* Old manifest (NULL for initial) */
+    const tl_manifest_t* base;      /* Old manifest (NULL for initial) */
 
     /* Pending additions */
     tl_segment_t**  add_l0;
@@ -132,7 +132,7 @@ typedef struct tl_manifest_builder {
  */
 void tl_manifest_builder_init(tl_manifest_builder_t* mb,
                                tl_alloc_ctx_t* alloc,
-                               tl_manifest_t* base);
+                               const tl_manifest_t* base);
 
 /**
  * Destroy builder and free temporary buffers.

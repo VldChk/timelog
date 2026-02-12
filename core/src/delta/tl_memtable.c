@@ -60,8 +60,13 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
     mt->ooo_head_last_handle = 0;
     mt->ooo_next_gen = 0;
 
-    /* Derive OOO chunk size from budget (bounded) */
-    size_t budget_records = (ooo_budget_bytes / TL_RECORD_SIZE);
+    /* Derive OOO chunk size from budget (bounded).
+     * Use head-record footprint (record + seq watermark) to avoid
+     * optimistic chunk sizing that can overshoot OOO budget pressure. */
+    size_t ooo_head_record_bytes = TL_RECORD_SIZE + sizeof(tl_seq_t);
+    size_t budget_records = (ooo_head_record_bytes == 0)
+        ? 0
+        : (ooo_budget_bytes / ooo_head_record_bytes);
     size_t chunk = budget_records / TL_OOO_TARGET_RUNS;
     if (chunk < TL_OOO_CHUNK_MIN_RECORDS) {
         chunk = TL_OOO_CHUNK_MIN_RECORDS;
@@ -151,11 +156,7 @@ static void memtable_adjust_tomb_bytes(tl_memtable_t* mt,
 
     if (tl__alloc_would_overflow(diff, sizeof(tl_interval_t))) {
         /* Saturate conservatively on overflow. */
-        if (after_len > before_len) {
-            mt->active_bytes_est = SIZE_MAX;
-        } else {
-            mt->active_bytes_est = 0;
-        }
+        mt->active_bytes_est = SIZE_MAX;
         return;
     }
 
@@ -165,7 +166,7 @@ static void memtable_adjust_tomb_bytes(tl_memtable_t* mt,
         memtable_add_bytes(mt, bytes);
     } else {
         if (mt->active_bytes_est < bytes) {
-            mt->active_bytes_est = 0;
+            mt->active_bytes_est = SIZE_MAX;
         } else {
             mt->active_bytes_est -= bytes;
         }
@@ -219,9 +220,42 @@ static void ooo_head_note_append(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t hand
     mt->ooo_head_last_handle = handle;
 }
 
+static tl_status_t memtable_collect_drop(tl_memtable_t* mt,
+                                         tl_record_t** dropped,
+                                         size_t* dropped_len,
+                                         size_t* dropped_cap,
+                                         tl_ts_t ts,
+                                         tl_handle_t handle) {
+    if (dropped == NULL || dropped_len == NULL || dropped_cap == NULL) {
+        return TL_OK;
+    }
+
+    if (*dropped_len >= *dropped_cap) {
+        size_t new_cap = (*dropped_cap == 0) ? 64 : (*dropped_cap * 2);
+        if (tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+            return TL_EOVERFLOW;
+        }
+        tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
+                                           new_cap * sizeof(tl_record_t));
+        if (new_arr == NULL) {
+            return TL_ENOMEM;
+        }
+        *dropped = new_arr;
+        *dropped_cap = new_cap;
+    }
+
+    (*dropped)[*dropped_len].ts = ts;
+    (*dropped)[*dropped_len].handle = handle;
+    (*dropped_len)++;
+    return TL_OK;
+}
+
 static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
                                            bool required,
-                                           tl_seq_t applied_seq) {
+                                           tl_seq_t applied_seq,
+                                           tl_record_t** dropped,
+                                           size_t* dropped_len,
+                                           size_t* dropped_cap) {
     size_t head_len = tl_recvec_len(&mt->ooo_head);
     if (head_len == 0) {
         return TL_OK;
@@ -280,6 +314,14 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
             tomb_seq = tl_intervals_cursor_max_seq(&cur, copy[i].ts);
         }
         if (tomb_seq > copy_seqs[i]) {
+            tl_status_t drop_st = memtable_collect_drop(mt, dropped, dropped_len,
+                                                        dropped_cap, copy[i].ts,
+                                                        copy[i].handle);
+            if (drop_st != TL_OK) {
+                tl__free(mt->alloc, copy_seqs);
+                tl__free(mt->alloc, copy);
+                return drop_st;
+            }
             continue;
         }
         copy[out_len++] = copy[i];
@@ -287,7 +329,7 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
 
     tl__free(mt->alloc, copy_seqs);
 
-    size_t dropped = head_len - out_len;
+    size_t dropped_count = head_len - out_len;
     size_t dec = 0;
     bool dec_valid = true;
     if (head_len > 0) {
@@ -296,9 +338,9 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
         } else {
             dec_valid = false;
         }
-        if (dec_valid && dropped > 0) {
-            if (!tl__alloc_would_overflow(dropped, TL_RECORD_SIZE)) {
-                size_t drop_bytes = dropped * TL_RECORD_SIZE;
+        if (dec_valid && dropped_count > 0) {
+            if (!tl__alloc_would_overflow(dropped_count, TL_RECORD_SIZE)) {
+                size_t drop_bytes = dropped_count * TL_RECORD_SIZE;
                 if (dec <= SIZE_MAX - drop_bytes) {
                     dec += drop_bytes;
                 } else {
@@ -318,9 +360,9 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
         mt->ooo_head_last_ts = TL_TS_MIN;
         mt->ooo_head_last_handle = 0;
         if (!dec_valid) {
-            mt->active_bytes_est = 0;
+            mt->active_bytes_est = SIZE_MAX;
         } else if (mt->active_bytes_est < dec) {
-            mt->active_bytes_est = 0;
+            mt->active_bytes_est = SIZE_MAX;
         } else {
             mt->active_bytes_est -= dec;
         }
@@ -359,9 +401,9 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
 
     mt->epoch++;
     if (!dec_valid) {
-        mt->active_bytes_est = 0;
+        mt->active_bytes_est = SIZE_MAX;
     } else if (mt->active_bytes_est < dec) {
-        mt->active_bytes_est = 0;
+        mt->active_bytes_est = SIZE_MAX;
     } else {
         mt->active_bytes_est -= dec;
     }
@@ -424,7 +466,8 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
 
     /* Best-effort head flush when threshold reached */
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
-        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq);
+        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
+                                                       NULL, NULL, NULL);
         if (flush_st != TL_OK) {
             return TL_EBUSY; /* Insert succeeded, flush failed */
         }
@@ -591,7 +634,8 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
 
     /* Best-effort head flush when threshold reached */
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
-        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq);
+        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
+                                                       NULL, NULL, NULL);
         if (flush_st != TL_OK) {
             return TL_EBUSY; /* Inserted all records, flush failed */
         }
@@ -683,11 +727,22 @@ bool tl_memtable_is_active_empty(const tl_memtable_t* mt) {
            tl_intervals_is_empty(&mt->active_tombs);
 }
 
-tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
-                              tl_seq_t applied_seq) {
+tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
+                                 tl_seq_t applied_seq,
+                                 tl_record_t** out_dropped,
+                                 size_t* out_dropped_len) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(mu != NULL);
     TL_ASSERT(applied_seq > 0);
+
+    if (out_dropped != NULL && out_dropped_len != NULL) {
+        *out_dropped = NULL;
+        *out_dropped_len = 0;
+    }
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    size_t dropped_cap = 0;
 
     /* Step 1: Check if anything to seal (no lock needed - under writer_mu) */
     if (tl_memtable_is_active_empty(mt)) {
@@ -741,8 +796,12 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
     }
 
     /* Step 4: Flush OOO head (required at seal) */
-    tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq);
+    tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq,
+                                                   &dropped, &dropped_len, &dropped_cap);
     if (flush_st != TL_OK) {
+        if (dropped != NULL) {
+            tl__free(mt->alloc, dropped);
+        }
         tl__free(mt->alloc, mr);
         return flush_st; /* Active state PRESERVED */
     }
@@ -763,6 +822,7 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
         if (run_seqs != NULL) tl__free(mt->alloc, run_seqs);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
         if (tombs != NULL) tl__free(mt->alloc, tombs);
+        if (dropped != NULL) tl__free(mt->alloc, dropped);
         tl__free(mt->alloc, mr);
         return TL_EINTERNAL;
     }
@@ -775,6 +835,18 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
         for (size_t i = 0; i < run_len; i++) {
             tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&cur, run[i].ts);
             if (tomb_seq > run_seqs[i]) {
+                tl_status_t drop_st = memtable_collect_drop(mt, &dropped, &dropped_len,
+                                                            &dropped_cap, run[i].ts,
+                                                            run[i].handle);
+                if (drop_st != TL_OK) {
+                    if (run != NULL) tl__free(mt->alloc, run);
+                    if (run_seqs != NULL) tl__free(mt->alloc, run_seqs);
+                    if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
+                    if (tombs != NULL) tl__free(mt->alloc, tombs);
+                    if (dropped != NULL) tl__free(mt->alloc, dropped);
+                    tl__free(mt->alloc, mr);
+                    return drop_st;
+                }
                 continue;
             }
             run[out_len++] = run[i];
@@ -798,6 +870,7 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
         if (run != NULL) tl__free(mt->alloc, run);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
         if (tombs != NULL) tl__free(mt->alloc, tombs);
+        if (dropped != NULL) tl__free(mt->alloc, dropped);
         tl__free(mt->alloc, mr);
         return TL_EINTERNAL;
     }
@@ -813,6 +886,7 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
         tl_memrun_release(mr);
+        if (dropped != NULL) tl__free(mt->alloc, dropped);
         return TL_EBUSY;
     }
     TL_ASSERT(mt->sealed_len < mt->sealed_max_runs);
@@ -838,7 +912,19 @@ tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
         tl_cond_signal(cond);
     }
 
+    if (out_dropped != NULL && out_dropped_len != NULL) {
+        *out_dropped = dropped;
+        *out_dropped_len = dropped_len;
+    } else if (dropped != NULL) {
+        tl__free(mt->alloc, dropped);
+    }
+
     return TL_OK;
+}
+
+tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
+                              tl_seq_t applied_seq) {
+    return tl_memtable_seal_ex(mt, mu, cond, applied_seq, NULL, NULL);
 }
 
 /*===========================================================================

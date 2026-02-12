@@ -128,16 +128,16 @@ tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out,
     return TL_OK;
 }
 
-void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
+tl_status_t tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
     TL_ASSERT(sm != NULL);
 
     if (tl_heap_is_empty(&sm->heap)) {
-        return;
+        return TL_OK;
     }
 
     const tl_heap_entry_t* min = tl_heap_peek(&sm->heap);
     if (min != NULL && min->ts >= target) {
-        return;
+        return TL_OK;
     }
 
     while (!tl_heap_is_empty(&sm->heap)) {
@@ -170,6 +170,10 @@ void tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target) {
             .iter = src
         };
         tl_status_t st = tl_heap_push(&sm->heap, &new_entry);
-        TL_ASSERT(st == TL_OK);
+        if (st != TL_OK) {
+            return st;
+        }
     }
+
+    return TL_OK;
 }

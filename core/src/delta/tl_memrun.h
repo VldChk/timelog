@@ -70,8 +70,18 @@ struct tl_memrun {
 
     /*-----------------------------------------------------------------------
      * Tombstone watermark
+     *
+     * Same contract as tl_segment_t.applied_seq: all tombstones with
+     * seq <= applied_seq were physically applied during seal for this source.
+     *
+     * Read-path filtering uses strict greater-than semantics:
+     * - tomb_seq > source_watermark  -> tombstone is newer, record may be dropped
+     * - tomb_seq == source_watermark -> tombstone already applied, record is kept
+     *
+     * The value is set to op_seq at seal time, which is >= max_seq of all
+     * tombstones visible at that point. See tl_segment.h for the full contract.
      *-----------------------------------------------------------------------*/
-    tl_seq_t        applied_seq; /* Tombstones <= applied_seq already applied */
+    tl_seq_t        applied_seq;
 };
 
 /*===========================================================================

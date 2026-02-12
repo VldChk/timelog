@@ -1,4 +1,5 @@
 #include "tl_segment.h"
+#include "../internal/tl_refcount.h"
 #include <string.h>  /* memcpy */
 
 /*===========================================================================
@@ -211,6 +212,9 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     if (record_count == 0 && tombstones_len == 0) {
         return TL_EINVAL;
     }
+    if (applied_seq == 0) {
+        return TL_EINVAL;
+    }
 
     /* Check tombstones_len overflow */
     if (tombstones_len > UINT32_MAX) {
@@ -228,9 +232,34 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
-    /* Validate tombstone intervals: must be non-empty (end > start for bounded) */
+    /* Validate tombstone intervals for release builds as well.
+     * This protects callers that bypass debug-only validators. */
     for (size_t i = 0; i < tombstones_len; i++) {
-        if (!tombstones[i].end_unbounded && tombstones[i].end <= tombstones[i].start) {
+        const tl_interval_t* cur = &tombstones[i];
+        if (cur->max_seq == 0 || cur->max_seq > applied_seq) {
+            return TL_EINVAL;
+        }
+        if (!cur->end_unbounded && cur->end <= cur->start) {
+            return TL_EINVAL;
+        }
+        if (i > 0) {
+            const tl_interval_t* prev = &tombstones[i - 1];
+            if (cur->start < prev->start) {
+                return TL_EINVAL;
+            }
+            if (prev->end_unbounded) {
+                return TL_EINVAL;
+            }
+            if (!prev->end_unbounded && prev->end > cur->start) {
+                return TL_EINVAL;
+            }
+            if (!prev->end_unbounded &&
+                prev->end == cur->start &&
+                prev->max_seq == cur->max_seq) {
+                return TL_EINVAL;
+            }
+        }
+        if (cur->end_unbounded && i + 1 < tombstones_len) {
             return TL_EINVAL;
         }
     }
@@ -347,6 +376,10 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
+    if (applied_seq == 0) {
+        return TL_EINVAL;
+    }
+
     /* L1 must have records */
     if (record_count == 0 || records == NULL) {
         return TL_EINVAL;
@@ -430,18 +463,9 @@ void tl_segment_release(tl_segment_t* seg) {
      * Do NOT add a pre-check load (TOCTOU race). If old==0 after decrement,
      * this indicates a double-release bug which the assertion catches.
      */
-    uint32_t old = tl_atomic_fetch_sub_u32(&seg->refcnt, 1, TL_MO_RELEASE);
-    /* M-08 fix: Use TL_VERIFY to avoid UB in release on double-release. */
-    TL_VERIFY(old >= 1 && "segment double-release: refcnt was 0 before decrement");
-
-    if (old == 1) {
-        /*
-         * We're the last owner. Acquire fence synchronizes with all prior
-         * releasers to ensure we see all their writes before destruction.
-         */
-        tl_atomic_fence(TL_MO_ACQUIRE);
-        segment_destroy(seg);
-    }
+    TL_REFCOUNT_RELEASE(&seg->refcnt,
+                        segment_destroy(seg),
+                        "segment double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================
@@ -484,6 +508,9 @@ bool tl_segment_validate(const tl_segment_t* seg) {
     if (seg->level != TL_SEG_L0 && seg->level != TL_SEG_L1) {
         return false;
     }
+    if (seg->applied_seq == 0) {
+        return false;
+    }
 
     /*
      * CRITICAL: Validate page_count == catalog.n_pages BEFORE any indexing.
@@ -509,6 +536,11 @@ bool tl_segment_validate(const tl_segment_t* seg) {
         if (seg->tombstones != NULL && seg->tombstones->n > 0) {
             if (!tl_intervals_arr_validate(seg->tombstones->v, seg->tombstones->n)) {
                 return false;
+            }
+            for (uint32_t i = 0; i < seg->tombstones->n; i++) {
+                if (seg->tombstones->v[i].max_seq > seg->applied_seq) {
+                    return false;
+                }
             }
         }
 
