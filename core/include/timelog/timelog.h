@@ -498,6 +498,17 @@ TL_API tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t 
                                  tl_scan_fn fn, void* ctx);
 
 /*===========================================================================
+ * Count API
+ *===========================================================================*/
+
+/* Count visible records in full snapshot range [MIN_TS, +inf). */
+TL_API tl_status_t tl_count(const tl_timelog_t* tl, uint64_t* out);
+
+/* Count visible records in [t1, t2). */
+TL_API tl_status_t tl_count_range(const tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2,
+                                  uint64_t* out);
+
+/*===========================================================================
  * Timestamp navigation
  *
  * Convenience functions for finding min/max timestamps and navigating between
