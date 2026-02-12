@@ -1,6 +1,7 @@
 #include "tl_flush.h"
 #include "../internal/tl_heap.h"
 #include "../internal/tl_intervals.h"
+#include "../internal/tl_formal_trace.h"
 
 /*===========================================================================
  * Merge Iterator Implementation
@@ -104,6 +105,18 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     *out_seg = NULL;
     *out_dropped = NULL;
     *out_dropped_len = 0;
+
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "flush_build",
+        .seq = ctx->applied_seq,
+        .t1 = tl_memrun_min_ts(mr),
+        .t2 = tl_memrun_max_ts(mr),
+        .src0 = (uint64_t)mr->run_len,
+        .src1 = (uint64_t)mr->ooo_total_len,
+        .wm0 = (uint64_t)ctx->applied_seq,
+        .wm1 = (uint64_t)mr->applied_seq,
+        .status = TL_OK
+    });
 
     /*
      * Step 1: Addition overflow check FIRST.
@@ -358,6 +371,17 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
 
     *out_dropped = dropped;
     *out_dropped_len = dropped_len;
+
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "flush_build_done",
+        .seq = ctx->applied_seq,
+        .t1 = tl_memrun_min_ts(mr),
+        .t2 = tl_memrun_max_ts(mr),
+        .src0 = (uint64_t)kept,
+        .src1 = (uint64_t)dropped_len,
+        .wm0 = (uint64_t)ctx->applied_seq,
+        .status = TL_OK
+    });
 
     return TL_OK;
 }
