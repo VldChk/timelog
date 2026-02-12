@@ -2223,6 +2223,47 @@ PyTimelog_exit(PyTimelog* self, PyObject* args)
     Py_RETURN_FALSE;  /* Don't suppress original exception */
 }
 
+static tl_status_t
+pytimelog_count_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
+                      uint64_t* out_count)
+{
+    if (snap == NULL || out_count == NULL) {
+        return TL_EINVAL;
+    }
+
+    tl_iter_t* count_it = NULL;
+    tl_status_t st = tl_iter_range(snap, t1, t2, &count_it);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    uint64_t count = 0;
+    for (;;) {
+        tl_record_t rec;
+        st = tl_iter_next(count_it, &rec);
+        if (st == TL_OK) {
+            if (count == UINT64_MAX) {
+                tl_iter_destroy(count_it);
+                return TL_EOVERFLOW;
+            }
+            count++;
+            continue;
+        }
+        if (st == TL_EOF) {
+            st = TL_OK;
+        }
+        break;
+    }
+
+    tl_iter_destroy(count_it);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    *out_count = count;
+    return TL_OK;
+}
+
 /*===========================================================================
  * Iterator Factory (LLD-B3)
  *
@@ -2318,12 +2359,14 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 
     /* Initialize fields */
     pyit->owner = Py_NewRef((PyObject*)self);
-    pyit->snapshot = snap;
+    pyit->pinned_snapshot = snap;
     pyit->iter = it;
     pyit->handle_ctx = ctx;  /* borrowed pointer, safe due to strong owner ref */
+    pyit->remaining_count = 0;
+    pyit->remaining_valid = 0;
     pyit->closed = 0;
 
-    /* Store normalized range for view() support */
+    /* Store normalized range for view() and deterministic remaining length. */
     switch (mode) {
         case ITER_MODE_RANGE:  pyit->range_t1 = t1; pyit->range_t2 = t2; break;
         case ITER_MODE_SINCE:  pyit->range_t1 = t1; pyit->range_t2 = TL_TS_MAX; break;
@@ -2332,6 +2375,19 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         case ITER_MODE_POINT:  pyit->range_t1 = t1; pyit->range_t2 = (t1 < TL_TS_MAX) ? t1 + 1 : TL_TS_MAX; break;
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
+
+    st = pytimelog_count_range(snap, pyit->range_t1, pyit->range_t2,
+                               &pyit->remaining_count);
+    if (st != TL_OK) {
+        tl_iter_destroy(it);
+        tl_snapshot_release(snap);
+        Py_DECREF(pyit->owner);
+        pyit->owner = NULL;
+        PyObject_GC_Del((PyObject*)pyit);
+        tl_py_pins_exit_and_maybe_drain(ctx);
+        return TlPy_RaiseFromStatus(st);
+    }
+    pyit->remaining_valid = 1;
 
     /* Enable GC tracking */
     PyObject_GC_Track((PyObject*)pyit);

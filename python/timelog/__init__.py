@@ -583,6 +583,11 @@ class Timelog(_CTimelog):
             For int key: list of objects at that timestamp.
             For slice: TimelogIter for the specified range.
 
+        Notes:
+            ``len(log[t1:t2])`` is supported and returns remaining visible
+            rows in that iterator's snapshot (decreases as the iterator is
+            consumed), not a live global timelog count.
+
         Raises:
             ValueError: If slice step is not None or 1.
         """

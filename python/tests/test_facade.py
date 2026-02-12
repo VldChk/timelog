@@ -230,6 +230,27 @@ class TestSlicing:
             with pytest.raises(ValueError, match="step"):
                 log[0:10:1.0]
 
+
+    def test_slice_iter_len_reports_remaining_snapshot_rows(self):
+        """len(log[t1:t2]) returns remaining rows for that iterator snapshot."""
+        from timelog import Timelog
+
+        with Timelog() as log:
+            log.extend([(i, f"item{i}") for i in range(6)])
+            it = log[1:5]
+
+            assert len(it) == 4
+            assert next(it) == (1, "item1")
+            assert len(it) == 3
+
+            # Iterator length tracks the snapshot captured at iterator creation,
+            # not subsequent live appends.
+            log.append(2, "late")
+            assert len(it) == 3
+
+            assert list(it) == [(2, "item2"), (3, "item3"), (4, "item4")]
+            assert len(it) == 0
+
     def test_int_key_returns_list(self):
         """log[t] returns list of objects at that timestamp."""
         from timelog import Timelog

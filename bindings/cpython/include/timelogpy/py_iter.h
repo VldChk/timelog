@@ -75,10 +75,10 @@ typedef struct {
     PyObject* owner;
 
     /**
-     * Core snapshot (valid only when !closed).
+     * Pinned core snapshot (valid only when !closed).
      * Acquired via tl_snapshot_acquire, released on cleanup.
      */
-    tl_snapshot_t* snapshot;
+    tl_snapshot_t* pinned_snapshot;
 
     /**
      * Core iterator derived from snapshot (valid only when !closed).
@@ -100,6 +100,23 @@ typedef struct {
      */
     tl_ts_t range_t1;
     tl_ts_t range_t2;
+
+    /**
+     * Exact count of remaining rows visible in this iterator snapshot.
+     *
+     * Initialized once at iterator creation for the iterator's normalized
+     * query bounds, then decremented after each successful next().
+     */
+    uint64_t remaining_count;
+
+    /**
+     * Whether remaining_count is valid.
+     *
+     * Set to 1 on successful iterator construction after count precompute.
+     * Kept explicit so __len__ can fail deterministically if initialization
+     * logic changes in the future.
+     */
+    uint8_t remaining_valid;
 
     /**
      * State flag.
