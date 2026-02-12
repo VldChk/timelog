@@ -13,7 +13,8 @@
  * - Track live handles (multiset) to release all objects on close()
  *
  * Thread safety:
- * - on_drop callback: called from maintenance thread, NO GIL, NO Python C-API
+ * - on_drop callback: called from flush/maintenance publisher thread, NO GIL,
+ *   NO Python C-API
  * - drain: called from Python thread with GIL held
  * - pins: atomic counter, safe from any thread
  *
@@ -98,7 +99,7 @@ typedef struct tl_py_drop_node {
 typedef struct tl_py_handle_ctx {
     /**
      * Lock-free MPSC stack of retired objects awaiting DECREF.
-     * Producers: maintenance thread (on_drop callback)
+     * Producers: flush or maintenance thread (on_drop callback)
      * Consumer: Python thread (drain function)
      */
     _Atomic(tl_py_drop_node_t*) retired_head;
@@ -117,7 +118,7 @@ typedef struct tl_py_handle_ctx {
 
     /**
      * Metrics: total objects retired (enqueued by on_drop).
-     * Written by maintenance thread, read by Python thread.
+     * Written by flush or maintenance thread, read by Python thread.
      */
     _Atomic(uint64_t) retired_count;
 
@@ -216,7 +217,7 @@ uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx);
  * On-Drop Callback (Invariant I4)
  *
  * Registered with Timelog via tl_config_t.on_drop_handle.
- * Called from maintenance thread when records are physically reclaimed.
+ * Called from flush or maintenance thread when records are physically reclaimed.
  *
  * CRITICAL: This function does NOT acquire GIL, does NOT call Python C-API,
  * and does NOT re-enter Timelog. It only enqueues to the lock-free stack.
@@ -281,6 +282,18 @@ void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj);
  * Must be called with GIL held. Clears tracking table.
  */
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
+
+/**
+ * GC traversal helper: visit all Python objects currently referenced by ctx.
+ * Must be called with GIL held.
+ */
+int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg);
+
+/**
+ * GC clear helper: release Python references held by ctx (force-drain + live table).
+ * Must be called with GIL held.
+ */
+void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx);
 
 /*===========================================================================
  * Metrics API

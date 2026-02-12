@@ -753,6 +753,21 @@ def ingest_records(
     return elapsed / 1e9
 
 
+def _drain_manual_maintenance(log: Timelog, max_steps: int = 100_000) -> int:
+    """
+    Execute maint_step() until manual maintenance has no pending work.
+
+    Used by demos that run with maintenance="disabled" and want compact()
+    to execute immediately, not just queue a request.
+    """
+    steps = 0
+    while steps < max_steps:
+        if not log.maint_step():
+            return steps
+        steps += 1
+    raise RuntimeError(f"maintenance did not quiesce within {max_steps} steps")
+
+
 def _alternate_dataset_path(data_path: str) -> str | None:
     """
     Locate a related dataset with different ordering characteristics.
@@ -1371,20 +1386,19 @@ def demo_a2_batch_ingestion(runner: DemoRunner) -> dict:
                 try:
                     log.extend(batch)
                 except TimelogBusyError:
-                    # Backpressure is expected with maintenance disabled.
-                    # Flush then retry the same batch to preserve correctness.
+                    # For write-path busy, the batch is already committed.
+                    # Do not retry, or duplicates can be created.
                     busy_count += 1
                     log.flush()
-                    log.extend(batch)
                 total += len(batch)
                 batch.clear()
         if batch:
             try:
                 log.extend(batch)
             except TimelogBusyError:
+                # Batch already committed; only relieve pressure.
                 busy_count += 1
                 log.flush()
-                log.extend(batch)
             total += len(batch)
     finally:
         log.close()
@@ -1461,7 +1475,7 @@ def demo_a4_out_of_order(runner: DemoRunner) -> dict:
 
 @feature("A5", "Backpressure handling", "A")
 def demo_a5_backpressure(runner: DemoRunner) -> dict:
-    """Handle TimelogBusyError gracefully."""
+    """Handle TimelogBusyError without retrying already-committed writes."""
     busy_count = 0
     total = 0
 
@@ -1476,9 +1490,9 @@ def demo_a5_backpressure(runner: DemoRunner) -> dict:
                 log.append(ts, order)
                 total += 1
             except TimelogBusyError:
+                # append() committed; avoid retrying the same row.
                 busy_count += 1
                 log.flush()
-                log.append(ts, order)
                 total += 1
     finally:
         log.close()
@@ -2011,10 +2025,11 @@ def demo_e1_manual_flush(runner: DemoRunner) -> dict:
 
 @feature("E2", "Request compaction", "E")
 def demo_e2_request_compaction(runner: DemoRunner) -> dict:
-    """Trigger compaction."""
+    """Trigger compaction and execute it in manual-maintenance mode."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
     log = Timelog.for_bulk_ingest(time_unit="ns")
+    maint_steps = 0
     try:
         # Load in batches to create multiple memruns
         batch_size = 10_000
@@ -2022,10 +2037,11 @@ def demo_e2_request_compaction(runner: DemoRunner) -> dict:
             log.extend(records[i : i + batch_size])
             log.flush()
         log.compact()
+        maint_steps = _drain_manual_maintenance(log)
     finally:
         log.close()
 
-    return {"records": len(records)}
+    return {"records": len(records), "maint_steps": maint_steps}
 
 
 @feature("E3", "Background mode", "E")
@@ -2092,14 +2108,11 @@ def demo_f1_pagespan_iteration(runner: DemoRunner) -> dict:
     span_count = 0
     total_timestamps = 0
 
-    spans = runner.log.views(first, first + window)
-    try:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            span_count += 1
-            total_timestamps += len(span)
-            span.close()
-    finally:
-        spans.close()
+            with span:
+                span_count += 1
+                total_timestamps += len(span)
 
     return {"records": total_timestamps, "spans": span_count}
 
@@ -2116,20 +2129,17 @@ def demo_f2_timestamp_memoryview(runner: DemoRunner) -> dict:
     total_timestamps = 0
     first_ts = last_ts = 0
 
-    spans = runner.log.views(first, first + window)
-    try:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            mv = span.timestamps
-            total_timestamps += len(mv)
-            if len(mv) > 0:
-                if first_ts == 0:
-                    first_ts = mv[0]
-                last_ts = mv[-1]
-            # Release the buffer view before closing the span to avoid UAF.
-            del mv
-            span.close()
-    finally:
-        spans.close()
+            with span as live_span:
+                mv = live_span.timestamps
+                total_timestamps += len(mv)
+                if len(mv) > 0:
+                    if first_ts == 0:
+                        first_ts = mv[0]
+                    last_ts = mv[-1]
+                # Release the buffer view before closing the span to avoid UAF.
+                del mv
 
     return {
         "records": total_timestamps,
@@ -2150,16 +2160,13 @@ def demo_f3_objects_view(runner: DemoRunner) -> dict:
     total_objects = 0
     tickers = set()
 
-    spans = runner.log.views(first, first + window)
-    try:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            objects = span.objects()
-            total_objects += len(objects)
-            for obj in objects:
-                tickers.add(obj.ticker)
-            span.close()
-    finally:
-        spans.close()
+            with span as live_span:
+                objects = live_span.objects()
+                total_objects += len(objects)
+                for obj in objects:
+                    tickers.add(obj.ticker)
 
     return {"records": total_objects, "unique_tickers": len(tickers)}
 
@@ -2179,20 +2186,17 @@ def demo_f4_numpy_integration(runner: DemoRunner) -> dict:
     total_timestamps = 0
     avg_gap = 0.0
 
-    spans = runner.log.views(first, first + window)
-    try:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            arr = np.asarray(span.timestamps)  # Zero-copy!
-            total_timestamps += len(arr)
-            if len(arr) > 1:
-                diffs = np.diff(arr)
-                avg_gap = float(np.mean(diffs))
-            # Release the NumPy view before closing the span to avoid UAF.
-            del arr
-            span.close()
+            with span as live_span:
+                arr = np.asarray(live_span.timestamps)  # Zero-copy!
+                total_timestamps += len(arr)
+                if len(arr) > 1:
+                    diffs = np.diff(arr)
+                    avg_gap = float(np.mean(diffs))
+                # Release the NumPy view before closing the span to avoid UAF.
+                del arr
             break  # Just first span for demo
-    finally:
-        spans.close()
 
     return {"records": total_timestamps, "dtype": "int64", "avg_gap_ns": avg_gap}
 
@@ -2212,16 +2216,13 @@ def demo_f5_bulk_statistics(runner: DemoRunner) -> dict:
     all_timestamps = []
     total = 0
 
-    spans = runner.log.views(first, first + window)
-    try:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            # Copy the array data since we need it after the span closes
-            arr = np.array(span.timestamps, copy=True)
-            all_timestamps.append(arr)
-            total += len(arr)
-            span.close()
-    finally:
-        spans.close()
+            with span as live_span:
+                # Copy the array data since we need it after the span closes
+                arr = np.array(live_span.timestamps, copy=True)
+                all_timestamps.append(arr)
+                total += len(arr)
 
     if all_timestamps:
         combined = np.concatenate(all_timestamps)
@@ -2866,6 +2867,7 @@ def demo_k1b_append_latency_manual(runner: DemoRunner) -> dict:
     flush_every = 10_000
     compact_every = 5
     flush_count = 0
+    compact_steps: list[int] = []
 
     log = Timelog.for_bulk_ingest(
         time_unit="ns",
@@ -2889,6 +2891,7 @@ def demo_k1b_append_latency_manual(runner: DemoRunner) -> dict:
                 if flush_count % compact_every == 0:
                     t1 = time.perf_counter_ns()
                     log.compact()
+                    compact_steps.append(_drain_manual_maintenance(log))
                     compact_times.append((time.perf_counter_ns() - t1) / 1e6)
     finally:
         log.close()
@@ -2898,6 +2901,7 @@ def demo_k1b_append_latency_manual(runner: DemoRunner) -> dict:
         "latency_ns": lat.summary(),
         "flush_times_ms": flush_times,
         "compact_times_ms": compact_times,
+        "compact_maint_steps": compact_steps,
         "reuse_obj": runner.reuse_obj,
         "config": {
             "maintenance": "disabled",
@@ -3052,6 +3056,7 @@ def demo_k4_delete_impact(runner: DemoRunner) -> dict:
         t3 = time.perf_counter_ns()
         t4 = time.perf_counter_ns()
         log.compact()
+        maint_steps = _drain_manual_maintenance(log)
         t5 = time.perf_counter_ns()
         after_compact = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t6 = time.perf_counter_ns()
@@ -3061,6 +3066,7 @@ def demo_k4_delete_impact(runner: DemoRunner) -> dict:
             "delete_ms": (t2 - t1) / 1e6,
             "read_after_rps": after / ((t3 - t2) / 1e9) if t3 > t2 else 0,
             "compact_ms": (t5 - t4) / 1e6,
+            "compact_maint_steps": maint_steps,
             "read_after_compact_rps": after_compact
             / ((t6 - t5) / 1e9)
             if t6 > t5
@@ -3104,7 +3110,7 @@ def demo_k5_a2b_stress_grid(runner: DemoRunner) -> dict:
             for mem_bytes in memtables:
                 for runs in sealed_runs:
                     busy_events = 0
-                    failed_batches = 0
+                    busy_action_failures = 0
                     inserted = 0
                     batch_size = 1000
                     start = time.perf_counter_ns()
@@ -3118,23 +3124,18 @@ def demo_k5_a2b_stress_grid(runner: DemoRunner) -> dict:
                     try:
                         for i in range(0, len(records), batch_size):
                             batch = records[i : i + batch_size]
-                            attempts = 0
-                            while True:
+                            try:
+                                log.extend(batch)
+                                inserted += len(batch)
+                            except TimelogBusyError:
+                                # extend() committed; do not retry this batch.
+                                busy_events += 1
+                                inserted += len(batch)
+                                # Best-effort pressure relief for subsequent batches.
                                 try:
-                                    log.extend(batch)
-                                    inserted += len(batch)
-                                    break
-                                except TimelogBusyError:
-                                    busy_events += 1
-                                    attempts += 1
-                                    # Best-effort flush before retrying.
-                                    try:
-                                        log.flush()
-                                    except Exception:
-                                        pass
-                                    if attempts >= 2:
-                                        failed_batches += 1
-                                        break
+                                    log.flush()
+                                except Exception:
+                                    busy_action_failures += 1
                     finally:
                         log.close()
                     elapsed = time.perf_counter_ns() - start
@@ -3149,7 +3150,7 @@ def demo_k5_a2b_stress_grid(runner: DemoRunner) -> dict:
                             "attempted_records": len(records),
                             "records_per_sec": rps,
                             "busy_events": busy_events,
-                            "failed_batches": failed_batches,
+                            "busy_action_failures": busy_action_failures,
                         }
                     )
 

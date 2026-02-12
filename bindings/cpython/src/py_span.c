@@ -237,6 +237,11 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
         return -1;
     }
 
+    if (self->len > (size_t)PY_SSIZE_T_MAX) {
+        PyErr_SetString(PyExc_OverflowError, "PageSpan too large for buffer");
+        return -1;
+    }
+
     const Py_ssize_t n = (Py_ssize_t)self->len;
     void* ptr = (void*)self->ts;
 

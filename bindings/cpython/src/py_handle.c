@@ -293,14 +293,14 @@ uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx)
  * On-Drop Callback Implementation (Invariant I4)
  *
  * CRITICAL CONSTRAINTS:
- * - Called from maintenance thread (NOT a Python thread)
+ * - Called from any thread invoking flush or compaction (NOT necessarily a Python thread)
  * - Does NOT hold the GIL
  * - Must NOT call any Python C-API functions
  * - Must NOT call back into Timelog APIs
  * - Must NOT block for extended periods
  *
  * Note: This is NOT async-signal-safe (uses malloc). It is only safe to
- * call from Timelog's maintenance thread context.
+ * call from Timelog's flush or maintenance thread context.
  *
  * Implementation uses Treiber stack (lock-free LIFO):
  * 1. Allocate node with libc malloc (NOT Python allocator)
@@ -432,6 +432,11 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
         goto out;  /* Nothing to drain */
     }
 
+    tl_py_drop_node_t* list_tail = list;
+    while (list_tail->next != NULL) {
+        list_tail = list_tail->next;
+    }
+
     /*
      * Batch limit: 0 = unlimited.
      * When force=1 (close path), always drain everything regardless of limit.
@@ -447,19 +452,13 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
              * Must be done atomically in case on_drop is concurrent.
              */
             tl_py_drop_node_t* remaining = list;
-            tl_py_drop_node_t* tail = list;
-
-            /* Find tail of remaining list */
-            while (tail->next != NULL) {
-                tail = tail->next;
-            }
 
             /* Atomically prepend remaining to current queue head */
             tl_py_drop_node_t* current_head;
             do {
                 current_head = atomic_load_explicit(
                     &ctx->retired_head, memory_order_relaxed);
-                tail->next = current_head;
+                list_tail->next = current_head;
             } while (!atomic_compare_exchange_weak_explicit(
                         &ctx->retired_head,
                         &current_head,
@@ -472,6 +471,9 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
         /* Process one node */
         tl_py_drop_node_t* node = list;
         list = node->next;
+        if (list == NULL) {
+            list_tail = NULL;
+        }
 
         /* Update live tracking before DECREF */
         tl_py_live_note_drop(ctx, node->obj);
@@ -621,6 +623,56 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
+}
+
+int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
+{
+#ifndef NDEBUG
+    assert(PyGILState_Check() &&
+           "tl_py_handle_ctx_traverse requires GIL");
+#endif
+    if (ctx == NULL || visit == NULL) {
+        return 0;
+    }
+
+    if (ctx->live_entries != NULL) {
+        for (size_t i = 0; i < ctx->live_cap; i++) {
+            tl_py_live_entry_t* e = &ctx->live_entries[i];
+            if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
+                int st = visit(e->obj, arg);
+                if (st != 0) {
+                    return st;
+                }
+            }
+        }
+    }
+
+    tl_py_drop_node_t* retired = atomic_load_explicit(
+        &ctx->retired_head, memory_order_acquire);
+    while (retired != NULL) {
+        if (retired->obj != NULL) {
+            int st = visit(retired->obj, arg);
+            if (st != 0) {
+                return st;
+            }
+        }
+        retired = retired->next;
+    }
+
+    return 0;
+}
+
+void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx)
+{
+#ifndef NDEBUG
+    assert(PyGILState_Check() &&
+           "tl_py_handle_ctx_clear requires GIL");
+#endif
+    if (ctx == NULL) {
+        return;
+    }
+    (void)tl_py_drain_retired(ctx, 1);
+    tl_py_live_release_all(ctx);
 }
 
 /*===========================================================================

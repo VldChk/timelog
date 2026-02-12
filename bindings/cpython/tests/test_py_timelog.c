@@ -466,6 +466,55 @@ TEST(dealloc_handles_unclosed)
     /* If we get here without crash, test passes */
 }
 
+TEST(gc_collects_timelog_cycle)
+{
+    PyObject* gc_mod = PyImport_ImportModule("gc");
+    ASSERT_NOT_NULL(gc_mod);
+    PyObject* weakref_mod = PyImport_ImportModule("weakref");
+    ASSERT_NOT_NULL(weakref_mod);
+
+    PyTimelog* tl = create_timelog_custom("disabled", "raise");
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* weakref_fn = PyObject_GetAttrString(weakref_mod, "ref");
+    ASSERT_NOT_NULL(weakref_fn);
+    PyObject* wr = PyObject_CallFunctionObjArgs(weakref_fn, (PyObject*)tl, NULL);
+    ASSERT_NOT_NULL(wr);
+
+    /* Create cycle: timelog -> stored object(list) -> timelog */
+    PyObject* holder = PyList_New(1);
+    ASSERT_NOT_NULL(holder);
+    Py_INCREF((PyObject*)tl);
+    PyList_SET_ITEM(holder, 0, (PyObject*)tl);  /* Steals reference */
+
+    PyObject* append_method = PyObject_GetAttrString((PyObject*)tl, "append");
+    ASSERT_NOT_NULL(append_method);
+    PyObject* append_res = PyObject_CallFunction(append_method, "LO", 1LL, holder);
+    ASSERT_NOT_NULL(append_res);
+    Py_DECREF(append_res);
+    Py_DECREF(append_method);
+    Py_DECREF(holder);
+
+    /* Drop external strong reference; only the cycle remains. */
+    Py_DECREF((PyObject*)tl);
+
+    for (int i = 0; i < 3; i++) {
+        PyObject* collect_res = PyObject_CallMethod(gc_mod, "collect", NULL);
+        ASSERT_NOT_NULL(collect_res);
+        Py_DECREF(collect_res);
+    }
+
+    PyObject* target = PyObject_CallNoArgs(wr);
+    ASSERT_NOT_NULL(target);
+    ASSERT(target == Py_None);
+    Py_DECREF(target);
+
+    Py_DECREF(wr);
+    Py_DECREF(weakref_fn);
+    Py_DECREF(weakref_mod);
+    Py_DECREF(gc_mod);
+}
+
 /*===========================================================================
  * Test Suite: Append
  *===========================================================================*/
@@ -1490,6 +1539,7 @@ int main(int argc, char* argv[])
     run_close_sets_state();
     run_close_refuses_with_pins();
     run_dealloc_handles_unclosed();
+    run_gc_collects_timelog_cycle();
 
     /* Append tests */
     printf("\n[Append]\n");

@@ -59,6 +59,8 @@ CSV_COLUMNS = [
     "commission",
 ]
 
+TL_TS_MAX = (1 << 63) - 1
+
 
 @dataclass
 class ScanResult:
@@ -126,6 +128,7 @@ class RollingReader:
         self.source = source
         self.span = span
         self.offset = 0
+        self.cycles = 0
         self._iter: Optional[Iterator[int]] = None
 
     def _reset_iter(self) -> None:
@@ -141,9 +144,20 @@ class RollingReader:
                 ts = next(self._iter)
             except StopIteration:
                 self.offset += self.span
+                self.cycles += 1
+                if self.offset > TL_TS_MAX:
+                    raise OverflowError(
+                        f"rolling timestamp offset exceeded int64 max after {self.cycles} cycles"
+                    )
                 self._reset_iter()
                 continue
-            out.append(ts + self.offset)
+            shifted_ts = ts + self.offset
+            if shifted_ts > TL_TS_MAX:
+                raise OverflowError(
+                    f"rolling timestamp overflow at cycle={self.cycles}, "
+                    f"base_ts={ts}, offset={self.offset}"
+                )
+            out.append(shifted_ts)
         return out
 
 
@@ -344,6 +358,7 @@ def main() -> int:
     deleted_requests = 0
     deleted_rows_est: Optional[int] = 0 if args.delete_mode == "range" else None
     busy_errors = 0
+    busy_action_failures = 0
     flush_calls = 0
     compact_calls = 0
 
@@ -399,20 +414,23 @@ def main() -> int:
         return {"payload": idx}
 
     def handle_busy() -> None:
-        nonlocal busy_errors, flush_calls, compact_calls
+        nonlocal busy_errors, busy_action_failures, flush_calls, compact_calls
         busy_errors += 1
-        if args.busy_action == "flush":
-            t0 = time.perf_counter_ns()
-            log.flush()
-            t1 = time.perf_counter_ns()
-            flush_latency.add(t1 - t0)
-            flush_calls += 1
-        elif args.busy_action == "compact":
-            t0 = time.perf_counter_ns()
-            log.compact()
-            t1 = time.perf_counter_ns()
-            compact_latency.add(t1 - t0)
-            compact_calls += 1
+        try:
+            if args.busy_action == "flush":
+                t0 = time.perf_counter_ns()
+                log.flush()
+                t1 = time.perf_counter_ns()
+                flush_latency.add(t1 - t0)
+                flush_calls += 1
+            elif args.busy_action == "compact":
+                t0 = time.perf_counter_ns()
+                log.compact()
+                t1 = time.perf_counter_ns()
+                compact_latency.add(t1 - t0)
+                compact_calls += 1
+        except Exception:
+            busy_action_failures += 1
 
     def ingest_batch(batch_ts: list[int]) -> tuple[int, int]:
         nonlocal appended_total, busy_errors, last_ts, global_max_ts
@@ -593,6 +611,7 @@ def main() -> int:
                     "delete_rate_rps": deleted_delta / dt if dt > 0 else 0,
                     "busy_errors_delta": busy_delta,
                     "busy_errors": busy_errors,
+                    "busy_action_failures": busy_action_failures,
                     "flush_calls": flush_calls,
                     "compact_calls": compact_calls,
                     "adjacent_ooo": adjacent_ooo,
@@ -630,6 +649,7 @@ def main() -> int:
         "ranges_queue_len": len(ranges) if args.delete_mode == "range" else None,
         "late_records": late_records if args.delete_mode == "ttl" else None,
         "busy_errors": busy_errors,
+        "busy_action_failures": busy_action_failures,
         "flush_calls": flush_calls,
         "compact_calls": compact_calls,
         "maintenance_effective": maintenance_effective,

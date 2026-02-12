@@ -429,11 +429,11 @@ The `on_drop_handle` callback has a specific, narrow contract:
 
 **When it fires:**
 - During compaction when a tombstone physically deletes a record
+- During flush when a tombstone removes sealed records
 - AFTER successful manifest publish (not speculatively)
 
 **When it does NOT fire:**
 - During tl_close()
-- During flush (flush moves records, doesn't drop them)
 - When segments are released
 - For records not covered by tombstones
 

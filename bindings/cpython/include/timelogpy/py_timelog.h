@@ -116,6 +116,11 @@ typedef struct {
      */
     tl_py_busy_policy_t busy_policy;
 
+    /**
+     * Weak reference list head for Python weakref support.
+     */
+    PyObject* weakreflist;
+
 } PyTimelog;
 
 /*===========================================================================

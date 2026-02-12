@@ -68,6 +68,12 @@ static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject* args);
 static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject* args);
 static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
 static void PyTimelog_finalize(PyObject* self_obj);
+typedef tl_status_t (*tl_py_core_call_fn)(tl_timelog_t*);
+static int tl_py_core_call_strict(PyTimelog* self,
+                                  tl_py_core_call_fn fn,
+                                  tl_status_t* out_status);
+static tl_status_t tl_py_core_call_best_effort(PyTimelog* self,
+                                                tl_py_core_call_fn fn);
 
 /* Internal non-throwing close helper */
 static void pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
@@ -206,21 +212,7 @@ static int tl_py_handle_write_ebusy(PyTimelog* self, const char* msg)
     }
 
     if (self->busy_policy == TL_PY_BUSY_FLUSH) {
-        tl_status_t flush_st = TL_ESTATE;
-        TL_PY_LOCK(self);
-        if (!self->closed && self->tl != NULL) {
-            Py_BEGIN_ALLOW_THREADS
-            flush_st = tl_flush(self->tl);
-            /*
-             * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-             * deadlock: Thread A holds core_lock + wants GIL, Thread B
-             * holds GIL + wants core_lock.
-             */
-            PyThread_release_lock(self->core_lock);
-            Py_END_ALLOW_THREADS
-        } else {
-            TL_PY_UNLOCK(self);
-        }
+        tl_status_t flush_st = tl_py_core_call_best_effort(self, tl_flush);
 
         if (flush_st != TL_OK && flush_st != TL_EOF) {
 #ifndef NDEBUG
@@ -246,6 +238,56 @@ int tl_py_lock_checked(PyTimelog* self)
         return -1;
     }
     return 0;
+}
+
+static int
+tl_py_core_call_strict(PyTimelog* self, tl_py_core_call_fn fn, tl_status_t* out_status)
+{
+    if (self == NULL || fn == NULL || out_status == NULL) {
+        return -1;
+    }
+
+    if (tl_py_lock_checked(self) < 0) {
+        return -1;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    *out_status = fn(self->tl);
+    /*
+     * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
+     * deadlock: Thread A holds core_lock + wants GIL, Thread B
+     * holds GIL + wants core_lock.
+     */
+    PyThread_release_lock(self->core_lock);
+    Py_END_ALLOW_THREADS
+
+    return 0;
+}
+
+static tl_status_t
+tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
+{
+    if (self == NULL || fn == NULL) {
+        return TL_EINVAL;
+    }
+
+    tl_status_t st = TL_ESTATE;
+    TL_PY_LOCK(self);
+    if (!self->closed && self->tl != NULL) {
+        Py_BEGIN_ALLOW_THREADS
+        st = fn(self->tl);
+        /*
+         * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
+         * deadlock: Thread A holds core_lock + wants GIL, Thread B
+         * holds GIL + wants core_lock.
+         */
+        PyThread_release_lock(self->core_lock);
+        Py_END_ALLOW_THREADS
+    } else {
+        TL_PY_UNLOCK(self);
+    }
+
+    return st;
 }
 
 /*===========================================================================
@@ -346,6 +388,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     self->core_lock = NULL;
+    self->weakreflist = NULL;
 
     enum {
         KW_TIME_UNIT = 0,
@@ -950,7 +993,6 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     self->core_lock = PyThread_allocate_lock();
     if (self->core_lock == NULL) {
         /* Best-effort shutdown on allocation failure */
-        tl_maint_stop(self->tl);
         tl_close(self->tl);
         self->tl = NULL;
         self->closed = 1;
@@ -1004,7 +1046,6 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         tl_timelog_t* tl = self->tl;
         if (allow_threads) {
             Py_BEGIN_ALLOW_THREADS
-            tl_maint_stop(tl);
             tl_close(tl);
             self->tl = NULL;
             /*
@@ -1019,7 +1060,6 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
              * Avoid releasing GIL during interpreter shutdown or
              * finalizer-driven cleanup.
              */
-            tl_maint_stop(tl);
             tl_close(tl);
             self->tl = NULL;
             TL_PY_UNLOCK(self);
@@ -1036,7 +1076,22 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         TL_PY_PRESERVE_EXC_END;
     }
 
+    uint64_t alloc_failures = tl_py_alloc_failures(&self->handle_ctx);
+    int live_tracking_failed = (self->handle_ctx.live_tracking_failed != 0);
+
     tl_py_handle_ctx_destroy(&self->handle_ctx);
+
+    if (!finalizing && (alloc_failures > 0 || live_tracking_failed)) {
+        TL_PY_PRESERVE_EXC_BEGIN;
+        if (PyErr_WarnFormat(PyExc_ResourceWarning, 1,
+                             "Timelog close detected handle-tracking degradation "
+                             "(live_tracking_failed=%d, alloc_failures=%llu)",
+                             live_tracking_failed,
+                             (unsigned long long)alloc_failures) < 0) {
+            PyErr_Clear();
+        }
+        TL_PY_PRESERVE_EXC_END;
+    }
 
     if (self->core_lock) {
         PyThread_type_lock lk = self->core_lock;
@@ -1110,6 +1165,8 @@ PyTimelog_finalize(PyObject* self_obj)
 static void
 PyTimelog_dealloc(PyTimelog* self)
 {
+    PyObject_GC_UnTrack((PyObject*)self);
+
     /* Ensure tp_finalize runs before deallocation */
     if (PyObject_CallFinalizerFromDealloc((PyObject*)self) < 0) {
         return;
@@ -1120,6 +1177,10 @@ PyTimelog_dealloc(PyTimelog* self)
         return;
     }
 
+    if (self->weakreflist != NULL) {
+        PyObject_ClearWeakRefs((PyObject*)self);
+    }
+
     if (self->core_lock) {
         PyThread_type_lock lk = self->core_lock;
         self->core_lock = NULL;
@@ -1127,6 +1188,19 @@ PyTimelog_dealloc(PyTimelog* self)
     }
 
     Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static int
+PyTimelog_traverse(PyTimelog* self, visitproc visit, void* arg)
+{
+    return tl_py_handle_ctx_traverse(&self->handle_ctx, visit, arg);
+}
+
+static int
+PyTimelog_clear(PyTimelog* self)
+{
+    pytimelog_close_no_raise(self, 1);
+    return 0;
 }
 
 /*===========================================================================
@@ -1619,13 +1693,9 @@ PyTimelog_flush(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_status_t st;
-    if (tl_py_lock_checked(self) < 0) {
+    if (tl_py_core_call_strict(self, tl_flush, &st) < 0) {
         return NULL;
     }
-    Py_BEGIN_ALLOW_THREADS
-    st = tl_flush(self->tl);
-    PyThread_release_lock(self->core_lock);
-    Py_END_ALLOW_THREADS
 
     if (st == TL_EBUSY) {
         return TlPy_RaiseFromStatusFmt(TL_EBUSY,
@@ -1651,13 +1721,9 @@ PyTimelog_compact(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_status_t st;
-    if (tl_py_lock_checked(self) < 0) {
+    if (tl_py_core_call_strict(self, tl_compact, &st) < 0) {
         return NULL;
     }
-    Py_BEGIN_ALLOW_THREADS
-    st = tl_compact(self->tl);
-    PyThread_release_lock(self->core_lock);
-    Py_END_ALLOW_THREADS
 
     if (st != TL_OK && st != TL_EOF) {
         return TlPy_RaiseFromStatus(st);
@@ -1824,13 +1890,9 @@ PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_status_t st;
-    if (tl_py_lock_checked(self) < 0) {
+    if (tl_py_core_call_strict(self, tl_maint_step, &st) < 0) {
         return NULL;
     }
-    Py_BEGIN_ALLOW_THREADS
-    st = tl_maint_step(self->tl);
-    PyThread_release_lock(self->core_lock);
-    Py_END_ALLOW_THREADS
 
     if (st == TL_OK) {
         tl_py_drain_retired(&self->handle_ctx, 0);
@@ -2070,13 +2132,9 @@ PyTimelog_stop_maint(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_status_t st;
-    if (tl_py_lock_checked(self) < 0) {
+    if (tl_py_core_call_strict(self, tl_maint_stop, &st) < 0) {
         return NULL;
     }
-    Py_BEGIN_ALLOW_THREADS
-    st = tl_maint_stop(self->tl);  /* Blocks until worker exits */
-    PyThread_release_lock(self->core_lock);
-    Py_END_ALLOW_THREADS
 
     if (st != TL_OK) {
         return TlPy_RaiseFromStatus(st);
@@ -2683,11 +2741,14 @@ PyTypeObject PyTimelog_Type = {
     ),
     .tp_basicsize = sizeof(PyTimelog),
     .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)PyTimelog_init,
     .tp_dealloc = (destructor)PyTimelog_dealloc,
     .tp_finalize = (destructor)PyTimelog_finalize,
+    .tp_traverse = (traverseproc)PyTimelog_traverse,
+    .tp_clear = (inquiry)PyTimelog_clear,
+    .tp_weaklistoffset = offsetof(PyTimelog, weakreflist),
     .tp_methods = PyTimelog_methods,
     .tp_getset = PyTimelog_getset,
 };
