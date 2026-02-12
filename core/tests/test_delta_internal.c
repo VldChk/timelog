@@ -32,6 +32,7 @@
 #include "internal/tl_records.h"
 #include "query/tl_active_iter.h"
 #include "query/tl_memrun_iter.h"
+#include "query/tl_immutable_count.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -704,6 +705,7 @@ TEST_DECLARE(delta_memtable_insert_batch_slow_path) {
     size_t total = tl_memtable_run_len(&mt) + tl_memtable_ooo_total_len(&mt);
     TEST_ASSERT_EQ(3, total);  /* All records accounted for */
     TEST_ASSERT(tl_memtable_epoch(&mt) > 0);  /* At least one epoch tick */
+
 #ifdef TL_DEBUG
     TEST_ASSERT(tl_memtable_validate(&mt));  /* Sortedness invariants hold */
 #endif
@@ -769,6 +771,7 @@ TEST_DECLARE(delta_memtable_insert_batch_full_sort_check) {
     size_t total = tl_memtable_run_len(&mt) + tl_memtable_ooo_total_len(&mt);
     TEST_ASSERT_EQ(5, total);  /* All records accounted for */
     TEST_ASSERT(tl_memtable_ooo_total_len(&mt) > 0);  /* OOO used because unsorted */
+
 #ifdef TL_DEBUG
     TEST_ASSERT(tl_memtable_validate(&mt));  /* Sortedness invariants hold */
 #endif
@@ -2660,6 +2663,7 @@ TEST_DECLARE(delta_flush_tombstone_half_open_boundary) {
  * They test internal invariants that may change with implementation.
  *===========================================================================*/
 
+
 #ifdef TL_DEBUG
 
 TEST_DECLARE(delta_memrun_validate_correct) {
@@ -3137,6 +3141,64 @@ TEST_DECLARE(delta_memtable_c14_ooo_sorted_at_seal) {
  * Test Runner
  *===========================================================================*/
 
+TEST_DECLARE(delta_memrun_count_range_includes_immutable_ooo_runs) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 3);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 30, .handle = 2};
+    run[2] = (tl_record_t){.ts = 50, .handle = 3};
+
+    tl_record_t* ooo_records = TL_NEW_ARRAY(&alloc, tl_record_t, 3);
+    TEST_ASSERT_NOT_NULL(ooo_records);
+    ooo_records[0] = (tl_record_t){.ts = 15, .handle = 4};
+    ooo_records[1] = (tl_record_t){.ts = 35, .handle = 5};
+    ooo_records[2] = (tl_record_t){.ts = 45, .handle = 6};
+
+    tl_ooorunset_t* ooo_runs = NULL;
+    TEST_ASSERT_STATUS(TL_OK, make_ooo_runset(&alloc, ooo_records, 3, &ooo_runs));
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 3, ooo_runs, NULL, 0, &mr));
+
+    TEST_ASSERT_EQ_U64(6, tl_count_records_in_memrun_range(mr, 0, 100, false));
+    TEST_ASSERT_EQ_U64(4, tl_count_records_in_memrun_range(mr, 12, 46, false));
+
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_memrun_count_visible_subtracts_newer_tombs) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t* run = TL_NEW_ARRAY(&alloc, tl_record_t, 5);
+    TEST_ASSERT_NOT_NULL(run);
+    run[0] = (tl_record_t){.ts = 10, .handle = 1};
+    run[1] = (tl_record_t){.ts = 20, .handle = 2};
+    run[2] = (tl_record_t){.ts = 30, .handle = 3};
+    run[3] = (tl_record_t){.ts = 40, .handle = 4};
+    run[4] = (tl_record_t){.ts = 50, .handle = 5};
+
+    tl_memrun_t* mr = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 5, NULL, NULL, 0, &mr));
+
+    tl_interval_t tombs[2] = {
+        {.start = 15, .end = 35, .end_unbounded = false, .max_seq = 2},
+        {.start = 45, .end = 60, .end_unbounded = false, .max_seq = 9}
+    };
+
+    uint64_t visible = tl_count_visible_records_in_memrun_range(mr, 0, 60, false, tombs, 2);
+    TEST_ASSERT_EQ_U64(2, visible);
+
+    tl_memrun_release(mr);
+    tl__alloc_destroy(&alloc);
+}
+
+
+
 void run_delta_internal_tests(void) {
     /* OOO run tests (2 tests) */
     RUN_TEST(delta_ooorun_create_bounds);
@@ -3198,6 +3260,8 @@ void run_delta_internal_tests(void) {
     /* Active/memrun iterator tests (2 tests) */
     RUN_TEST(delta_memrun_iter_merges_run_and_runs);
     RUN_TEST(delta_memrun_iter_merges_multiple_runs);
+    RUN_TEST(delta_memrun_count_range_includes_immutable_ooo_runs);
+    RUN_TEST(delta_memrun_count_visible_subtracts_newer_tombs);
     RUN_TEST(delta_memrun_iter_generation_tie_break);
     RUN_TEST(delta_active_iter_merges_run_head_runs);
 
@@ -3222,6 +3286,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_flush_collect_drops_false);
     RUN_TEST(delta_flush_unbounded_tombstone);
     RUN_TEST(delta_flush_tombstone_half_open_boundary);
+
 
 #ifdef TL_DEBUG
     /* Debug validation tests (3 tests) */

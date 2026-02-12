@@ -114,11 +114,48 @@ static void segment_destroy(tl_segment_t* seg) {
     /* Destroy catalog (frees metadata array, not pages) */
     tl_page_catalog_destroy(&seg->catalog);
 
+    if (seg->page_prefix_counts != NULL) {
+        TL_FREE(alloc, seg->page_prefix_counts);
+    }
+
     /* Destroy tombstones */
     destroy_tombstones(seg->tombstones, alloc);
 
     /* Free segment itself */
     TL_FREE(alloc, seg);
+}
+
+
+static tl_status_t build_page_prefix_counts(tl_segment_t* seg) {
+    TL_ASSERT(seg != NULL);
+
+    size_t n_pages = (size_t)seg->catalog.n_pages;
+    if (n_pages == 0) {
+        seg->page_prefix_counts = NULL;
+        return TL_OK;
+    }
+
+    if (n_pages > SIZE_MAX / sizeof(uint64_t) - 1) {
+        return TL_EOVERFLOW;
+    }
+
+    uint64_t* prefix = TL_NEW_ARRAY(seg->alloc, uint64_t, n_pages + 1);
+    if (prefix == NULL) {
+        return TL_ENOMEM;
+    }
+
+    prefix[0] = 0;
+    for (size_t i = 0; i < n_pages; i++) {
+        uint64_t cnt = seg->catalog.pages[i].count;
+        if (UINT64_MAX - prefix[i] < cnt) {
+            TL_FREE(seg->alloc, prefix);
+            return TL_EOVERFLOW;
+        }
+        prefix[i + 1] = prefix[i] + cnt;
+    }
+
+    seg->page_prefix_counts = prefix;
+    return TL_OK;
 }
 
 /*===========================================================================
@@ -281,6 +318,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
     seg->tomb_max_ts = 0;
+    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -315,6 +353,12 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
+
+    st = build_page_prefix_counts(seg);
+    if (st != TL_OK) {
+        segment_destroy(seg);
+        return st;
+    }
 
     /*
      * Compute bounds.
@@ -403,6 +447,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
     seg->tomb_max_ts = 0;
+    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -419,6 +464,12 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
+
+    st = build_page_prefix_counts(seg);
+    if (st != TL_OK) {
+        segment_destroy(seg);
+        return st;
+    }
 
     /* Bounds from pages */
     seg->record_min_ts = seg->catalog.pages[0].min_ts;
