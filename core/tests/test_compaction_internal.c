@@ -204,6 +204,26 @@ TEST_DECLARE(cint_needed_at_threshold) {
     tl_close(tl);
 }
 
+TEST_DECLARE(cint_needed_active_delete_debt) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.max_delta_segments = 100;      /* Avoid L0-count trigger */
+    cfg.delete_debt_threshold = 0.5;   /* Trigger on >50% delete ratio */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    for (tl_ts_t ts = 100; ts < 110; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts, (tl_handle_t)(uintptr_t)ts));
+    }
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 106));
+
+    /* No flush happened, so debt must come from active buffers. */
+    TEST_ASSERT(tl_compact_needed(tl));
+
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Compaction Selection Tests (Internal API)
  *
@@ -1000,6 +1020,7 @@ void run_compaction_internal_tests(void) {
     RUN_TEST(cint_needed_empty);
     RUN_TEST(cint_needed_below_threshold);
     RUN_TEST(cint_needed_at_threshold);
+    RUN_TEST(cint_needed_active_delete_debt);
 
     /* Compaction selection tests (2 tests) */
     RUN_TEST(cint_select_no_l0);
