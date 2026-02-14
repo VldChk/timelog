@@ -26,6 +26,7 @@
 #include "tl_page.h"
 #include "tl_segment.h"
 #include "tl_manifest.h"
+#include "tl_segment_range.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -924,6 +925,62 @@ TEST_DECLARE(storage_segment_l0_bounds_tombstones_extend_max) {
     /* max_ts should be TL_TS_MAX due to unbounded tombstone */
     TEST_ASSERT_EQ(100, seg->min_ts);
     TEST_ASSERT_EQ(TL_TS_MAX, seg->max_ts);
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_segment_page_prefix_counts_built) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[40];
+    for (size_t i = 0; i < 40; i++) {
+        records[i].ts = (tl_ts_t)(i * 10);
+        records[i].handle = (tl_handle_t)(i + 1);
+    }
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 40,
+                                                   NULL, 0,
+                                                   1, /* force multi-page */
+                                                   1, &seg));
+    TEST_ASSERT_NOT_NULL(seg);
+    TEST_ASSERT(seg->page_count >= 3);
+    TEST_ASSERT_NOT_NULL(seg->page_prefix_counts);
+    TEST_ASSERT_EQ(0, seg->page_prefix_counts[0]);
+    TEST_ASSERT_EQ(40, seg->page_prefix_counts[seg->page_count]);
+    TEST_ASSERT_EQ(40, tl_segment_page_prefix_sum(seg, 0, seg->page_count));
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_segment_count_records_in_range_no_scan) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[40];
+    for (size_t i = 0; i < 40; i++) {
+        records[i].ts = (tl_ts_t)(i * 10);
+        records[i].handle = (tl_handle_t)(i + 1);
+    }
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_segment_build_l0(&alloc, records, 40,
+                                                   NULL, 0,
+                                                   1, /* force multi-page */
+                                                   1, &seg));
+    TEST_ASSERT_NOT_NULL(seg);
+
+    /* [55, 325) -> ts = 60..320 => 27 records */
+    TEST_ASSERT_EQ(27, tl_count_records_in_segment_range(seg, 55, 325));
+
+    /* [355, +inf) -> ts = 360,370,380,390 => 4 records */
+    TEST_ASSERT_EQ(4, tl_count_records_in_segment_since(seg, 355));
+
+    /* Empty/degenerate range */
+    TEST_ASSERT_EQ(0, tl_count_records_in_segment_range(seg, 100, 100));
 
     tl_segment_release(seg);
     tl__alloc_destroy(&alloc);
@@ -1862,6 +1919,8 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_segment_tombstones_imm);
     RUN_TEST(storage_segment_l0_bounds_include_tombstones);
     RUN_TEST(storage_segment_l0_bounds_tombstones_extend_max);
+    RUN_TEST(storage_segment_page_prefix_counts_built);
+    RUN_TEST(storage_segment_count_records_in_range_no_scan);
 
     /* Manifest tests (15 tests) */
     RUN_TEST(storage_manifest_create_empty);
