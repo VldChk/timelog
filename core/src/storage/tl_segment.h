@@ -111,6 +111,13 @@ typedef struct tl_segment {
     /* Page catalog */
     tl_page_catalog_t catalog;
 
+    /*
+     * Optional page prefix sums for fast in-segment range counting.
+     * When present, page_prefix_counts[i] is the cumulative record count
+     * over pages [0, i). Length = page_count + 1, with [0] == 0.
+     */
+    uint64_t* page_prefix_counts;
+
     /* Tombstones (L0 only, NULL for L1) */
     tl_tombstones_t* tombstones;
 

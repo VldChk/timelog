@@ -26,6 +26,8 @@
 #include "tl_page.h"
 #include "tl_segment.h"
 #include "tl_manifest.h"
+#include "query/tl_segment_range.h"
+#include "query/tl_immutable_count.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -1688,6 +1690,58 @@ TEST_DECLARE(storage_segment_build_small_page_bytes_clamped) {
  * They test internal invariants that may change with implementation.
  *===========================================================================*/
 
+
+TEST_DECLARE(storage_segment_count_records_in_range_uses_catalog) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[10] = {
+        {10, 1}, {20, 2}, {30, 3}, {40, 4}, {50, 5},
+        {60, 6}, {70, 7}, {80, 8}, {90, 9}, {100, 10}
+    };
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK,
+        tl_segment_build_l1(&alloc, records, 10, sizeof(tl_record_t) * 3,
+                            0, 200, false, 1, &seg));
+    TEST_ASSERT_NOT_NULL(seg->page_prefix_counts);
+
+    TEST_ASSERT_EQ_U64(10, tl_count_records_in_segment_range(seg, 0, 200, false));
+    TEST_ASSERT_EQ_U64(4, tl_count_records_in_segment_range(seg, 35, 75, false));
+    TEST_ASSERT_EQ_U64(5, tl_count_records_in_segment_range(seg, 55, 0, true));
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(storage_segment_count_visible_records_subtracts_newer_tombs) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_record_t records[8] = {
+        {10, 1}, {20, 2}, {30, 3}, {40, 4},
+        {50, 5}, {60, 6}, {70, 7}, {80, 8}
+    };
+
+    tl_segment_t* seg = NULL;
+    TEST_ASSERT_STATUS(TL_OK,
+        tl_segment_build_l1(&alloc, records, 8, sizeof(tl_record_t) * 2,
+                            0, 200, false, 1, &seg));
+
+    tl_interval_t tombs[3] = {
+        {.start = 15, .end = 35, .end_unbounded = false, .max_seq = 2},
+        {.start = 45, .end = 65, .end_unbounded = false, .max_seq = 5},
+        {.start = 75, .end = 200, .end_unbounded = false, .max_seq = 5}
+    };
+
+    uint64_t visible = tl_count_visible_records_in_segment_range(seg, 0, 200, false,
+                                                                 tombs, 3);
+    TEST_ASSERT_EQ_U64(5, visible);
+
+    tl_segment_release(seg);
+    tl__alloc_destroy(&alloc);
+}
+
 #ifdef TL_DEBUG
 
 TEST_DECLARE(storage_page_validate_correct) {
@@ -1862,6 +1916,8 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_segment_tombstones_imm);
     RUN_TEST(storage_segment_l0_bounds_include_tombstones);
     RUN_TEST(storage_segment_l0_bounds_tombstones_extend_max);
+    RUN_TEST(storage_segment_count_records_in_range_uses_catalog);
+    RUN_TEST(storage_segment_count_visible_records_subtracts_newer_tombs);
 
     /* Manifest tests (15 tests) */
     RUN_TEST(storage_manifest_create_empty);
@@ -1887,6 +1943,7 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_seq_contract);
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_order_contract);
     RUN_TEST(storage_segment_build_small_page_bytes_clamped);
+
 
 #ifdef TL_DEBUG
     /* Debug validation tests (5 tests) */

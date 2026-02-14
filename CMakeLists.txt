@@ -108,6 +108,7 @@ set(TIMELOG_SOURCES
     core/src/query/tl_filter.c
     core/src/query/tl_point.c
     core/src/query/tl_pagespan_iter.c
+    core/src/query/tl_immutable_count.c
     # Phase 8
     core/src/maint/tl_compaction.c
     # Adaptive Segmentation (V-Next)
