@@ -39,6 +39,7 @@ from typing import Any, Callable
 # ---------------------------------------------------------------------------
 
 _REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "python"))
 for _candidate in [
     _REPO / "bindings" / "cpython" / "build-test" / "Release",
@@ -51,6 +52,7 @@ for _candidate in [
 
 from timelog import Timelog, TimelogBusyError, TimelogError  # noqa: E402
 from timelog._api import TL_TS_MAX, TL_TS_MIN, _coerce_ts  # noqa: E402
+from formal.reference_model import ReferenceModel, SnapshotMetadata  # noqa: E402
 
 
 DEFAULT_CSVS = [
@@ -61,6 +63,11 @@ DEFAULT_CSVS = [
 ISSUE_STATUS_CONFIRMED = "CONFIRMED_ENGINE_BUG"
 ISSUE_STATUS_CHECKER = "CHECKER_BUG"
 ISSUE_STATUS_TRANSIENT = "UNCONFIRMED_TRANSIENT"
+
+ISSUE_CLASS_ENGINE_BUG = "ENGINE_BUG"
+ISSUE_CLASS_CHECKER_BUG = "CHECKER_BUG"
+ISSUE_CLASS_UNSUPPORTED = "UNSUPPORTED_SCENARIO"
+ISSUE_CLASS_FORMAL_DIVERGENCE = "FORMAL_DIVERGENCE"
 
 
 def _utc_now_iso() -> str:
@@ -211,6 +218,7 @@ class ComparisonResult:
 @dataclass
 class IssueOutcome:
     status: str
+    issue_class: str
     notes: list[str]
     triage_records: dict[str, Any]
 
@@ -253,6 +261,7 @@ class IssueRegistry:
         kind: str,
         severity: str,
         status: str,
+        issue_class: str,
         op_index: int,
         check_index: int,
         title: str,
@@ -268,6 +277,7 @@ class IssueRegistry:
             "kind": kind,
             "severity": severity,
             "status": status,
+            "issue_class": issue_class,
             "op_index": op_index,
             "check_index": check_index,
             "title": title,
@@ -290,6 +300,7 @@ class IssueRegistry:
             f"- Kind: `{kind}`",
             f"- Severity: `{severity}`",
             f"- Status: `{status}`",
+            f"- Issue class: `{issue_class}`",
             f"- Operation index: `{op_index}`",
             f"- Check index: `{check_index}`",
             "",
@@ -729,7 +740,7 @@ class MismatchTriager:
             triage_records["truth_agrees"] = Counter(expected_fast) == Counter(expected_truth)
             if not triage_records["truth_agrees"]:
                 notes.append("ShadowFast and ShadowTruth disagree")
-                return IssueOutcome(ISSUE_STATUS_CHECKER, notes, triage_records)
+                return IssueOutcome(ISSUE_STATUS_CHECKER, ISSUE_CLASS_CHECKER_BUG, notes, triage_records)
 
         if initial_got is not None:
             cmp_initial = _compare_rows(expected_rows, initial_got)
@@ -749,7 +760,7 @@ class MismatchTriager:
             }
             if cmp_rerun.ok:
                 notes.append("mismatch disappeared on identical rerun")
-                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, ISSUE_CLASS_UNSUPPORTED, notes, triage_records)
         except Exception as exc:
             triage_records["reruns"]["same_query"] = {"exception": repr(exc)}
 
@@ -764,7 +775,7 @@ class MismatchTriager:
                 }
                 if cmp_alt.ok:
                     notes.append("mismatch disappeared on alternate query")
-                    return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+                    return IssueOutcome(ISSUE_STATUS_TRANSIENT, ISSUE_CLASS_UNSUPPORTED, notes, triage_records)
             except Exception as exc:
                 triage_records["reruns"]["alternate_query"] = {"exception": repr(exc)}
 
@@ -779,12 +790,12 @@ class MismatchTriager:
             }
             if cmp_after.ok:
                 notes.append("mismatch disappeared after maintenance sweep")
-                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, ISSUE_CLASS_UNSUPPORTED, notes, triage_records)
         except Exception as exc:
             triage_records["reruns"]["post_maintenance"] = {"exception": repr(exc)}
 
         notes.append("mismatch persisted across reruns")
-        return IssueOutcome(ISSUE_STATUS_CONFIRMED, notes, triage_records)
+        return IssueOutcome(ISSUE_STATUS_CONFIRMED, ISSUE_CLASS_ENGINE_BUG, notes, triage_records)
 
 
 class CorrectnessRunner:
@@ -817,6 +828,8 @@ class CorrectnessRunner:
         self.run_id = f"ccv2_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
         self.run_dir = Path(cfg.out_dir) / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.replay_dir = self.run_dir / "replay_bundles"
+        self.replay_dir.mkdir(parents=True, exist_ok=True)
 
         ops_path = Path(cfg.log_alias_path) if cfg.log_alias_path else self.run_dir / "ops.jsonl"
         self.ops_writer = JsonlWriter(ops_path)
@@ -845,6 +858,7 @@ class CorrectnessRunner:
 
         self.shadow_fast = ShadowFast()
         self.shadow_truth = ShadowTruth()
+        self.reference_model = ReferenceModel()
         self.triager = MismatchTriager(self)
 
         self.rows_by_rid: dict[int, StoredRow] = {}
@@ -1069,12 +1083,14 @@ class CorrectnessRunner:
 
     def _oracle_insert(self, rows: list[StoredRow]) -> None:
         self.shadow_fast.insert_rows(rows)
+        self.reference_model.insert_rows(rows)
         for row in rows:
             self.shadow_truth.record_insert(row)
             self.recent_insert_ts.append(row.ts)
 
     def _oracle_delete_range(self, t1: int, t2: int) -> list[StoredRow]:
         removed = self.shadow_fast.delete_range(t1, t2, self.op_index)
+        self.reference_model.delete_range(t1, t2)
         self.shadow_truth.record_delete(t1, t2, self.op_index)
         self.recent_delete_ranges.append((t1, t2))
         return removed
@@ -1355,6 +1371,8 @@ class CorrectnessRunner:
                     "ok": False,
                     "missing_sample": missing,
                     "context": asdict(ctx),
+                    "snapshot_seq": self.reference_model.op_seq,
+                    "watermark_seq": self.reference_model.watermark_seq,
                 },
                 flush=True,
             )
@@ -1373,6 +1391,8 @@ class CorrectnessRunner:
                 "kind": "views_subset",
                 "ok": True,
                 "context": asdict(ctx),
+                "snapshot_seq": self.reference_model.op_seq,
+                "watermark_seq": self.reference_model.watermark_seq,
             }
         )
 
@@ -1427,6 +1447,8 @@ class CorrectnessRunner:
                 "expected_max": exp_max,
                 "got_min": got_min,
                 "got_max": got_max,
+                "snapshot_seq": self.reference_model.op_seq,
+                "watermark_seq": self.reference_model.watermark_seq,
             },
             flush=not ok,
         )
@@ -1438,6 +1460,45 @@ class CorrectnessRunner:
                 severity="HIGH",
                 status=ISSUE_STATUS_CONFIRMED,
             )
+
+
+    def _reference_expected_rows(self, ctx: CheckContext) -> tuple[list[StoredRow], SnapshotMetadata]:
+        kind = ctx.query_kind
+        p = ctx.params
+        if kind == "point":
+            rows, snap = self.reference_model.query_point(int(p["ts"]))
+        elif kind == "slice_since":
+            rows, snap = self.reference_model.query_since(int(p["t1"]))
+        elif kind == "slice_until":
+            rows, snap = self.reference_model.query_range(TL_TS_MIN, int(p["t2"]))
+        elif kind in {"slice_all", "full_scan", "all_sample"}:
+            rows, snap = self.reference_model.query_all()
+        elif kind == "range":
+            rows, snap = self.reference_model.query_range(int(p["t1"]), int(p["t2"]))
+        else:
+            rows, snap = [], SnapshotMetadata(self.reference_model.op_seq, self.reference_model.watermark_seq)
+        return list(rows), snap
+
+    def _snapshot_meta_dict(self, snap: SnapshotMetadata) -> dict[str, int]:
+        return {"snapshot_seq": int(snap.snapshot_seq), "watermark_seq": int(snap.watermark_seq)}
+
+    def _replay_bundle(self, *, ctx: CheckContext, expected_rows: list[StoredRow], got_records: list[tuple[int, Any]]) -> dict[str, Any]:
+        return {
+            "schema": "timelog.trace_checker.replay.v1",
+            "run_id": self.run_id,
+            "op_index": self.op_index,
+            "check_index": self.check_index,
+            "query": asdict(ctx),
+            "expected": _rows_to_expected_keys(expected_rows),
+            "got": _records_to_engine_keys(got_records),
+        }
+
+    def _write_replay_bundle(self, bundle: dict[str, Any]) -> str:
+        bundle_name = f"check_{self.check_index:07d}_op_{self.op_index:07d}.json"
+        out = self.replay_dir / bundle_name
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(bundle, fh, indent=2, ensure_ascii=True, default=str)
+        return str(out)
 
     # ------------------------------------------------------------------
     # Verification core
@@ -1468,10 +1529,27 @@ class CorrectnessRunner:
         alt_fetch: Callable[[], list[tuple[int, Any]]] | None,
     ) -> None:
         self.check_index += 1
+        expected_ref, snap_meta = self._reference_expected_rows(ctx)
+        fast_cmp = Counter(_rows_to_expected_keys(expected_rows)) == Counter(_rows_to_expected_keys(expected_ref))
+        if not fast_cmp:
+            self._register_runtime_issue(
+                kind="FORMAL_DIVERGENCE",
+                title=f"checker shadow diverged from formal oracle: {ctx.description}",
+                evidence={
+                    "context": asdict(ctx),
+                    "snapshot": self._snapshot_meta_dict(snap_meta),
+                    "shadow_fast_sample": _rows_to_expected_keys(expected_rows)[:20],
+                    "formal_sample": _rows_to_expected_keys(expected_ref)[:20],
+                },
+                severity="HIGH",
+                status=ISSUE_STATUS_CHECKER,
+                issue_class=ISSUE_CLASS_FORMAL_DIVERGENCE,
+            )
+            return
         initial_got = None
         try:
             initial_got = engine_fetch()
-            cmp = _compare_rows(expected_rows, initial_got)
+            cmp = _compare_rows(expected_ref, initial_got)
         except Exception as exc:
             self._register_runtime_issue(
                 kind="CHECKER_INCONSISTENCY",
@@ -1493,6 +1571,8 @@ class CorrectnessRunner:
                     "expected_n": cmp.expected_n,
                     "got_n": cmp.got_n,
                     "context": asdict(ctx),
+                    "snapshot_seq": snap_meta.snapshot_seq,
+                    "watermark_seq": snap_meta.watermark_seq,
                 }
             )
             return
@@ -1500,21 +1580,27 @@ class CorrectnessRunner:
         self.mismatches += 1
         outcome = self.triager.triage(
             ctx=ctx,
-            expected_rows=expected_rows,
+            expected_rows=expected_ref,
             engine_fetch=engine_fetch,
             alt_fetch=alt_fetch,
             initial_got=initial_got,
         )
         severity = "CRITICAL" if outcome.status == ISSUE_STATUS_CONFIRMED else "HIGH"
+        replay_bundle = self._replay_bundle(ctx=ctx, expected_rows=expected_ref, got_records=initial_got or [])
+        replay_bundle_path = self._write_replay_bundle(replay_bundle)
         issue_id = self.issue_registry.create_issue(
             kind=cmp.reason,
             severity=severity,
             status=outcome.status,
+            issue_class=outcome.issue_class,
             op_index=self.op_index,
             check_index=self.check_index,
             title=f"{cmp.reason} in {ctx.description}",
-            context=asdict(ctx),
+            context={**asdict(ctx), **self._snapshot_meta_dict(snap_meta)},
             evidence={
+                "snapshot": self._snapshot_meta_dict(snap_meta),
+                "replay_bundle": replay_bundle,
+                "replay_bundle_path": replay_bundle_path,
                 "comparison": {
                     "reason": cmp.reason,
                     "expected_n": cmp.expected_n,
@@ -1533,7 +1619,11 @@ class CorrectnessRunner:
                 "ok": False,
                 "issue_id": issue_id,
                 "status": outcome.status,
+                "issue_class": outcome.issue_class,
                 "reason": cmp.reason,
+                "snapshot_seq": snap_meta.snapshot_seq,
+                "watermark_seq": snap_meta.watermark_seq,
+                "replay_bundle_path": replay_bundle_path,
                 "context": asdict(ctx),
             },
             flush=True,
@@ -1906,6 +1996,7 @@ class CorrectnessRunner:
         evidence: dict[str, Any],
         severity: str,
         status: str,
+        issue_class: str | None = None,
     ) -> None:
         issue_id = self.issue_registry.create_issue(
             kind=kind,
@@ -1913,8 +2004,9 @@ class CorrectnessRunner:
             status=status,
             op_index=self.op_index,
             check_index=self.check_index,
+            issue_class=(issue_class if issue_class is not None else (ISSUE_CLASS_CHECKER_BUG if status == ISSUE_STATUS_CHECKER else ISSUE_CLASS_ENGINE_BUG)),
             title=title,
-            context={"op_index": self.op_index, "check_index": self.check_index},
+            context={"op_index": self.op_index, "check_index": self.check_index, "snapshot_seq": self.reference_model.op_seq, "watermark_seq": self.reference_model.watermark_seq},
             evidence=evidence,
         )
         if status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
