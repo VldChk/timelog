@@ -1041,6 +1041,60 @@ TEST_DECLARE(func_stats_after_flush) {
     tl_close(tl);
 }
 
+
+TEST_DECLARE(func_stats_after_flush_with_newer_tombstones) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* First flush creates immutable source with watermark W0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Newer tombstone overlaps two immutable rows (100,200). */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 250));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* Immutable visible count should subtract newer skyline overlap: only ts=300 remains. */
+    TEST_ASSERT_EQ(1, stats.records_estimate);
+    TEST_ASSERT(stats.tombstone_count >= 1);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_stats_after_flush_overlapping_newer_tombstones_no_double_subtract) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Two overlapping deletes should still subtract each row once after skyline merge. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 250));
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 150, 300));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* Overlap at ts=200 must not be double-subtracted; ts=400 survives. */
+    TEST_ASSERT_EQ(1, stats.records_estimate);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 TEST_DECLARE(func_stats_null_checks) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
@@ -2657,6 +2711,8 @@ void run_functional_tests(void) {
     RUN_TEST(func_stats_with_records);
     RUN_TEST(func_stats_with_tombstones);
     RUN_TEST(func_stats_after_flush);
+    RUN_TEST(func_stats_after_flush_with_newer_tombstones);
+    RUN_TEST(func_stats_after_flush_overlapping_newer_tombstones_no_double_subtract);
     RUN_TEST(func_stats_null_checks);
 
     /* Maintenance config tests (2 tests) */

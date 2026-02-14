@@ -2590,9 +2590,11 @@ static uint64_t tl__visible_records_in_segment(const tl_segment_t* seg,
             continue;
         }
 
-        gross -= ov_hi_unbounded
+        uint64_t dec = ov_hi_unbounded
             ? tl_count_records_in_segment_since(seg, ov_lo)
             : tl_count_records_in_segment_range(seg, ov_lo, ov_hi);
+        TL_ASSERT(dec <= gross);
+        gross = (dec <= gross) ? (gross - dec) : 0;
     }
 
     return gross;
@@ -2629,7 +2631,12 @@ static uint64_t tl__visible_records_in_memrun(const tl_memrun_t* mr,
             continue;
         }
 
-        gross -= tl__count_records_in_memrun_range(mr, ov_lo, ov_hi, ov_hi_unbounded);
+        uint64_t dec = tl__count_records_in_memrun_range(mr,
+                                                         ov_lo,
+                                                         ov_hi,
+                                                         ov_hi_unbounded);
+        TL_ASSERT(dec <= gross);
+        gross = (dec <= gross) ? (gross - dec) : 0;
     }
 
     return gross;
