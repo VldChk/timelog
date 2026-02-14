@@ -114,6 +114,10 @@ static void segment_destroy(tl_segment_t* seg) {
     /* Destroy catalog (frees metadata array, not pages) */
     tl_page_catalog_destroy(&seg->catalog);
 
+    if (seg->page_prefix_counts != NULL) {
+        TL_FREE(alloc, seg->page_prefix_counts);
+    }
+
     /* Destroy tombstones */
     destroy_tombstones(seg->tombstones, alloc);
 
@@ -281,6 +285,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
     seg->tomb_max_ts = 0;
+    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -315,6 +320,25 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
+
+    if (seg->page_count > 0) {
+        size_t prefix_len = (size_t)seg->page_count + 1;
+        seg->page_prefix_counts = TL_NEW_ARRAY(alloc, uint64_t, prefix_len);
+        if (seg->page_prefix_counts == NULL) {
+            destroy_tombstones(seg->tombstones, alloc);
+            for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
+                tl_page_destroy(seg->catalog.pages[i].page, alloc);
+            }
+            tl_page_catalog_destroy(&seg->catalog);
+            TL_FREE(alloc, seg);
+            return TL_ENOMEM;
+        }
+        seg->page_prefix_counts[0] = 0;
+        for (uint32_t i = 0; i < seg->page_count; i++) {
+            seg->page_prefix_counts[i + 1] =
+                seg->page_prefix_counts[i] + seg->catalog.pages[i].count;
+        }
+    }
 
     /*
      * Compute bounds.
@@ -403,6 +427,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
     seg->tomb_max_ts = 0;
+    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     /* Initialize catalog */
@@ -419,6 +444,24 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
+
+    if (seg->page_count > 0) {
+        size_t prefix_len = (size_t)seg->page_count + 1;
+        seg->page_prefix_counts = TL_NEW_ARRAY(alloc, uint64_t, prefix_len);
+        if (seg->page_prefix_counts == NULL) {
+            for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
+                tl_page_destroy(seg->catalog.pages[i].page, alloc);
+            }
+            tl_page_catalog_destroy(&seg->catalog);
+            TL_FREE(alloc, seg);
+            return TL_ENOMEM;
+        }
+        seg->page_prefix_counts[0] = 0;
+        for (uint32_t i = 0; i < seg->page_count; i++) {
+            seg->page_prefix_counts[i + 1] =
+                seg->page_prefix_counts[i] + seg->catalog.pages[i].count;
+        }
+    }
 
     /* Bounds from pages */
     seg->record_min_ts = seg->catalog.pages[0].min_ts;
