@@ -4,6 +4,7 @@
 #include "internal/tl_log.h"
 #include "internal/tl_sync.h"
 #include "internal/tl_seqlock.h"
+#include "internal/tl_search.h"
 #include "internal/tl_locks.h"
 #include "internal/tl_timelog_internal.h"
 #include "delta/tl_memtable.h"
@@ -16,6 +17,7 @@
 #include "query/tl_merge_iter.h"
 #include "query/tl_filter.h"
 #include "query/tl_point.h"
+#include "query/tl_segment_range.h"
 #include "maint/tl_compaction.h"
 #include "maint/tl_adaptive.h"
 
@@ -2502,6 +2504,185 @@ tl_status_t tl_maint_step(tl_timelog_t* tl) {
     return TL_EOF;  /* No work to do */
 }
 
+static bool tl__range_overlap_half_open(tl_ts_t a1,
+                                     tl_ts_t a2,
+                                     bool a2_unbounded,
+                                     tl_ts_t b1,
+                                     tl_ts_t b2,
+                                     bool b2_unbounded,
+                                     tl_ts_t* out_lo,
+                                     tl_ts_t* out_hi,
+                                     bool* out_hi_unbounded) {
+    tl_ts_t lo = (a1 > b1) ? a1 : b1;
+
+    bool hi_unbounded = a2_unbounded && b2_unbounded;
+    tl_ts_t hi = 0;
+    if (!hi_unbounded) {
+        hi = a2_unbounded ? b2 : (b2_unbounded ? a2 : TL_MIN(a2, b2));
+        if (lo >= hi) {
+            return false;
+        }
+    }
+
+    if (out_lo != NULL) *out_lo = lo;
+    if (out_hi != NULL) *out_hi = hi;
+    if (out_hi_unbounded != NULL) *out_hi_unbounded = hi_unbounded;
+    return true;
+}
+
+static uint64_t tl__count_records_sorted_range(const tl_record_t* data,
+                                               size_t len,
+                                               tl_ts_t t1,
+                                               tl_ts_t t2,
+                                               bool t2_unbounded) {
+    if (data == NULL || len == 0) {
+        return 0;
+    }
+
+    size_t lo = tl_record_lower_bound(data, len, t1);
+    size_t hi = t2_unbounded ? len : tl_record_lower_bound(data, len, t2);
+    if (hi <= lo) {
+        return 0;
+    }
+    return (uint64_t)(hi - lo);
+}
+
+static uint64_t tl__count_records_in_memrun_range(const tl_memrun_t* mr,
+                                                  tl_ts_t t1,
+                                                  tl_ts_t t2,
+                                                  bool t2_unbounded) {
+    uint64_t total = 0;
+    total += tl__count_records_sorted_range(tl_memrun_run_data(mr),
+                                            tl_memrun_run_len(mr),
+                                            t1, t2, t2_unbounded);
+
+    size_t run_count = tl_memrun_ooo_run_count(mr);
+    for (size_t i = 0; i < run_count; i++) {
+        const tl_ooorun_t* run = tl_memrun_ooo_run_at(mr, i);
+        total += tl__count_records_sorted_range(tl_ooorun_records(run),
+                                                tl_ooorun_len(run),
+                                                t1, t2, t2_unbounded);
+    }
+
+    return total;
+}
+
+static bool tl__memrun_record_bounds(const tl_memrun_t* mr,
+                                     tl_ts_t* out_min,
+                                     tl_ts_t* out_max) {
+    bool has = false;
+    tl_ts_t min_ts = TL_TS_MAX;
+    tl_ts_t max_ts = TL_TS_MIN;
+
+    if (tl_memrun_run_len(mr) > 0) {
+        const tl_record_t* run = tl_memrun_run_data(mr);
+        min_ts = TL_MIN(min_ts, run[0].ts);
+        max_ts = TL_MAX(max_ts, run[tl_memrun_run_len(mr) - 1].ts);
+        has = true;
+    }
+
+    for (size_t i = 0; i < tl_memrun_ooo_run_count(mr); i++) {
+        const tl_ooorun_t* run = tl_memrun_ooo_run_at(mr, i);
+        if (tl_ooorun_len(run) == 0) {
+            continue;
+        }
+        min_ts = TL_MIN(min_ts, tl_ooorun_min_ts(run));
+        max_ts = TL_MAX(max_ts, tl_ooorun_max_ts(run));
+        has = true;
+    }
+
+    if (!has) {
+        return false;
+    }
+
+    *out_min = min_ts;
+    *out_max = max_ts;
+    return true;
+}
+
+static uint64_t tl__visible_records_in_segment(const tl_segment_t* seg,
+                                               const tl_interval_t* tombs,
+                                               size_t tomb_count) {
+    if (!tl_segment_has_records(seg)) {
+        return 0;
+    }
+
+    tl_ts_t src_start = tl_segment_record_min_ts(seg);
+    tl_ts_t src_end = tl_segment_record_max_ts(seg);
+    bool src_end_unbounded = (src_end == TL_TS_MAX);
+    tl_ts_t src_end_exclusive = src_end_unbounded ? 0 : (src_end + 1);
+
+    uint64_t gross = src_end_unbounded
+        ? tl_count_records_in_segment_since(seg, src_start)
+        : tl_count_records_in_segment_range(seg, src_start, src_end_exclusive);
+
+    tl_seq_t watermark = tl_segment_applied_seq(seg);
+    for (size_t i = 0; i < tomb_count; i++) {
+        const tl_interval_t* f = &tombs[i];
+        if (f->max_seq <= watermark) {
+            continue;
+        }
+
+        tl_ts_t ov_lo = 0, ov_hi = 0;
+        bool ov_hi_unbounded = false;
+        if (!tl__range_overlap_half_open(src_start, src_end_exclusive, src_end_unbounded,
+                                         f->start, f->end, f->end_unbounded,
+                                         &ov_lo, &ov_hi, &ov_hi_unbounded)) {
+            continue;
+        }
+
+        uint64_t dec = ov_hi_unbounded
+            ? tl_count_records_in_segment_since(seg, ov_lo)
+            : tl_count_records_in_segment_range(seg, ov_lo, ov_hi);
+        TL_ASSERT(dec <= gross);
+        gross = (dec <= gross) ? (gross - dec) : 0;
+    }
+
+    return gross;
+}
+
+static uint64_t tl__visible_records_in_memrun(const tl_memrun_t* mr,
+                                              const tl_interval_t* tombs,
+                                              size_t tomb_count) {
+    tl_ts_t src_min = 0, src_max = 0;
+    if (!tl__memrun_record_bounds(mr, &src_min, &src_max)) {
+        return 0;
+    }
+
+    bool src_end_unbounded = (src_max == TL_TS_MAX);
+    tl_ts_t src_end_exclusive = src_end_unbounded ? 0 : (src_max + 1);
+
+    uint64_t gross = tl__count_records_in_memrun_range(mr,
+                                                        src_min,
+                                                        src_end_exclusive,
+                                                        src_end_unbounded);
+
+    tl_seq_t watermark = tl_memrun_applied_seq(mr);
+    for (size_t i = 0; i < tomb_count; i++) {
+        const tl_interval_t* f = &tombs[i];
+        if (f->max_seq <= watermark) {
+            continue;
+        }
+
+        tl_ts_t ov_lo = 0, ov_hi = 0;
+        bool ov_hi_unbounded = false;
+        if (!tl__range_overlap_half_open(src_min, src_end_exclusive, src_end_unbounded,
+                                         f->start, f->end, f->end_unbounded,
+                                         &ov_lo, &ov_hi, &ov_hi_unbounded)) {
+            continue;
+        }
+
+        uint64_t dec = tl__count_records_in_memrun_range(mr,
+                                                         ov_lo,
+                                                         ov_hi,
+                                                         ov_hi_unbounded);
+        TL_ASSERT(dec <= gross);
+        gross = (dec <= gross) ? (gross - dec) : 0;
+    }
+
+    return gross;
+}
+
 /*===========================================================================
  * Statistics and Diagnostics
  *
@@ -2541,43 +2722,65 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
     out->segments_l1 = tl_manifest_l1_count(manifest);
 
     /*
-     * Count total pages and records from manifest.
-     * Iterate through all segments in both layers.
+     * Count total pages and records from immutable sources.
+     * For records_estimate, use watermark-aware subtraction over immutable
+     * sources (segments + sealed memruns) without row scans.
      */
     uint64_t total_pages = 0;
-    uint64_t total_records = 0;
+    uint64_t immutable_visible_records = 0;
+
+    tl_intervals_t skyline;
+    tl_intervals_init(&skyline, snap->alloc);
+    tl_status_t skyline_st = tl_snapshot_collect_tombstones(snap,
+                                                            &skyline,
+                                                            TL_TS_MIN,
+                                                            0,
+                                                            true);
+    if (skyline_st != TL_OK) {
+        tl_intervals_destroy(&skyline);
+        return skyline_st;
+    }
+
+    tl_intervals_imm_t skyline_imm = tl_intervals_as_imm(&skyline);
+    const tl_interval_t* skyline_data = skyline_imm.data;
+    size_t skyline_len = skyline_imm.len;
 
     /* L0 segments */
     for (uint32_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
         total_pages += seg->page_count;
-        total_records += seg->record_count;
+        immutable_visible_records += tl__visible_records_in_segment(seg,
+                                                                    skyline_data,
+                                                                    skyline_len);
     }
 
     /* L1 segments */
     for (uint32_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
         total_pages += seg->page_count;
-        total_records += seg->record_count;
+        immutable_visible_records += tl__visible_records_in_segment(seg,
+                                                                    skyline_data,
+                                                                    skyline_len);
     }
 
     out->pages_total = total_pages;
 
-    /*
-     * records_estimate includes both storage and memview records.
-     * This is RAW data before tombstone filtering.
-     */
+    uint64_t total_records = immutable_visible_records;
+
+    /* Mutable memview remains approximate by contract. */
     total_records += tl_memview_run_len(memview);
     total_records += tl_memview_ooo_total_len(memview);
 
-    /* Add records from sealed memruns */
+    /* Sealed memruns use watermark-aware immutable counting. */
     for (size_t i = 0; i < tl_memview_sealed_len(memview); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(memview, i);
-        total_records += tl_memrun_run_len(mr);
-        total_records += tl_memrun_ooo_len(mr);
+        total_records += tl__visible_records_in_memrun(mr,
+                                                        skyline_data,
+                                                        skyline_len);
     }
 
     out->records_estimate = total_records;
+    tl_intervals_destroy(&skyline);
 
     /*
      * Bounds: Use snapshot's precomputed bounds.

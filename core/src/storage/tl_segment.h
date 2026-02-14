@@ -111,6 +111,11 @@ typedef struct tl_segment {
     /* Page catalog */
     tl_page_catalog_t catalog;
 
+    /* Optional prefix sums over page counts, length = page_count + 1.
+     * page_prefix_counts[i] = total records in pages [0, i).
+     * NULL when page_count == 0. */
+    uint64_t* page_prefix_counts;
+
     /* Tombstones (L0 only, NULL for L1) */
     tl_tombstones_t* tombstones;
 
@@ -275,6 +280,36 @@ TL_INLINE tl_seq_t tl_segment_applied_seq(const tl_segment_t* seg) {
     return seg->applied_seq;
 }
 
+TL_INLINE const tl_page_catalog_t* tl_segment_catalog(const tl_segment_t* seg) {
+    return &seg->catalog;
+}
+
+TL_INLINE const uint64_t* tl_segment_page_prefix_counts(const tl_segment_t* seg) {
+    return seg->page_prefix_counts;
+}
+
+TL_INLINE uint64_t tl_segment_page_prefix_sum(const tl_segment_t* seg,
+                                              size_t first,
+                                              size_t last) {
+    TL_ASSERT(seg != NULL);
+    TL_ASSERT(first <= last);
+    TL_ASSERT(last <= seg->page_count);
+
+    if (first == last) {
+        return 0;
+    }
+
+    if (seg->page_prefix_counts != NULL) {
+        return seg->page_prefix_counts[last] - seg->page_prefix_counts[first];
+    }
+
+    uint64_t total = 0;
+    for (size_t i = first; i < last; i++) {
+        total += seg->catalog.pages[i].count;
+    }
+    return total;
+}
+
 /**
  * Get immutable view of tombstones for read path.
  * Returns empty view if tombstones is NULL.
@@ -289,13 +324,6 @@ TL_INLINE tl_intervals_imm_t tl_segment_tombstones_imm(const tl_segment_t* seg) 
         imm.len = 0;
     }
     return imm;
-}
-
-/**
- * Get page catalog (for iteration).
- */
-TL_INLINE const tl_page_catalog_t* tl_segment_catalog(const tl_segment_t* seg) {
-    return &seg->catalog;
 }
 
 /*===========================================================================
