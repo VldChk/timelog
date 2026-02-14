@@ -232,9 +232,9 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
  * @return TL_OK on success, TL_EINVAL for invalid args, other errors on
  *         allocation/iterator init failures
  */
-tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
-                                     tl_ts_t t1, tl_ts_t t2,
-                                     bool t2_unbounded,
-                                     uint64_t* out);
+tl_status_t tl_snapshot_count_range_internal(const tl_snapshot_t* snap,
+                                              tl_ts_t t1, tl_ts_t t2,
+                                              bool t2_unbounded,
+                                              uint64_t* out);
 
 #endif /* TL_SNAPSHOT_H */

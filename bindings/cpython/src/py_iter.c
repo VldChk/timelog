@@ -24,6 +24,65 @@
 static void pytimelogiter_cleanup(PyTimelogIter* self);
 
 /*===========================================================================
+ * Test-Only Failpoints
+ *
+ * These hooks are compiled only for the py_iter C test target. They allow
+ * deterministic simulation of allocation failure AFTER tl_iter_next consumes
+ * a row, so we can validate fail-closed iterator behavior.
+ *===========================================================================*/
+
+#ifdef TL_PY_ITER_TEST_HOOKS
+volatile int tl_py_iter_fail_after_fetch_iternext = 0;
+volatile int tl_py_iter_fail_after_fetch_next_batch = 0;
+
+void tl_py_iter_test_reset_failpoints(void)
+{
+    tl_py_iter_fail_after_fetch_iternext = 0;
+    tl_py_iter_fail_after_fetch_next_batch = 0;
+}
+
+void tl_py_iter_test_fail_iternext_once(void)
+{
+    tl_py_iter_fail_after_fetch_iternext = 1;
+}
+
+void tl_py_iter_test_fail_next_batch_once(void)
+{
+    tl_py_iter_fail_after_fetch_next_batch = 1;
+}
+
+static int tl_py_iter_test_should_fail_iternext(void)
+{
+    if (tl_py_iter_fail_after_fetch_iternext > 0) {
+        tl_py_iter_fail_after_fetch_iternext--;
+        PyErr_NoMemory();
+        return 1;
+    }
+    return 0;
+}
+
+static int tl_py_iter_test_should_fail_next_batch(void)
+{
+    if (tl_py_iter_fail_after_fetch_next_batch > 0) {
+        tl_py_iter_fail_after_fetch_next_batch--;
+        PyErr_NoMemory();
+        return 1;
+    }
+    return 0;
+}
+#else
+static int tl_py_iter_test_should_fail_iternext(void)
+{
+    return 0;
+}
+
+static int tl_py_iter_test_should_fail_next_batch(void)
+{
+    return 0;
+}
+#endif
+
+/*===========================================================================
  * Block Direct Construction
  *
  * Iterators are only created via factory methods (range, since, etc.).
@@ -155,12 +214,22 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     tl_status_t st = tl_iter_next(self->iter, &rec);
 
     if (st == TL_OK) {
+        /*
+         * If materialization fails after fetch, fail closed to avoid silently
+         * skipping rows with an apparently still-live iterator.
+         */
+        if (tl_py_iter_test_should_fail_iternext()) {
+            pytimelogiter_cleanup(self);
+            return NULL;
+        }
+
         /* Decode handle to PyObject* and take new reference */
         PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
         PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
         if (!ts) {
             Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
             return NULL;
         }
 
@@ -168,6 +237,7 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
         if (!tup) {
             Py_DECREF(ts);
             Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
             return NULL;
         }
 
@@ -245,11 +315,22 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         tl_status_t st = tl_iter_next(self->iter, &rec);
 
         if (st == TL_OK) {
+            /*
+             * Row already consumed from core iterator. On any subsequent
+             * materialization failure, close to keep remaining length/state
+             * deterministic and avoid silent row loss.
+             */
+            if (tl_py_iter_test_should_fail_next_batch()) {
+                pytimelogiter_cleanup(self);
+                goto fail;
+            }
+
             PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
             PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
             if (!ts) {
                 Py_DECREF(obj);
+                pytimelogiter_cleanup(self);
                 goto fail;
             }
 
@@ -257,6 +338,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
             if (!tup) {
                 Py_DECREF(ts);
                 Py_DECREF(obj);
+                pytimelogiter_cleanup(self);
                 goto fail;
             }
 

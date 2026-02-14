@@ -429,6 +429,8 @@ COMPLEXITY = {
     "B4": {"time": "O(N)", "space": "O(K)", "notes": "full k-way merge"},
     "B5": {"time": "O(K*log P + D)", "space": "O(K)", "notes": "D=duplicates"},
     "B6": {"time": "O(K*log P + M)", "space": "O(K)", "notes": "tiny result set"},
+    "B7": {"time": "O(S*T*log P + A)", "space": "O(S+T)", "notes": "snapshot full len(log) count path"},
+    "B8": {"time": "O(S*T*log P + A)", "space": "O(S+T)", "notes": "slice iterator remaining-count len(it) path"},
     "C1": {"time": "O(K*log P + W)", "space": "O(K)", "notes": "W=window records"},
     "C1B": {"time": "O(K*log P + M)", "space": "O(K)", "notes": "single pass over window"},
     "C2": {"time": "O(K*log P + W)", "space": "O(K)", "notes": "range + filter"},
@@ -498,6 +500,8 @@ EXPECTED_PERFORMANCE = {
     "B4": {"records_per_sec": 600_000},      # Full scan
     "B5": {"records_per_sec": 10_000},       # Point queries/sec (query-count metric)
     "B6": {"records_per_sec": 150_000},      # Micro-window queries/sec (query-count metric)
+    "B7": {"ops_per_sec": 2_000},            # len(log) calls/sec
+    "B8": {"ops_per_sec": 2_000},            # len(slice_iter) calls/sec
 
     # Category C: HFT Analytics (iteration + Python computation)
     "C1": {"records_per_sec": 8_000},        # Multi-window counting (10 windows)
@@ -1648,6 +1652,179 @@ def demo_b6_microsecond_window(runner: DemoRunner) -> dict:
 
     # Treat "records" as query count for throughput calculation.
     return {"records": queries, "queries": queries, "total_found": total_found, "window_ns": window_ns}
+
+
+@feature("B7", "len(log) full count benchmark", "B")
+def demo_b7_len_full_count(runner: DemoRunner) -> dict:
+    """Benchmark full timelog length calls under heavy loaded state."""
+    runner.ensure_data_loaded()
+
+    expected_full_count = None
+    b4_result = runner.results.get("B4")
+    if isinstance(b4_result, dict) and "error" not in b4_result:
+        b4_count = b4_result.get("records")
+        if isinstance(b4_count, int) and b4_count >= 0:
+            expected_full_count = b4_count
+    if expected_full_count is None:
+        expected_full_count = sum(1 for _ in runner.log)
+
+    # Warmup to reduce one-time effects.
+    for _ in range(3):
+        _ = len(runner.log)
+
+    target_seconds = 2.0 if runner.limit else 6.0
+    max_calls = 5_000 if runner.limit else 25_000
+    deadline = time.perf_counter() + target_seconds
+    lat = LatencyStats()
+    mismatch_calls = 0
+    calls = 0
+    len_value_last = 0
+
+    while calls < max_calls and time.perf_counter() < deadline:
+        t0 = time.perf_counter_ns()
+        got = len(runner.log)
+        dt = time.perf_counter_ns() - t0
+        lat.add(dt)
+        calls += 1
+        len_value_last = got
+        if got != expected_full_count:
+            mismatch_calls += 1
+
+    return {
+        "records": calls,  # operation count for throughput
+        "len_value_last": len_value_last,
+        "expected_full_count": expected_full_count,
+        "mismatch_calls": mismatch_calls,
+        "latency_ns": lat.summary(),
+    }
+
+
+@feature("B8", "len(slice) remaining-count benchmark", "B")
+def demo_b8_len_slice_count(runner: DemoRunner) -> dict:
+    """Benchmark len() on slice iterators and verify remaining-length contract."""
+    runner.ensure_data_loaded()
+
+    anchors: list[int] = []
+    for i, (ts, _) in enumerate(runner.log):
+        if i % 64 == 0:
+            anchors.append(ts)
+        if i >= 10_000:
+            break
+
+    if len(anchors) < 2:
+        return {"records": 0, "error": "insufficient anchors for slice len benchmark"}
+
+    def pick_range() -> tuple[int, int]:
+        i = random.randint(0, len(anchors) - 1)
+        j = min(len(anchors) - 1, i + random.randint(1, max(1, len(anchors) // 10)))
+        t1 = anchors[i]
+        t2 = anchors[j] + 1 if anchors[j] >= t1 else t1 + 1
+        return t1, t2
+
+    def make_iter(variant: str, t1: int, t2: int) -> TimelogIter:
+        if variant == "range":
+            return runner.log[t1:t2]
+        if variant == "since":
+            return runner.log[t1:]
+        if variant == "until":
+            return runner.log[:t2]
+        return runner.log[:]
+
+    def expected_count(variant: str, t1: int, t2: int) -> int:
+        if variant == "range":
+            return sum(1 for _ in runner.log[t1:t2])
+        if variant == "since":
+            return sum(1 for _ in runner.log[t1:])
+        if variant == "until":
+            return sum(1 for _ in runner.log[:t2])
+        return sum(1 for _ in runner.log[:])
+
+    # Contract probe before timing loop.
+    contract_failures: list[str] = []
+    probe_variants = ["range", "since", "until", "all"]
+    probe_count = min(8, len(anchors))
+    for i in range(probe_count):
+        variant = probe_variants[i % len(probe_variants)]
+        t1, t2 = pick_range()
+        it = None
+        try:
+            exp = expected_count(variant, t1, t2)
+            it = make_iter(variant, t1, t2)
+            before = len(it)
+            if before != exp:
+                contract_failures.append(
+                    f"{variant}:len_mismatch expected={exp} got={before} t1={t1} t2={t2}"
+                )
+                continue
+
+            consume_target = min(3, before)
+            consumed = 0
+            for _ in range(consume_target):
+                try:
+                    next(it)
+                    consumed += 1
+                except StopIteration:
+                    break
+            after = len(it)
+            if after != before - consumed:
+                contract_failures.append(
+                    f"{variant}:remaining_mismatch before={before} consumed={consumed} after={after}"
+                )
+                continue
+
+            it.close()
+            closed_len = len(it)
+            if closed_len != 0:
+                contract_failures.append(f"{variant}:closed_len_not_zero got={closed_len}")
+        except Exception as exc:
+            contract_failures.append(f"{variant}:exception {exc!r}")
+        finally:
+            if it is not None:
+                try:
+                    it.close()
+                except Exception:
+                    pass
+
+    # Timed len(slice) benchmark.
+    target_seconds = 2.0 if runner.limit else 6.0
+    max_calls = 8_000 if runner.limit else 30_000
+    deadline = time.perf_counter() + target_seconds
+    lat = LatencyStats()
+    variant_mix: Counter[str] = Counter()
+    total_returned = 0
+    calls = 0
+    variants = ["range", "since", "until", "all"]
+
+    while calls < max_calls and time.perf_counter() < deadline:
+        variant = random.choice(variants)
+        t1, t2 = pick_range()
+        it = None
+        t0 = time.perf_counter_ns()
+        n = 0
+        try:
+            it = make_iter(variant, t1, t2)
+            n = len(it)
+        finally:
+            if it is not None:
+                try:
+                    it.close()
+                except Exception:
+                    pass
+        dt = time.perf_counter_ns() - t0
+        lat.add(dt)
+        calls += 1
+        variant_mix[variant] += 1
+        total_returned += n
+
+    avg_returned_len = (total_returned / calls) if calls > 0 else 0.0
+    return {
+        "records": calls,  # operation count for throughput
+        "variant_mix": dict(sorted(variant_mix.items())),
+        "contract_failures": len(contract_failures),
+        "contract_failure_samples": contract_failures[:10],
+        "avg_returned_len": avg_returned_len,
+        "latency_ns": lat.summary(),
+    }
 
 
 # =============================================================================

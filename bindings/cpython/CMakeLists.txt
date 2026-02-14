@@ -301,6 +301,9 @@ if(TIMELOG_BUILD_PY_TESTS)
             TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
         )
     endif()
+    target_compile_definitions(test_py_iter PRIVATE
+        TL_PY_ITER_TEST_HOOKS
+    )
 
     target_link_libraries(test_py_iter PRIVATE
         timelog

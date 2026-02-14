@@ -21,6 +21,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef TL_PY_ITER_TEST_HOOKS
+/* Test-only failpoints from py_iter.c */
+extern void tl_py_iter_test_reset_failpoints(void);
+extern void tl_py_iter_test_fail_iternext_once(void);
+extern void tl_py_iter_test_fail_next_batch_once(void);
+#endif
+
 /*===========================================================================
  * Test Framework (same as test_py_timelog.c)
  *===========================================================================*/
@@ -1390,6 +1397,114 @@ TEST(next_batch_closed)
     close_and_dealloc(tl);
 }
 
+TEST(iternext_alloc_failure_is_fail_closed)
+{
+#ifdef TL_PY_ITER_TEST_HOOKS
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* obj = PyDict_New();
+    ASSERT_NOT_NULL(obj);
+    ASSERT_EQ(append_record(tl, 1, obj), 0);
+    ASSERT_EQ(append_record(tl, 2, obj), 0);
+
+    PyObject* range_method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* args = make_range_args(0, 100);
+    PyObject* iter = PyObject_Call(range_method, args, NULL);
+    Py_DECREF(args);
+    Py_DECREF(range_method);
+    ASSERT_NOT_NULL(iter);
+
+    ASSERT_EQ(PyObject_Length(iter), 2);
+
+    tl_py_iter_test_reset_failpoints();
+    tl_py_iter_test_fail_iternext_once();
+
+    PyObject* item = PyIter_Next(iter);
+    ASSERT_NULL(item);
+    ASSERT_EXCEPTION(PyExc_MemoryError);
+
+    PyObject* closed = PyObject_GetAttrString(iter, "closed");
+    ASSERT_NOT_NULL(closed);
+    ASSERT(closed == Py_True);
+    Py_DECREF(closed);
+
+    ASSERT_EQ(PyObject_Length(iter), 0);
+
+    /* Closed iterator: stop iteration, no error. */
+    item = PyIter_Next(iter);
+    ASSERT_NULL(item);
+    ASSERT(!PyErr_Occurred());
+
+    tl_py_iter_test_reset_failpoints();
+    Py_DECREF(iter);
+    Py_DECREF(obj);
+    close_and_dealloc(tl);
+#else
+    ASSERT(0);
+#endif
+}
+
+TEST(next_batch_alloc_failure_is_fail_closed)
+{
+#ifdef TL_PY_ITER_TEST_HOOKS
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* obj = PyDict_New();
+    ASSERT_NOT_NULL(obj);
+    ASSERT_EQ(append_record(tl, 1, obj), 0);
+    ASSERT_EQ(append_record(tl, 2, obj), 0);
+    ASSERT_EQ(append_record(tl, 3, obj), 0);
+
+    PyObject* range_method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* args = make_range_args(0, 100);
+    PyObject* iter = PyObject_Call(range_method, args, NULL);
+    Py_DECREF(args);
+    Py_DECREF(range_method);
+    ASSERT_NOT_NULL(iter);
+
+    ASSERT_EQ(PyObject_Length(iter), 3);
+
+    tl_py_iter_test_reset_failpoints();
+    tl_py_iter_test_fail_next_batch_once();
+
+    PyObject* batch_method = PyObject_GetAttrString(iter, "next_batch");
+    ASSERT_NOT_NULL(batch_method);
+    PyObject* n = PyLong_FromLong(2);
+    ASSERT_NOT_NULL(n);
+    PyObject* batch = PyObject_CallOneArg(batch_method, n);
+    Py_DECREF(n);
+    ASSERT_NULL(batch);
+    ASSERT_EXCEPTION(PyExc_MemoryError);
+
+    PyObject* closed = PyObject_GetAttrString(iter, "closed");
+    ASSERT_NOT_NULL(closed);
+    ASSERT(closed == Py_True);
+    Py_DECREF(closed);
+
+    ASSERT_EQ(PyObject_Length(iter), 0);
+
+    /* Closed iterator returns empty batch. */
+    n = PyLong_FromLong(5);
+    ASSERT_NOT_NULL(n);
+    batch = PyObject_CallOneArg(batch_method, n);
+    Py_DECREF(n);
+    ASSERT_NOT_NULL(batch);
+    ASSERT(PyList_Check(batch));
+    ASSERT_EQ(PyList_Size(batch), 0);
+
+    tl_py_iter_test_reset_failpoints();
+    Py_DECREF(batch);
+    Py_DECREF(batch_method);
+    Py_DECREF(iter);
+    Py_DECREF(obj);
+    close_and_dealloc(tl);
+#else
+    ASSERT(0);
+#endif
+}
+
 /*===========================================================================
  * Test Runner
  *===========================================================================*/
@@ -1479,6 +1594,8 @@ int main(int argc, char* argv[])
     run_next_batch_zero();
     run_next_batch_negative();
     run_next_batch_closed();
+    run_iternext_alloc_failure_is_fail_closed();
+    run_next_batch_alloc_failure_is_fail_closed();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
 

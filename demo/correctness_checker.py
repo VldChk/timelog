@@ -160,6 +160,9 @@ class RunConfig:
     full_verify_interval_ops: int
     full_verify_interval_seconds: int
     checkpoint_interval_ops: int
+    len_checks: bool
+    len_slice_samples: int
+    len_consume_samples: int
     continue_on_mismatch: bool
     max_issues: int
     verbose: bool
@@ -552,6 +555,23 @@ class ShadowFast:
     def query_all(self) -> list[StoredRow]:
         return [self._live_rows[rid] for _, rid in self._index if rid in self._live_rows]
 
+    def count_range(self, t1: int, t2: int) -> int:
+        lo = bisect.bisect_left(self._index, (t1, -1))
+        hi = bisect.bisect_left(self._index, (t2, -1))
+        return max(0, hi - lo)
+
+    def count_since(self, t1: int) -> int:
+        lo = bisect.bisect_left(self._index, (t1, -1))
+        return max(0, len(self._index) - lo)
+
+    def count_point(self, ts: int) -> int:
+        lo = bisect.bisect_left(self._index, (ts, -1))
+        hi = bisect.bisect_right(self._index, (ts, 2**63))
+        return max(0, hi - lo)
+
+    def count_all(self) -> int:
+        return len(self._index)
+
     def live_count(self) -> int:
         return len(self._index)
 
@@ -621,6 +641,18 @@ class ShadowTruth:
         rows = list(self.replay_live().values())
         rows.sort(key=lambda r: (r.ts, r.rid))
         return rows
+
+    def count_range(self, t1: int, t2: int) -> int:
+        return len(self.query_range(t1, t2))
+
+    def count_since(self, t1: int) -> int:
+        return len(self.query_since(t1))
+
+    def count_point(self, ts: int) -> int:
+        return len(self.query_point(ts))
+
+    def count_all(self) -> int:
+        return len(self.query_all())
 
 
 def _rows_to_expected_keys(rows: list[StoredRow]) -> list[tuple[int, int | None, str]]:
@@ -827,7 +859,10 @@ class CorrectnessRunner:
             "py -V:3.13 demo/correctness_checker.py "
             f"--duration-seconds={cfg.duration_seconds} "
             f"--seed={cfg.seed} "
-            f"--source-mode={cfg.source_mode}"
+            f"--source-mode={cfg.source_mode} "
+            f"--len-checks={'on' if cfg.len_checks else 'off'} "
+            f"--len-slice-samples={cfg.len_slice_samples} "
+            f"--len-consume-samples={cfg.len_consume_samples}"
         )
         self.issue_registry = IssueRegistry(self.run_dir, self.issues_writer, self.repro_cmd)
 
@@ -860,6 +895,9 @@ class CorrectnessRunner:
         self.deletes = 0
         self.mismatches = 0
         self.full_verifies = 0
+        self.len_checks_total = 0
+        self.len_checks_failed = 0
+        self.len_mismatches_by_kind: Counter[str] = Counter()
         self.stop_reason: str | None = None
         self.started_utc = _utc_now_iso()
 
@@ -1439,9 +1477,418 @@ class CorrectnessRunner:
                 status=ISSUE_STATUS_CONFIRMED,
             )
 
+        # Higher-frequency one-shot len() contract check.
+        if self.cfg.len_checks:
+            self._verify_len_full_contract()
+
     # ------------------------------------------------------------------
     # Verification core
     # ------------------------------------------------------------------
+
+    def _make_slice_iter(self, variant: str, t1: int, t2: int):
+        if variant == "range":
+            return self.log[t1:t2]
+        if variant == "since":
+            return self.log[t1:]
+        if variant == "until":
+            return self.log[:t2]
+        return self.log[:]
+
+    def _expected_len_count(self, shadow: ShadowFast | ShadowTruth, variant: str, t1: int, t2: int) -> int:
+        if variant == "range":
+            return shadow.count_range(t1, t2)
+        if variant == "since":
+            return shadow.count_since(t1)
+        if variant == "until":
+            return shadow.count_range(TL_TS_MIN, t2)
+        if variant == "point":
+            return shadow.count_point(t1)
+        return shadow.count_all()
+
+    def _len_slice_once(self, variant: str, t1: int, t2: int) -> int:
+        it = self._make_slice_iter(variant, t1, t2)
+        try:
+            return len(it)
+        finally:
+            try:
+                it.close()
+            except Exception:
+                pass
+
+    def _sum_slice_once(self, variant: str, t1: int, t2: int) -> int:
+        with self._make_slice_iter(variant, t1, t2) as it:
+            return sum(1 for _ in it)
+
+    def _len_point_once(self, ts: int, use_equal: bool = False) -> int:
+        with (self.log.equal(ts) if use_equal else self.log.point(ts)) as it:
+            return len(it)
+
+    def _pick_len_window(self) -> tuple[int, int]:
+        mn, mx = self.shadow_fast.min_ts(), self.shadow_fast.max_ts()
+        if mn is None or mx is None:
+            return TL_TS_MIN, TL_TS_MIN + 1
+        t1 = mn if mn == mx else self.rng.randint(mn, mx)
+        if t1 >= TL_TS_MAX:
+            return TL_TS_MAX, TL_TS_MAX
+        span = max(1, mx - mn)
+        width = self.rng.randint(1, max(1, span // 20))
+        t2 = self._bounded_ts(t1 + width)
+        if t2 <= t1:
+            t2 = t1 + 1
+        return t1, t2
+
+    def _triage_len_mismatch(
+        self,
+        *,
+        kind: str,
+        expected_fast: int,
+        expected_truth: int,
+        engine_fetch: Callable[[], int],
+        alt_fetch: Callable[[], int] | None,
+    ) -> IssueOutcome:
+        notes: list[str] = []
+        triage_records: dict[str, Any] = {
+            "kind": kind,
+            "expected_fast": expected_fast,
+            "expected_truth": expected_truth,
+            "truth_agrees": expected_fast == expected_truth,
+            "reruns": {},
+        }
+
+        if expected_fast != expected_truth:
+            notes.append("ShadowFast and ShadowTruth disagree")
+            return IssueOutcome(ISSUE_STATUS_CHECKER, notes, triage_records)
+
+        try:
+            got_same = engine_fetch()
+            triage_records["reruns"]["same_query"] = {"got": got_same}
+            if got_same == expected_fast:
+                notes.append("len mismatch disappeared on identical rerun")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["same_query"] = {"exception": repr(exc)}
+
+        if alt_fetch is not None:
+            try:
+                got_alt = alt_fetch()
+                triage_records["reruns"]["alternate_query"] = {"got": got_alt}
+                if got_alt == expected_fast:
+                    notes.append("len mismatch disappeared on alternate query")
+                    return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+            except Exception as exc:
+                triage_records["reruns"]["alternate_query"] = {"exception": repr(exc)}
+
+        self._safe_maintenance_sweep("len-triage")
+        try:
+            got_post = engine_fetch()
+            triage_records["reruns"]["post_maintenance"] = {"got": got_post}
+            if got_post == expected_fast:
+                notes.append("len mismatch disappeared after maintenance sweep")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["post_maintenance"] = {"exception": repr(exc)}
+
+        notes.append("len mismatch persisted across reruns")
+        return IssueOutcome(ISSUE_STATUS_CONFIRMED, notes, triage_records)
+
+    def _triage_len_remaining_mismatch(
+        self,
+        *,
+        kind: str,
+        probe_fetch: Callable[[], dict[str, Any]],
+    ) -> IssueOutcome:
+        notes: list[str] = []
+        triage_records: dict[str, Any] = {"kind": kind, "reruns": {}}
+
+        try:
+            same = probe_fetch()
+            triage_records["reruns"]["same_query"] = same
+            if same.get("ok"):
+                notes.append("remaining-len mismatch disappeared on identical rerun")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["same_query"] = {"exception": repr(exc)}
+
+        self._safe_maintenance_sweep("len-remaining-triage")
+        try:
+            post = probe_fetch()
+            triage_records["reruns"]["post_maintenance"] = post
+            if post.get("ok"):
+                notes.append("remaining-len mismatch disappeared after maintenance sweep")
+                return IssueOutcome(ISSUE_STATUS_TRANSIENT, notes, triage_records)
+        except Exception as exc:
+            triage_records["reruns"]["post_maintenance"] = {"exception": repr(exc)}
+
+        notes.append("remaining-len mismatch persisted across reruns")
+        return IssueOutcome(ISSUE_STATUS_CONFIRMED, notes, triage_records)
+
+    def _handle_len_mismatch(
+        self,
+        *,
+        check_kind: str,
+        title: str,
+        expected_fast: int,
+        expected_truth: int,
+        got: int,
+        engine_fetch: Callable[[], int],
+        alt_fetch: Callable[[], int] | None,
+        context: dict[str, Any],
+    ) -> None:
+        self.mismatches += 1
+        self.len_checks_failed += 1
+        self.len_mismatches_by_kind[check_kind] += 1
+        outcome = self._triage_len_mismatch(
+            kind=check_kind,
+            expected_fast=expected_fast,
+            expected_truth=expected_truth,
+            engine_fetch=engine_fetch,
+            alt_fetch=alt_fetch,
+        )
+        severity = "CRITICAL" if outcome.status == ISSUE_STATUS_CONFIRMED else "HIGH"
+        issue_id = self.issue_registry.create_issue(
+            kind="LEN_CONTRACT",
+            severity=severity,
+            status=outcome.status,
+            op_index=self.op_index,
+            check_index=self.check_index,
+            title=title,
+            context=context,
+            evidence={
+                "expected_fast": expected_fast,
+                "expected_truth": expected_truth,
+                "got": got,
+                "triage": {"notes": outcome.notes, "records": outcome.triage_records},
+            },
+        )
+        self.checks_writer.write(
+            {
+                "check_index": self.check_index,
+                "op_index": self.op_index,
+                "kind": check_kind,
+                "ok": False,
+                "issue_id": issue_id,
+                "status": outcome.status,
+                "expected_fast": expected_fast,
+                "expected_truth": expected_truth,
+                "got": got,
+                "context": context,
+            },
+            flush=True,
+        )
+        if outcome.status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
+            self.stop_reason = f"{outcome.status}:{issue_id}"
+
+    def _verify_len_count_case(
+        self,
+        *,
+        check_kind: str,
+        title: str,
+        expected_fast: int,
+        expected_truth: int,
+        engine_fetch: Callable[[], int],
+        alt_fetch: Callable[[], int] | None,
+        context: dict[str, Any],
+    ) -> None:
+        self.check_index += 1
+        self.len_checks_total += 1
+        try:
+            got = engine_fetch()
+        except Exception as exc:
+            self._register_runtime_issue(
+                kind="CHECKER_INCONSISTENCY",
+                title=f"len check crashed: {title}",
+                evidence={"exception": repr(exc), "traceback": traceback.format_exc(), "context": context},
+                severity="HIGH",
+                status=ISSUE_STATUS_CHECKER,
+            )
+            return
+
+        if got == expected_fast and expected_fast == expected_truth:
+            self.checks_writer.write(
+                {
+                    "check_index": self.check_index,
+                    "op_index": self.op_index,
+                    "kind": check_kind,
+                    "ok": True,
+                    "expected_fast": expected_fast,
+                    "expected_truth": expected_truth,
+                    "got": got,
+                    "context": context,
+                }
+            )
+            return
+
+        self._handle_len_mismatch(
+            check_kind=check_kind,
+            title=title,
+            expected_fast=expected_fast,
+            expected_truth=expected_truth,
+            got=got,
+            engine_fetch=engine_fetch,
+            alt_fetch=alt_fetch,
+            context=context,
+        )
+
+    def _remaining_len_probe(self, variant: str, t1: int, t2: int) -> dict[str, Any]:
+        it = self._make_slice_iter(variant, t1, t2)
+        before = 0
+        consumed = 0
+        after = 0
+        closed_len = -1
+        try:
+            before = len(it)
+            consume_target = min(self.cfg.len_consume_samples, before)
+            for _ in range(consume_target):
+                try:
+                    next(it)
+                    consumed += 1
+                except StopIteration:
+                    break
+            after = len(it)
+        finally:
+            try:
+                it.close()
+            except Exception:
+                pass
+            try:
+                closed_len = len(it)
+            except Exception:
+                closed_len = -1
+        expected_after = before - consumed
+        ok = (after == expected_after) and (closed_len == 0)
+        return {
+            "variant": variant,
+            "before": before,
+            "consumed": consumed,
+            "after": after,
+            "expected_after": expected_after,
+            "closed_len": closed_len,
+            "ok": ok,
+        }
+
+    def _verify_len_full_contract(self) -> None:
+        if not self.cfg.len_checks:
+            return
+        expected_fast = self.shadow_fast.count_all()
+        expected_truth = self.shadow_truth.count_all()
+        self._verify_len_count_case(
+            check_kind="len_full",
+            title="len(log) contract mismatch",
+            expected_fast=expected_fast,
+            expected_truth=expected_truth,
+            engine_fetch=lambda: len(self.log),
+            alt_fetch=lambda: sum(1 for _ in self.log[:]),
+            context={"query": "len(log)"},
+        )
+
+    def _verify_len_slice_contracts(self) -> None:
+        if not self.cfg.len_checks:
+            return
+        if self.shadow_fast.live_count() == 0:
+            return
+
+        for i in range(self.cfg.len_slice_samples):
+            variant = ("range", "since", "until", "all")[i % 4]
+            t1, t2 = self._pick_len_window()
+            expected_fast = self._expected_len_count(self.shadow_fast, variant, t1, t2)
+            expected_truth = self._expected_len_count(self.shadow_truth, variant, t1, t2)
+            desc = f"len(slice:{variant})"
+            self._verify_len_count_case(
+                check_kind="len_slice",
+                title=f"{desc} contract mismatch",
+                expected_fast=expected_fast,
+                expected_truth=expected_truth,
+                engine_fetch=lambda v=variant, a=t1, b=t2: self._len_slice_once(v, a, b),
+                alt_fetch=lambda v=variant, a=t1, b=t2: self._sum_slice_once(v, a, b),
+                context={"variant": variant, "t1": t1, "t2": t2},
+            )
+
+        # Remaining-length contract checks (decrement + close).
+        for variant in ("range", "since", "until", "all"):
+            t1, t2 = self._pick_len_window()
+            self.check_index += 1
+            self.len_checks_total += 1
+            try:
+                probe = self._remaining_len_probe(variant, t1, t2)
+            except Exception as exc:
+                self._register_runtime_issue(
+                    kind="CHECKER_INCONSISTENCY",
+                    title=f"remaining len probe crashed: {variant}",
+                    evidence={"exception": repr(exc), "traceback": traceback.format_exc()},
+                    severity="HIGH",
+                    status=ISSUE_STATUS_CHECKER,
+                )
+                continue
+
+            if probe["ok"]:
+                self.checks_writer.write(
+                    {
+                        "check_index": self.check_index,
+                        "op_index": self.op_index,
+                        "kind": "len_slice_remaining",
+                        "ok": True,
+                        "context": probe,
+                    }
+                )
+                continue
+
+            self.mismatches += 1
+            self.len_checks_failed += 1
+            self.len_mismatches_by_kind["len_slice_remaining"] += 1
+            outcome = self._triage_len_remaining_mismatch(
+                kind="len_slice_remaining",
+                probe_fetch=lambda v=variant, a=t1, b=t2: self._remaining_len_probe(v, a, b),
+            )
+            severity = "CRITICAL" if outcome.status == ISSUE_STATUS_CONFIRMED else "HIGH"
+            issue_id = self.issue_registry.create_issue(
+                kind="LEN_CONTRACT",
+                severity=severity,
+                status=outcome.status,
+                op_index=self.op_index,
+                check_index=self.check_index,
+                title=f"remaining len contract mismatch ({variant})",
+                context={"variant": variant, "t1": t1, "t2": t2},
+                evidence={"probe": probe, "triage": {"notes": outcome.notes, "records": outcome.triage_records}},
+            )
+            self.checks_writer.write(
+                {
+                    "check_index": self.check_index,
+                    "op_index": self.op_index,
+                    "kind": "len_slice_remaining",
+                    "ok": False,
+                    "issue_id": issue_id,
+                    "status": outcome.status,
+                    "context": probe,
+                },
+                flush=True,
+            )
+            if outcome.status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
+                self.stop_reason = f"{outcome.status}:{issue_id}"
+
+    def _verify_len_point_contract(self) -> None:
+        if not self.cfg.len_checks:
+            return
+        ts_candidates: list[int] = []
+        rnd = self.shadow_fast.random_live_ts(self.rng)
+        if rnd is not None:
+            ts_candidates.append(rnd)
+        if self.shadow_fast.count_point(TL_TS_MAX) > 0:
+            ts_candidates.append(TL_TS_MAX)
+        if not ts_candidates:
+            return
+
+        for ts in ts_candidates:
+            expected_fast = self.shadow_fast.count_point(ts)
+            expected_truth = self.shadow_truth.count_point(ts)
+            self._verify_len_count_case(
+                check_kind="len_point",
+                title=f"len(point:{ts}) contract mismatch",
+                expected_fast=expected_fast,
+                expected_truth=expected_truth,
+                engine_fetch=lambda q=ts: self._len_point_once(q, use_equal=False),
+                alt_fetch=lambda q=ts: self._len_point_once(q, use_equal=True),
+                context={"ts": ts},
+            )
 
     def _verify_point(self, ts: int, tag: str) -> None:
         self._run_row_check(
@@ -1549,23 +1996,9 @@ class CorrectnessRunner:
             engine_fetch=lambda: list(self.log),
             alt_fetch=lambda: list(self.log[:]),
         )
-
-        engine_len = len(self.log)
-        shadow_len = self.shadow_fast.live_count()
-        if shadow_len > 0:
-            delta_pct = abs(engine_len - shadow_len) / shadow_len * 100.0
-            if delta_pct > 5.0:
-                self.checks_writer.write(
-                    {
-                        "check_index": self.check_index,
-                        "op_index": self.op_index,
-                        "kind": "len_warning",
-                        "ok": True,
-                        "engine_len": engine_len,
-                        "shadow_len": shadow_len,
-                        "delta_pct": round(delta_pct, 2),
-                    }
-                )
+        if self.cfg.len_checks:
+            self._verify_len_slice_contracts()
+            self._verify_len_point_contract()
         self._op_meta_probe()
 
     # ------------------------------------------------------------------
@@ -1938,6 +2371,9 @@ class CorrectnessRunner:
                 "live_rows": self.shadow_fast.live_count(),
                 "full_verifies": self.full_verifies,
                 "mismatches": self.mismatches,
+                "len_checks_total": self.len_checks_total,
+                "len_checks_failed": self.len_checks_failed,
+                "len_mismatches_by_kind": dict(self.len_mismatches_by_kind),
                 "issues_total": self.issue_registry.count,
                 "issues_by_status": dict(self.issue_registry.by_status),
                 "issues_by_kind": dict(self.issue_registry.by_kind),
@@ -1973,6 +2409,8 @@ class CorrectnessRunner:
             f"- Live rows: `{self.shadow_fast.live_count()}`",
             f"- Full verifies: `{self.full_verifies}`",
             f"- Mismatches: `{self.mismatches}`",
+            f"- Len checks total: `{self.len_checks_total}`",
+            f"- Len checks failed: `{self.len_checks_failed}`",
             f"- Issues: `{self.issue_registry.count}`",
             f"- Stop reason: `{self.stop_reason}`",
             "",
@@ -1984,6 +2422,12 @@ class CorrectnessRunner:
         md += ["", "## Issues by Kind", ""]
         for k, v in sorted(self.issue_registry.by_kind.items()):
             md.append(f"- `{k}`: `{v}`")
+        md += ["", "## Len Mismatches by Kind", ""]
+        if self.len_mismatches_by_kind:
+            for k, v in sorted(self.len_mismatches_by_kind.items()):
+                md.append(f"- `{k}`: `{v}`")
+        else:
+            md.append("- none")
         md += ["", "## Reproduction Command", "", "```powershell", self.repro_cmd, "```", ""]
         with open(self.run_dir / "summary.md", "w", encoding="utf-8") as fh:
             fh.write("\n".join(md) + "\n")
@@ -2019,6 +2463,9 @@ def _parse_args() -> RunConfig:
     parser.add_argument("--full-verify-interval-ops", type=int, default=200)
     parser.add_argument("--full-verify-interval-seconds", type=int, default=30)
     parser.add_argument("--checkpoint-interval-ops", type=int, default=1000)
+    parser.add_argument("--len-checks", choices=["on", "off"], default="on")
+    parser.add_argument("--len-slice-samples", type=int, default=6)
+    parser.add_argument("--len-consume-samples", type=int, default=3)
     parser.add_argument("--continue-on-mismatch", action="store_true")
     parser.add_argument("--max-issues", type=int, default=100)
     parser.add_argument("--verbose", action="store_true")
@@ -2046,6 +2493,9 @@ def _parse_args() -> RunConfig:
         full_verify_interval_ops=max(1, args.full_verify_interval_ops),
         full_verify_interval_seconds=max(1, args.full_verify_interval_seconds),
         checkpoint_interval_ops=max(1, args.checkpoint_interval_ops),
+        len_checks=(args.len_checks == "on"),
+        len_slice_samples=max(1, args.len_slice_samples),
+        len_consume_samples=max(0, args.len_consume_samples),
         continue_on_mismatch=args.continue_on_mismatch,
         max_issues=max(1, args.max_issues),
         verbose=args.verbose,

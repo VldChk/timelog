@@ -8,6 +8,7 @@
 #include "tl_plan.h"
 #include "tl_merge_iter.h"
 #include "tl_filter.h"
+#include "tl_count.h"
 #include <string.h>
 
 /*===========================================================================
@@ -284,59 +285,66 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
  * Snapshot Count API
  *===========================================================================*/
 
-tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
-                                     tl_ts_t t1, tl_ts_t t2,
-                                     bool t2_unbounded,
-                                     uint64_t* out) {
+tl_status_t tl_snapshot_count_range_internal(const tl_snapshot_t* snap,
+                                              tl_ts_t t1, tl_ts_t t2,
+                                              bool t2_unbounded,
+                                              uint64_t* out) {
     if (snap == NULL || out == NULL) {
         return TL_EINVAL;
     }
 
     *out = 0;
 
-    tl_plan_t plan;
-    tl_status_t st = tl_plan_build(&plan,
-                                   (tl_snapshot_t*)snap,
-                                   tl_snapshot_alloc(snap),
-                                   t1, t2, t2_unbounded);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    if (tl_plan_is_empty(&plan)) {
-        tl_plan_destroy(&plan);
+    /* Short-circuit for empty bounded ranges */
+    if (!t2_unbounded && t1 >= t2) {
         return TL_OK;
     }
 
-    tl_kmerge_iter_t kmerge;
-    memset(&kmerge, 0, sizeof(kmerge));
-    st = tl_kmerge_iter_init(&kmerge, &plan, tl_snapshot_alloc(snap));
+    /* Collect tombstone skyline for query range */
+    tl_intervals_t skyline;
+    tl_intervals_init(&skyline, snap->alloc);
+    tl_status_t st = tl_snapshot_collect_tombstones(snap, &skyline,
+                                                     t1, t2, t2_unbounded);
     if (st != TL_OK) {
-        tl_plan_destroy(&plan);
+        tl_intervals_destroy(&skyline);
         return st;
     }
 
-    tl_intervals_imm_t tombs = {
-        .data = tl_plan_tombstones(&plan),
-        .len = tl_plan_tomb_count(&plan)
-    };
-    tl_filter_iter_t filter;
-    tl_filter_iter_init(&filter, &kmerge, tombs);
+    tl_intervals_imm_t sky_imm = tl_intervals_as_imm(&skyline);
+    const tl_interval_t* sky_data = sky_imm.data;
+    size_t sky_len = sky_imm.len;
 
-    uint64_t count = 0;
-    tl_record_t rec;
-    while ((st = tl_filter_iter_next(&filter, &rec)) == TL_OK) {
-        (void)rec;
-        count++;
+    const tl_manifest_t* manifest = tl_snapshot_manifest(snap);
+    const tl_memview_t* memview = tl_snapshot_memview(snap);
+
+    uint64_t total = 0;
+
+    /* L0 segments */
+    for (uint32_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
+        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+        total += tl__visible_records_in_segment_range(seg, sky_data, sky_len,
+                                                       t1, t2, t2_unbounded);
     }
 
-    tl_kmerge_iter_destroy(&kmerge);
-    tl_plan_destroy(&plan);
-
-    if (st == TL_EOF) {
-        *out = count;
-        return TL_OK;
+    /* L1 segments */
+    for (uint32_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
+        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
+        total += tl__visible_records_in_segment_range(seg, sky_data, sky_len,
+                                                       t1, t2, t2_unbounded);
     }
 
-    return st;
+    /* Sealed memruns */
+    for (size_t i = 0; i < tl_memview_sealed_len(memview); i++) {
+        const tl_memrun_t* mr = tl_memview_sealed_get(memview, i);
+        total += tl__visible_records_in_memrun_range(mr, sky_data, sky_len,
+                                                      t1, t2, t2_unbounded);
+    }
+
+    /* Active buffers (per-record watermark filtering) */
+    total += tl__count_active_visible_range(memview, sky_imm,
+                                             t1, t2, t2_unbounded);
+
+    tl_intervals_destroy(&skyline);
+    *out = total;
+    return TL_OK;
 }

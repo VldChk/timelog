@@ -2234,70 +2234,6 @@ typedef enum {
     ITER_MODE_POINT
 } iter_mode_t;
 
-static tl_status_t
-pytimelog_count_mode(const tl_snapshot_t* snap,
-                    iter_mode_t mode,
-                    tl_ts_t t1,
-                    tl_ts_t t2,
-                    uint64_t* out_count)
-{
-    if (snap == NULL || out_count == NULL) {
-        return TL_EINVAL;
-    }
-
-    tl_iter_t* count_it = NULL;
-    tl_status_t st = TL_EINVAL;
-    switch (mode) {
-        case ITER_MODE_RANGE:
-            st = tl_iter_range(snap, t1, t2, &count_it);
-            break;
-        case ITER_MODE_SINCE:
-            st = tl_iter_since(snap, t1, &count_it);
-            break;
-        case ITER_MODE_UNTIL:
-            st = tl_iter_until(snap, t2, &count_it);
-            break;
-        case ITER_MODE_EQUAL:
-            st = tl_iter_equal(snap, t1, &count_it);
-            break;
-        case ITER_MODE_POINT:
-            st = tl_iter_point(snap, t1, &count_it);
-            break;
-        default:
-            return TL_EINVAL;
-    }
-
-    if (st != TL_OK) {
-        return st;
-    }
-
-    uint64_t count = 0;
-    for (;;) {
-        tl_record_t rec;
-        st = tl_iter_next(count_it, &rec);
-        if (st == TL_OK) {
-            if (count == UINT64_MAX) {
-                tl_iter_destroy(count_it);
-                return TL_EOVERFLOW;
-            }
-            count++;
-            continue;
-        }
-        if (st == TL_EOF) {
-            st = TL_OK;
-        }
-        break;
-    }
-
-    tl_iter_destroy(count_it);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    *out_count = count;
-    return TL_OK;
-}
-
 /*===========================================================================
  * Iterator Factory (LLD-B3)
  *
@@ -2399,8 +2335,45 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
 
-    st = pytimelog_count_mode(snap, mode, t1, t2, &pyit->remaining_count);
+    /* Compute count via optimized O(S*T*log P) path with GIL released. */
+    {
+        tl_ts_t count_t1, count_t2;
+        int count_unbounded;
+        switch (mode) {
+            case ITER_MODE_RANGE:
+                count_t1 = t1; count_t2 = t2; count_unbounded = 0;
+                break;
+            case ITER_MODE_SINCE:
+                count_t1 = t1; count_t2 = 0; count_unbounded = 1;
+                break;
+            case ITER_MODE_UNTIL:
+                count_t1 = TL_TS_MIN; count_t2 = t2; count_unbounded = 0;
+                break;
+            case ITER_MODE_EQUAL:
+            case ITER_MODE_POINT:
+                count_t1 = t1;
+                count_t2 = (t1 < TL_TS_MAX) ? t1 + 1 : 0;
+                count_unbounded = (t1 == TL_TS_MAX) ? 1 : 0;
+                break;
+            default:
+                count_t1 = TL_TS_MIN; count_t2 = 0; count_unbounded = 1;
+                break;
+        }
+
+        Py_BEGIN_ALLOW_THREADS
+        st = tl_snapshot_count_range(snap, count_t1, count_t2,
+                                      count_unbounded,
+                                      &pyit->remaining_count);
+        Py_END_ALLOW_THREADS
+    }
     if (st != TL_OK) {
+        /* NULL out pointers before Py_DECREF which may run arbitrary
+         * Python code (__del__) — prevents use-after-free if the
+         * partially-constructed object is somehow reachable. */
+        pyit->iter = NULL;
+        pyit->pinned_snapshot = NULL;
+        pyit->handle_ctx = NULL;
+        pyit->closed = 1;
         tl_iter_destroy(it);
         tl_snapshot_release(snap);
         Py_DECREF(pyit->owner);

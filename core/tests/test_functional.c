@@ -26,6 +26,7 @@
 
 /* Internal headers required for test threading scaffolding. */
 #include "internal/tl_sync.h"
+#include "query/tl_snapshot.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -584,15 +585,17 @@ TEST_DECLARE(func_count_respects_tombstone_watermark_tie) {
     /* Reinsert at higher watermark (active source, treated as visible). */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
 
-    /* Second tombstone at seq 4: strict compare tomb_seq > watermark keeps reinsert. */
+    /* Second tombstone at seq 4: max_seq(4) > reinsert seq(3) → reinsert is
+     * tombstoned. Both the original (L0, watermark=1) and the reinsert (active,
+     * watermark=3) are covered by the coalesced tombstone [100,101) max_seq=4. */
     TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
 
     uint64_t count = 0;
     TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
-    TEST_ASSERT_EQ(1, (long long)count);
+    TEST_ASSERT_EQ(0, (long long)count);
 
     TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 100, 101, &count));
-    TEST_ASSERT_EQ(1, (long long)count);
+    TEST_ASSERT_EQ(0, (long long)count);
 
     tl_close(tl);
 }
@@ -623,6 +626,363 @@ TEST_DECLARE(func_count_snapshot_isolation) {
     uint64_t count = 0;
     TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
     TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Optimized Count Path Tests
+ *
+ * Verify the O(S*T*log P) count path produces correct results across
+ * mixed sources (memtable + flushed segments), OOO records, boundary
+ * conditions, and cross-validates against O(N) iterator scan.
+ *===========================================================================*/
+
+TEST_DECLARE(func_count_range_mixed_sources) {
+    /* Insert records, flush to L0, insert more into memtable.
+     * Verify count_range spans both sources correctly. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Phase 1: records that will be flushed to L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Phase 2: records in memtable */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 5));
+
+    /* Full range: all 5 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(5, (long long)count);
+
+    /* Spanning both sources: [15, 45) => ts=20,30,40 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 15, 45, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Only segment: [10, 35) => ts=10,20,30 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 10, 35, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Only memtable: [35, 55) => ts=40,50 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 35, 55, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_with_ooo) {
+    /* Insert OOO records, verify count handles multi-run memview. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 2));   /* OOO */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 75, 4));   /* OOO */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 5));
+
+    /* Full count: 5 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(5, (long long)count);
+
+    /* Range [60, 160) => ts=75,100,150 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 60, 160, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Range [50, 51) => just ts=50 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 50, 51, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_ts_max_boundary) {
+    /* Insert record at TL_TS_MAX, verify no overflow from ts+1. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX - 1, 2));
+
+    /* Full count: 2 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    /* Range [TL_TS_MAX, TL_TS_MAX+1) expressed as count_range */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, TL_TS_MAX, 0,
+                                                       true, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+    tl_snapshot_release(snap);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_empty) {
+    /* Verify count returns 0 for empty log and out-of-range queries. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Empty log */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 0, 100, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    /* Insert records, then query out of range */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 100, 200, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    /* Empty range [10, 10) */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 10, 10, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_matches_iter_scan) {
+    /* Cross-validation: count must match manual iterator scan count.
+     * Insert diverse records with tombstones, compare both paths. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert records spanning a wide range */
+    for (tl_ts_t ts = 0; ts < 100; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Flush half to L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Insert more (in memtable) */
+    for (tl_ts_t ts = 100; ts < 150; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Add some OOO records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 5, 200));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 201));
+
+    /* Delete a range covering some records */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 200, 500));
+
+    /* Now compare count vs scan for several query ranges */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Test several range queries */
+    tl_ts_t ranges[][2] = {
+        {0, 1500},       /* Full range */
+        {200, 500},      /* Exactly the deleted range */
+        {0, 200},        /* Before deletion */
+        {500, 1500},     /* After deletion */
+        {100, 600},      /* Overlapping deletion */
+    };
+
+    for (size_t r = 0; r < sizeof(ranges) / sizeof(ranges[0]); r++) {
+        tl_ts_t qt1 = ranges[r][0];
+        tl_ts_t qt2 = ranges[r][1];
+
+        /* Optimized count */
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, qt1, qt2,
+                                                           false, &opt_count));
+
+        /* Manual scan count */
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, qt1, qt2, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) {
+            scan_count++;
+        }
+        tl_iter_destroy(it);
+
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_cross_validate_l1) {
+    /* Cross-validation with L1 segments: flush, compact, then compare
+     * optimized count vs iterator scan for diverse query ranges including
+     * unbounded and records at TL_TS_MAX. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records and flush to create L0 segments */
+    for (tl_ts_t ts = 0; ts < 50; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    for (tl_ts_t ts = 50; ts < 100; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add two disjoint tombstones with different seqs */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 250));  /* seq=101 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 400, 550));  /* seq=102 */
+
+    /* Compact L0 -> L1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do { st = tl_maint_step(tl); } while (st == TL_OK);
+    TEST_ASSERT_STATUS(TL_EOF, st);
+
+    /* Insert more records in memtable (some in tombstoned range) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 999));  /* in tombstoned range */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 1500, 998));  /* outside */
+
+    /* Snapshot and compare optimized count vs scan */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Verify L1 segments exist */
+    tl_stats_t stats;
+    tl_stats(snap, &stats);
+    TEST_ASSERT(stats.segments_l1 > 0);
+
+    /* Test bounded ranges */
+    tl_ts_t ranges[][2] = {
+        {0, 2000},       /* Full range */
+        {100, 250},      /* Exactly first tombstone */
+        {400, 550},      /* Exactly second tombstone */
+        {0, 100},        /* Before all tombstones */
+        {550, 2000},     /* After all tombstones */
+        {200, 500},      /* Spanning gap between tombstones */
+    };
+    for (size_t r = 0; r < sizeof(ranges) / sizeof(ranges[0]); r++) {
+        tl_ts_t qt1 = ranges[r][0];
+        tl_ts_t qt2 = ranges[r][1];
+
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, qt1, qt2,
+                                                           false, &opt_count));
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, qt1, qt2, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+        tl_iter_destroy(it);
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    /* Test unbounded range [200, +inf) */
+    {
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 200, 0,
+                                                           true, &opt_count));
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 200, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+        tl_iter_destroy(it);
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_ooo_runs_with_tombstones) {
+    /* Verify count correctly handles OOO runs in active buffer with tombstones.
+     * OOO runs use per-record cursor scan with run-level watermark. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert in-order records first */
+    for (tl_ts_t ts = 0; ts < 20; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Insert OOO records that fall between in-order records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 5, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 101));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 25, 102));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 35, 103));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 45, 104));
+
+    /* Delete range covering some OOO and some in-order records */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 10, 40));
+
+    /* Compare optimized count vs scan */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Full range cross-validate */
+    uint64_t opt_count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 0, 200,
+                                                       false, &opt_count));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, 0, 200, &it));
+    uint64_t scan_count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+    tl_iter_destroy(it);
+
+    TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+
+    /* Targeted range that's purely inside tombstoned area */
+    uint64_t tomb_count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 10, 40,
+                                                       false, &tomb_count));
+    tl_iter_t* it2 = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, 10, 40, &it2));
+    uint64_t tomb_scan = 0;
+    while (tl_iter_next(it2, &rec) == TL_OK) { tomb_scan++; }
+    tl_iter_destroy(it2);
+
+    TEST_ASSERT_EQ((long long)tomb_scan, (long long)tomb_count);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_stats_active_memtable_filtered) {
+    /* Insert records, add tombstone covering some active records,
+     * verify tl_stats().records_estimate excludes tombstoned active records. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+
+    /* Delete ts=20 and ts=30 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 20, 40));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* records_estimate should be 2 (ts=10 and ts=40 visible) */
+    TEST_ASSERT_EQ(2, (long long)stats.records_estimate);
 
     tl_snapshot_release(snap);
     tl_close(tl);
@@ -1080,8 +1440,9 @@ TEST_DECLARE(func_stats_with_tombstones) {
     tl_stats_t stats;
     TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
 
-    /* Should have 3 RAW records and 1 tombstone */
-    TEST_ASSERT_EQ(3, stats.records_estimate);
+    /* Active buffers now filtered: ts=200 covered by [150,250) → 2 visible.
+     * Tombstone count remains 1 (raw). */
+    TEST_ASSERT_EQ(2, stats.records_estimate);
     TEST_ASSERT_EQ(1, stats.tombstone_count);
 
     tl_snapshot_release(snap);
@@ -2765,6 +3126,16 @@ void run_functional_tests(void) {
     RUN_TEST(func_count_range_basic);
     RUN_TEST(func_count_respects_tombstone_watermark_tie);
     RUN_TEST(func_count_snapshot_isolation);
+
+    /* Optimized count path tests (8 tests) */
+    RUN_TEST(func_count_range_mixed_sources);
+    RUN_TEST(func_count_range_with_ooo);
+    RUN_TEST(func_count_range_ts_max_boundary);
+    RUN_TEST(func_count_range_empty);
+    RUN_TEST(func_count_matches_iter_scan);
+    RUN_TEST(func_count_cross_validate_l1);
+    RUN_TEST(func_count_ooo_runs_with_tombstones);
+    RUN_TEST(func_stats_active_memtable_filtered);
 
     /* Timestamp navigation tests (3 tests) - migrated from test_phase5.c */
     RUN_TEST(func_min_max_ts_basic);

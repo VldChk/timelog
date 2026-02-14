@@ -508,6 +508,21 @@ TL_API tl_status_t tl_count(const tl_timelog_t* tl, uint64_t* out);
 TL_API tl_status_t tl_count_range(const tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2,
                                   uint64_t* out);
 
+/**
+ * Count visible records in a snapshot range [t1, t2) or [t1, +inf).
+ *
+ * @param snap         Snapshot to query
+ * @param t1           Range start (inclusive)
+ * @param t2           Range end (exclusive) - ignored if t2_unbounded
+ * @param t2_unbounded If nonzero, treat range as [t1, +inf)
+ * @param out          Output count
+ * @return TL_OK on success
+ */
+TL_API tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
+                                            tl_ts_t t1, tl_ts_t t2,
+                                            int t2_unbounded,
+                                            uint64_t* out);
+
 /*===========================================================================
  * Timestamp navigation
  *
@@ -665,7 +680,7 @@ typedef struct tl_stats {
     uint64_t segments_l0;       /* L0 (delta) segments */
     uint64_t segments_l1;       /* L1 (main) segments */
     uint64_t pages_total;       /* Total pages across all segments */
-    uint64_t records_estimate;  /* Estimated total records (may include deleted) */
+    uint64_t records_estimate;  /* Snapshot-time tombstone-aware visible record count */
     tl_ts_t  min_ts;            /* Minimum timestamp (TL_TS_MAX if empty) */
     tl_ts_t  max_ts;            /* Maximum timestamp (TL_TS_MIN if empty) */
     uint64_t tombstone_count;   /* Number of tombstone intervals */
