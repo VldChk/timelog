@@ -2223,16 +2223,50 @@ PyTimelog_exit(PyTimelog* self, PyObject* args)
     Py_RETURN_FALSE;  /* Don't suppress original exception */
 }
 
+/**
+ * Iterator mode enumeration.
+ */
+typedef enum {
+    ITER_MODE_RANGE,
+    ITER_MODE_SINCE,
+    ITER_MODE_UNTIL,
+    ITER_MODE_EQUAL,
+    ITER_MODE_POINT
+} iter_mode_t;
+
 static tl_status_t
-pytimelog_count_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
-                      uint64_t* out_count)
+pytimelog_count_mode(const tl_snapshot_t* snap,
+                    iter_mode_t mode,
+                    tl_ts_t t1,
+                    tl_ts_t t2,
+                    uint64_t* out_count)
 {
     if (snap == NULL || out_count == NULL) {
         return TL_EINVAL;
     }
 
     tl_iter_t* count_it = NULL;
-    tl_status_t st = tl_iter_range(snap, t1, t2, &count_it);
+    tl_status_t st = TL_EINVAL;
+    switch (mode) {
+        case ITER_MODE_RANGE:
+            st = tl_iter_range(snap, t1, t2, &count_it);
+            break;
+        case ITER_MODE_SINCE:
+            st = tl_iter_since(snap, t1, &count_it);
+            break;
+        case ITER_MODE_UNTIL:
+            st = tl_iter_until(snap, t2, &count_it);
+            break;
+        case ITER_MODE_EQUAL:
+            st = tl_iter_equal(snap, t1, &count_it);
+            break;
+        case ITER_MODE_POINT:
+            st = tl_iter_point(snap, t1, &count_it);
+            break;
+        default:
+            return TL_EINVAL;
+    }
+
     if (st != TL_OK) {
         return st;
     }
@@ -2270,17 +2304,6 @@ pytimelog_count_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
  * Creates PyTimelogIter instances for range queries.
  * Follows the protocol: pins_enter → snapshot_acquire → iter_create → track
  *===========================================================================*/
-
-/**
- * Iterator mode enumeration.
- */
-typedef enum {
-    ITER_MODE_RANGE,
-    ITER_MODE_SINCE,
-    ITER_MODE_UNTIL,
-    ITER_MODE_EQUAL,
-    ITER_MODE_POINT
-} iter_mode_t;
 
 /**
  * Internal factory: create a PyTimelogIter for the given mode and timestamps.
@@ -2376,8 +2399,7 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
 
-    st = pytimelog_count_range(snap, pyit->range_t1, pyit->range_t2,
-                               &pyit->remaining_count);
+    st = pytimelog_count_mode(snap, mode, t1, t2, &pyit->remaining_count);
     if (st != TL_OK) {
         tl_iter_destroy(it);
         tl_snapshot_release(snap);

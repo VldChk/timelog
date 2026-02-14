@@ -72,6 +72,8 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     tl_snapshot_t* snap = self->pinned_snapshot;
     self->pinned_snapshot = NULL;
 
+    self->remaining_count = 0;
+
     tl_py_handle_ctx_t* ctx = self->handle_ctx;
     /* Don't NULL handle_ctx - it's borrowed, and we need it for pin exit */
 

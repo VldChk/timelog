@@ -251,6 +251,30 @@ class TestSlicing:
             assert list(it) == [(2, "item2"), (3, "item3"), (4, "item4")]
             assert len(it) == 0
 
+
+    def test_slice_iter_len_closed_iterator_is_zero(self):
+        """len(iter) is 0 after close() because no rows remain yieldable."""
+        from timelog import Timelog
+
+        with Timelog() as log:
+            log.extend([(i, f"item{i}") for i in range(4)])
+            it = log[1:4]
+            assert len(it) == 3
+            it.close()
+            assert len(it) == 0
+
+
+
+    def test_point_max_timestamp_len_matches_equal(self):
+        """len(log.point(TL_TS_MAX)) handles max timestamp without range overflow."""
+        from timelog import Timelog
+        from timelog._api import TL_TS_MAX
+
+        with Timelog() as log:
+            log.append(TL_TS_MAX, "max")
+            assert len(log.point(TL_TS_MAX)) == 1
+            assert len(log.equal(TL_TS_MAX)) == 1
+
     def test_int_key_returns_list(self):
         """log[t] returns list of objects at that timestamp."""
         from timelog import Timelog
@@ -274,6 +298,7 @@ class TestSlicing:
 # =============================================================================
 # Category 5: Iteration
 # =============================================================================
+
 
 
 class TestIteration:
