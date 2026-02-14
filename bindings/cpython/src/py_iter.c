@@ -69,8 +69,10 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     tl_iter_t* it = self->iter;
     self->iter = NULL;
 
-    tl_snapshot_t* snap = self->snapshot;
-    self->snapshot = NULL;
+    tl_snapshot_t* snap = self->pinned_snapshot;
+    self->pinned_snapshot = NULL;
+
+    self->remaining_count = 0;
 
     tl_py_handle_ctx_t* ctx = self->handle_ctx;
     /* Don't NULL handle_ctx - it's borrowed, and we need it for pin exit */
@@ -172,6 +174,11 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
         /* PyTuple_SET_ITEM steals references */
         PyTuple_SET_ITEM(tup, 0, ts);
         PyTuple_SET_ITEM(tup, 1, obj);
+
+        if (self->remaining_valid && self->remaining_count > 0) {
+            self->remaining_count--;
+        }
+
         return tup;
     }
 
@@ -256,6 +263,10 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
             PyTuple_SET_ITEM(tup, 0, ts);
             PyTuple_SET_ITEM(tup, 1, obj);
             PyList_SET_ITEM(list, i, tup);
+
+            if (self->remaining_valid && self->remaining_count > 0) {
+                self->remaining_count--;
+            }
             continue;
         }
 
@@ -287,6 +298,23 @@ fail:
 /*===========================================================================
  * Getters/Setters
  *===========================================================================*/
+
+static Py_ssize_t PyTimelogIter_len(PyTimelogIter* self)
+{
+    if (!self->remaining_valid) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "iterator remaining length is unavailable");
+        return -1;
+    }
+
+    if (self->remaining_count > (uint64_t)PY_SSIZE_T_MAX) {
+        PyErr_SetString(PyExc_OverflowError,
+            "iterator length does not fit in Py_ssize_t");
+        return -1;
+    }
+
+    return (Py_ssize_t)self->remaining_count;
+}
 
 static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
 {
@@ -332,6 +360,10 @@ static PyGetSetDef PyTimelogIter_getset[] = {
     {NULL, NULL, NULL, NULL, NULL}
 };
 
+static PySequenceMethods timelogiter_as_sequence = {
+    .sq_length = (lenfunc)PyTimelogIter_len,
+};
+
 /*===========================================================================
  * Type Object
  *===========================================================================*/
@@ -342,7 +374,9 @@ PyTypeObject PyTimelogIter_Type = {
     .tp_doc = PyDoc_STR(
         "Snapshot-based iterator over timelog records.\n\n"
         "Yields (timestamp, object) tuples. Cannot be instantiated directly;\n"
-        "use Timelog.range(), .since(), .until(), .all() factory methods."
+        "use Timelog.range(), .since(), .until(), .all() factory methods.\n\n"
+        "len(iter) reports remaining visible rows in the iterator snapshot,\n"
+        "not a live global timelog count."
     ),
     .tp_basicsize = sizeof(PyTimelogIter),
     .tp_itemsize = 0,
@@ -354,6 +388,7 @@ PyTypeObject PyTimelogIter_Type = {
     .tp_free = PyObject_GC_Del,         /* Explicit for GC-allocated types */
     .tp_iter = PyObject_SelfIter,
     .tp_iternext = (iternextfunc)PyTimelogIter_iternext,
+    .tp_as_sequence = &timelogiter_as_sequence,
     .tp_methods = PyTimelogIter_methods,
     .tp_getset = PyTimelogIter_getset,
 };
