@@ -1834,6 +1834,47 @@ tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
     return (st == TL_EOF) ? TL_OK : st;
 }
 
+
+
+tl_status_t tl_count_range(const tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2,
+                           uint64_t* out) {
+    if (tl == NULL || out == NULL) {
+        return TL_EINVAL;
+    }
+    if (!tl->is_open) {
+        return TL_ESTATE;
+    }
+
+    tl_snapshot_t* snap = NULL;
+    tl_status_t st = tl_snapshot_acquire(tl, &snap);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    st = tl_snapshot_count_range(snap, t1, t2, false, out);
+    tl_snapshot_release(snap);
+    return st;
+}
+
+tl_status_t tl_count(const tl_timelog_t* tl, uint64_t* out) {
+    if (tl == NULL || out == NULL) {
+        return TL_EINVAL;
+    }
+    if (!tl->is_open) {
+        return TL_ESTATE;
+    }
+
+    tl_snapshot_t* snap = NULL;
+    tl_status_t st = tl_snapshot_acquire(tl, &snap);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    st = tl_snapshot_count_range(snap, TL_TS_MIN, 0, true, out);
+    tl_snapshot_release(snap);
+    return st;
+}
+
 /*===========================================================================
  * Timestamp Navigation (Phase 5)
  *===========================================================================*/

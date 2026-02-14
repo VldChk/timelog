@@ -5,6 +5,9 @@
 #include "../internal/tl_range.h"
 #include "../internal/tl_tombstone_utils.h"
 #include "../storage/tl_segment.h"
+#include "tl_plan.h"
+#include "tl_merge_iter.h"
+#include "tl_filter.h"
 #include <string.h>
 
 /*===========================================================================
@@ -274,4 +277,66 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
     }
 
     return TL_OK;
+}
+
+
+/*===========================================================================
+ * Snapshot Count API
+ *===========================================================================*/
+
+tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
+                                     tl_ts_t t1, tl_ts_t t2,
+                                     bool t2_unbounded,
+                                     uint64_t* out) {
+    if (snap == NULL || out == NULL) {
+        return TL_EINVAL;
+    }
+
+    *out = 0;
+
+    tl_plan_t plan;
+    tl_status_t st = tl_plan_build(&plan,
+                                   (tl_snapshot_t*)snap,
+                                   tl_snapshot_alloc(snap),
+                                   t1, t2, t2_unbounded);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    if (tl_plan_is_empty(&plan)) {
+        tl_plan_destroy(&plan);
+        return TL_OK;
+    }
+
+    tl_kmerge_iter_t kmerge;
+    memset(&kmerge, 0, sizeof(kmerge));
+    st = tl_kmerge_iter_init(&kmerge, &plan, tl_snapshot_alloc(snap));
+    if (st != TL_OK) {
+        tl_plan_destroy(&plan);
+        return st;
+    }
+
+    tl_intervals_imm_t tombs = {
+        .data = tl_plan_tombstones(&plan),
+        .len = tl_plan_tomb_count(&plan)
+    };
+    tl_filter_iter_t filter;
+    tl_filter_iter_init(&filter, &kmerge, tombs);
+
+    uint64_t count = 0;
+    tl_record_t rec;
+    while ((st = tl_filter_iter_next(&filter, &rec)) == TL_OK) {
+        (void)rec;
+        count++;
+    }
+
+    tl_kmerge_iter_destroy(&kmerge);
+    tl_plan_destroy(&plan);
+
+    if (st == TL_EOF) {
+        *out = count;
+        return TL_OK;
+    }
+
+    return st;
 }

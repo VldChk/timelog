@@ -216,4 +216,25 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
                                             tl_ts_t t1, tl_ts_t t2,
                                             bool t2_unbounded);
 
+
+/**
+ * Count visible records in a snapshot range [t1, t2) or [t1, +inf).
+ *
+ * Semantics are identical to read-path filtering:
+ * - half-open range bounds [t1, t2)
+ * - record dropped only when tomb_seq(ts) > row_watermark
+ *
+ * @param snap         Snapshot to query
+ * @param t1           Range start (inclusive)
+ * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
+ * @param t2_unbounded True => [t1, +inf)
+ * @param out          Output count
+ * @return TL_OK on success, TL_EINVAL for invalid args, other errors on
+ *         allocation/iterator init failures
+ */
+tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
+                                     tl_ts_t t1, tl_ts_t t2,
+                                     bool t2_unbounded,
+                                     uint64_t* out);
+
 #endif /* TL_SNAPSHOT_H */

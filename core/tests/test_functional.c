@@ -553,6 +553,81 @@ TEST_DECLARE(func_scan_range_early_stop) {
     tl_close(tl);
 }
 
+
+TEST_DECLARE(func_count_range_basic) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 20, 40, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_respects_tombstone_watermark_tie) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Segment watermark will be seq 1 after first flush. */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* First tombstone at seq 2 should hide ts=100 in newer snapshots. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
+
+    /* Reinsert at higher watermark (active source, treated as visible). */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+
+    /* Second tombstone at seq 4: strict compare tomb_seq > watermark keeps reinsert. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 100, 101, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_snapshot_isolation) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Mutate after snapshot acquisition. */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, TL_TS_MIN, &it));
+
+    uint64_t snap_count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        snap_count++;
+    }
+    TEST_ASSERT_EQ(1, (long long)snap_count);
+    tl_iter_destroy(it);
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Timestamp Navigation Tests (migrated from test_phase5.c)
  *===========================================================================*/
@@ -2633,6 +2708,9 @@ void run_functional_tests(void) {
     /* Scan tests (2 tests) - migrated from test_phase5.c */
     RUN_TEST(func_scan_range_basic);
     RUN_TEST(func_scan_range_early_stop);
+    RUN_TEST(func_count_range_basic);
+    RUN_TEST(func_count_respects_tombstone_watermark_tie);
+    RUN_TEST(func_count_snapshot_isolation);
 
     /* Timestamp navigation tests (3 tests) - migrated from test_phase5.c */
     RUN_TEST(func_min_max_ts_basic);
