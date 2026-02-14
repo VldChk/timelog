@@ -5,6 +5,7 @@
 #include "../internal/tl_seqlock.h"
 #include "../internal/tl_heap.h"
 #include "../internal/tl_recvec.h"
+#include "../internal/tl_search.h"
 #include "../query/tl_segment_iter.h"
 #include "../query/tl_snapshot.h"
 #include "../storage/tl_window.h"
@@ -223,12 +224,100 @@ static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
     return TL_OK;
 }
 
+static uint64_t tl__count_active_run_window(const tl_memview_t* mv,
+                                            tl_intervals_imm_t tombs,
+                                            tl_ts_t w_start,
+                                            tl_ts_t w_end,
+                                            uint64_t* deleted) {
+    const tl_record_t* run = tl_memview_run_data(mv);
+    const tl_seq_t* run_seqs = tl_memview_run_seqs(mv);
+    size_t run_len = tl_memview_run_len(mv);
+    if (run == NULL || run_seqs == NULL || run_len == 0) {
+        *deleted = 0;
+        return 0;
+    }
+
+    size_t lo = tl_record_lower_bound(run, run_len, w_start);
+    size_t hi = tl_record_lower_bound(run, run_len, w_end);
+    if (hi <= lo) {
+        *deleted = 0;
+        return 0;
+    }
+
+    uint64_t total = 0;
+    uint64_t del = 0;
+    tl_intervals_cursor_t cursor;
+    tl_intervals_cursor_init(&cursor, tombs);
+    for (size_t i = lo; i < hi; i++) {
+        total++;
+        if (tl_intervals_cursor_max_seq(&cursor, run[i].ts) > run_seqs[i]) {
+            del++;
+        }
+    }
+
+    *deleted = del;
+    return total;
+}
+
+static uint64_t tl__count_ooo_head_window(const tl_memview_t* mv,
+                                          tl_intervals_imm_t tombs,
+                                          tl_ts_t w_start,
+                                          tl_ts_t w_end,
+                                          uint64_t* deleted) {
+    const tl_record_t* head = tl_memview_ooo_head_data(mv);
+    const tl_seq_t* head_seqs = tl_memview_ooo_head_seqs(mv);
+    size_t head_len = tl_memview_ooo_head_len(mv);
+    if (head == NULL || head_seqs == NULL || head_len == 0) {
+        *deleted = 0;
+        return 0;
+    }
+
+    uint64_t total = 0;
+    uint64_t del = 0;
+    tl_intervals_cursor_t cursor;
+    tl_intervals_cursor_init(&cursor, tombs);
+    for (size_t i = 0; i < head_len; i++) {
+        tl_ts_t ts = head[i].ts;
+        if (ts < w_start || ts >= w_end) {
+            continue;
+        }
+        total++;
+        if (tl_intervals_cursor_max_seq(&cursor, ts) > head_seqs[i]) {
+            del++;
+        }
+    }
+
+    *deleted = del;
+    return total;
+}
+
+static double tl__compute_active_delete_debt(const tl_memview_t* mv,
+                                             tl_intervals_imm_t tombs,
+                                             tl_ts_t w_start,
+                                             tl_ts_t w_end) {
+    uint64_t run_deleted = 0;
+    uint64_t run_total = tl__count_active_run_window(mv, tombs, w_start, w_end,
+                                                     &run_deleted);
+    uint64_t head_deleted = 0;
+    uint64_t head_total = tl__count_ooo_head_window(mv, tombs, w_start, w_end,
+                                                    &head_deleted);
+
+    uint64_t total = run_total + head_total;
+    if (total == 0) {
+        return 0.0;
+    }
+
+    uint64_t deleted = run_deleted + head_deleted;
+    return (double)deleted / (double)total;
+}
+
 /**
  * Compute maximum delete debt ratio across all windows.
  * Used for delete_debt_threshold trigger.
  */
 static double tl__compute_delete_debt(const tl_timelog_t* tl,
-                                       const tl_manifest_t* m) {
+                                       const tl_manifest_t* m,
+                                       const tl_snapshot_t* snap) {
     tl_intervals_t tombs;
     tl_intervals_init(&tombs, (tl_alloc_ctx_t*)&tl->alloc);
 
@@ -360,6 +449,17 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         idx = i;
 
         double ratio = (double)covered / (double)window_size;
+        if (snap != NULL) {
+            const tl_memview_t* mv = tl_snapshot_memview(snap);
+            double active_ratio = tl__compute_active_delete_debt(
+                                    mv,
+                                    tl_intervals_as_imm(&tombs),
+                                    w_start,
+                                    w_end);
+            if (active_ratio > ratio) {
+                ratio = active_ratio;
+            }
+        }
         if (ratio > max_ratio) {
             max_ratio = ratio;
         }
@@ -372,7 +472,7 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
 #ifdef TL_TEST_HOOKS
 double tl_test_compute_delete_debt(const tl_timelog_t* tl,
                                    const tl_manifest_t* m) {
-    return tl__compute_delete_debt(tl, m);
+    return tl__compute_delete_debt(tl, m, NULL);
 }
 #endif
 
@@ -409,11 +509,15 @@ bool tl_compact_needed(const tl_timelog_t* tl) {
         goto done;
     }
 
+    tl_snapshot_t* snap = NULL;
+
     /* Trigger 2: Delete debt threshold (optional) */
     if (tl->config.delete_debt_threshold > 0.0) {
+        tl_snapshot_acquire_internal(tl_mut, (tl_alloc_ctx_t*)&tl->alloc, &snap);
+
         /* Compute per-window delete debt
          * This is expensive - only do if threshold is configured */
-        if (tl__compute_delete_debt(tl, m) >= tl->config.delete_debt_threshold) {
+        if (tl__compute_delete_debt(tl, m, snap) >= tl->config.delete_debt_threshold) {
             needed = true;
             goto done;
         }
@@ -423,6 +527,9 @@ bool tl_compact_needed(const tl_timelog_t* tl) {
      * This is checked by caller (worker loop) via pending flag */
 
 done:
+    if (snap != NULL) {
+        tl_snapshot_release_internal(snap);
+    }
     tl_manifest_release(m);
     return needed;
 }
@@ -563,9 +670,6 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     }
     est = (size_t)seg->record_count * sizeof(tl_record_t);
 
-    if (seg->page_count > SIZE_MAX / sizeof(tl_page_meta_t)) {
-        return SIZE_MAX;
-    }
     size_t page_meta_bytes = (size_t)seg->page_count * sizeof(tl_page_meta_t);
     if (est > SIZE_MAX - page_meta_bytes) {
         return SIZE_MAX;
@@ -573,9 +677,6 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     est += page_meta_bytes;
 
     if (seg->tombstones != NULL) {
-        if (seg->tombstones->n > SIZE_MAX / sizeof(tl_interval_t)) {
-            return SIZE_MAX;
-        }
         size_t tomb_bytes = (size_t)seg->tombstones->n * sizeof(tl_interval_t);
         if (est > SIZE_MAX - tomb_bytes) {
             return SIZE_MAX;
