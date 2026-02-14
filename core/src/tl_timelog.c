@@ -7,6 +7,7 @@
 #include "internal/tl_search.h"
 #include "internal/tl_locks.h"
 #include "internal/tl_timelog_internal.h"
+#include "internal/tl_formal_trace.h"
 #include "delta/tl_memtable.h"
 #include "delta/tl_memview.h"
 #include "delta/tl_memrun.h"
@@ -54,8 +55,26 @@ struct tl_iter {
     bool                done;
     bool                initialized;
     bool                point_mode;     /* True if using point fast path */
+    uint64_t            trace_hash;
+    uint64_t            trace_count;
+    tl_seq_t            trace_snap_seq;
+    tl_ts_t             trace_t1;
+    tl_ts_t             trace_t2;
+    bool                trace_unbounded;
 };
 
+
+TL_INLINE uint64_t tl__trace_hash_mix_u64(uint64_t h, uint64_t x) {
+    h ^= x;
+    h *= UINT64_C(1099511628211);
+    return h;
+}
+
+TL_INLINE void tl__trace_hash_record(tl_iter_t* it, const tl_record_t* rec) {
+    it->trace_hash = tl__trace_hash_mix_u64(it->trace_hash, (uint64_t)rec->ts);
+    it->trace_hash = tl__trace_hash_mix_u64(it->trace_hash, rec->handle);
+    it->trace_count++;
+}
 /*===========================================================================
  * Status Code Strings
  *===========================================================================*/
@@ -840,9 +859,15 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
     if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
+        tl_formal_trace_emit(&(tl_formal_trace_event_t){
+            .ev = "append", .seq = seq, .t1 = ts, .t2 = ts, .status = TL_EBUSY
+        });
         return TL_EBUSY;
     }
 
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "append", .seq = seq, .t1 = ts, .t2 = ts, .status = seal_st
+    });
     return seal_st;
 }
 
@@ -958,6 +983,9 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
     }
     tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "delete_range", .seq = seq, .t1 = t1, .t2 = t2, .status = st
+    });
     return st;
 }
 
@@ -1005,6 +1033,9 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     }
     tl__emit_drop_callbacks(tl, dropped, dropped_len);
 
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "delete_before", .seq = seq, .t1 = TL_TS_MIN, .t2 = cutoff, .status = st
+    });
     return st;
 }
 
@@ -1098,6 +1129,9 @@ static tl_status_t flush_publish(tl_timelog_t* tl, tl_memrun_t* mr, tl_segment_t
         TL_UNLOCK_WRITER(tl);
         tl_manifest_release(new_manifest);
         tl_manifest_release(base);
+        tl_formal_trace_emit(&(tl_formal_trace_event_t){
+            .ev = "flush_publish", .seq = mr->applied_seq, .status = TL_EBUSY
+        });
         /* NOTE: seg NOT released - caller will retry with it */
         return TL_EBUSY;
     }
@@ -1129,6 +1163,15 @@ static tl_status_t flush_publish(tl_timelog_t* tl, tl_memrun_t* mr, tl_segment_t
     tl_segment_release(seg);
 
     tl_atomic_inc_u64(&tl->flushes_total);
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "flush_publish",
+        .seq = tl_segment_applied_seq(seg),
+        .t1 = tl_segment_has_records(seg) ? tl_segment_record_min_ts(seg) : tl_segment_tomb_min_ts(seg),
+        .t2 = tl_segment_has_records(seg) ? tl_segment_record_max_ts(seg) : tl_segment_tomb_max_ts(seg),
+        .src0 = (uint64_t)(uintptr_t)seg,
+        .wm0 = (uint64_t)mr->applied_seq,
+        .status = TL_OK
+    });
     return TL_OK;
 }
 
@@ -1551,12 +1594,23 @@ tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out) {
     }
 
     /* Cast away const - internal locking requires non-const access */
-    return tl_snapshot_acquire_internal((tl_timelog_t*)tl,
+    tl_status_t st = tl_snapshot_acquire_internal((tl_timelog_t*)tl,
                                         (tl_alloc_ctx_t*)&tl->alloc,
                                         out);
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "snapshot_acquire",
+        .snap_seq = (st == TL_OK && *out != NULL) ? tl_snapshot_seq(*out) : 0,
+        .status = st
+    });
+    return st;
 }
 
 void tl_snapshot_release(tl_snapshot_t* s) {
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "snapshot_release",
+        .snap_seq = (s != NULL) ? tl_snapshot_seq(s) : 0,
+        .status = TL_OK
+    });
     tl_snapshot_release_internal(s);
 }
 
@@ -1610,6 +1664,19 @@ static tl_status_t iter_create_internal(tl_snapshot_t* snap,
     if (tl_plan_is_empty(&it->plan)) {
         it->done = true;
         it->initialized = true;
+        it->trace_hash = UINT64_C(1469598103934665603);
+        it->trace_count = 0;
+        it->trace_snap_seq = tl_snapshot_seq(snap);
+        it->trace_t1 = t1;
+        it->trace_t2 = t2;
+        it->trace_unbounded = t2_unbounded;
+        tl_formal_trace_emit(&(tl_formal_trace_event_t){
+            .ev = "query_begin",
+            .t1 = t1,
+            .t2 = t2_unbounded ? TL_TS_MAX : t2,
+            .snap_seq = tl_snapshot_seq(snap),
+            .status = TL_OK
+        });
         *out = it;
 #ifdef TL_DEBUG
         tl_snapshot_iter_created(snap);
@@ -1634,6 +1701,19 @@ static tl_status_t iter_create_internal(tl_snapshot_t* snap,
 
     it->done = tl_filter_iter_done(&it->filter);
     it->initialized = true;
+    it->trace_hash = UINT64_C(1469598103934665603);
+    it->trace_count = 0;
+    it->trace_snap_seq = tl_snapshot_seq(snap);
+    it->trace_t1 = t1;
+    it->trace_t2 = t2;
+    it->trace_unbounded = t2_unbounded;
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "query_begin",
+        .t1 = t1,
+        .t2 = t2_unbounded ? TL_TS_MAX : t2,
+        .snap_seq = tl_snapshot_seq(snap),
+        .status = TL_OK
+    });
 
 #ifdef TL_DEBUG
     tl_snapshot_iter_created(snap);
@@ -1736,6 +1816,19 @@ tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
 
     it->done = (it->point_result.count == 0);
     it->initialized = true;
+    it->trace_hash = UINT64_C(1469598103934665603);
+    it->trace_count = 0;
+    it->trace_snap_seq = tl_snapshot_seq((tl_snapshot_t*)snap);
+    it->trace_t1 = ts;
+    it->trace_t2 = ts;
+    it->trace_unbounded = false;
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "query_begin",
+        .t1 = ts,
+        .t2 = ts,
+        .snap_seq = tl_snapshot_seq((tl_snapshot_t*)snap),
+        .status = st
+    });
 
 #ifdef TL_DEBUG
     tl_snapshot_iter_created((tl_snapshot_t*)snap);
@@ -1767,6 +1860,7 @@ tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out) {
         if (it->point_idx >= it->point_result.count) {
             it->done = true;
         }
+        tl__trace_hash_record(it, out);
         return TL_OK;
     }
 
@@ -1774,6 +1868,8 @@ tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out) {
     tl_status_t st = tl_filter_iter_next(&it->filter, out);
     if (st == TL_EOF) {
         it->done = true;
+    } else if (st == TL_OK) {
+        tl__trace_hash_record(it, out);
     }
     return st;
 }
@@ -1782,6 +1878,16 @@ void tl_iter_destroy(tl_iter_t* it) {
     if (it == NULL) {
         return;
     }
+
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "query_end",
+        .t1 = it->trace_t1,
+        .t2 = it->trace_unbounded ? TL_TS_MAX : it->trace_t2,
+        .snap_seq = it->trace_snap_seq,
+        .digest = it->trace_hash,
+        .src0 = it->trace_count,
+        .status = TL_OK
+    });
 
 #ifdef TL_DEBUG
     if (it->snapshot != NULL) {

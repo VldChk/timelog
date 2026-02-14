@@ -13,6 +13,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(TIMELOG_NATIVE_OPT "Enable -march=native for maximum local performance" OFF)
 # Option to build shared library (exports symbols)
 option(TIMELOG_BUILD_SHARED "Build timelog as a shared library" OFF)
+option(TIMELOG_FORMAL_TRACE "Enable formal trace instrumentation" OFF)
 
 # Build type defaults to Release
 if(NOT CMAKE_BUILD_TYPE)
@@ -76,6 +77,7 @@ set(TIMELOG_SOURCES
     # Phase 0
     core/src/internal/tl_alloc.c
     core/src/internal/tl_log.c
+    core/src/internal/tl_formal_trace.c
     core/src/tl_timelog.c
     # Phase 1
     core/src/internal/tl_sync.c
@@ -201,6 +203,11 @@ target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
 
 # Enable adaptive module internal test helpers
 target_compile_definitions(test_timelog PRIVATE TL_ADAPTIVE_INTERNAL_TEST)
+
+if(TIMELOG_FORMAL_TRACE)
+    target_compile_definitions(timelog PRIVATE TL_FORMAL_TRACE)
+    target_compile_definitions(test_timelog PRIVATE TL_FORMAL_TRACE)
+endif()
 
 # Link pthread on POSIX systems
 if(NOT WIN32)

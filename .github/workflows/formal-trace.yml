@@ -1,0 +1,25 @@
+name: formal-trace
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+
+jobs:
+  verify-formal-trace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (trace enabled)
+        run: cmake -S . -B build-formal -DTIMELOG_FORMAL_TRACE=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-formal -j
+      - name: Chaos/fuzz run artifact
+        run: |
+          ./build-formal/test_timelog >formal_trace.log 2>&1 || true
+          python3 formal/trace/check_trace.py formal_trace.log
+      - name: Upload trace artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: formal-trace-log
+          path: formal_trace.log

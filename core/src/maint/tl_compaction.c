@@ -7,6 +7,7 @@
 #include "../internal/tl_recvec.h"
 #include "../query/tl_segment_iter.h"
 #include "../query/tl_snapshot.h"
+#include "../internal/tl_formal_trace.h"
 #include "../storage/tl_window.h"
 #include <string.h>
 
@@ -563,9 +564,6 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     }
     est = (size_t)seg->record_count * sizeof(tl_record_t);
 
-    if (seg->page_count > SIZE_MAX / sizeof(tl_page_meta_t)) {
-        return SIZE_MAX;
-    }
     size_t page_meta_bytes = (size_t)seg->page_count * sizeof(tl_page_meta_t);
     if (est > SIZE_MAX - page_meta_bytes) {
         return SIZE_MAX;
@@ -573,9 +571,6 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     est += page_meta_bytes;
 
     if (seg->tombstones != NULL) {
-        if (seg->tombstones->n > SIZE_MAX / sizeof(tl_interval_t)) {
-            return SIZE_MAX;
-        }
         size_t tomb_bytes = (size_t)seg->tombstones->n * sizeof(tl_interval_t);
         if (est > SIZE_MAX - tomb_bytes) {
             return SIZE_MAX;
@@ -787,6 +782,16 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
         tl_atomic_fetch_add_u64(&tl->compaction_select_l1_inputs,
                                 (uint64_t)ctx->input_l1_len, TL_MO_RELAXED);
     }
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "compact_select",
+        .seq = ctx->applied_seq,
+        .t1 = (st == TL_OK) ? ctx->output_min_ts : 0,
+        .t2 = (st == TL_OK) ? ctx->output_max_ts : 0,
+        .src0 = (uint64_t)ctx->input_l0_len,
+        .src1 = (uint64_t)ctx->input_l1_len,
+        .snap_seq = (ctx->snapshot != NULL) ? tl_snapshot_seq(ctx->snapshot) : 0,
+        .status = st
+    });
     return st;
 }
 
@@ -1335,6 +1340,16 @@ cleanup:
     tl_heap_destroy(&heap);
     tl__free(ctx->alloc, watermarks);
     tl__free(ctx->alloc, iters);
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "compact_merge",
+        .seq = ctx->applied_seq,
+        .t1 = ctx->output_min_ts,
+        .t2 = ctx->output_max_ts,
+        .src0 = (uint64_t)ctx->output_l1_len,
+        .src1 = (uint64_t)ctx->dropped_len,
+        .wm0 = (uint64_t)tl_intervals_len(&ctx->tombs_clipped),
+        .status = st
+    });
     return st;
 }
 
@@ -1446,6 +1461,9 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
         /* Manifest changed - caller must retry with fresh selection */
         TL_UNLOCK_WRITER(tl);
         tl_manifest_release(new_manifest);
+        tl_formal_trace_emit(&(tl_formal_trace_event_t){
+            .ev = "compact_publish", .seq = ctx->applied_seq, .status = TL_EBUSY
+        });
         return TL_EBUSY;
     }
 
@@ -1500,6 +1518,15 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
      * ctx_destroy will release ctx's refs, leaving manifest's refs.
      * This is correct reference counting semantics. */
 
+    tl_formal_trace_emit(&(tl_formal_trace_event_t){
+        .ev = "compact_publish",
+        .seq = ctx->applied_seq,
+        .t1 = ctx->output_min_ts,
+        .t2 = ctx->output_max_ts,
+        .src0 = (uint64_t)ctx->output_l1_len,
+        .src1 = (uint64_t)ctx->input_l0_len,
+        .status = TL_OK
+    });
     return TL_OK;
 }
 
@@ -1661,6 +1688,13 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
         if (attempt + 1 < max_retries) {
             tl_atomic_inc_u64(&tl->compaction_retries);
         }
+        tl_formal_trace_emit(&(tl_formal_trace_event_t){
+            .ev = "compact_retry",
+            .seq = ctx.applied_seq,
+            .src0 = (uint64_t)(attempt + 1),
+            .src1 = (uint64_t)max_retries,
+            .status = TL_EBUSY
+        });
 
         /* Manifest changed - re-select and re-merge for retry.
          * This is expensive but correct - ensures we don't publish

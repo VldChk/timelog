@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "timelog formal trace event",
+  "type": "object",
+  "required": ["ev", "seq", "t1", "t2", "src0", "src1", "wm0", "wm1", "snap", "digest", "st"],
+  "properties": {
+    "ev": {"type": "string"},
+    "seq": {"type": "integer", "minimum": 0},
+    "t1": {"type": "integer"},
+    "t2": {"type": "integer"},
+    "src0": {"type": "integer", "minimum": 0},
+    "src1": {"type": "integer", "minimum": 0},
+    "wm0": {"type": "integer", "minimum": 0},
+    "wm1": {"type": "integer", "minimum": 0},
+    "snap": {"type": "integer", "minimum": 0},
+    "digest": {"type": "integer", "minimum": 0},
+    "st": {"type": "integer"}
+  },
+  "additionalProperties": false
+}
