@@ -22,8 +22,10 @@ import hashlib
 import json
 import math
 import random
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 import weakref
@@ -61,6 +63,7 @@ DEFAULT_CSVS = [
 ISSUE_STATUS_CONFIRMED = "CONFIRMED_ENGINE_BUG"
 ISSUE_STATUS_CHECKER = "CHECKER_BUG"
 ISSUE_STATUS_TRANSIENT = "UNCONFIRMED_TRANSIENT"
+DEFAULT_FAIL_STATUSES = ISSUE_STATUS_CONFIRMED
 
 
 def _utc_now_iso() -> str:
@@ -167,6 +170,109 @@ class RunConfig:
     max_issues: int
     verbose: bool
     log_alias_path: str | None = None
+    ci_profile: str = "off"
+    artifact_mode: str = "full"
+    fail_statuses: set[str] = field(default_factory=lambda: {DEFAULT_FAIL_STATUSES})
+    summary_json_out: str | None = None
+    summary_md_out: str | None = None
+    failure_bundle_out: str | None = None
+    run_id_override: str | None = None
+
+
+@dataclass
+class RunOutcome:
+    exit_code: int
+    result: str
+    fail_status_counts: dict[str, int]
+    artifact_manifest: dict[str, Any] = field(default_factory=dict)
+
+
+def _parse_fail_statuses(raw: str | None) -> set[str]:
+    if raw is None:
+        return {DEFAULT_FAIL_STATUSES}
+    statuses = {token.strip() for token in raw.split(",") if token.strip()}
+    if not statuses:
+        return {DEFAULT_FAIL_STATUSES}
+    return statuses
+
+
+def _compute_exit_code(issue_status_counts: dict[str, int], fail_statuses: set[str]) -> RunOutcome:
+    fail_counts = {status: int(issue_status_counts.get(status, 0)) for status in sorted(fail_statuses)}
+    has_fail = any(count > 0 for count in fail_counts.values())
+    return RunOutcome(
+        exit_code=2 if has_fail else 0,
+        result="fail" if has_fail else "pass",
+        fail_status_counts=fail_counts,
+    )
+
+
+def _apply_artifact_policy(
+    *,
+    run_dir: Path,
+    artifact_mode: str,
+    result: str,
+    detail_paths: list[Path],
+    failure_bundle_out: Path | None,
+) -> dict[str, Any]:
+    removed_paths: list[str] = []
+    bundled_paths: list[str] = []
+    bundle_path: str | None = None
+
+    def _remove_path(path: Path) -> None:
+        if not path.exists():
+            return
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return
+        removed_paths.append(str(path))
+
+    detail_existing: list[Path] = [p for p in detail_paths if p.exists()]
+
+    if artifact_mode == "full":
+        pass
+    elif artifact_mode == "minimal":
+        for path in detail_existing:
+            _remove_path(path)
+    elif artifact_mode == "fail-bundle":
+        if result == "fail" and detail_existing:
+            out = failure_bundle_out or (run_dir / "failure_bundle.tar.gz")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(out, "w:gz") as tar:
+                for path in detail_existing:
+                    if not path.exists():
+                        continue
+                    try:
+                        arcname = path.relative_to(run_dir)
+                    except ValueError:
+                        arcname = Path(path.name)
+                    tar.add(path, arcname=str(arcname))
+                    bundled_paths.append(str(path))
+            bundle_path = str(out)
+        for path in detail_existing:
+            _remove_path(path)
+    else:
+        raise ValueError(f"unknown artifact mode: {artifact_mode}")
+
+    retained: set[str] = set()
+    if run_dir.exists():
+        for path in run_dir.rglob("*"):
+            if path.is_file():
+                retained.add(str(path))
+    if bundle_path:
+        retained.add(bundle_path)
+
+    return {
+        "mode": artifact_mode,
+        "result": result,
+        "bundle_path": bundle_path,
+        "bundled_paths": sorted(bundled_paths),
+        "removed_paths": sorted(removed_paths),
+        "retained_files": sorted(retained),
+    }
 
 
 @dataclass
@@ -846,7 +952,7 @@ class CorrectnessRunner:
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
         self.git_commit = _safe_git_commit()
-        self.run_id = f"cc_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
+        self.run_id = cfg.run_id_override or f"cc_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
         self.run_dir = Path(cfg.out_dir) / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -910,13 +1016,15 @@ class CorrectnessRunner:
         self._write_run_header()
 
     def _write_run_header(self) -> None:
+        cfg_dict = asdict(self.cfg)
+        cfg_dict["fail_statuses"] = sorted(self.cfg.fail_statuses)
         self.ops_writer.write(
             {
                 "op": "run_start",
                 "t_utc": self.started_utc,
                 "run_id": self.run_id,
                 "git_commit": self.git_commit,
-                "config": asdict(self.cfg),
+                "config": cfg_dict,
                 "csv_source": None if self.csv_source is None else [str(p) for p in self.csv_source.paths],
             },
             flush=True,
@@ -949,6 +1057,8 @@ class CorrectnessRunner:
 
         started = time.monotonic()
         last_progress = started
+        summary: dict[str, Any] | None = None
+        outcome: RunOutcome | None = None
         try:
             while True:
                 elapsed = time.monotonic() - started
@@ -1021,10 +1131,20 @@ class CorrectnessRunner:
                 if self.issue_registry.count >= self.cfg.max_issues:
                     self.stop_reason = "max_issues_reached"
 
-            self._finalize_summary(started)
-            return 0 if self.issue_registry.by_status[ISSUE_STATUS_CONFIRMED] == 0 else 2
+            outcome = _compute_exit_code(dict(self.issue_registry.by_status), self.cfg.fail_statuses)
+            summary = self._finalize_summary(started, outcome)
         finally:
             self._close_all()
+
+        if outcome is None:
+            outcome = _compute_exit_code(dict(self.issue_registry.by_status), self.cfg.fail_statuses)
+        if summary is None:
+            summary = self._build_summary(started, outcome)
+
+        self._finalize_artifacts(summary, outcome)
+        self._write_summary_files(summary)
+        self._print_summary(summary)
+        return outcome.exit_code
 
     def _pick_operation(self) -> str:
         if self.shadow_fast.live_count() == 0:
@@ -2353,16 +2473,27 @@ class CorrectnessRunner:
         if status in {ISSUE_STATUS_CONFIRMED, ISSUE_STATUS_CHECKER} and not self.cfg.continue_on_mismatch:
             self.stop_reason = f"{status}:{issue_id}"
 
-    def _finalize_summary(self, started: float) -> None:
+    def _build_summary(self, started: float, outcome: RunOutcome) -> dict[str, Any]:
         ended_utc = _utc_now_iso()
         elapsed_s = int(time.monotonic() - started)
-        summary = {
+        triggered_statuses = sorted([k for k, v in outcome.fail_status_counts.items() if v > 0])
+        cfg_dict = asdict(self.cfg)
+        cfg_dict["fail_statuses"] = sorted(self.cfg.fail_statuses)
+        return {
             "run_id": self.run_id,
             "started_utc": self.started_utc,
             "ended_utc": ended_utc,
             "elapsed_seconds": elapsed_s,
             "git_commit": self.git_commit,
-            "config": asdict(self.cfg),
+            "config": cfg_dict,
+            "result": outcome.result,
+            "exit_code": outcome.exit_code,
+            "artifact_mode": self.cfg.artifact_mode,
+            "gate": {
+                "fail_statuses": sorted(self.cfg.fail_statuses),
+                "fail_status_counts": dict(outcome.fail_status_counts),
+                "triggered_statuses": triggered_statuses,
+            },
             "stats": {
                 "ops": self.op_index,
                 "checks": self.check_index,
@@ -2386,60 +2517,147 @@ class CorrectnessRunner:
                 "issues_jsonl": str(self.issues_writer.path),
                 "issues_dir": str(self.issue_registry.issues_dir),
             },
+            "artifact_manifest": [],
             "csv_source": None if self.csv_source is None else self.csv_source.stats(),
         }
-        with open(self.run_dir / "summary.json", "w", encoding="utf-8") as fh:
-            json.dump(summary, fh, indent=2, ensure_ascii=True, default=str)
 
+    def _render_summary_md(self, summary: dict[str, Any]) -> str:
         md = [
             "# Timelog Correctness Checker Summary",
             "",
-            f"- Run ID: `{self.run_id}`",
-            f"- Started (UTC): `{self.started_utc}`",
-            f"- Ended (UTC): `{ended_utc}`",
-            f"- Elapsed: `{elapsed_s}s`",
-            f"- Git commit: `{self.git_commit}`",
+            f"- Run ID: `{summary.get('run_id')}`",
+            f"- Started (UTC): `{summary.get('started_utc')}`",
+            f"- Ended (UTC): `{summary.get('ended_utc')}`",
+            f"- Elapsed: `{summary.get('elapsed_seconds')}s`",
+            f"- Git commit: `{summary.get('git_commit')}`",
+            f"- Result: `{summary.get('result')}`",
+            f"- Exit code: `{summary.get('exit_code')}`",
+            f"- Artifact mode: `{summary.get('artifact_mode')}`",
             "",
             "## Totals",
             "",
-            f"- Operations: `{self.op_index}`",
-            f"- Checks: `{self.check_index}`",
-            f"- Inserts: `{self.inserts}`",
-            f"- Deletes: `{self.deletes}`",
-            f"- Live rows: `{self.shadow_fast.live_count()}`",
-            f"- Full verifies: `{self.full_verifies}`",
-            f"- Mismatches: `{self.mismatches}`",
-            f"- Len checks total: `{self.len_checks_total}`",
-            f"- Len checks failed: `{self.len_checks_failed}`",
-            f"- Issues: `{self.issue_registry.count}`",
-            f"- Stop reason: `{self.stop_reason}`",
+            f"- Operations: `{summary['stats']['ops']}`",
+            f"- Checks: `{summary['stats']['checks']}`",
+            f"- Inserts: `{summary['stats']['inserts']}`",
+            f"- Deletes: `{summary['stats']['deletes']}`",
+            f"- Live rows: `{summary['stats']['live_rows']}`",
+            f"- Full verifies: `{summary['stats']['full_verifies']}`",
+            f"- Mismatches: `{summary['stats']['mismatches']}`",
+            f"- Len checks total: `{summary['stats']['len_checks_total']}`",
+            f"- Len checks failed: `{summary['stats']['len_checks_failed']}`",
+            f"- Issues: `{summary['stats']['issues_total']}`",
+            f"- Stop reason: `{summary['stats']['stop_reason']}`",
+            "",
+            "## Gate",
+            "",
+            f"- Fail statuses: `{', '.join(summary['gate']['fail_statuses'])}`",
+            f"- Triggered: `{', '.join(summary['gate']['triggered_statuses']) or 'none'}`",
             "",
             "## Issues by Status",
             "",
         ]
-        for k, v in sorted(self.issue_registry.by_status.items()):
+        for k, v in sorted(summary["stats"]["issues_by_status"].items()):
             md.append(f"- `{k}`: `{v}`")
         md += ["", "## Issues by Kind", ""]
-        for k, v in sorted(self.issue_registry.by_kind.items()):
+        for k, v in sorted(summary["stats"]["issues_by_kind"].items()):
             md.append(f"- `{k}`: `{v}`")
         md += ["", "## Len Mismatches by Kind", ""]
-        if self.len_mismatches_by_kind:
-            for k, v in sorted(self.len_mismatches_by_kind.items()):
+        if summary["stats"]["len_mismatches_by_kind"]:
+            for k, v in sorted(summary["stats"]["len_mismatches_by_kind"].items()):
                 md.append(f"- `{k}`: `{v}`")
         else:
             md.append("- none")
+        md += ["", "## Retained Artifacts", ""]
+        manifest = summary.get("artifact_manifest", [])
+        if manifest:
+            for item in manifest:
+                md.append(f"- `{item}`")
+        else:
+            md.append("- pending")
         md += ["", "## Reproduction Command", "", "```powershell", self.repro_cmd, "```", ""]
-        with open(self.run_dir / "summary.md", "w", encoding="utf-8") as fh:
-            fh.write("\n".join(md) + "\n")
+        return "\n".join(md) + "\n"
 
-        self.ops_writer.write({"op": "run_end", "t_utc": ended_utc, "summary": summary["stats"]}, flush=True)
+    def _finalize_summary(self, started: float, outcome: RunOutcome) -> dict[str, Any]:
+        summary = self._build_summary(started, outcome)
+        self.ops_writer.write({"op": "run_end", "t_utc": summary["ended_utc"], "summary": summary["stats"]}, flush=True)
+        return summary
 
+    def _write_summary_files(self, summary: dict[str, Any]) -> None:
+        summary_json_path = self.run_dir / "summary.json"
+        summary_md_path = self.run_dir / "summary.md"
+
+        summary_json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True, default=str) + "\n", encoding="utf-8")
+        summary_md_path.write_text(self._render_summary_md(summary), encoding="utf-8")
+
+        extra_outputs: list[Path] = []
+        if self.cfg.summary_json_out:
+            extra_outputs.append(Path(self.cfg.summary_json_out))
+        if self.cfg.summary_md_out:
+            extra_outputs.append(Path(self.cfg.summary_md_out))
+
+        for out in extra_outputs:
+            out.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.cfg.summary_json_out:
+            Path(self.cfg.summary_json_out).write_text(
+                json.dumps(summary, indent=2, ensure_ascii=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+        if self.cfg.summary_md_out:
+            Path(self.cfg.summary_md_out).write_text(self._render_summary_md(summary), encoding="utf-8")
+
+        retained: set[str] = set(summary.get("artifact_manifest", []))
+        retained.add(str(summary_json_path))
+        retained.add(str(summary_md_path))
+        if self.cfg.summary_json_out:
+            retained.add(str(Path(self.cfg.summary_json_out)))
+        if self.cfg.summary_md_out:
+            retained.add(str(Path(self.cfg.summary_md_out)))
+        summary["artifact_manifest"] = sorted(retained)
+        if "artifact_policy" in summary:
+            summary["artifact_policy"]["retained_files"] = list(summary["artifact_manifest"])
+
+        summary_json_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True, default=str) + "\n", encoding="utf-8")
+        summary_md_path.write_text(self._render_summary_md(summary), encoding="utf-8")
+        if self.cfg.summary_json_out:
+            Path(self.cfg.summary_json_out).write_text(
+                json.dumps(summary, indent=2, ensure_ascii=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+        if self.cfg.summary_md_out:
+            Path(self.cfg.summary_md_out).write_text(self._render_summary_md(summary), encoding="utf-8")
+
+    def _finalize_artifacts(self, summary: dict[str, Any], outcome: RunOutcome) -> None:
+        detail_paths = [
+            Path(summary["artifact_paths"]["ops_jsonl"]),
+            Path(summary["artifact_paths"]["checks_jsonl"]),
+            Path(summary["artifact_paths"]["issues_jsonl"]),
+            Path(summary["artifact_paths"]["issues_dir"]),
+        ]
+        bundle_out = Path(self.cfg.failure_bundle_out) if self.cfg.failure_bundle_out else None
+        manifest = _apply_artifact_policy(
+            run_dir=self.run_dir,
+            artifact_mode=self.cfg.artifact_mode,
+            result=outcome.result,
+            detail_paths=detail_paths,
+            failure_bundle_out=bundle_out,
+        )
+        outcome.artifact_manifest = manifest
+        if manifest.get("bundle_path"):
+            summary["artifact_paths"]["failure_bundle"] = manifest["bundle_path"]
+        summary["artifact_manifest"] = list(manifest.get("retained_files", []))
+        summary["artifact_policy"] = manifest
+
+    def _print_summary(self, summary: dict[str, Any]) -> None:
         print("=" * 96)
         print(
             "SUMMARY: "
-            f"ops={self.op_index} checks={self.check_index} inserts={self.inserts} "
-            f"deletes={self.deletes} issues={self.issue_registry.count} "
-            f"confirmed={self.issue_registry.by_status[ISSUE_STATUS_CONFIRMED]}"
+            f"ops={summary['stats']['ops']} checks={summary['stats']['checks']} "
+            f"inserts={summary['stats']['inserts']} deletes={summary['stats']['deletes']} "
+            f"issues={summary['stats']['issues_total']} "
+            f"confirmed={summary['stats']['issues_by_status'].get(ISSUE_STATUS_CONFIRMED, 0)} "
+            f"checker={summary['stats']['issues_by_status'].get(ISSUE_STATUS_CHECKER, 0)} "
+            f"result={summary.get('result')}"
         )
         print(f"Artifacts: {self.run_dir}")
         print("=" * 96)
@@ -2470,6 +2688,18 @@ def _parse_args() -> RunConfig:
     parser.add_argument("--max-issues", type=int, default=100)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ci-profile", choices=["off", "pr", "nightly"], default="off")
+    parser.add_argument("--artifact-mode", choices=["full", "minimal", "fail-bundle"], default="full")
+    parser.add_argument(
+        "--fail-statuses",
+        type=str,
+        default=DEFAULT_FAIL_STATUSES,
+        help="Comma-separated statuses that should fail the run.",
+    )
+    parser.add_argument("--summary-json-out", type=str, default=None)
+    parser.add_argument("--summary-md-out", type=str, default=None)
+    parser.add_argument("--failure-bundle-out", type=str, default=None)
+    parser.add_argument("--run-id", type=str, default=None)
     args = parser.parse_args()
 
     duration = args.duration if args.duration is not None else args.duration_seconds
@@ -2479,6 +2709,7 @@ def _parse_args() -> RunConfig:
     min_batch = max(1, args.min_batch)
     max_batch = max(min_batch, args.max_batch)
     csv_paths = args.csv if args.csv is not None else DEFAULT_CSVS
+    fail_statuses = _parse_fail_statuses(args.fail_statuses)
 
     return RunConfig(
         duration_seconds=duration,
@@ -2500,6 +2731,13 @@ def _parse_args() -> RunConfig:
         max_issues=max(1, args.max_issues),
         verbose=args.verbose,
         log_alias_path=args.log,
+        ci_profile=args.ci_profile,
+        artifact_mode=args.artifact_mode,
+        fail_statuses=fail_statuses,
+        summary_json_out=args.summary_json_out,
+        summary_md_out=args.summary_md_out,
+        failure_bundle_out=args.failure_bundle_out,
+        run_id_override=args.run_id,
     )
 
 

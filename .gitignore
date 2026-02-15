@@ -94,6 +94,7 @@ proposal_unified.md
 everything_you_want_to_know_about_timelog.md
 *.json
 *.csv
+!demo/order_book_50MB_*_ooo_clean.csv
 
 # LLVM binary cache
 llvm_bin/

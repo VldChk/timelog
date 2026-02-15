@@ -3429,8 +3429,58 @@ def main():
         type=int,
         help="Override sealed_max_runs for all Timelog instances in this run",
     )
+    parser.add_argument(
+        "--methodology",
+        action="store_true",
+        help="Run methodology-compliant benchmark harness instead of legacy demo mode",
+    )
+    parser.add_argument(
+        "--methodology-profile",
+        type=str,
+        default="pr",
+        choices=["pr", "full", "custom"],
+        help="Methodology profile: pr|full|custom",
+    )
+    parser.add_argument(
+        "--methodology-export-json",
+        type=str,
+        default="demo/benchmark_runs/methodology_v1.json",
+        help="Methodology JSON export path",
+    )
+    parser.add_argument(
+        "--methodology-export-md",
+        type=str,
+        default="demo/benchmark_runs/methodology_v1.md",
+        help="Methodology markdown export path",
+    )
+    parser.add_argument(
+        "--methodology-baseline",
+        type=str,
+        default=None,
+        help="Optional methodology baseline path override",
+    )
+    parser.add_argument(
+        "--methodology-seed",
+        type=int,
+        default=12345,
+        help="Methodology run seed",
+    )
+    parser.add_argument(
+        "--methodology-config",
+        type=str,
+        default=None,
+        help="Path to custom methodology profile JSON when --methodology-profile=custom",
+    )
 
     args = parser.parse_args()
+
+    if args.methodology:
+        from timelog_benchmark import run_from_demo_namespace
+
+        code = run_from_demo_namespace(args)
+        if code != 0:
+            raise SystemExit(code)
+        return
 
     log_overrides: dict[str, object] = {}
     if args.force_maintenance is not None:

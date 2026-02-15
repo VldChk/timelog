@@ -152,6 +152,8 @@ endif()
 # Link pthread on POSIX systems
 if(NOT WIN32)
     find_package(Threads REQUIRED)
+    # Adaptive code uses llround; export libm so all timelog consumers link cleanly on Unix.
+    target_link_libraries(timelog PUBLIC m)
     target_link_libraries(timelog PRIVATE Threads::Threads)
 endif()
 

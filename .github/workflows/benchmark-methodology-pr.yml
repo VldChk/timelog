@@ -1,0 +1,88 @@
+name: Benchmark Methodology (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "core/**"
+      - "bindings/**"
+      - "python/**"
+      - "demo/**"
+      - ".github/workflows/benchmark-methodology-pr.yml"
+
+jobs:
+  methodology-pr:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build e2e targets
+        run: cmake --build build --target timelog_e2e_build -j 2
+
+      - name: Run methodology PR profile
+        shell: bash
+        run: |
+          set +e
+          python demo/timelog_benchmark.py \
+            --profile pr \
+            --data demo/order_book_50MB_5pct_ooo_clean.csv \
+            --export-json demo/benchmark_runs/methodology_pr_${{ runner.os }}.json \
+            --export-md demo/benchmark_runs/methodology_pr_${{ runner.os }}.md \
+            2>&1 | tee demo/benchmark_runs/methodology_pr_${{ runner.os }}.log
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: methodology-pr-${{ runner.os }}
+          path: |
+            demo/benchmark_runs/methodology_pr_${{ runner.os }}.json
+            demo/benchmark_runs/methodology_pr_${{ runner.os }}.md
+            demo/benchmark_runs/methodology_pr_${{ runner.os }}.log
+
+      - name: Append summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = "demo/benchmark_runs/methodology_pr_${{ runner.os }}.json"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write("## Methodology PR\n")
+              p = Path(path)
+              if not p.exists():
+                  out.write("- summary JSON missing\n")
+              else:
+                  try:
+                      d = json.loads(p.read_text(encoding="utf-8"))
+                  except Exception as exc:
+                      out.write(f"- summary JSON parse error: {exc}\n")
+                  else:
+                      counts = d.get("summary", {}).get("gate_counts", {})
+                      throughput = counts.get("throughput", {})
+                      correctness = counts.get("correctness", {})
+                      complexity = counts.get("complexity", {})
+                      out.write(f"- platform: {d.get('platform')}\n")
+                      out.write(f"- correctness fail: {correctness.get('fail', 0)}\n")
+                      out.write(f"- complexity fail: {complexity.get('fail', 0)}\n")
+                      out.write(f"- throughput warn (advisory): {throughput.get('warn', 0)}\n")
+          PY

@@ -1,0 +1,82 @@
+name: Benchmark Methodology (Main)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demo/**'
+      - 'docs/PERFORMANCE_METHODOLOGY.md'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmark-methodology-main.yml'
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  methodology-main:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build e2e targets
+        run: cmake --build build --target timelog_e2e_build -j 2
+
+      - name: Run methodology full profile and refresh baseline
+        shell: bash
+        run: |
+          set +e
+          python demo/timelog_benchmark.py \
+            --profile full \
+            --data demo/order_book_50MB_5pct_ooo_clean.csv \
+            --update-baseline \
+            --export-json demo/benchmark_runs/methodology_full_${{ runner.os }}.json \
+            --export-md demo/benchmark_runs/methodology_full_${{ runner.os }}.md \
+            2>&1 | tee demo/benchmark_runs/methodology_full_${{ runner.os }}.log
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: methodology-full-${{ runner.os }}
+          path: |
+            demo/benchmark_runs/methodology_full_${{ runner.os }}.json
+            demo/benchmark_runs/methodology_full_${{ runner.os }}.md
+            demo/benchmark_runs/methodology_full_${{ runner.os }}.log
+            benchmarks/baselines/**/methodology_v1.json
+
+      - name: Create baseline update PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "benchmark: refresh methodology baseline (${{ runner.os }})"
+          title: "benchmark: refresh methodology baseline (${{ runner.os }})"
+          body: |
+            Automated methodology baseline refresh for ${{ runner.os }}.
+
+            - Profile: full
+            - Advisory throughput gate enabled
+            - Correctness/complexity gate still hard-fail
+          branch: auto/benchmark-baseline-${{ runner.os }}
+          delete-branch: true
+          labels: |
+            benchmarks
+            automated

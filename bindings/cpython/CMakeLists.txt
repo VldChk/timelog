@@ -211,6 +211,25 @@ endif()
 option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
 
 if(TIMELOG_BUILD_PY_TESTS)
+    # Embedded-Python C tests may run under launcher shims (e.g. pyenv) where
+    # executable dirname is not a valid CPython home. Resolve a stable prefix
+    # once at configure time and pass it to CTest via PYTHONHOME.
+    set(TIMELOG_TEST_PYTHONHOME "")
+    if(Python3_EXECUTABLE)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" -c "import sys; print(sys.base_prefix)"
+            RESULT_VARIABLE _timelog_pyhome_rc
+            OUTPUT_VARIABLE _timelog_pyhome_out
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(_timelog_pyhome_rc EQUAL 0 AND IS_DIRECTORY "${_timelog_pyhome_out}")
+            set(TIMELOG_TEST_PYTHONHOME "${_timelog_pyhome_out}")
+        elseif(DEFINED Python3_PREFIX AND IS_DIRECTORY "${Python3_PREFIX}")
+            set(TIMELOG_TEST_PYTHONHOME "${Python3_PREFIX}")
+        endif()
+    endif()
+
     # =========================================================================
     # Test: test_py_handle (Handle unit tests)
     # =========================================================================
@@ -565,6 +584,28 @@ if(TIMELOG_BUILD_PY_TESTS)
         COMMAND test_py_errors
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
+
+    if(NOT WIN32)
+        set(_timelog_py_test_env "")
+        if(TIMELOG_TEST_PYTHONHOME)
+            list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
+        endif()
+        # Embedded CPython may keep tiny process-lifetime allocations that are
+        # not actionable for extension correctness; keep ASan/UBSan enabled but
+        # disable LSan in these CTest runs to avoid false-red failures.
+        list(APPEND _timelog_py_test_env "ASAN_OPTIONS=detect_leaks=0")
+
+        set_tests_properties(
+            py_handle_tests
+            py_timelog_tests
+            py_iter_tests
+            py_span_tests
+            py_maint_b5_tests
+            py_errors_tests
+            PROPERTIES
+            ENVIRONMENT "${_timelog_py_test_env}"
+        )
+    endif()
 
     # Custom target to run all tests (alternative to ctest)
     # Note: -C $<CONFIG> is required for multi-config generators (MSVC)

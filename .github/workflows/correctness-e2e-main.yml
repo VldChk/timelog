@@ -1,0 +1,98 @@
+name: Correctness E2E (Main)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "bindings/**"
+      - "python/**"
+      - "demo/correctness_checker.py"
+      - "demo/correctness_ci.py"
+      - ".github/workflows/correctness-e2e-main.yml"
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+jobs:
+  correctness-e2e-main:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build e2e targets
+        run: cmake --build build --target timelog_e2e_build -j 2
+
+      - name: Run correctness CI profile (nightly)
+        shell: bash
+        run: |
+          mkdir -p demo/correctness_runs
+          set +e
+          python demo/correctness_ci.py \
+            --profile nightly \
+            --out-dir "${RUNNER_TEMP}/timelog-correctness-nightly-${{ runner.os }}" \
+            --export-json demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.json \
+            --export-md demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.md \
+            --failure-bundle-dir demo/correctness_runs/failure_bundles_nightly_${{ runner.os }} \
+            2>&1 | tee demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.log
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Upload correctness summary artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correctness-ci-nightly-${{ runner.os }}
+          path: |
+            demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.json
+            demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.md
+            demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.log
+
+      - name: Upload failure bundles
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correctness-ci-nightly-failures-${{ runner.os }}
+          path: demo/correctness_runs/failure_bundles_nightly_${{ runner.os }}/*.tar.gz
+          if-no-files-found: ignore
+
+      - name: Append summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path("demo/correctness_runs/correctness_ci_nightly_${{ runner.os }}.json")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("## Correctness E2E (Main/Schedule)\n")
+              if not p.exists():
+                  out.write("- summary JSON missing\n")
+              else:
+                  try:
+                      d = json.loads(p.read_text(encoding="utf-8"))
+                  except Exception as exc:
+                      out.write(f"- summary JSON parse error: {exc}\n")
+                  else:
+                      out.write(f"- platform runner: ${{ runner.os }}\n")
+                      out.write(f"- result: {d.get('result')}\n")
+                      out.write(f"- exit_code: {d.get('exit_code')}\n")
+                      out.write(f"- legs: {len(d.get('legs', []))}\n")
+                      out.write(f"- failed_legs: {', '.join(d.get('failed_legs', [])) or 'none'}\n")
+          PY
