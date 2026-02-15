@@ -13,6 +13,12 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(TIMELOG_NATIVE_OPT "Enable -march=native for maximum local performance" OFF)
 # Option to build shared library (exports symbols)
 option(TIMELOG_BUILD_SHARED "Build timelog as a shared library" OFF)
+option(TIMELOG_BUILD_PYTHON "Build CPython bindings from the top-level build" ON)
+option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
+option(TIMELOG_STAGE_PYTHON_MODULE
+    "Copy built _timelog extension into python/timelog for in-repo imports" ON)
+option(TIMELOG_BUILD_PY_FACADE_TESTS
+    "Add target to run python/tests via pytest (requires pytest installed)" OFF)
 
 # Build type defaults to Release
 if(NOT CMAKE_BUILD_TYPE)
@@ -215,6 +221,58 @@ add_test(NAME timelog_tests COMMAND test_timelog)
 
 add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
 target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
+
+# =============================================================================
+# Python Bindings (Integrated Build)
+# =============================================================================
+
+if(TIMELOG_BUILD_PYTHON)
+    # Expose repository root for bindings/cpython standalone-aware CMake.
+    set(TIMELOG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT DEFINED TIMELOG_PYTHON_PACKAGE_DIR)
+        set(TIMELOG_PYTHON_PACKAGE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/python/timelog"
+            CACHE PATH "Directory where built _timelog extension is staged"
+        )
+    endif()
+
+    add_subdirectory(bindings/cpython)
+
+    add_custom_target(timelog_e2e_build
+        DEPENDS timelog test_timelog _timelog
+        COMMENT "Build core library/tests plus CPython extension"
+    )
+
+    if(TIMELOG_BUILD_PY_TESTS)
+        add_dependencies(timelog_e2e_build
+            test_py_handle
+            test_py_timelog
+            test_py_iter
+            test_py_span
+            test_py_maint_b5
+            test_py_errors
+        )
+    endif()
+
+    add_custom_target(timelog_e2e_test
+        COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG> --output-on-failure
+        DEPENDS timelog_e2e_build
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Run all registered core and binding tests"
+    )
+
+    if(TIMELOG_BUILD_PY_FACADE_TESTS)
+        add_custom_target(timelog_python_facade_tests
+            COMMAND ${CMAKE_COMMAND} -E env
+                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+                    "${Python3_EXECUTABLE}" -m pytest
+                    "${CMAKE_CURRENT_SOURCE_DIR}/python/tests" -q
+            DEPENDS _timelog
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Run Python facade tests with staged extension module"
+        )
+    endif()
+endif()
 
 # Ensure ASan runtime DLL is discoverable when using Clang on Windows.
 if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)

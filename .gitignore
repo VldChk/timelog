@@ -2,6 +2,7 @@
 # Build directories
 # =============================================================================
 build/
+build-*/
 build_*/
 cmake-build-*/
 out/
@@ -38,9 +39,15 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
+CTestTestfile.cmake
+build.ninja
 compile_commands.json
 *.vcxproj*
 *.sln
+*.slnx
+*.recipe
+.ninja_log
+.ninja_deps
 
 # =============================================================================
 # Test artifacts

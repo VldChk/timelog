@@ -179,12 +179,6 @@ static tl_status_t validate_config(const tl_config_t* cfg) {
         return TL_EINVAL;
     }
 
-    /* Phase 2 OOO Scaling: compaction_strategy must be valid enum value */
-    if ((int)cfg->compaction_strategy < (int)TL_COMPACT_AUTO ||
-        (int)cfg->compaction_strategy > (int)TL_COMPACT_RESHAPE) {
-        return TL_EINVAL;
-    }
-
     return TL_OK;
 }
 

@@ -16,6 +16,9 @@
 #
 
 cmake_minimum_required(VERSION 3.14)
+if(POLICY CMP0177)
+    cmake_policy(SET CMP0177 NEW)
+endif()
 
 # If building standalone, set up project
 if(NOT TARGET timelog)
@@ -61,6 +64,14 @@ if(NOT TARGET timelog)
     )
 
     message(STATUS "Standalone build: linking against ${TIMELOG_LIB_PATH}")
+endif()
+
+# Root build enables warnings-as-errors globally for core. Disable that policy
+# in bindings so Python/C API header warnings do not break extension builds.
+if(MSVC)
+    add_compile_options(/WX-)
+else()
+    add_compile_options(-Wno-error)
 endif()
 
 # =============================================================================
@@ -140,6 +151,15 @@ Python3_add_library(_timelog MODULE ${TIMELOG_PY_SOURCES})
 if(NOT DEFINED TIMELOG_ROOT)
     set(TIMELOG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 endif()
+if(NOT DEFINED TIMELOG_PYTHON_PACKAGE_DIR)
+    set(TIMELOG_PYTHON_PACKAGE_DIR
+        "${TIMELOG_ROOT}/python/timelog"
+        CACHE PATH "Directory where built _timelog extension is staged"
+    )
+endif()
+
+option(TIMELOG_STAGE_PYTHON_MODULE
+    "Copy built _timelog extension into the in-repo python/timelog directory" ON)
 
 # Include directories
 # NOTE: B4 requires access to internal headers in core/src
@@ -156,6 +176,7 @@ target_link_libraries(_timelog PRIVATE timelog)
 if(MSVC)
     target_compile_options(_timelog PRIVATE
         /W4
+        /WX-
         /D_CRT_SECURE_NO_WARNINGS
         /std:c17
         /experimental:c11atomics
@@ -166,6 +187,19 @@ else()
         -Wno-unused-parameter
         -fvisibility=hidden
     )
+endif()
+
+if(TIMELOG_STAGE_PYTHON_MODULE)
+    add_custom_command(TARGET _timelog POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${TIMELOG_PYTHON_PACKAGE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:_timelog>"
+                "${TIMELOG_PYTHON_PACKAGE_DIR}/$<TARGET_FILE_NAME:_timelog>"
+        COMMENT "Staging _timelog in ${TIMELOG_PYTHON_PACKAGE_DIR}"
+        VERBATIM
+    )
+
+    add_custom_target(stage_timelog_python_module DEPENDS _timelog)
 endif()
 
 # =============================================================================
@@ -206,6 +240,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_handle PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics
@@ -259,6 +294,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_timelog PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics
@@ -315,6 +351,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_iter PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics
@@ -368,6 +405,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_span PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics
@@ -421,6 +459,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_maint_b5 PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics
@@ -474,6 +513,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     if(MSVC)
         target_compile_options(test_py_errors PRIVATE
             /W4
+            /WX-
             /D_CRT_SECURE_NO_WARNINGS
             /std:c17
             /experimental:c11atomics

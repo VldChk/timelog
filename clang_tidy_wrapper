@@ -1,2 +1,2 @@
 #!/bin/bash
-exec "/c/Program Files/LLVM/bin/clang-tidy" "$@"
+exec "${CLANG_TIDY:-clang-tidy}" "$@"
