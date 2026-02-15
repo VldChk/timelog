@@ -26,8 +26,8 @@
  *     data is not persisted. Call flush() before close() if you need to
  *     preserve all records.
  *
- * See: docs/V2/timelog_v2_engineering_plan.md
- *      docs/V2/timelog_v2_c_software_design_spec.md
+ * See: docs/python-api.md
+ *      docs/internals/components/python-binding-architecture.md
  */
 
 #ifndef TL_PY_TIMELOG_H

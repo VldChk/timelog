@@ -39,7 +39,7 @@ Set these GitHub checks as required:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIMELOG_BUILD_PYTHON=ON -DTIMELOG_BUILD_PY_TESTS=ON
 cmake --build build --target timelog_e2e_build -j 2
-python demo/ci/run_core_test_groups.py --build-dir build --config Release --summary-json /tmp/core.json --summary-md /tmp/core.md
+python demo/ci/run_core_test_groups.py --build-dir build --config Release --summary-json demo/benchmark_runs/core.local.json --summary-md demo/benchmark_runs/core.local.md
 ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$'
 cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests -q
 python -m unittest discover -s demo/tests -p "test_*.py" -v
