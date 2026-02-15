@@ -16,6 +16,11 @@
  * 2. For each page: use binary search to find row boundaries
  * 3. Iterate through rows, checking range bounds
  *
+ * API contract:
+ * - This iterator is pull-based (next-only).
+ * - It does not expose a persistent "current row" or peek operation.
+ * - Callers that need non-advancing inspection should cache the last row.
+ *
  * UNBOUNDED QUERY DESIGN:
  * - If t2_unbounded == true, the query is [t1, +inf)
  * - When t2_unbounded is true, the 't2' field is ignored (pass 0 for clarity)
@@ -81,6 +86,8 @@ void tl_segment_iter_init(tl_segment_iter_t* it,
  * @param it   Iterator
  * @param out  Output record (may be NULL if only checking for existence)
  * @return TL_OK if record available, TL_EOF if exhausted
+ *
+ * The iterator advances only through this function.
  */
 tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out);
 

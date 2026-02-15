@@ -522,7 +522,11 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     }
     est = (size_t)seg->record_count * sizeof(tl_record_t);
 
-    if (seg->page_count > SIZE_MAX / sizeof(tl_page_meta_t)) {
+    /* seg->page_count is uint32_t. On 64-bit builds this multiplication cannot
+     * overflow size_t, but keep the defensive guard for narrower size_t. */
+    size_t page_count_limit = SIZE_MAX / sizeof(tl_page_meta_t);
+    if (page_count_limit < UINT32_MAX &&
+        (size_t)seg->page_count > page_count_limit) {
         return SIZE_MAX;
     }
     size_t page_meta_bytes = (size_t)seg->page_count * sizeof(tl_page_meta_t);
@@ -532,7 +536,9 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
     est += page_meta_bytes;
 
     if (seg->tombstones != NULL) {
-        if (seg->tombstones->n > SIZE_MAX / sizeof(tl_interval_t)) {
+        size_t tomb_count_limit = SIZE_MAX / sizeof(tl_interval_t);
+        if (tomb_count_limit < UINT32_MAX &&
+            (size_t)seg->tombstones->n > tomb_count_limit) {
             return SIZE_MAX;
         }
         size_t tomb_bytes = (size_t)seg->tombstones->n * sizeof(tl_interval_t);

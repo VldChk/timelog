@@ -18,6 +18,7 @@
 
 /* TL_ADAPTIVE_INTERNAL_TEST is defined via CMake (target_compile_definitions) */
 #include "tl_adaptive.h"
+#include "internal/tl_timelog_internal.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -609,6 +610,70 @@ TEST_DECLARE(adapt_fallback_candidate_zero) {
 }
 
 /*===========================================================================
+ * Advisory Resize Query
+ *===========================================================================*/
+
+TEST_DECLARE(adapt_wants_resize_disabled) {
+    tl_timelog_t tl;
+    memset(&tl, 0, sizeof(tl));
+
+    tl.window_grid_frozen = false;
+    tl.config.adaptive.target_records = 0;  /* disabled */
+    tl.config.adaptive.warmup_flushes = 3;
+    tl.adaptive.flush_count = 100;
+
+    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+}
+
+TEST_DECLARE(adapt_wants_resize_grid_frozen) {
+    tl_timelog_t tl;
+    memset(&tl, 0, sizeof(tl));
+
+    tl.window_grid_frozen = true;
+    tl.config.adaptive.target_records = 1000;
+    tl.config.adaptive.warmup_flushes = 3;
+    tl.adaptive.flush_count = 100;
+
+    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+}
+
+TEST_DECLARE(adapt_wants_resize_warmup_not_met) {
+    tl_timelog_t tl;
+    memset(&tl, 0, sizeof(tl));
+
+    tl.window_grid_frozen = false;
+    tl.config.adaptive.target_records = 1000;
+    tl.config.adaptive.warmup_flushes = 4;
+    tl.adaptive.flush_count = 3;
+
+    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+}
+
+TEST_DECLARE(adapt_wants_resize_warmup_met) {
+    tl_timelog_t tl;
+    memset(&tl, 0, sizeof(tl));
+
+    tl.window_grid_frozen = false;
+    tl.config.adaptive.target_records = 1000;
+    tl.config.adaptive.warmup_flushes = 4;
+    tl.adaptive.flush_count = 4;
+
+    TEST_ASSERT(tl_adaptive_wants_resize(&tl));
+}
+
+TEST_DECLARE(adapt_wants_resize_zero_warmup) {
+    tl_timelog_t tl;
+    memset(&tl, 0, sizeof(tl));
+
+    tl.window_grid_frozen = false;
+    tl.config.adaptive.target_records = 1000;
+    tl.config.adaptive.warmup_flushes = 0;
+    tl.adaptive.flush_count = 0;
+
+    TEST_ASSERT(tl_adaptive_wants_resize(&tl));
+}
+
+/*===========================================================================
  * Phase 3: Full Computation - Basic Tests
  *===========================================================================*/
 
@@ -1123,6 +1188,13 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_fallback_stale);
     RUN_TEST(adapt_fallback_stale_zero);
     RUN_TEST(adapt_fallback_candidate_zero);
+
+    /* Phase 3: Advisory Resize Query */
+    RUN_TEST(adapt_wants_resize_disabled);
+    RUN_TEST(adapt_wants_resize_grid_frozen);
+    RUN_TEST(adapt_wants_resize_warmup_not_met);
+    RUN_TEST(adapt_wants_resize_warmup_met);
+    RUN_TEST(adapt_wants_resize_zero_warmup);
 
     /* Phase 3: Full Computation */
     RUN_TEST(adapt_compute_basic);

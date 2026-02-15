@@ -41,6 +41,12 @@ typedef struct tl_memrun_iter {
 /**
  * Initialize memrun iterator for range [t1, t2) or [t1, +inf).
  *
+ * Lifecycle contract:
+ * - This API may allocate internal merge state.
+ * - After each init attempt (success or failure), calling
+ *   tl_memrun_iter_destroy() is always safe.
+ * - Re-initializing the same iterator without destroy is invalid.
+ *
  * After init, call tl_memrun_iter_next() to get the first record.
  *
  * @param it           Iterator to initialize
@@ -57,7 +63,11 @@ tl_status_t tl_memrun_iter_init(tl_memrun_iter_t* it,
                                  bool t2_unbounded,
                                  tl_alloc_ctx_t* alloc);
 
-/** Destroy memrun iterator and free internal resources. */
+/**
+ * Destroy memrun iterator and free internal resources.
+ *
+ * Safe to call on a zeroed or partially initialized iterator.
+ */
 void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
 
 /*===========================================================================
@@ -69,7 +79,8 @@ void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
  *
  * @param it   Iterator
  * @param out  Output record (may be NULL)
- * @return TL_OK if record available, TL_EOF if exhausted
+ * @param out_watermark Source watermark for the emitted record (optional)
+ * @return TL_OK if record available, TL_EOF if exhausted, or error status
  */
 tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
                                  tl_record_t* out,
@@ -83,7 +94,9 @@ tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
  *
  * @param it     Iterator
  * @param target Target timestamp
- * @return TL_OK on success, TL_ENOMEM on internal heap growth failure
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on internal growth failure
+ *
+ * On error, iterator transitions to done=true.
  */
 tl_status_t tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target);
 

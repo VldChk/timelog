@@ -220,9 +220,17 @@ void tl__free(tl_alloc_ctx_t* ctx, void* ptr) {
     if (ctx == NULL || ptr == NULL) return;
 
 #ifdef TL_DEBUG
-    /* Note: We can't accurately decrement without tracking sizes.
-     * For debug, we just decrement count. */
-    (void)tl_atomic_fetch_sub_u64(&ctx->allocation_count, 1, TL_MO_RELAXED);
+    /* Keep debug accounting sane even under internal mismatches.
+     * Verify non-underflow before decrementing to avoid wraparound noise. */
+    uint64_t expected = tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED);
+    for (;;) {
+        TL_VERIFY(expected > 0);
+        uint64_t desired = expected - 1;
+        if (tl_atomic_cas_u64(&ctx->allocation_count, &expected, desired,
+                              TL_MO_RELAXED, TL_MO_RELAXED)) {
+            break;
+        }
+    }
 #endif
 
     ctx->alloc.free_fn(ctx->alloc.ctx, ptr);
