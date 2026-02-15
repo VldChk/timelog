@@ -34,7 +34,6 @@
  * This ensures tombstones outside record bounds are NOT pruned during
  * read-path overlap checks.
  *
- * Reference: Write Path LLD Section 3.5
  *===========================================================================*/
 
 struct tl_memrun {
@@ -172,7 +171,7 @@ TL_INLINE uint32_t tl_memrun_refcnt(const tl_memrun_t* mr) {
 }
 
 /*===========================================================================
- * Internal Helpers (M-11: Exposed for reuse by tl_memtable.c)
+ * Internal helpers (exposed for reuse by tl_memtable.c)
  *===========================================================================*/
 
 /**

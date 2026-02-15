@@ -1,11 +1,8 @@
 /**
  * @file py_iter.c
- * @brief PyTimelogIter CPython extension type implementation (LLD-B3)
+ * @brief PyTimelogIter CPython extension type implementation
  *
  * Implements snapshot-based iteration over timelog records.
- *
- * See: docs/V2/timelog_v2_lld_read_path.md
- *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -121,10 +118,7 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     }
     self->closed = 1;
 
-    /*
-     * Clear pointers BEFORE operations that may run Python code.
-     * This prevents reentrancy issues if Py_DECREF triggers __del__.
-     */
+    /* Clear pointers before Py_DECREF to prevent reentrancy via __del__. */
     tl_iter_t* it = self->iter;
     self->iter = NULL;
 
@@ -134,17 +128,14 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     self->remaining_count = 0;
 
     tl_py_handle_ctx_t* ctx = self->handle_ctx;
-    /* Don't NULL handle_ctx - it's borrowed, and we need it for pin exit */
+    /* handle_ctx is borrowed; keep for pin exit below */
 
     PyObject* owner = self->owner;
     self->owner = NULL;
 
     /*
-     * Release resources in order:
-     * 1. Destroy iterator (no Python code)
-     * 2. Release snapshot (no Python code)
-     * 3. Exit pins - may drain retired objects (runs Python code via Py_DECREF)
-     * 4. DECREF owner (runs Python code)
+     * Release order: iter/snapshot first (C only), then pins_exit/DECREF
+     * (may run Python code). Preserve exception state across the latter.
      */
     if (it) {
         tl_iter_destroy(it);
@@ -154,13 +145,7 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
         tl_snapshot_release(snap);
     }
 
-    /*
-     * Preserve exception state across operations that may run arbitrary Python
-     * code (drain, owner DECREF). This ensures:
-     * - TL_EOF path stays a clean StopIteration (no exception)
-     * - __exit__ path doesn't corrupt the propagating exception
-     * - Bad finalizers in __del__ don't clobber our exception state
-     */
+    /* Preserve exception state across Py_DECREF / drain. */
     PyObject *exc_type, *exc_value, *exc_tb;
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
 
@@ -202,10 +187,7 @@ static void PyTimelogIter_dealloc(PyTimelogIter* self)
 
 static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 {
-    /*
-     * Closed iterator returns NULL with no exception set.
-     * Per CPython convention, this signals StopIteration.
-     */
+    /* NULL without exception signals StopIteration (CPython convention). */
     if (self->closed) {
         return NULL;
     }
@@ -214,16 +196,12 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     tl_status_t st = tl_iter_next(self->iter, &rec);
 
     if (st == TL_OK) {
-        /*
-         * If materialization fails after fetch, fail closed to avoid silently
-         * skipping rows with an apparently still-live iterator.
-         */
+        /* Fail closed on materialization error to avoid silent row loss. */
         if (tl_py_iter_test_should_fail_iternext()) {
             pytimelogiter_cleanup(self);
             return NULL;
         }
 
-        /* Decode handle to PyObject* and take new reference */
         PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
         PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
@@ -241,8 +219,7 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
             return NULL;
         }
 
-        /* PyTuple_SET_ITEM steals references */
-        PyTuple_SET_ITEM(tup, 0, ts);
+        PyTuple_SET_ITEM(tup, 0, ts);  /* steals ref */
         PyTuple_SET_ITEM(tup, 1, obj);
 
         if (self->remaining_valid && self->remaining_count > 0) {
@@ -253,9 +230,8 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     }
 
     if (st == TL_EOF) {
-        /* Exhaustion - cleanup and signal StopIteration */
         pytimelogiter_cleanup(self);
-        return NULL;  /* No exception = StopIteration */
+        return NULL;  /* StopIteration */
     }
 
     /* Error path - cleanup and raise */
@@ -294,7 +270,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         return NULL;  /* Conversion error */
     }
 
-    /* Negative n is an error (unlike zero which returns empty list) */
+    /* Negative is an error; zero returns empty list. */
     if (n < 0) {
         PyErr_SetString(PyExc_ValueError, "next_batch size must be >= 0");
         return NULL;
@@ -315,11 +291,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         tl_status_t st = tl_iter_next(self->iter, &rec);
 
         if (st == TL_OK) {
-            /*
-             * Row already consumed from core iterator. On any subsequent
-             * materialization failure, close to keep remaining length/state
-             * deterministic and avoid silent row loss.
-             */
+            /* Fail closed on materialization error to avoid silent row loss. */
             if (tl_py_iter_test_should_fail_next_batch()) {
                 pytimelogiter_cleanup(self);
                 goto fail;
@@ -363,7 +335,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         goto fail;
     }
 
-    /* Shrink list if early EOF */
+    /* Trim list if exhausted before n. */
     if (i < n) {
         if (PyList_SetSlice(list, i, n, NULL) < 0) {
             goto fail;

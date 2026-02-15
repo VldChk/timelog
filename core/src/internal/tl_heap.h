@@ -13,7 +13,7 @@
  * - Initial heapify in O(K)
  *
  * Used by:
- * - Merge iterator (Read Path LLD Section 6)
+ * - Merge iterator
  * - Memview iterator (K-way merge of memruns)
  *
  * Thread Safety:
@@ -26,7 +26,7 @@
  */
 typedef struct tl_heap_entry {
     tl_ts_t       ts;            /* Sort key (timestamp) */
-    uint32_t      tie_break_key; /* M-14: Secondary sort key for equal timestamps */
+    uint32_t      tie_break_key; /* Secondary sort key for equal timestamps */
     tl_handle_t   handle;        /* Current record handle */
     tl_seq_t      watermark;     /* Per-record/source tombstone watermark */
     void*         iter;          /* Opaque pointer to component iterator */

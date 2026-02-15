@@ -1,10 +1,4 @@
-"""
-Tests for API simplification: dict kwargs and preset constructors.
-
-Tests the adaptive={...} and compaction={...} grouped dict kwargs,
-preset classmethods (for_streaming, for_bulk_ingest, for_low_latency),
-and backward compatibility of flat kwargs.
-"""
+"""Tests for dict kwargs (adaptive, compaction) and preset constructors."""
 
 import pytest
 from timelog import Timelog

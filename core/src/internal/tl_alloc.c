@@ -182,7 +182,7 @@ void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size
     }
 
     if (tl__alloc_would_overflow(count, size)) {
-        return NULL;  /* ptr NOT freed — caller retains ownership */
+        return NULL;  /* ptr NOT freed; caller retains ownership */
     }
 
     return tl__realloc(ctx, ptr, count * size);

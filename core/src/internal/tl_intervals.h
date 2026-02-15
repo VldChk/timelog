@@ -85,7 +85,7 @@ void tl_intervals_clear(tl_intervals_t* iv);
 /**
  * Insert a bounded interval [t1, t2).
  *
- * Semantics (Write Path LLD Section 3.8):
+ * Semantics:
  * - t1 > t2:  Returns TL_EINVAL (invalid interval)
  * - t1 == t2: Returns TL_OK (no-op, empty interval not stored)
  * - t1 < t2:  Inserts and coalesces
@@ -222,7 +222,7 @@ tl_interval_t* tl_intervals_take(tl_intervals_t* iv, size_t* out_len);
 
 /**
  * Compute total span covered by intervals (for delete debt metric).
- * Used by compaction policy (Compaction Policy LLD Section 5).
+ * Used by compaction policy for delete-debt calculation.
  *
  * Unbounded interval handling:
  * - SHOULD only be called after clipping to a bounded window.
@@ -238,7 +238,7 @@ tl_interval_t* tl_intervals_take(tl_intervals_t* iv, size_t* out_len);
 tl_ts_t tl_intervals_covered_span(const tl_intervals_t* iv);
 
 /*---------------------------------------------------------------------------
- * Cursor-Based Iteration (for tombstone filtering - Read Path LLD Section 7)
+ * Cursor-Based Iteration (for tombstone filtering)
  *
  * The tombstone filter uses a cursor over sorted intervals to achieve
  * amortized O(1) per-record filtering. The cursor advances forward only.
@@ -267,7 +267,7 @@ TL_INLINE void tl_intervals_cursor_init(tl_intervals_cursor_t* cur,
 /**
  * Get max tombstone seq at ts and advance cursor.
  *
- * Algorithm (Read Path LLD Section 7.1):
+ * Algorithm:
  * - Advance cursor while ts >= cur.end (for bounded intervals)
  * - Return max_seq if cur.start <= ts (and ts < cur.end for bounded, always for unbounded)
  *
@@ -284,7 +284,7 @@ tl_seq_t tl_intervals_cursor_max_seq(tl_intervals_cursor_t* cur, tl_ts_t ts);
 
 /**
  * Get the next uncovered timestamp after the current position.
- * Used for skip-ahead optimization (Read Path LLD Section 7.2).
+ * Used for skip-ahead optimization during tombstone filtering.
  *
  * If ts is covered by interval [start, end), sets *out = end and returns true.
  * If ts is covered by unbounded interval [start, +inf), returns false

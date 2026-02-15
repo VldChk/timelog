@@ -6,7 +6,7 @@
 /*===========================================================================
  * Seqlock for Snapshot Consistency
  *
- * Protocol from timelog_v1_c_software_design_spec.md Section 4.2:
+ * Protocol:
  *
  * Writer (publication):
  *   1. Lock writer_mu

@@ -25,8 +25,6 @@
  * Thread Safety:
  * - Not thread-safe; create one plan per query per thread
  * - Snapshot must remain valid for the lifetime of the plan
- *
- * Reference: Read Path LLD Section 4
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -142,42 +140,32 @@ void tl_plan_destroy(tl_plan_t* plan);
  * Accessors
  *===========================================================================*/
 
-/**
- * Get the number of sources in the plan.
- */
+/** Get the number of sources in the plan. */
 TL_INLINE size_t tl_plan_source_count(const tl_plan_t* plan) {
     TL_ASSERT(plan != NULL);
     return plan->source_count;
 }
 
-/**
- * Get a source by index.
- */
+/** Get a source by index. */
 TL_INLINE tl_iter_source_t* tl_plan_source(tl_plan_t* plan, size_t idx) {
     TL_ASSERT(plan != NULL);
     TL_ASSERT(idx < plan->source_count);
     return &plan->sources[idx];
 }
 
-/**
- * Get tombstone intervals.
- */
+/** Get tombstone intervals. */
 TL_INLINE const tl_interval_t* tl_plan_tombstones(const tl_plan_t* plan) {
     TL_ASSERT(plan != NULL);
     return plan->tombstones;
 }
 
-/**
- * Get tombstone count.
- */
+/** Get tombstone count. */
 TL_INLINE size_t tl_plan_tomb_count(const tl_plan_t* plan) {
     TL_ASSERT(plan != NULL);
     return plan->tomb_count;
 }
 
-/**
- * Check if plan is empty (no data sources).
- */
+/** Check if plan is empty (no data sources). */
 TL_INLINE bool tl_plan_is_empty(const tl_plan_t* plan) {
     TL_ASSERT(plan != NULL);
     return plan->source_count == 0;

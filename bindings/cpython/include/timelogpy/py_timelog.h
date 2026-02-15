@@ -1,6 +1,6 @@
 /**
  * @file py_timelog.h
- * @brief PyTimelog CPython extension type declaration (LLD-B2)
+ * @brief PyTimelog CPython extension type declaration
  *
  * This module provides the PyTimelog type which wraps tl_timelog_t*
  * and exposes a stable, low-overhead Python API for writes, deletes,

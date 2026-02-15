@@ -1,9 +1,9 @@
 /**
  * @file py_timelog.c
- * @brief PyTimelog CPython extension implementation (LLD-B2)
+ * @brief PyTimelog CPython extension implementation
  *
  * Implementation of the PyTimelog type which wraps tl_timelog_t*.
- * See docs/V2/timelog_v2_engineering_plan.md for current design intent.
+ * Coordinates lifetimes between the Python object graph and core snapshots.
  *
  * CRITICAL SEMANTICS:
  * - TL_EBUSY from write operations means record/tombstone WAS inserted
@@ -21,7 +21,7 @@
 
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_iter.h"
-#include "timelogpy/py_span_iter.h"  /* LLD-B4: PageSpan factory */
+#include "timelogpy/py_span_iter.h"  /* PageSpan factory */
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_compat.h"
@@ -253,11 +253,7 @@ tl_py_core_call_strict(PyTimelog* self, tl_py_core_call_fn fn, tl_status_t* out_
 
     Py_BEGIN_ALLOW_THREADS
     *out_status = fn(self->tl);
-    /*
-     * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-     * deadlock: Thread A holds core_lock + wants GIL, Thread B
-     * holds GIL + wants core_lock.
-     */
+    /* Release core_lock before GIL reacquire to prevent ABBA deadlock. */
     PyThread_release_lock(self->core_lock);
     Py_END_ALLOW_THREADS
 
@@ -381,7 +377,7 @@ dict_validate_keys(PyObject* dict, const char* dict_name,
 static int
 PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 {
-    /* Check if already initialized (re-init not allowed) */
+    /* Re-init not allowed. */
     if (self->tl != NULL) {
         PyErr_SetString(PyExc_TypeError, "Timelog already initialized");
         return -1;
@@ -485,7 +481,6 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     PyObject* adaptive_dict = NULL;
     PyObject* compaction_dict = NULL;
 
-    /* 29 converters: 27 original + 2 dict kwargs */
     if (!PyArg_ParseTupleAndKeywords(args, kwds,
             "|ssnnnnsnnnnLLdnnnnLLnLdnnnnOO", kwlist,
             &time_unit_str, &maint_str,
@@ -689,11 +684,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         return -1;
     }
 
-    /*
-     * Apply numeric overrides with validation.
-     * Unset = use default, 0 allowed where supported by core config.
-     * Also check for overflow on platforms where size_t < Py_ssize_t.
-     */
+    /* Apply numeric overrides with range/overflow validation. */
     if (memtable_max_bytes != PY_SSIZE_T_MIN) {
         if (memtable_max_bytes < 0) {
             tl_py_handle_ctx_destroy(&self->handle_ctx);
@@ -1016,10 +1007,8 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
  *===========================================================================*/
 
 /**
- * Non-throwing close helper used by close(), finalizer, and dealloc.
- *
- * - Always performs C-only shutdown (stop maint + tl_close).
- * - Only drains Python handles if the interpreter is NOT finalizing.
+ * Non-throwing close helper (close, finalizer, dealloc).
+ * Skips Python handle drain during interpreter finalization.
  */
 static void
 pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
@@ -1035,7 +1024,6 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
     int finalizing = TL_PY_IS_FINALIZING();
     int allow_threads = (!finalizing && !from_finalizer);
 
-    /* Always do C-only shutdown */
     TL_PY_LOCK(self);
     if (self->closed || self->tl == NULL) {
         TL_PY_UNLOCK(self);
@@ -1056,10 +1044,7 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
             PyThread_release_lock(self->core_lock);
             Py_END_ALLOW_THREADS
         } else {
-            /*
-             * Avoid releasing GIL during interpreter shutdown or
-             * finalizer-driven cleanup.
-             */
+            /* Keep GIL during interpreter shutdown / finalizer paths. */
             tl_close(tl);
             self->tl = NULL;
             TL_PY_UNLOCK(self);
@@ -1068,7 +1053,7 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         TL_PY_UNLOCK(self);
     }
 
-    /* Skip Python-aware cleanup during interpreter finalization */
+    /* Skip handle drain during interpreter finalization. */
     if (!finalizing) {
         TL_PY_PRESERVE_EXC_BEGIN;
         tl_py_drain_retired(&self->handle_ctx, 1);
@@ -1103,23 +1088,18 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
 static PyObject*
 PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
-    /* Idempotent - already closed */
     if (self->closed) {
         Py_RETURN_NONE;
     }
 
-    /* Handle case where tl is already NULL */
+    /* Engine already NULL (partial init failure). */
     if (self->tl == NULL) {
         self->closed = 1;
         tl_py_handle_ctx_destroy(&self->handle_ctx);
         Py_RETURN_NONE;
     }
 
-    /*
-     * Check pins BEFORE any irreversible operations.
-     * This prevents the inconsistent state where maintenance is stopped
-     * but we rollback because of active pins.
-     */
+    /* Reject close with active pins to avoid inconsistent state. */
     uint64_t pins = tl_py_pins_count(&self->handle_ctx);
     if (pins != 0) {
         return TlPy_RaiseFromStatusFmt(TL_ESTATE,
@@ -1127,7 +1107,6 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
             (unsigned long long)pins);
     }
 
-    /* Close using the shared non-throwing helper */
     pytimelog_close_no_raise(self, 0);
 
     Py_RETURN_NONE;
@@ -1137,9 +1116,7 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
  * PyTimelog_dealloc (tp_dealloc)
  *===========================================================================*/
 
-/**
- * tp_finalize (PEP 442): best-effort cleanup without raising.
- */
+/** tp_finalize (PEP 442): best-effort cleanup. */
 static void
 PyTimelog_finalize(PyObject* self_obj)
 {
@@ -1167,12 +1144,12 @@ PyTimelog_dealloc(PyTimelog* self)
 {
     PyObject_GC_UnTrack((PyObject*)self);
 
-    /* Ensure tp_finalize runs before deallocation */
+    /* Run tp_finalize before deallocation. */
     if (PyObject_CallFinalizerFromDealloc((PyObject*)self) < 0) {
         return;
     }
 
-    /* If resurrected by finalizer, abort dealloc */
+    /* Resurrected by finalizer. */
     if (Py_REFCNT(self) > 0) {
         return;
     }
@@ -1247,13 +1224,7 @@ PyTimelog_append(PyTimelog* self, PyObject* args)
     }
 
     if (st == TL_EBUSY) {
-        /*
-         * CRITICAL: EBUSY means record WAS inserted, but backpressure occurred.
-         * This can happen in background mode (sealed queue timeout) or after
-         * an OOO head flush failure. DO NOT retry - would create duplicates.
-         *
-         * DO NOT rollback INCREF - record is in engine.
-         */
+        /* Record IS in engine; do NOT rollback INCREF or retry. */
         (void)tl_py_live_note_insert(&self->handle_ctx, obj);
 
         if (tl_py_handle_write_ebusy(self,
@@ -1453,12 +1424,7 @@ error_seq:
         long long ts_ll;
         PyObject* obj;
         if (PyArg_ParseTuple(item, "LO", &ts_ll, &obj)) {
-            /*
-             * CRITICAL: obj is borrowed from item (the tuple).
-             * INCREF obj BEFORE DECREF item to prevent UAF.
-             * Generators yield fresh tuples (refcount=1); DECREF would
-             * free the tuple and transitively free obj.
-             */
+            /* INCREF obj before DECREF item: obj is borrowed from tuple. */
             Py_INCREF(obj);
         } else {
             PyErr_Clear();
@@ -1477,10 +1443,7 @@ error_seq:
             PyObject* ts_obj = PySequence_Fast_GET_ITEM(pair, 0);
             obj = PySequence_Fast_GET_ITEM(pair, 1);
             ts_ll = PyLong_AsLongLong(ts_obj);
-            /*
-             * CRITICAL: obj is borrowed from pair.
-             * INCREF obj BEFORE DECREF pair to prevent UAF.
-             */
+            /* INCREF obj before DECREF pair: obj is borrowed from pair. */
             Py_INCREF(obj);
             Py_DECREF(pair);
             if (PyErr_Occurred()) {
@@ -1489,7 +1452,7 @@ error_seq:
                 goto error_stream;
             }
         }
-        /* obj is now a strong reference (INCREF'd above in both paths) */
+        /* obj is a strong reference from either path above. */
         Py_DECREF(item);
 
         if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
@@ -1729,12 +1692,7 @@ PyTimelog_compact(PyTimelog* self, PyObject* Py_UNUSED(args))
         return TlPy_RaiseFromStatus(st);
     }
 
-    /*
-     * Note: In manual mode (maintenance='disabled'), compact() only requests
-     * compaction. Use maint_step() to perform the work explicitly.
-     */
-
-    /* Opportunistic drain after compact */
+    /* Opportunistic drain after compact. */
     tl_py_drain_retired(&self->handle_ctx, 0);
 
     Py_RETURN_NONE;
@@ -2157,16 +2115,7 @@ PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
         return TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
     }
 
-    /*
-     * Ensure maintenance worker is running in background mode.
-     *
-     * tl_open() auto-starts the worker, and tl_maint_start() is idempotent,
-     * so this is a safe no-op in the common case. It also allows users who
-     * previously stopped maintenance to re-enable it by re-entering the
-     * context manager.
-     *
-     * Note: close() (called by __exit__) already calls tl_maint_stop().
-     */
+    /* Idempotent: re-starts maintenance if previously stopped. */
     if (self->maint_mode == TL_MAINT_BACKGROUND) {
         tl_status_t st;
         if (tl_py_lock_checked(self) < 0) {
@@ -2177,18 +2126,13 @@ PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
         if (st != TL_OK) {
             return TlPy_RaiseFromStatus(st);
         }
-        /* TL_OK = started (or already running - idempotent) */
     }
 
     Py_INCREF(self);
     return (PyObject*)self;
 }
 
-/*
- * __exit__ error handling rules:
- * - If `with` block raised: suppress close() errors, propagate original
- * - If `with` block succeeded: propagate close() errors
- */
+/* Propagate close() errors only if `with` block succeeded. */
 static PyObject*
 PyTimelog_exit(PyTimelog* self, PyObject* args)
 {
@@ -2203,24 +2147,16 @@ PyTimelog_exit(PyTimelog* self, PyObject* args)
     PyObject* result = PyTimelog_close(self, NULL);
 
     if (result == NULL) {
-        /* close() raised an exception */
         if (exc_type == Py_None) {
-            /*
-             * No original exception from the with block.
-             * Propagate the close() error.
-             */
-            return NULL;
+            return NULL;  /* Propagate close() error. */
         }
-        /*
-         * Original exception exists from with block.
-         * Suppress close() error to preserve original context.
-         */
+        /* Suppress close() error to preserve original exception. */
         PyErr_Clear();
         Py_RETURN_FALSE;
     }
 
     Py_DECREF(result);
-    Py_RETURN_FALSE;  /* Don't suppress original exception */
+    Py_RETURN_FALSE;
 }
 
 /**
@@ -2235,10 +2171,10 @@ typedef enum {
 } iter_mode_t;
 
 /*===========================================================================
- * Iterator Factory (LLD-B3)
+ * Iterator Factory
  *
  * Creates PyTimelogIter instances for range queries.
- * Follows the protocol: pins_enter → snapshot_acquire → iter_create → track
+ * Follows the protocol: pins_enter -> snapshot_acquire -> iter_create -> track
  *===========================================================================*/
 
 /**
@@ -2256,12 +2192,11 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 {
     CHECK_CLOSED(self);
 
-    tl_py_handle_ctx_t* ctx = &self->handle_ctx;  /* NOTE: & for embedded */
+    tl_py_handle_ctx_t* ctx = &self->handle_ctx;
 
-    /* Enter pins BEFORE acquiring snapshot */
+    /* Enter pins BEFORE snapshot acquisition. */
     tl_py_pins_enter(ctx);
 
-    /* Acquire snapshot */
     tl_snapshot_t* snap = NULL;
     if (tl_py_lock_checked(self) < 0) {
         tl_py_pins_exit_and_maybe_drain(ctx);
@@ -2274,7 +2209,6 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         return TlPy_RaiseFromStatus(st);
     }
 
-    /* Create core iterator */
     tl_iter_t* it = NULL;
     switch (mode) {
         case ITER_MODE_RANGE:
@@ -2307,7 +2241,6 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         return TlPy_RaiseFromStatus(st);
     }
 
-    /* Allocate Python iterator object */
     PyTimelogIter* pyit = PyObject_GC_New(PyTimelogIter, &PyTimelogIter_Type);
     if (!pyit) {
         tl_iter_destroy(it);
@@ -2316,7 +2249,6 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         return PyErr_NoMemory();
     }
 
-    /* Initialize fields */
     pyit->owner = Py_NewRef((PyObject*)self);
     pyit->pinned_snapshot = snap;
     pyit->iter = it;
@@ -2325,7 +2257,7 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
     pyit->remaining_valid = 0;
     pyit->closed = 0;
 
-    /* Store normalized range for view() and deterministic remaining length. */
+    /* Normalized range for view() and __len__. */
     switch (mode) {
         case ITER_MODE_RANGE:  pyit->range_t1 = t1; pyit->range_t2 = t2; break;
         case ITER_MODE_SINCE:  pyit->range_t1 = t1; pyit->range_t2 = TL_TS_MAX; break;
@@ -2335,7 +2267,7 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
 
-    /* Compute count via optimized O(S*T*log P) path with GIL released. */
+    /* Precompute remaining count (GIL released for long computation). */
     {
         tl_ts_t count_t1, count_t2;
         int count_unbounded;
@@ -2367,9 +2299,7 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         Py_END_ALLOW_THREADS
     }
     if (st != TL_OK) {
-        /* NULL out pointers before Py_DECREF which may run arbitrary
-         * Python code (__del__) — prevents use-after-free if the
-         * partially-constructed object is somehow reachable. */
+        /* Clear pointers before Py_DECREF to prevent UAF via __del__. */
         pyit->iter = NULL;
         pyit->pinned_snapshot = NULL;
         pyit->handle_ctx = NULL;
@@ -2384,7 +2314,6 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
     }
     pyit->remaining_valid = 1;
 
-    /* Enable GC tracking */
     PyObject_GC_Track((PyObject*)pyit);
 
     return (PyObject*)pyit;
@@ -2509,7 +2438,7 @@ static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
 }
 
 /*===========================================================================
- * PageSpan Factory Methods (LLD-B4)
+ * PageSpan Factory Methods
  *===========================================================================*/
 
 /**
@@ -2699,7 +2628,7 @@ static PyMethodDef PyTimelog_methods[] = {
      "still owned by the engine are released on close.\n\n"
      "Note: close() should not raise TimelogBusyError."},
 
-    /* Iterator factory methods (LLD-B3) */
+    /* Iterator factory methods */
     {"range", (PyCFunction)PyTimelog_range, METH_VARARGS,
      "range(t1, t2) -> TimelogIter\n\n"
      "Return an iterator over records in [t1, t2).\n"
@@ -2748,7 +2677,7 @@ static PyMethodDef PyTimelog_methods[] = {
      "validate() -> None\n\n"
      "Run snapshot validation; raises TimelogError on invariant failure."},
 
-    /* PageSpan factory methods (LLD-B4) */
+    /* PageSpan factory methods */
     {"page_spans", (PyCFunction)PyTimelog_page_spans, METH_VARARGS | METH_KEYWORDS,
      "page_spans(t1, t2, *, kind='segment') -> PageSpanIter\n\n"
      "Return an iterator yielding PageSpan objects for [t1, t2).\n"

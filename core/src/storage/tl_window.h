@@ -23,8 +23,6 @@
  * The last window containing TL_TS_MAX has an unbounded end because
  * window_start + window_size would exceed int64_t range. This is
  * represented by end_unbounded=true, similar to unbounded tombstones.
- *
- * Reference: Storage LLD Section 6.1, HLD Section 9.2
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -45,7 +43,7 @@
  *---------------------------------------------------------------------------*/
 
 TL_INLINE int64_t tl_floor_div_i64(int64_t a, int64_t b) {
-    /* C-06 fix: Runtime guard against division by zero.
+    /* Runtime guard against division by zero.
      * TL_ASSERT becomes UB in release builds. Return 0 as safe fallback. */
     if (b <= 0) {
         return 0;

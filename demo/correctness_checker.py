@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Timelog Correctness Checker V2.
+Timelog Correctness Checker.
 
 Chaotic long-run validator with dual-oracle verification, issue triage,
 and structured artifacts:
@@ -137,7 +137,7 @@ def _normalize_csv_row(row: dict[str, str]) -> dict[str, Any]:
 
 
 def _extract_rid_digest(obj: Any) -> tuple[int | None, str]:
-    if isinstance(obj, dict) and obj.get("__cc_v2") == 1 and isinstance(obj.get("rid"), int):
+    if isinstance(obj, dict) and obj.get("__cc_schema") == 1 and isinstance(obj.get("rid"), int):
         rid = int(obj["rid"])
         digest = obj.get("payload_digest")
         if isinstance(digest, str) and digest:
@@ -846,7 +846,7 @@ class CorrectnessRunner:
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
         self.git_commit = _safe_git_commit()
-        self.run_id = f"ccv2_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
+        self.run_id = f"cc_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{cfg.seed}"
         self.run_dir = Path(cfg.out_dir) / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -942,7 +942,7 @@ class CorrectnessRunner:
 
     def run(self) -> int:
         print(
-            "Timelog Correctness Checker V2 | "
+            "Timelog Correctness Checker | "
             f"seed={self.cfg.seed} | duration={self.cfg.duration_seconds}s | run_id={self.run_id}"
         )
         print("=" * 96)
@@ -1084,7 +1084,7 @@ class CorrectnessRunner:
             self.next_rid += 1
             digest = _payload_digest(src.payload)
             obj = {
-                "__cc_v2": 1,
+                "__cc_schema": 1,
                 "rid": rid,
                 "src": src.src,
                 "cycle": src.cycle,
@@ -2241,7 +2241,7 @@ class CorrectnessRunner:
         row_min = StoredRow(
             rid=rid_min,
             ts=TL_TS_MIN,
-            obj={"__cc_v2": 1, "rid": rid_min, "src": "boundary", "cycle": 0,
+            obj={"__cc_schema": 1, "rid": rid_min, "src": "boundary", "cycle": 0,
                  "payload_digest": _payload_digest("tl_ts_min"), "payload": "tl_ts_min"},
             payload_digest=_payload_digest("tl_ts_min"),
             src="boundary",
@@ -2264,7 +2264,7 @@ class CorrectnessRunner:
             row_max = StoredRow(
                 rid=rid_max,
                 ts=TL_TS_MAX,
-                obj={"__cc_v2": 1, "rid": rid_max, "src": "boundary", "cycle": 0,
+                obj={"__cc_schema": 1, "rid": rid_max, "src": "boundary", "cycle": 0,
                      "payload_digest": _payload_digest("tl_ts_max"), "payload": "tl_ts_max"},
                 payload_digest=_payload_digest("tl_ts_max"),
                 src="boundary",
@@ -2392,7 +2392,7 @@ class CorrectnessRunner:
             json.dump(summary, fh, indent=2, ensure_ascii=True, default=str)
 
         md = [
-            "# Timelog Correctness Checker V2 Summary",
+            "# Timelog Correctness Checker Summary",
             "",
             f"- Run ID: `{self.run_id}`",
             f"- Started (UTC): `{self.started_utc}`",
@@ -2447,7 +2447,7 @@ class CorrectnessRunner:
 
 def _parse_args() -> RunConfig:
     parser = argparse.ArgumentParser(
-        description="Timelog Correctness Checker V2 (chaotic, oracle-backed validator)"
+        description="Timelog Correctness Checker (chaotic, oracle-backed validator)"
     )
     parser.add_argument("--duration-seconds", type=int, default=3600)
     parser.add_argument("--duration", type=int, default=None, help=argparse.SUPPRESS)

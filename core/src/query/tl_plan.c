@@ -17,9 +17,7 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Ensure source array has capacity for one more entry.
- */
+/** Grow source array if at capacity. */
 static tl_status_t ensure_source_capacity(tl_plan_t* plan) {
     if (plan->source_count < plan->source_capacity) {
         return TL_OK;
@@ -58,9 +56,7 @@ static tl_status_t ensure_source_capacity(tl_plan_t* plan) {
     return TL_OK;
 }
 
-/**
- * Add a segment source to the plan.
- */
+/** Add a segment source to the plan. */
 static tl_status_t add_segment_source(tl_plan_t* plan,
                                        const tl_segment_t* seg,
                                        uint32_t priority) {
@@ -85,9 +81,7 @@ static tl_status_t add_segment_source(tl_plan_t* plan,
     return TL_OK;
 }
 
-/**
- * Add a memrun source to the plan.
- */
+/** Add a memrun source to the plan. */
 static tl_status_t add_memrun_source(tl_plan_t* plan,
                                       const tl_memrun_t* mr,
                                       uint32_t priority) {
@@ -119,9 +113,7 @@ static tl_status_t add_memrun_source(tl_plan_t* plan,
     return TL_OK;
 }
 
-/**
- * Add the active memview source to the plan.
- */
+/** Add the active memview source to the plan. */
 static tl_status_t add_active_source(tl_plan_t* plan,
                                       const tl_memview_t* mv) {
     tl_status_t st = ensure_source_capacity(plan);
@@ -210,29 +202,21 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
     tl_intervals_init(&tombs, alloc);
     tl_status_t st;
 
-    /*
-     * Check if range is empty (bounded only).
-     * Unbounded ranges are never empty.
-     */
+    /* Empty range short-circuit (unbounded ranges are never empty) */
     if (tl_range_is_empty(t1, t2, t2_unbounded)) {
         return TL_OK;
     }
 
-    /*
-     * Step 1: Add L1 segment sources.
-     * Use binary search to find first potentially overlapping segment.
-     */
+    /* Step 1: L1 segments (binary search to first overlap) */
     size_t l1_start = tl_manifest_l1_find_first_overlap(manifest, t1);
     for (size_t i = l1_start; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
-        /* Stop early if segment starts past range end */
         if (!t2_unbounded && seg->min_ts >= t2) {
             plan->segments_pruned += (tl_manifest_l1_count(manifest) - i);
             break;
         }
 
-        /* Check overlap */
         if (!tl_range_overlaps(seg->min_ts, seg->max_ts, t1, t2, t2_unbounded)) {
             plan->segments_pruned++;
             continue;
@@ -241,7 +225,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
-        /* Defensive: include L1 tombstones if present (should be empty in V1). */
+        /* Defensive: include any L1 tombstones if present. */
         st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
@@ -249,15 +233,10 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
     /* Count pruned segments from before l1_start */
     plan->segments_pruned += l1_start;
 
-    /*
-     * Step 2: Add L0 segment sources.
-     * L0 segments may overlap and are in flush order.
-     * Assign priorities based on position (later = higher priority).
-     */
+    /* Step 2: L0 segments (may overlap; priority by generation) */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
-        /* Check overlap using record/tombstone bounds independently. */
         bool overlaps = false;
         if (tl_segment_has_records(seg)) {
             overlaps |= tl_range_overlaps(seg->record_min_ts, seg->record_max_ts,
@@ -280,22 +259,16 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /*
-     * Step 3: Add sealed memrun sources.
-     * Memruns are in FIFO order (oldest first).
-     * Assign priorities: higher index = newer = higher priority.
-     */
+    /* Step 3: Sealed memruns (FIFO; higher index = newer = higher priority) */
     size_t sealed_len = tl_memview_sealed_len(mv);
     for (size_t i = 0; i < sealed_len; i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
-        /* Check if memrun has any data */
         if (!tl_memrun_has_records(mr) && !tl_memrun_has_tombstones(mr)) {
             plan->memruns_pruned++;
             continue;
         }
 
-        /* Check overlap */
         if (!tl_range_overlaps(tl_memrun_min_ts(mr), tl_memrun_max_ts(mr),
                                t1, t2, t2_unbounded)) {
             plan->memruns_pruned++;
@@ -311,7 +284,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         }
 
         /*
-         * M-15 fix: Overflow-safe priority assignment with saturation.
+         * Overflow-safe priority assignment with saturation.
          * If base_priority + i would exceed UINT32_MAX, saturate to UINT32_MAX.
          * This preserves relative ordering within the valid range.
          */
@@ -331,10 +304,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /*
-     * Step 4: Add active memview source.
-     * Active data is the newest and has highest priority.
-     */
+    /* Step 4: Active memview (highest priority) */
     if (mv->has_data && tl_memview_overlaps(mv, t1, t2, t2_unbounded)) {
         size_t active_run_len = tl_memview_run_len(mv);
         size_t active_ooo_len = tl_memview_ooo_total_len(mv);
@@ -348,10 +318,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /*
-     * Step 5: Clip tombstones to query range and finalize plan tombstones.
-     * Intervals are already in piecewise-max form via tl_intervals_insert().
-     */
+    /* Step 5: Clip tombstones to query range */
     if (!tl_intervals_is_empty(&tombs)) {
         if (t2_unbounded) {
             tl_intervals_clip_lower(&tombs, t1);

@@ -17,13 +17,7 @@ volatile int tl_test_kmerge_force_error_count = 0;
 #pragma warning(disable: 4702)
 #endif
 
-/**
- * Advance a source iterator and get the next record.
- *
- * @param src    Source to advance
- * @param out    Output record
- * @return TL_OK if record available, TL_EOF if exhausted
- */
+/** Advance a source iterator and get the next record. */
 static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out,
                                tl_seq_t* out_watermark) {
 #ifdef TL_TEST_HOOKS
@@ -50,9 +44,7 @@ static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out,
     return TL_EINVAL;
 }
 
-/**
- * Check if a source is done.
- */
+/** Check if a source is done. */
 static bool source_done(const tl_iter_source_t* src) {
     if (src->kind == TL_ITER_SEGMENT) {
         return tl_segment_iter_done(&src->iter.segment);
@@ -68,10 +60,7 @@ static bool source_done(const tl_iter_source_t* src) {
     return true;
 }
 
-/**
- * Seek a source iterator to target timestamp.
- * After seek, caller should call source_next to get the first record >= target.
- */
+/** Seek a source to target timestamp (forward-only). */
 static tl_status_t source_seek(tl_iter_source_t* src, tl_ts_t target) {
     if (src->kind == TL_ITER_SEGMENT) {
         tl_segment_iter_seek(&src->iter.segment, target);
@@ -92,42 +81,24 @@ static tl_status_t source_seek(tl_iter_source_t* src, tl_ts_t target) {
 #pragma warning(pop)
 #endif
 
-/**
- * Push initial entry for a source onto the heap.
- *
- * Primes the source iterator with next() and pushes if successful.
- *
- * @param h    Heap to push onto
- * @param src  Source to prime (priority field used for tie-breaking)
- * @return TL_OK on success (whether pushed or source was empty),
- *         TL_ENOMEM on heap allocation failure
- */
+/** Prime a source with next() and push initial entry onto heap. */
 static tl_status_t push_initial_entry(tl_heap_t* h,
                                        tl_iter_source_t* src) {
-    /* Check if already exhausted (from init pruning) */
     if (source_done(src)) {
         return TL_OK;
     }
 
-    /* Prime the iterator */
     tl_record_t rec;
     tl_seq_t watermark = 0;
     tl_status_t st = source_next(src, &rec, &watermark);
 
     if (st == TL_EOF) {
-        /* Source was empty */
         return TL_OK;
     }
     if (st != TL_OK) {
         return st;
     }
 
-    /* Push entry onto heap.
-     *
-     * Use source priority for tie-breaking. Higher priority sources
-     * (newer data) will appear after lower priority on timestamp ties.
-     * This is an implementation detail, not a public guarantee.
-     */
     tl_heap_entry_t entry = {
         .ts = rec.ts,
         .tie_break_key = src->priority,
@@ -231,48 +202,30 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
     }
 
     /*
-     * Use peek + replace_top pattern to eliminate allocation failure window.
-     *
-     * Previous code used pop + push, which had a failure window: if push
-     * failed after pop, the next record from that source would be lost.
-     * Since init() reserves capacity for source_count entries, push "should"
-     * never allocate, but relying on that is fragile.
-     *
-     * New pattern:
-     * 1. Peek minimum (no modification)
-     * 2. Output the record
-     * 3. Advance source
-     * 4. If source has more: replace_top (cannot fail - no allocation)
-     * 5. If source exhausted: pop (cannot fail - just removes)
-     *
-     * This guarantees no data loss regardless of allocation behavior.
+     * Peek + replace_top pattern: avoids the data-loss window of
+     * pop + push (where push failure would lose a record).
      */
-
-    /* Step 1: Peek minimum (heap unchanged) */
     const tl_heap_entry_t* peek = tl_heap_peek(&it->heap);
     if (peek == NULL) {
         it->done = true;
         return TL_EOF;
     }
 
-    /* Step 2: Output the record */
     out->ts = peek->ts;
     out->handle = peek->handle;
     if (out_watermark != NULL) {
         *out_watermark = peek->watermark;
     }
 
-    /* Get source pointer and tie_break_key while peek is still valid */
     tl_iter_source_t* src = (tl_iter_source_t*)peek->iter;
     uint32_t tie_id = peek->tie_break_key;
 
-    /* Step 3: Advance the source that produced this record */
     tl_record_t next_rec;
     tl_seq_t next_watermark = 0;
     tl_status_t st = source_next(src, &next_rec, &next_watermark);
 
     if (st == TL_OK) {
-        /* Step 4: Source has more - replace top entry (no allocation) */
+        /* Replace top (no allocation needed) */
         tl_heap_entry_t new_entry = {
             .ts = next_rec.ts,
             .tie_break_key = tie_id,
@@ -282,19 +235,15 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
         };
         tl_heap_replace_top(&it->heap, &new_entry);
     } else if (st == TL_EOF) {
-        /* Source exhausted - remove entry from heap (no allocation).
-         * Source iterators are expected to return TL_OK or TL_EOF only. */
         tl_heap_entry_t discard;
         (void)tl_heap_pop(&it->heap, &discard);
     } else {
-        /* Error - clear heap to avoid stale refs */
         it->error = st;
         it->done = true;
         tl_heap_clear(&it->heap);
         return st;
     }
 
-    /* Check if heap is now empty */
     if (tl_heap_is_empty(&it->heap)) {
         it->done = true;
     }
@@ -317,57 +266,29 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         return;
     }
 
-    /*
-     * Optimization: Check if target is at or before current minimum.
-     * If so, this is a no-op (forward-only seek).
-     */
+    /* Forward-only: no-op if target <= current min */
     const tl_ts_t* current_min = tl_kmerge_iter_peek_ts(it);
     if (current_min != NULL && target <= *current_min) {
         return;
     }
 
     /*
-     * FIXED seek algorithm (C-02 / QUERY-1.1):
-     *
-     * The heap contains PREFETCHED records. Each heap entry has a timestamp (ts)
-     * and an iterator pointer (iter). The source iterator has already advanced
-     * past the record stored in the heap entry via previous next() calls.
-     *
-     * Source iterators use FORWARD-ONLY seek: seek(target) advances to the first
-     * record >= target, but cannot go backwards. If we clear the entire heap and
-     * re-seek all sources, we lose records that were:
-     * - Already fetched (in heap) with ts >= target
-     * - Not recoverable because the source has already advanced past them
-     *
-     * Correct algorithm:
-     * 1. Pop entries with ts < target (these sources need to advance)
-     * 2. For each popped entry, seek that source and push new entry if available
-     * 3. Preserve entries with ts >= target (already correct, no action needed)
-     *
-     * The min-heap property guarantees: if peek()->ts >= target, then ALL entries
-     * in the heap have ts >= target, so we can stop the loop.
-     *
-     * Complexity: O(P * (log K + seek_cost)) where P = popped entries, K = heap size.
-     * Worst case P = K (all entries < target), but typically P << K when seeking
-     * past tombstone ranges where most sources are already positioned ahead.
+     * Pop entries with ts < target, re-seek those sources, push replacements.
+     * Entries with ts >= target are preserved (source already advanced past them,
+     * so they cannot be re-fetched). Min-heap property lets us stop when
+     * peek()->ts >= target.
      */
-
-    /* Pop all entries with ts < target and re-seek those sources */
     while (!tl_heap_is_empty(&it->heap)) {
         const tl_heap_entry_t* min = tl_heap_peek(&it->heap);
         if (min->ts >= target) {
-            /* Min-heap property: if minimum >= target, all entries >= target.
-             * These prefetched records are already valid; preserve them. */
             break;
         }
 
-        /* Pop entry for source that needs to advance */
         tl_heap_entry_t popped;
         (void)tl_heap_pop(&it->heap, &popped);
 
         tl_iter_source_t* src = (tl_iter_source_t*)popped.iter;
 
-        /* Seek this source to target */
         tl_status_t seek_st = source_seek(src, target);
         if (seek_st != TL_OK) {
             it->error = seek_st;
@@ -376,12 +297,10 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
             return;
         }
 
-        /* Check if source is exhausted after seek */
         if (source_done(src)) {
             continue;
         }
 
-        /* Prime the iterator with next record */
         tl_record_t rec;
         tl_seq_t watermark = 0;
         tl_status_t st = source_next(src, &rec, &watermark);
@@ -391,17 +310,12 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         }
 
         if (st != TL_OK) {
-            /* Error - mark as done and return.
-             * Existing behavior: errors become EOF (see H-16 for error state). */
             it->error = st;
             it->done = true;
             tl_heap_clear(&it->heap);
             return;
         }
 
-        /* Push onto heap.
-         * Use popped.tie_break_key to preserve original tie-break semantics
-         * (Codex review: safer than re-reading src->priority). */
         tl_heap_entry_t entry = {
             .ts = rec.ts,
             .tie_break_key = popped.tie_break_key,
@@ -412,8 +326,6 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
 
         tl_status_t push_st = tl_heap_push(&it->heap, &entry);
         if (push_st != TL_OK) {
-            /* Allocation failure during seek invalidates the iterator.
-             * Subsequent operations will return EOF. */
             it->error = push_st;
             it->done = true;
             tl_heap_clear(&it->heap);
@@ -421,7 +333,6 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         }
     }
 
-    /* Check if all sources exhausted */
     if (tl_heap_is_empty(&it->heap)) {
         it->done = true;
     }

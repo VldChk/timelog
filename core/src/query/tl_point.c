@@ -19,9 +19,7 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Ensure result has capacity for additional records.
- */
+/** Grow result array if needed. */
 static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional) {
     size_t needed = result->count + additional;
     if (needed <= result->capacity) {
@@ -52,9 +50,7 @@ static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional)
     return TL_OK;
 }
 
-/**
- * Add a record to the result.
- */
+/** Append a record to the result. */
 static tl_status_t add_record(tl_point_result_t* result, tl_ts_t ts, tl_handle_t handle) {
     tl_status_t st = ensure_capacity(result, 1);
     if (st != TL_OK) {
@@ -68,9 +64,7 @@ static tl_status_t add_record(tl_point_result_t* result, tl_ts_t ts, tl_handle_t
 }
 
 
-/**
- * Collect all records with exact timestamp from a sorted array.
- */
+/** Collect all records with exact timestamp from a sorted array. */
 static tl_status_t collect_from_sorted(tl_point_result_t* result,
                                         const tl_record_t* data,
                                         const tl_seq_t* seqs,
@@ -102,9 +96,7 @@ static tl_status_t collect_from_sorted(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a page.
- */
+/** Collect matching records from a page. */
 static tl_status_t collect_from_page(tl_point_result_t* result,
                                       const tl_page_t* page,
                                       tl_ts_t ts,
@@ -139,9 +131,7 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a segment.
- */
+/** Collect matching records from a segment. */
 static tl_status_t collect_from_segment(tl_point_result_t* result,
                                          const tl_segment_t* seg,
                                          tl_ts_t ts,
@@ -199,9 +189,7 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a memrun.
- */
+/** Collect matching records from a memrun. */
 static tl_status_t collect_from_memrun(tl_point_result_t* result,
                                         const tl_memrun_t* mr,
                                         tl_ts_t ts,
@@ -248,9 +236,7 @@ static tl_status_t collect_from_memrun(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from memview active buffers.
- */
+/** Collect matching records from memview active buffers. */
 static tl_status_t collect_from_memview(tl_point_result_t* result,
                                          const tl_memview_t* mv,
                                          tl_ts_t ts,
@@ -301,12 +287,8 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
 }
 
 /**
- * Check if ts is covered by any tombstone in the snapshot.
- *
- * M-18 fix: Added bounds pruning before scanning tombstones.
- * If ts is outside a source's bounds, skip tombstone check entirely.
- * This avoids O(log T) binary search in tl_intervals_imm_contains
- * when bounds make it impossible for the tombstone to cover ts.
+ * Compute max tombstone seq at a given timestamp across all sources.
+ * Uses bounds pruning to skip sources where ts is outside their range.
  */
 static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     const tl_manifest_t* manifest = snap->manifest;
@@ -325,7 +307,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
-        /* M-18: Skip if ts outside memrun bounds */
+        /* Skip if ts outside memrun bounds */
         if (ts < tl_memrun_min_ts(mr) || ts > tl_memrun_max_ts(mr)) {
             continue;
         }
@@ -341,7 +323,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
-        /* M-18: Skip if ts outside segment bounds */
+        /* Skip if ts outside segment bounds */
         if (ts < seg->min_ts || ts > seg->max_ts) {
             continue;
         }
@@ -353,11 +335,11 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
         }
     }
 
-    /* Defensive: check L1 tombstones if present (should be empty in V1). */
+    /* Defensive: check any L1 tombstones if present. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
-        /* M-18: Skip if ts outside segment bounds */
+        /* Skip if ts outside segment bounds */
         if (ts < seg->min_ts || ts > seg->max_ts) {
             continue;
         }
@@ -384,7 +366,6 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
     TL_ASSERT(snap != NULL);
     TL_ASSERT(alloc != NULL);
 
-    /* Initialize result */
     memset(result, 0, sizeof(*result));
     result->alloc = alloc;
 

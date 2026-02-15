@@ -12,8 +12,6 @@
  * These tests ensure the public API behaves predictably and safely
  * when given invalid inputs or called in invalid states.
  *
- * Part of Phase 10: Integration Testing and Hardening
- *
  * Migration Status: COMPLETE (migrated from test_phase0.c)
  * Note: Test names prefixed with "api_" to avoid conflicts during migration.
  *===========================================================================*/
@@ -67,7 +65,7 @@ TEST_DECLARE(api_config_defaults) {
     TEST_ASSERT_EQ(0, cfg.window_size);  /* 0 means use default */
     TEST_ASSERT_EQ(0, cfg.window_origin);
 
-    /* Compaction policy fields (Phase 10 addition) */
+    /* Compaction policy fields */
     TEST_ASSERT(cfg.delete_debt_threshold == 0.0);  /* Disabled */
     TEST_ASSERT_EQ(0, cfg.compaction_target_bytes); /* Unlimited */
     TEST_ASSERT_EQ(0, cfg.max_compaction_inputs);   /* Unlimited */
@@ -382,7 +380,7 @@ TEST_DECLARE(api_write_null_checks) {
 }
 
 /*===========================================================================
- * Maintenance API Mode Validation Tests (Phase 10)
+ * Maintenance API Mode Validation Tests
  *
  * These tests verify the maintenance API behaves correctly w.r.t. mode.
  *===========================================================================*/
@@ -555,7 +553,7 @@ TEST_DECLARE(api_compact_sets_pending) {
 }
 
 /*===========================================================================
- * H-05: on_drop_handle Contract Verification
+ * on_drop_handle Contract Verification
  *===========================================================================*/
 
 static int g_h05_drop_count = 0;
@@ -568,7 +566,7 @@ static void h05_track_drop(void* ctx, tl_ts_t ts, tl_handle_t h) {
 }
 
 /**
- * Test: on_drop_handle NOT invoked at close (H-05 contract).
+ * Test: on_drop_handle NOT invoked at close.
  *
  * This test documents and verifies the intended behavior:
  * on_drop_handle fires ONLY when tombstones physically delete records
@@ -644,14 +642,14 @@ void run_api_semantics_tests(void) {
     RUN_TEST(api_write_flush);
     RUN_TEST(api_write_null_checks);
 
-    /* Maintenance API mode validation (5 tests - Phase 10) */
+    /* Maintenance API mode validation (5 tests) */
     RUN_TEST(api_maint_start_wrong_mode_estate);
     RUN_TEST(api_maint_step_wrong_mode_estate);
     RUN_TEST(api_maint_start_idempotent);
     RUN_TEST(api_maint_stop_idempotent);
     RUN_TEST(api_compact_sets_pending);
 
-    /* H-05 contract verification (1 test) */
+    /* on_drop_handle contract verification (1 test) */
     RUN_TEST(api_on_drop_handle_not_called_at_close);
 
     /* Total: 27 tests */

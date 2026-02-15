@@ -15,9 +15,7 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Compute global bounds from manifest and memview.
- */
+/** Compute global bounds from manifest and memview. */
 static void snap_compute_bounds(tl_snapshot_t* snap) {
     snap->has_data = false;
     snap->min_ts = 0;
@@ -79,13 +77,11 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
 
     *out = NULL;
 
-    /* Allocate snapshot structure */
     tl_snapshot_t* snap = TL_NEW(alloc, tl_snapshot_t);
     if (snap == NULL) {
         return TL_ENOMEM;
     }
 
-    /* Zero-initialize all fields for defensive safety */
     memset(snap, 0, sizeof(*snap));
     snap->alloc = alloc;
 
@@ -101,7 +97,6 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
 
     TL_LOCK_WRITER(tl);
 
-    /* Acquire manifest reference under writer_mu to prevent UAF */
     manifest = tl_manifest_acquire(tl->manifest);
 
     /* Capture or reuse memview (locks memtable_mu internally) */
@@ -123,7 +118,6 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
         }
     }
 
-    /* Capture op_seq under writer_mu for tombstone watermarks */
     snap->op_seq = tl->op_seq;
 
     TL_UNLOCK_WRITER(tl);
@@ -156,14 +150,11 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
     snap->manifest = manifest;
     snap->memview = mv;
 
-    /* Compute global bounds from manifest + memview */
     snap_compute_bounds(snap);
-
     snap->parent = tl;
 
 #ifdef TL_DEBUG
     snap->iter_count = 0;
-    /* Increment outstanding snapshot count for leak detection at close */
     tl_atomic_fetch_add_u32(&tl->snapshot_count, 1, TL_MO_RELAXED);
 #endif
 
@@ -178,21 +169,15 @@ void tl_snapshot_release_internal(tl_snapshot_t* snap) {
 
 #ifdef TL_DEBUG
     TL_ASSERT(snap->iter_count == 0 && "Outstanding iterators on snapshot release");
-    /* Decrement outstanding snapshot count (cast away const for atomic update) */
     if (snap->parent != NULL) {
         tl_atomic_fetch_sub_u32(&((struct tl_timelog*)snap->parent)->snapshot_count, 1, TL_MO_RELAXED);
     }
 #endif
 
-    /* Release memview (shared, refcounted) */
     tl_memview_shared_release(snap->memview);
-
-    /* Release manifest reference */
     if (snap->manifest != NULL) {
         tl_manifest_release(snap->manifest);
     }
-
-    /* Free snapshot structure */
     tl__free(snap->alloc, snap);
 }
 
@@ -257,7 +242,7 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
         }
     }
 
-    /* Defensive: L1 tombstones if present (should be empty in V1) */
+    /* Defensive: include any L1 tombstones if present. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 

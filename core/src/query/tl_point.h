@@ -12,7 +12,7 @@
  * Uses direct binary search on each component to find all records with
  * the exact timestamp.
  *
- * Algorithm (Read Path LLD Section 8):
+ * Algorithm:
  * 1. Tombstone watermark check: tomb_seq(ts) compared per row watermark
  * 2. L1 lookup: binary search window, catalog, page for ts
  * 3. L0 lookup: scan overlapping segments with binary search
@@ -28,8 +28,6 @@
  * Thread Safety:
  * - Snapshot must remain valid for the lifetime of the result
  * - Result array is owned by caller
- *
- * Reference: Read Path LLD Section 8, timelog_v1_c_software_design_spec.md
  *===========================================================================*/
 
 /**
@@ -79,16 +77,12 @@ void tl_point_result_destroy(tl_point_result_t* result);
  * Accessors
  *===========================================================================*/
 
-/**
- * Check if result is empty.
- */
+/** Check if result is empty. */
 TL_INLINE bool tl_point_result_empty(const tl_point_result_t* result) {
     return result->count == 0;
 }
 
-/**
- * Get record by index.
- */
+/** Get record by index. */
 TL_INLINE const tl_record_t* tl_point_result_get(const tl_point_result_t* result,
                                                   size_t idx) {
     TL_ASSERT(idx < result->count);

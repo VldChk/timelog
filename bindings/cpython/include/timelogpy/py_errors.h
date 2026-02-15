@@ -45,23 +45,13 @@ extern "C" {
 extern PyObject* TlPy_TimelogError;
 
 /**
- * Exception for resource busy / backpressure conditions (TL_EBUSY).
+ * Exception for TL_EBUSY (backpressure / resource busy).
  * Inherits from TimelogError.
  *
- * IMPORTANT: Context-dependent semantics:
- * - For WRITE operations (append, extend, delete_range, delete_before):
- *   The write WAS accepted, but backpressure occurred. DO NOT RETRY -
- *   retrying would create duplicate records. Call flush() in manual mode,
- *   or wait for background maintenance to catch up.
- * - For tl_flush()/tl_compact()/tl_maint_step(): publish retry exhausted;
- *   no data loss, safe to retry later.
- * - For start_maintenance(): stop in progress - retry later is safe.
- *
- * Typical causes:
- * - Sealed memrun queue is full (backpressure)
- * - OOO head flush failed after insert (runset pressure)
- * - Publish retry exhausted (flush/maintenance)
- * - Maintenance stop in progress
+ * Context-dependent semantics:
+ * - WRITE ops: record/tombstone WAS inserted. DO NOT RETRY.
+ * - flush/compact/maint_step: publish retry exhausted; safe to retry.
+ * - start_maintenance: stop in progress; safe to retry.
  */
 extern PyObject* TlPy_TimelogBusyError;
 

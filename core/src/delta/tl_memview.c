@@ -17,10 +17,7 @@ volatile int tl_test_memview_used_fallback = 0;
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Update bounds with a record array.
- * Assumes records are sorted by (ts, handle).
- */
+/** Update bounds from a sorted record array. */
 static void update_bounds_from_records(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                         bool* has_data,
                                         const tl_record_t* data, size_t len) {
@@ -41,9 +38,7 @@ static void update_bounds_from_records(tl_ts_t* min_ts, tl_ts_t* max_ts,
     }
 }
 
-/**
- * Update bounds with an unsorted record array (scan).
- */
+/** Update bounds from an unsorted record array (full scan). */
 static void update_bounds_from_records_unsorted(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                                  bool* has_data,
                                                  const tl_record_t* data, size_t len) {
@@ -68,9 +63,7 @@ static void update_bounds_from_records_unsorted(tl_ts_t* min_ts, tl_ts_t* max_ts
     }
 }
 
-/**
- * Update bounds with OOO runs (using per-run min/max).
- */
+/** Update bounds from OOO runs (using per-run precomputed min/max). */
 static void update_bounds_from_runs(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                      bool* has_data,
                                      const tl_ooorunset_t* runs) {
@@ -96,10 +89,7 @@ static void update_bounds_from_runs(tl_ts_t* min_ts, tl_ts_t* max_ts,
     }
 }
 
-/**
- * Update bounds with tombstone intervals.
- * Tombstones contribute to bounds per read-path overlap rules.
- */
+/** Update bounds from tombstone intervals (for read-path overlap). */
 static void update_bounds_from_tombs(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                       bool* has_data,
                                       const tl_interval_t* data, size_t len) {
@@ -107,22 +97,13 @@ static void update_bounds_from_tombs(tl_ts_t* min_ts, tl_ts_t* max_ts,
         return;
     }
 
-    /* Min is first interval's start (intervals are sorted by start) */
     tl_ts_t tomb_min = data[0].start;
-
-    /* Max is determined by last interval's end (or TL_TS_MAX if unbounded) */
     const tl_interval_t* last = &data[len - 1];
     tl_ts_t tomb_max;
     if (last->end_unbounded) {
         tomb_max = TL_TS_MAX;
     } else {
-        /*
-         * Tombstone [start, end) covers timestamps up to end-1.
-         * For overlap checking, we use end-1 as the max bound.
-         * However, we must be careful: if end == TL_TS_MIN (impossible
-         * for a valid interval), subtracting would underflow.
-         * Valid intervals have start < end, so end > TL_TS_MIN.
-         */
+        /* Half-open [start, end) covers up to end-1 (safe: valid intervals have end > start) */
         tomb_max = last->end - 1;
     }
 
@@ -136,16 +117,10 @@ static void update_bounds_from_tombs(tl_ts_t* min_ts, tl_ts_t* max_ts,
     }
 }
 
-/**
- * Update bounds from a memrun.
- */
+/** Update bounds from a memrun (uses precomputed bounds). */
 static void update_bounds_from_memrun(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                        bool* has_data,
                                        const tl_memrun_t* mr) {
-    /*
-     * Memrun has precomputed bounds that already include tombstones.
-     * However, we need to check if it has data first.
-     */
     bool mr_has_records = tl_memrun_has_records(mr);
     bool mr_has_tombs = tl_memrun_has_tombstones(mr);
 
@@ -166,34 +141,7 @@ static void update_bounds_from_memrun(tl_ts_t* min_ts, tl_ts_t* max_ts,
     }
 }
 
-/**
- * Deep-copy a record array.
- *
- * C-07 fix: Changed to return status for distinguishing errors.
- *
- * @param alloc   Allocator context
- * @param src     Source record array (may be NULL if len == 0)
- * @param len     Number of records
- * @param out     Output: copied array (set to NULL on error or len==0)
- * @return TL_OK on success (including len==0),
- *         TL_EINVAL if len > 0 but src == NULL,
- *         TL_EOVERFLOW if len * sizeof(tl_record_t) would overflow,
- *         TL_ENOMEM on allocation failure
- */
-/**
- * Deep-copy an interval array.
- *
- * C-07 fix: Changed to return status for distinguishing errors.
- *
- * @param alloc   Allocator context
- * @param src     Source interval array (may be NULL if len == 0)
- * @param len     Number of intervals
- * @param out     Output: copied array (set to NULL on error or len==0)
- * @return TL_OK on success (including len==0),
- *         TL_EINVAL if len > 0 but src == NULL,
- *         TL_EOVERFLOW if len * sizeof(tl_interval_t) would overflow,
- *         TL_ENOMEM on allocation failure
- */
+/** Deep-copy an interval array. Returns NULL for len==0. */
 static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
                                    const tl_interval_t* src, size_t len,
                                    tl_interval_t** out) {
@@ -207,7 +155,7 @@ static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;  /* Error: non-zero len but NULL src */
     }
 
-    /* C-07 fix: Check for size overflow before multiplication */
+    /* Check for size overflow before multiplication */
     if (tl__alloc_would_overflow(len, sizeof(tl_interval_t))) {
         return TL_EOVERFLOW;
     }
@@ -223,18 +171,7 @@ static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
     return TL_OK;
 }
 
-/**
- * Deep-copy a sequence array.
- *
- * @param alloc Allocator context
- * @param src   Source seq array (may be NULL if len == 0)
- * @param len   Number of seqs
- * @param out   Output: copied array (set to NULL on error or len==0)
- * @return TL_OK on success (including len==0),
- *         TL_EINVAL if len > 0 but src == NULL,
- *         TL_EOVERFLOW if len * sizeof(tl_seq_t) would overflow,
- *         TL_ENOMEM on allocation failure
- */
+/** Deep-copy a sequence array. Returns NULL for len==0. */
 static tl_status_t copy_seqs(tl_alloc_ctx_t* alloc,
                               const tl_seq_t* src, size_t len,
                               tl_seq_t** out) {
@@ -263,11 +200,7 @@ static tl_status_t copy_seqs(tl_alloc_ctx_t* alloc,
     return TL_OK;
 }
 
-/**
- * Allocate and populate sealed memrun array.
- * Acquires references to each memrun.
- * On failure, releases any already-acquired references.
- */
+/** Copy and pin sealed memruns. Uses epoch-based retry to minimize lock hold. */
 static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
                                         const tl_memtable_t* mt,
                                         tl_mutex_t* memtable_mu) {
@@ -278,7 +211,7 @@ static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
         size_t head = 0;
         uint64_t epoch = 0;
 
-        /* Phase 1: snapshot sealed queue metadata under lock */
+        /* Snapshot sealed queue metadata under lock */
         TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
         len = mt->sealed_len;
         head = mt->sealed_head;
@@ -291,19 +224,19 @@ static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
         }
         TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
 
-        /* C-07 fix: Check for size overflow before multiplication */
+        /* Check for size overflow before multiplication */
         if (tl__alloc_would_overflow(len, sizeof(tl_memrun_t*))) {
             return TL_EOVERFLOW;
         }
 
-        /* Phase 2: allocate outside lock */
+        /* Allocate outside lock */
         tl_memrun_t** sealed = (tl_memrun_t**)tl__malloc(mv->alloc,
                                                           len * sizeof(tl_memrun_t*));
         if (sealed == NULL) {
             return TL_ENOMEM;
         }
 
-        /* Phase 3: re-lock and verify queue unchanged */
+        /* Re-lock and verify queue unchanged */
         TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
         if (mt->sealed_len != len ||
             mt->sealed_head != head ||
@@ -387,22 +320,13 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
     TL_ASSERT(memtable_mu != NULL);
     TL_ASSERT(alloc != NULL);
 
-    /* Initialize to empty state */
     memset(mv, 0, sizeof(*mv));
     mv->alloc = alloc;
     mv->has_data = false;
 
     tl_status_t status;
 
-    /*
-     * Step 1: Copy active buffers.
-     * Caller holds writer_mu which protects active state.
-     *
-     * C-07 fix: Use new signatures that return status and preserve
-     * distinct error codes (TL_EOVERFLOW, TL_ENOMEM, TL_EINVAL).
-     */
-
-    /* Copy active_run */
+    /* Step 1: Copy active buffers (caller holds writer_mu) */
     size_t run_len = tl_memtable_run_len(mt);
     status = tl_records_copy(alloc, tl_memtable_run_data(mt), run_len, &mv->active_run);
     if (status != TL_OK) {
@@ -414,7 +338,6 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
         goto fail;
     }
 
-    /* Copy OOO head */
     size_t ooo_head_len = tl_memtable_ooo_head_len(mt);
     status = tl_records_copy(alloc, tl_memtable_ooo_head_data(mt), ooo_head_len,
                               &mv->active_ooo_head);
@@ -429,13 +352,11 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
         goto fail;
     }
 
-    /* Pin OOO runs */
     mv->active_ooo_runs = tl_ooorunset_acquire(
                             (tl_ooorunset_t*)tl_memtable_ooo_runs(mt));
     mv->active_ooo_total_len = ooo_head_len +
                                tl_ooorunset_total_len(mv->active_ooo_runs);
 
-    /* Copy active_tombs */
     tl_intervals_imm_t tombs_imm = tl_memtable_tombs_imm(mt);
     status = copy_intervals(alloc, tombs_imm.data, tombs_imm.len, &mv->active_tombs);
     if (status != TL_OK) {
@@ -443,19 +364,13 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
     }
     mv->active_tombs_len = tombs_imm.len;
 
-    /*
-     * Step 2: Pin sealed memruns.
-     * This function locks memtable_mu internally.
-     */
+    /* Step 2: Pin sealed memruns (locks memtable_mu internally) */
     status = copy_sealed_memruns(mv, mt, memtable_mu);
     if (status != TL_OK) {
         goto fail;
     }
 
-    /*
-     * Step 3: Compute bounds.
-     * Include records AND tombstones per read-path overlap rules.
-     */
+    /* Step 3: Compute bounds (records + tombstones) */
     update_bounds_from_records(&mv->min_ts, &mv->max_ts, &mv->has_data,
                                mv->active_run, mv->active_run_len);
     update_bounds_from_records_unsorted(&mv->min_ts, &mv->max_ts, &mv->has_data,
@@ -511,7 +426,6 @@ void tl_memview_destroy(tl_memview_t* mv) {
         return;
     }
 
-    /* Free copied active buffers */
     if (mv->active_run != NULL) {
         tl__free(mv->alloc, mv->active_run);
         mv->active_run = NULL;
@@ -545,7 +459,6 @@ void tl_memview_destroy(tl_memview_t* mv) {
     }
     mv->active_tombs_len = 0;
 
-    /* Release pinned sealed memruns */
     if (mv->sealed != NULL) {
         for (size_t i = 0; i < mv->sealed_len; i++) {
             if (mv->sealed[i] != NULL) {
@@ -557,7 +470,6 @@ void tl_memview_destroy(tl_memview_t* mv) {
     }
     mv->sealed_len = 0;
 
-    /* Reset bounds */
     mv->min_ts = 0;
     mv->max_ts = 0;
     mv->has_data = false;
@@ -648,27 +560,13 @@ bool tl_memview_overlaps(const tl_memview_t* mv, tl_ts_t t1, tl_ts_t t2,
 #include "../internal/tl_intervals.h"
 #include "../internal/tl_recvec.h"
 
-/**
- * Validate memview invariants.
- *
- * Invariants:
- * 1. active_run is sorted (non-decreasing timestamps)
- * 2. active_ooo_head is sorted (ts, handle)
- * 3. active_ooo_runs are valid and gen-ordered
- * 4. active_tombs is valid (sorted, non-overlapping, coalesced)
- * 5. sealed memrun pointers non-NULL
- * 6. has_data consistent with actual content
- */
+/** Validate memview invariants (sortedness, bounds, sealed refs). */
 bool tl_memview_validate(const tl_memview_t* mv) {
     if (mv == NULL) {
         return false;
     }
 
-    /*
-     * Invariant 1: active_run is sorted (non-decreasing timestamps)
-     *
-     * Use accessor functions for encapsulation.
-     */
+    /* active_run must be sorted */
     const tl_record_t* run = tl_memview_run_data(mv);
     size_t run_len = tl_memview_run_len(mv);
     if (run_len > 0 && mv->active_run_seqs == NULL) {
@@ -683,10 +581,7 @@ bool tl_memview_validate(const tl_memview_t* mv) {
         return false;
     }
 
-    /*
-     * Invariant 2: active_ooo_head is sorted (ts, handle) iff marked sorted.
-     * During two-phase capture, head may be unsorted until post-lock sort.
-     */
+    /* OOO head: sorted iff marked sorted (may be unsorted before post-lock sort) */
     const tl_record_t* ooo_head = tl_memview_ooo_head_data(mv);
     size_t ooo_head_len = tl_memview_ooo_head_len(mv);
     if (ooo_head_len > 0 && mv->active_ooo_head_seqs == NULL) {
@@ -707,9 +602,7 @@ bool tl_memview_validate(const tl_memview_t* mv) {
         return false;
     }
 
-    /*
-     * Invariant 3: active_ooo_runs are valid and gen-ordered
-     */
+    /* OOO runs: gen-ordered, each run internally sorted */
     const tl_ooorunset_t* runs = tl_memview_ooo_runs(mv);
     if (runs != NULL) {
         size_t total = 0;
@@ -750,20 +643,14 @@ bool tl_memview_validate(const tl_memview_t* mv) {
         return false;
     }
 
-    /*
-     * Invariant 4: active_tombs is valid
-     *
-     * Uses the shared tl_intervals_arr_validate() function.
-     */
+    /* Tombstones: sorted, non-overlapping, coalesced */
     const tl_interval_t* tombs = tl_memview_tomb_data(mv);
     size_t tombs_len = tl_memview_tomb_len(mv);
     if (!tl_intervals_arr_validate(tombs, tombs_len)) {
         return false;
     }
 
-    /*
-     * Invariant 5: sealed memrun pointers non-NULL
-     */
+    /* Sealed memruns must be non-NULL */
     size_t sealed_len = tl_memview_sealed_len(mv);
     for (size_t i = 0; i < sealed_len; i++) {
         if (tl_memview_sealed_get(mv, i) == NULL) {
@@ -771,13 +658,7 @@ bool tl_memview_validate(const tl_memview_t* mv) {
         }
     }
 
-    /*
-     * Invariant 6: has_data consistency
-     *
-     * If has_data is true, there must be some content.
-     * Content can be: records in run, records in OOO head/runs,
-     * tombstones, or sealed memruns.
-     */
+    /* has_data must be consistent with actual content */
     if (tl_memview_has_data(mv)) {
         bool has_content = (run_len > 0 || mv->active_ooo_total_len > 0 ||
                            tombs_len > 0 || sealed_len > 0);

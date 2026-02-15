@@ -10,9 +10,7 @@
  * - Owner reference counting
  * - Release hooks
  *
- * Total: 20 tests organized in 8 phases per the implementation plan.
- *
- * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
+ * Total: 20 tests organized in 8 sections.
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -104,7 +102,7 @@ static void test_release_hook_close_timelog(void* user) {
 }
 
 /*===========================================================================
- * Phase 1: Validation Tests (5 tests)
+ * Validation Tests (5 tests)
  *===========================================================================*/
 
 /**
@@ -202,7 +200,7 @@ TEST_DECLARE(pagespan_iter_open_invalid_args_no_hook) {
 }
 
 /*===========================================================================
- * Phase 2: Empty Cases (2 tests)
+ * Empty Cases (2 tests)
  *===========================================================================*/
 
 /**
@@ -253,7 +251,7 @@ TEST_DECLARE(pagespan_empty_range_iter_next_returns_eof) {
 }
 
 /*===========================================================================
- * Phase 3: Single Page (2 tests)
+ * Single Page (2 tests)
  *===========================================================================*/
 
 /**
@@ -328,7 +326,7 @@ TEST_DECLARE(pagespan_single_page_partial_range) {
 }
 
 /*===========================================================================
- * Phase 4: Multi-Page/Segment (2 tests)
+ * Multi-Page/Segment (2 tests)
  *===========================================================================*/
 
 /**
@@ -438,7 +436,7 @@ TEST_DECLARE(pagespan_l1_and_l0_segments) {
 }
 
 /*===========================================================================
- * Phase 5: Range Filtering (2 tests)
+ * Range Filtering (2 tests)
  *===========================================================================*/
 
 /**
@@ -513,7 +511,7 @@ TEST_DECLARE(pagespan_range_no_overlap_returns_eof) {
 }
 
 /*===========================================================================
- * Phase 6: Owner Refcounting (2 tests)
+ * Owner Refcounting (2 tests)
  *===========================================================================*/
 
 /**
@@ -589,7 +587,7 @@ TEST_DECLARE(pagespan_views_valid_after_iter_close) {
 }
 
 /*===========================================================================
- * Phase 7: Release Hooks (3 tests)
+ * Release Hooks (3 tests)
  *===========================================================================*/
 
 /**
@@ -784,7 +782,7 @@ TEST_DECLARE(pagespan_iter_open_alloc_failure_no_hook) {
 #endif
 
 /*===========================================================================
- * Phase 8: Stress (1 test)
+ * Stress (1 test)
  *===========================================================================*/
 
 /**
@@ -841,7 +839,7 @@ TEST_DECLARE(pagespan_stress_many_segments) {
 void run_pagespan_iter_tests(void) {
     printf("\n=== PageSpan Iterator Tests ===\n");
 
-    /* Phase 1: Validation */
+    /* Validation */
     RUN_TEST(pagespan_flags_default_value);
     RUN_TEST(pagespan_iter_open_null_timelog_returns_einval);
     RUN_TEST(pagespan_iter_open_null_out_returns_einval);
@@ -849,27 +847,27 @@ void run_pagespan_iter_tests(void) {
     RUN_TEST(pagespan_iter_open_without_segments_only_returns_einval);
     RUN_TEST(pagespan_iter_open_invalid_args_no_hook);
 
-    /* Phase 2: Empty Cases */
+    /* Empty Cases */
     RUN_TEST(pagespan_empty_timelog_iter_next_returns_eof);
     RUN_TEST(pagespan_empty_range_iter_next_returns_eof);
 
-    /* Phase 3: Single Page */
+    /* Single Page */
     RUN_TEST(pagespan_single_page_full_range);
     RUN_TEST(pagespan_single_page_partial_range);
 
-    /* Phase 4: Multi-Page/Segment */
+    /* Multi-Page/Segment */
     RUN_TEST(pagespan_multiple_pages_single_segment);
     RUN_TEST(pagespan_l1_and_l0_segments);
 
-    /* Phase 5: Range Filtering */
+    /* Range Filtering */
     RUN_TEST(pagespan_range_excludes_earlier_segments);
     RUN_TEST(pagespan_range_no_overlap_returns_eof);
 
-    /* Phase 6: Owner Refcounting */
+    /* Owner Refcounting */
     RUN_TEST(pagespan_owner_refcount_incremented_per_view);
     RUN_TEST(pagespan_views_valid_after_iter_close);
 
-    /* Phase 7: Release Hooks */
+    /* Release Hooks */
     RUN_TEST(pagespan_release_hook_called_on_owner_destruction);
     RUN_TEST(pagespan_release_hook_can_close_timelog);
     RUN_TEST(pagespan_release_hook_null_is_safe);
@@ -878,6 +876,6 @@ void run_pagespan_iter_tests(void) {
     RUN_TEST(pagespan_iter_open_alloc_failure_no_hook);
 #endif
 
-    /* Phase 8: Stress */
+    /* Stress */
     RUN_TEST(pagespan_stress_many_segments);
 }

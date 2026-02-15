@@ -9,19 +9,18 @@
  * - TL_TS_MAX edge cases (no sentinel assumption)
  * - NULL pointer handling
  *
- * NOTE: Other invariants documented in CLAUDE.md are verified in:
+ * NOTE: Other invariants are verified in:
  * - test_storage_internal.c: Page sortedness, segment bounds, L1 non-overlap
  * - test_delta_internal.c: Tombstone canonicalization, memtable invariants
  * - test_concurrency.c: Snapshot isolation
  *
- * Part of Phase 10: Test Suite Reorganization
  * Note: Test names prefixed with "inv_" to indicate invariant tests.
  *===========================================================================*/
 
 #include "test_harness.h"
 #include "timelog/timelog.h"
 
-/* Internal headers for T-42 (L0 generation ordering) */
+/* Internal headers for L0 generation ordering checks. */
 #include "internal/tl_timelog_internal.h"
 #include "tl_snapshot.h"
 #include "tl_manifest.h"
@@ -254,7 +253,7 @@ TEST_DECLARE(inv_validate_tombstone_ending_at_ts_max) {
 }
 
 /*===========================================================================
- * T-42: L0 Generation Ordering After Flush
+ * L0 Generation Ordering After Flush
  *
  * Multiple flush cycles should produce L0 segments with monotonically
  * increasing generation numbers. This is a fundamental invariant for
@@ -315,7 +314,7 @@ void run_invariants_tests(void) {
     RUN_TEST(inv_validate_record_at_ts_max);
     RUN_TEST(inv_validate_tombstone_ending_at_ts_max);
 
-    /* L0 generation ordering (1 test) - T-42 */
+    /* L0 generation ordering (1 test) */
     RUN_TEST(inv_l0_generation_ordering_after_flush);
 
     /* Total: 11 tests */

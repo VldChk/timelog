@@ -1,8 +1,4 @@
-"""
-Internal helper functions for the Timelog facade.
-
-This module is private API. Do not import directly.
-"""
+"""Private helpers for the Timelog facade. Do not import directly."""
 
 from __future__ import annotations
 
@@ -26,21 +22,10 @@ def _now_ts(time_unit: str) -> int:
 
 
 def _coerce_ts(x: object) -> int:
-    """
-    Coerce x to an integer timestamp.
-
-    Uses operator.index() to support numpy.int64 and similar types
-    that implement __index__.
-
-    Args:
-        x: Value to coerce to integer.
-
-    Returns:
-        Integer timestamp value.
+    """Coerce x to an int64 timestamp via ``__index__``.
 
     Raises:
-        TypeError: If x is bool (to prevent True -> 1 accidents)
-            or if x doesn't support __index__.
+        TypeError: If x is bool or lacks ``__index__``.
         OverflowError: If value is outside signed int64 range.
     """
     if isinstance(x, bool):
@@ -54,15 +39,7 @@ def _coerce_ts(x: object) -> int:
 
 
 def _slice_to_iter(log: Timelog, s: slice) -> TimelogIter:
-    """
-    Convert a slice to the appropriate iterator method call.
-
-    Args:
-        log: The Timelog instance.
-        s: Slice object from __getitem__.
-
-    Returns:
-        TimelogIter for the specified range.
+    """Convert a slice to a TimelogIter via the appropriate query method.
 
     Raises:
         TypeError: If s is not a slice.
@@ -74,9 +51,7 @@ def _slice_to_iter(log: Timelog, s: slice) -> TimelogIter:
             "use .at(ts) or .point(ts) for single-timestamp queries"
         )
 
-    # Reject step values that aren't None or the integer 1.
-    # Explicitly reject bool (True == 1) and float (1.0 == 1) for consistency
-    # with bool rejection in _coerce_ts.
+    # Reject non-int steps; bool/float are rejected even if == 1.
     if s.step is not None:
         if isinstance(s.step, bool) or not isinstance(s.step, int) or s.step != 1:
             raise ValueError(f"Timelog slice step must be None or 1, not {s.step!r}")

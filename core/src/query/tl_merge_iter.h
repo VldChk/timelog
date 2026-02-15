@@ -33,8 +33,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Plan must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 6
  *===========================================================================*/
 
 typedef struct tl_kmerge_iter {
@@ -137,9 +135,7 @@ TL_INLINE bool tl_kmerge_iter_can_skip(const tl_kmerge_iter_t* it,
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done || (it->error != TL_OK);

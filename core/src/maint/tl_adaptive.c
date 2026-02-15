@@ -4,7 +4,6 @@
  * Implements adaptive window size computation for L1 segmentation based on
  * data density. Pure policy module with no allocation in the computation loop.
  *
- * Reference: docs/timelog_adaptive_segmentation_lld_c17.md (draft-5)
  *===========================================================================*/
 
 #include "tl_adaptive.h"
@@ -157,7 +156,7 @@ bool tl__adaptive_hysteresis_skip(double candidate,
  * Apply nearest-quantum snapping.
  * Returns snapped value, or current_window if snapping fails.
  *
- * Algorithm (per LLD):
+ * Algorithm:
  * 1. wi = llround(candidate)
  * 2. qid = floor_div(wi, quantum)
  * 3. snapped = qid * quantum
@@ -199,14 +198,14 @@ tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
     int64_t q = (int64_t)window_quantum;
     int64_t qid = tl_floor_div_i64(wi, q);
 
-    /* C-11 fix: Defensive overflow check for qid * q.
+    /* Defensive overflow check for qid * q.
      * Mathematically, qid * q <= wi < INT64_MAX, so overflow is impossible.
-     * This check is defensive programming per LLD Section 12.1. */
+     * Defensive check: prevents propagation of invalid density values. */
     if (qid > 0 && q > INT64_MAX / qid) {
         return current_window;  /* Overflow - should never happen */
     }
 
-    /* Step 3: Compute snapped value (overflow-safe after C-11 check) */
+    /* Step 3: compute snapped value after overflow checks. */
     int64_t snapped = qid * q;
 
     /* Step 4: Compute remainder */
@@ -404,7 +403,7 @@ void tl_adaptive_record_failure(tl_adaptive_state_t* state) {
 }
 
 /*===========================================================================
- * Advisory Resize Query (M-20)
+ * Advisory Resize Query
  *
  * THREADING NOTE: This function intentionally reads fields without holding
  * maint_mu. This is safe because:

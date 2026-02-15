@@ -28,7 +28,7 @@ struct tl_memview_shared;
 typedef struct tl_memview_shared tl_memview_shared_t;
 
 /*===========================================================================
- * Maintenance Worker State Machine (Phase 7)
+ * Maintenance Worker State Machine
  *
  * Protected by maint_mu. State transitions:
  *   STOPPED  -> RUNNING  (tl_maint_start)
@@ -80,7 +80,7 @@ struct tl_timelog {
     tl_log_ctx_t    log;
 
     /*-----------------------------------------------------------------------
-     * Synchronization (Phase 1)
+     * Synchronization
      *
      * Lock ordering: maint_mu -> flush_mu -> writer_mu -> memtable_mu
      *-----------------------------------------------------------------------*/
@@ -112,7 +112,7 @@ struct tl_timelog {
     bool            is_open;
 
     /*-----------------------------------------------------------------------
-     * Maintenance State (Phase 7)
+     * Maintenance State
      *
      * CRITICAL: All fields in this section are protected by maint_mu.
      * NO atomics are used. This eliminates the lost-work race condition
@@ -156,7 +156,7 @@ struct tl_timelog {
     bool window_grid_frozen;
 
     /*-----------------------------------------------------------------------
-     * Delta Layer (Phase 4)
+     * Delta Layer
      *-----------------------------------------------------------------------*/
 
     /* Memtable: mutable write buffer for inserts and tombstones */
@@ -170,7 +170,7 @@ struct tl_timelog {
     uint64_t             memview_cache_epoch;
 
     /*-----------------------------------------------------------------------
-     * Storage Layer (Phase 5)
+     * Storage Layer
      *
      * The manifest is the atomic publication root for storage.
      * Swapped atomically under writer_mu + seqlock during flush/compaction.
@@ -192,7 +192,7 @@ struct tl_timelog {
     tl_atomic_u64   compactions_total;  /* Compaction operations completed */
     tl_atomic_u64   compaction_retries;       /* Compaction publish retries */
     tl_atomic_u64   compaction_publish_ebusy; /* Publish EBUSY returns */
-    /* Compaction selection observability (M-23) */
+    /* Compaction selection observability */
     tl_atomic_u64   compaction_select_calls;   /* Selection attempts */
     tl_atomic_u64   compaction_select_l0_inputs; /* Total L0 inputs selected */
     tl_atomic_u64   compaction_select_l1_inputs; /* Total L1 inputs selected */

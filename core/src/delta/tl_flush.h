@@ -16,7 +16,6 @@
  * 2. Passes merged records + tombstones to tl_segment_build_l0
  * 3. Returns the built L0 segment
  *
- * Reference: Write Path LLD Section 4.3
  *===========================================================================*/
 
 /*===========================================================================

@@ -1,11 +1,9 @@
 /**
  * @file test_py_span.c
- * @brief Unit tests for PyPageSpan and related types (LLD-B4)
+ * @brief Unit tests for PyPageSpan and related types
  *
  * TDD-driven tests for the PageSpan, PageSpanIter, and PageSpanObjectsView types.
  * Tests run with Python initialized and GIL held.
- *
- * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -250,7 +248,7 @@ static int append_and_flush(PyTimelog* tl, tl_ts_t* timestamps, PyObject** objec
 }
 
 /*===========================================================================
- * Phase 1: Infrastructure Tests
+ * Infrastructure Tests
  *===========================================================================*/
 
 /**
@@ -296,7 +294,7 @@ TEST(direct_instantiation_blocked)
 }
 
 /*===========================================================================
- * Phase 3: Span Collection Tests
+ * Span Collection Tests
  *===========================================================================*/
 
 /**
@@ -382,7 +380,7 @@ TEST(page_spans_with_data)
 }
 
 /*===========================================================================
- * Phase 4: Buffer Protocol Tests
+ * Buffer Protocol Tests
  *===========================================================================*/
 
 /**
@@ -509,7 +507,7 @@ TEST(buffer_write_rejected)
 }
 
 /*===========================================================================
- * Phase 5: Close Semantics Tests
+ * Close Semantics Tests
  *===========================================================================*/
 
 /**
@@ -599,7 +597,7 @@ TEST(close_with_exported_buffer_raises)
 }
 
 /*===========================================================================
- * Phase 6: Iterator Tests
+ * Iterator Tests
  *===========================================================================*/
 
 /**
@@ -726,7 +724,7 @@ TEST(iter_context_manager)
 }
 
 /*===========================================================================
- * Phase 7: Objects View Tests
+ * Objects View Tests
  *===========================================================================*/
 
 /**
@@ -947,7 +945,7 @@ TEST(objects_copy)
 }
 
 /*===========================================================================
- * Phase 8: Lifetime Integration Tests (CRITICAL - Pin Protocol)
+ * Lifetime Integration Tests (CRITICAL - Pin Protocol)
  *===========================================================================*/
 
 /**
@@ -1117,7 +1115,7 @@ TEST(multiple_spans_share_owner)
 }
 
 /*===========================================================================
- * Phase 9: Timestamp Correctness Tests
+ * Timestamp Correctness Tests
  *===========================================================================*/
 
 /**
@@ -1354,7 +1352,7 @@ TEST(span_len)
 }
 
 /*===========================================================================
- * Phase 4b: Additional Buffer Protocol Tests
+ * Additional Buffer Protocol Tests
  *===========================================================================*/
 
 /**
@@ -1483,7 +1481,7 @@ TEST(buffer_strides)
 }
 
 /*===========================================================================
- * Phase 5b: Additional Close Semantics Tests
+ * Additional Close Semantics Tests
  *===========================================================================*/
 
 /**
@@ -1586,7 +1584,7 @@ TEST(copy_timestamps)
 }
 
 /*===========================================================================
- * Phase 3b: Additional Span Collection Tests
+ * Additional Span Collection Tests
  *===========================================================================*/
 
 /**
@@ -1702,7 +1700,7 @@ TEST(page_spans_partial_range)
 }
 
 /*===========================================================================
- * Phase 10: Stress Tests
+ * Stress Tests
  *===========================================================================*/
 
 /**
@@ -1838,15 +1836,15 @@ int main(void)
     }
     Py_DECREF(mod);
 
-    printf("\nRunning LLD-B4 PageSpan tests:\n\n");
+    printf("\nRunning PageSpan tests:\n\n");
 
-    /* Phase 1: Infrastructure */
-    printf("Phase 1: Infrastructure\n");
+    /* Infrastructure */
+    printf("Infrastructure\n");
     run_types_ready();
     run_direct_instantiation_blocked();
 
-    /* Phase 3: Span Collection */
-    printf("\nPhase 3: Span Collection\n");
+    /* Span Collection */
+    printf("\nSpan Collection\n");
     run_page_spans_empty_timelog();
     run_page_spans_kind_invalid();
     run_page_spans_with_data();
@@ -1854,8 +1852,8 @@ int main(void)
     run_page_spans_no_overlap();
     run_page_spans_partial_range();
 
-    /* Phase 4: Buffer Protocol */
-    printf("\nPhase 4: Buffer Protocol\n");
+    /* Buffer Protocol */
+    printf("\nBuffer Protocol\n");
     run_timestamps_memoryview();
     run_buffer_ndim_always_one();
     run_buffer_write_rejected();
@@ -1864,41 +1862,41 @@ int main(void)
     run_buffer_strides();
     run_buffer_length_correct();
 
-    /* Phase 5: Close Semantics */
-    printf("\nPhase 5: Close Semantics\n");
+    /* Close Semantics */
+    printf("\nClose Semantics\n");
     run_close_idempotent();
     run_close_with_exported_buffer_raises();
     run_operations_on_closed_span_raise();
     run_copy_timestamps();
 
-    /* Phase 6: Iterator Tests */
-    printf("\nPhase 6: Iterator Tests\n");
+    /* Iterator Tests */
+    printf("\nIterator Tests\n");
     run_iter_exhaustion();
     run_iter_close();
     run_iter_context_manager();
 
-    /* Phase 7: Objects View */
-    printf("\nPhase 7: Objects View\n");
+    /* Objects View */
+    printf("\nObjects View\n");
     run_objects_len();
     run_objects_iteration();
     run_objects_indexing();
     run_objects_copy();
 
-    /* Phase 8: Lifetime Integration (CRITICAL) */
-    printf("\nPhase 8: Lifetime Integration (CRITICAL)\n");
+    /* Lifetime Integration (CRITICAL) */
+    printf("\nLifetime Integration (CRITICAL)\n");
     run_span_holds_pins();
     run_closed_spans_release_pins();
     run_multiple_spans_share_owner();
 
-    /* Phase 9: Timestamp Correctness */
-    printf("\nPhase 9: Timestamp Correctness\n");
+    /* Timestamp Correctness */
+    printf("\nTimestamp Correctness\n");
     run_timestamps_match_appended_data();
     run_timestamps_sorted_within_span();
     run_span_start_end_ts();
     run_span_len();
 
-    /* Phase 10: Stress Tests */
-    printf("\nPhase 10: Stress Tests\n");
+    /* Stress Tests */
+    printf("\nStress Tests\n");
     run_many_spans_no_leak();
     run_buffer_cycle_stress();
 

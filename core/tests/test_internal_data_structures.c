@@ -9,8 +9,6 @@
  * These tests validate the building blocks used by storage,
  * query, and maintenance subsystems.
  *
- * Part of Phase 10: Integration Testing and Hardening
- *
  * Migration Status: COMPLETE (migrated from test_phase2.c)
  * Note: Test names prefixed with "ds_" to avoid conflicts during migration.
  *===========================================================================*/
@@ -467,7 +465,7 @@ TEST_DECLARE(ds_intervals_insert_empty_is_noop) {
     tl_intervals_t iv;
     tl_intervals_init(&iv, &alloc);
 
-    /* t1 == t2 is a no-op (Write Path LLD Section 3.8) */
+    /* t1 == t2 is a no-op (empty half-open interval) */
     TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 10));
     TEST_ASSERT_EQ(0, tl_intervals_len(&iv)); /* Nothing stored */
 
@@ -818,7 +816,7 @@ TEST_DECLARE(ds_intervals_clip_removes_outside) {
 }
 
 /*---------------------------------------------------------------------------
- * clip_lower tests - Added for coverage (Phase 10)
+ * clip_lower tests
  *---------------------------------------------------------------------------*/
 
 TEST_DECLARE(ds_intervals_clip_lower_removes_before) {

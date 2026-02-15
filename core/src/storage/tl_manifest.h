@@ -22,8 +22,6 @@
  * - Manifest holds strong references to all its segments (acquired on build)
  * - When manifest is released and refcnt hits 0, all segment references are
  *   released
- *
- * Reference: Storage LLD Section 3.7, Section 8
  *===========================================================================*/
 
 typedef struct tl_manifest {
@@ -99,8 +97,6 @@ TL_INLINE uint32_t tl_manifest_refcnt(const tl_manifest_t* m) {
  * 2. Queue additions/removals
  * 3. Build new manifest
  * 4. Destroy builder (cleans up temporary buffers)
- *
- * Reference: Storage LLD Section 8
  *===========================================================================*/
 
 typedef struct tl_manifest_builder {
@@ -225,7 +221,7 @@ TL_INLINE uint64_t tl_manifest_version(const tl_manifest_t* m) {
  * Returns index of first potentially overlapping segment.
  * Returns m->n_l1 if no such segment exists.
  *
- * Used by read path for L1 pruning (Read Path LLD Section 4.1).
+ * Used by read path for L1 pruning.
  *
  * Note: Uses max_ts (not window_end) for precise pruning.
  * Since L1 segments are non-overlapping by window and sorted by window_start,

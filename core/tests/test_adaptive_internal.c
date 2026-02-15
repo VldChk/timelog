@@ -169,13 +169,13 @@ TEST_DECLARE(adapt_candidate_negative_density) {
 }
 
 TEST_DECLARE(adapt_candidate_very_high_density) {
-    /* Very high density → very small window */
+    /* Very high density -> very small window */
     double candidate = tl__adaptive_compute_raw_candidate(10000, 1000000.0);
     TEST_ASSERT(approx_eq(candidate, 0.01, 0.0001));
 }
 
 TEST_DECLARE(adapt_candidate_very_low_density) {
-    /* Very low density → very large window */
+    /* Very low density -> very large window */
     double candidate = tl__adaptive_compute_raw_candidate(10000, 0.001);
     TEST_ASSERT(approx_eq(candidate, 10000000.0, 0.001));
 }
@@ -185,31 +185,31 @@ TEST_DECLARE(adapt_candidate_very_low_density) {
  *===========================================================================*/
 
 TEST_DECLARE(adapt_guardrails_clamp_min) {
-    /* candidate < min → return min */
+    /* candidate < min -> return min */
     double result = tl__adaptive_apply_guardrails(500.0, 1000, 100000);
     TEST_ASSERT(approx_eq(result, 1000.0, 0.001));
 }
 
 TEST_DECLARE(adapt_guardrails_clamp_max) {
-    /* candidate > max → return max */
+    /* candidate > max -> return max */
     double result = tl__adaptive_apply_guardrails(150000.0, 1000, 100000);
     TEST_ASSERT(approx_eq(result, 100000.0, 0.001));
 }
 
 TEST_DECLARE(adapt_guardrails_within_range) {
-    /* candidate within range → unchanged */
+    /* candidate within range -> unchanged */
     double result = tl__adaptive_apply_guardrails(50000.0, 1000, 100000);
     TEST_ASSERT(approx_eq(result, 50000.0, 0.001));
 }
 
 TEST_DECLARE(adapt_guardrails_at_min) {
-    /* candidate == min → unchanged */
+    /* candidate == min -> unchanged */
     double result = tl__adaptive_apply_guardrails(1000.0, 1000, 100000);
     TEST_ASSERT(approx_eq(result, 1000.0, 0.001));
 }
 
 TEST_DECLARE(adapt_guardrails_at_max) {
-    /* candidate == max → unchanged */
+    /* candidate == max -> unchanged */
     double result = tl__adaptive_apply_guardrails(100000.0, 1000, 100000);
     TEST_ASSERT(approx_eq(result, 100000.0, 0.001));
 }
@@ -272,25 +272,25 @@ TEST_DECLARE(adapt_hysteresis_zero_current) {
  *===========================================================================*/
 
 TEST_DECLARE(adapt_quantum_round_down) {
-    /* remainder < q/2 → snap down */
+    /* remainder < q/2 -> snap down */
     tl_ts_t result = tl__adaptive_snap_to_quantum(10300.0, 1000, 5000);
     TEST_ASSERT_EQ(10000, result);  /* 300 < 500, snap down */
 }
 
 TEST_DECLARE(adapt_quantum_round_up) {
-    /* remainder >= q/2 → snap up */
+    /* remainder >= q/2 -> snap up */
     tl_ts_t result = tl__adaptive_snap_to_quantum(10500.0, 1000, 5000);
     TEST_ASSERT_EQ(11000, result);  /* 500 >= 500, snap up */
 }
 
 TEST_DECLARE(adapt_quantum_round_up_600) {
-    /* remainder > q/2 → snap up */
+    /* remainder > q/2 -> snap up */
     tl_ts_t result = tl__adaptive_snap_to_quantum(10600.0, 1000, 5000);
     TEST_ASSERT_EQ(11000, result);  /* 600 > 500, snap up */
 }
 
 TEST_DECLARE(adapt_quantum_exact) {
-    /* Exact multiple → no change */
+    /* Exact multiple -> no change */
     tl_ts_t result = tl__adaptive_snap_to_quantum(10000.0, 1000, 5000);
     TEST_ASSERT_EQ(10000, result);
 }
@@ -321,7 +321,7 @@ TEST_DECLARE(adapt_quantum_overflow_guard) {
 TEST_DECLARE(adapt_quantum_small_value) {
     /* Small quantum values work correctly */
     tl_ts_t result = tl__adaptive_snap_to_quantum(105.0, 10, 50);
-    TEST_ASSERT_EQ(110, result);  /* 105 → 110 (round up, 5 >= 5) */
+    TEST_ASSERT_EQ(110, result);  /* 105 -> 110 (round up, 5 >= 5) */
 }
 
 /*---------------------------------------------------------------------------
@@ -333,35 +333,35 @@ TEST_DECLARE(adapt_quantum_small_value) {
  *---------------------------------------------------------------------------*/
 
 TEST_DECLARE(adapt_quantum_odd_round_down) {
-    /* With q=7: remainder 3 < threshold 4 → round down */
+    /* With q=7: remainder 3 < threshold 4 -> round down */
     tl_ts_t result = tl__adaptive_snap_to_quantum(10.0, 7, 5);
-    TEST_ASSERT_EQ(7, result);  /* 10 → qid=1, snapped=7, rem=3, 3<4 → 7 */
+    TEST_ASSERT_EQ(7, result);  /* 10 -> qid=1, snapped=7, rem=3, 3<4 -> 7 */
 }
 
 TEST_DECLARE(adapt_quantum_odd_round_up) {
-    /* With q=7: remainder 4 >= threshold 4 → round up */
+    /* With q=7: remainder 4 >= threshold 4 -> round up */
     tl_ts_t result = tl__adaptive_snap_to_quantum(11.0, 7, 5);
-    TEST_ASSERT_EQ(14, result);  /* 11 → qid=1, snapped=7, rem=4, 4>=4 → 14 */
+    TEST_ASSERT_EQ(14, result);  /* 11 -> qid=1, snapped=7, rem=4, 4>=4 -> 14 */
 }
 
 TEST_DECLARE(adapt_quantum_odd_boundary) {
     /* With q=7: test the exact threshold boundary */
-    /* remainder 3 → down, remainder 4 → up */
+    /* remainder 3 -> down, remainder 4 -> up */
     tl_ts_t down = tl__adaptive_snap_to_quantum(17.0, 7, 5);  /* rem=3 */
     tl_ts_t up = tl__adaptive_snap_to_quantum(18.0, 7, 5);    /* rem=4 */
-    TEST_ASSERT_EQ(14, down);  /* 17 → qid=2, snapped=14, rem=3, 3<4 → 14 */
-    TEST_ASSERT_EQ(21, up);    /* 18 → qid=2, snapped=14, rem=4, 4>=4 → 21 */
+    TEST_ASSERT_EQ(14, down);  /* 17 -> qid=2, snapped=14, rem=3, 3<4 -> 14 */
+    TEST_ASSERT_EQ(21, up);    /* 18 -> qid=2, snapped=14, rem=4, 4>=4 -> 21 */
 }
 
 TEST_DECLARE(adapt_quantum_odd_larger) {
     /* Odd quantum = 13: threshold = (13+1)/2 = 7 */
-    /* rem 0-6 → down, rem 7-12 → up */
+    /* rem 0-6 -> down, rem 7-12 -> up */
     tl_ts_t result1 = tl__adaptive_snap_to_quantum(26.0, 13, 5);  /* rem=0 */
     tl_ts_t result2 = tl__adaptive_snap_to_quantum(32.0, 13, 5);  /* rem=6 */
     tl_ts_t result3 = tl__adaptive_snap_to_quantum(33.0, 13, 5);  /* rem=7 */
-    TEST_ASSERT_EQ(26, result1);  /* exact multiple → no change */
-    TEST_ASSERT_EQ(26, result2);  /* 32 → snapped=26, rem=6, 6<7 → 26 */
-    TEST_ASSERT_EQ(39, result3);  /* 33 → snapped=26, rem=7, 7>=7 → 39 */
+    TEST_ASSERT_EQ(26, result1);  /* exact multiple -> no change */
+    TEST_ASSERT_EQ(26, result2);  /* 32 -> snapped=26, rem=6, 6<7 -> 26 */
+    TEST_ASSERT_EQ(39, result3);  /* 33 -> snapped=26, rem=7, 7>=7 -> 39 */
 }
 
 /*===========================================================================
@@ -504,12 +504,12 @@ TEST_DECLARE(adapt_span_single_point) {
 
 TEST_DECLARE(adapt_span_negative) {
     int64_t span = tl__adaptive_compute_span(1000, 500);
-    TEST_ASSERT_EQ(0, span);  /* Invalid: max < min → 0 */
+    TEST_ASSERT_EQ(0, span);  /* Invalid: max < min -> 0 */
 }
 
 TEST_DECLARE(adapt_span_overflow) {
     int64_t span = tl__adaptive_compute_span(TL_TS_MIN, TL_TS_MAX);
-    TEST_ASSERT_EQ(0, span);  /* Would overflow → 0 */
+    TEST_ASSERT_EQ(0, span);  /* Would overflow -> 0 */
 }
 
 TEST_DECLARE(adapt_span_large_valid) {
@@ -527,7 +527,7 @@ TEST_DECLARE(adapt_span_large_valid) {
  *===========================================================================*/
 
 TEST_DECLARE(adapt_fallback_disabled) {
-    /* Adaptive disabled → return current_window */
+    /* Adaptive disabled -> return current_window */
     tl_adaptive_config_t cfg = {0};  /* target_records = 0 */
     tl_adaptive_state_t state = make_initialized_state(1.0);
 
@@ -536,7 +536,7 @@ TEST_DECLARE(adapt_fallback_disabled) {
 }
 
 TEST_DECLARE(adapt_fallback_warmup) {
-    /* Warmup not complete → return current_window */
+    /* Warmup not complete -> return current_window */
     tl_adaptive_config_t cfg = make_test_config();
     cfg.warmup_flushes = 10;
 
@@ -548,7 +548,7 @@ TEST_DECLARE(adapt_fallback_warmup) {
 }
 
 TEST_DECLARE(adapt_fallback_no_ewma) {
-    /* EWMA not initialized → return current_window */
+    /* EWMA not initialized -> return current_window */
     tl_adaptive_config_t cfg = make_test_config();
     tl_adaptive_state_t state = {0};
     state.flush_count = 100;  /* Past warmup */
@@ -559,7 +559,7 @@ TEST_DECLARE(adapt_fallback_no_ewma) {
 }
 
 TEST_DECLARE(adapt_fallback_zero_density) {
-    /* ewma_density <= 0 → return current_window */
+    /* ewma_density <= 0 -> return current_window */
     tl_adaptive_config_t cfg = make_test_config();
     tl_adaptive_state_t state = make_initialized_state(0.0);
 
@@ -568,7 +568,7 @@ TEST_DECLARE(adapt_fallback_zero_density) {
 }
 
 TEST_DECLARE(adapt_fallback_stale) {
-    /* Density stale → return current_window */
+    /* Density stale -> return current_window */
     tl_adaptive_config_t cfg = make_test_config();
     cfg.stale_flushes = 5;
 
@@ -595,7 +595,7 @@ TEST_DECLARE(adapt_fallback_stale_zero) {
 }
 
 TEST_DECLARE(adapt_fallback_candidate_zero) {
-    /* Candidate <= 0 (from overflow/bad math) → return current_window */
+    /* Candidate <= 0 (from overflow/bad math) -> return current_window */
     tl_adaptive_config_t cfg = make_test_config();
     cfg.target_records = 0;  /* Would cause division issues if not caught */
 
@@ -618,10 +618,10 @@ TEST_DECLARE(adapt_compute_basic) {
     cfg.hysteresis_pct = 5;  /* 5% threshold */
     cfg.window_quantum = 0;   /* No snapping */
 
-    /* density = 1.0, target = 10000 → candidate = 10000 */
+    /* density = 1.0, target = 10000 -> candidate = 10000 */
     tl_adaptive_state_t state = make_initialized_state(1.0);
 
-    /* current_window = 5000, candidate = 10000 → 100% change > 5% */
+    /* current_window = 5000, candidate = 10000 -> 100% change > 5% */
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 5000);
 
     /* Expected: 10000 (clamped to [1000, 100000]) */
@@ -635,7 +635,7 @@ TEST_DECLARE(adapt_compute_with_guardrails) {
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 0;
 
-    /* density = 0.5, target = 10000 → candidate = 20000 (> max) */
+    /* density = 0.5, target = 10000 -> candidate = 20000 (> max) */
     tl_adaptive_state_t state = make_initialized_state(0.5);
 
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 6000);
@@ -647,7 +647,7 @@ TEST_DECLARE(adapt_compute_with_quantum) {
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 1000;
 
-    /* density = 0.95, target = 10000 → candidate ≈ 10526 */
+    /* density = 0.95, target = 10000 -> candidate ~ 10526 */
     tl_adaptive_state_t state = make_initialized_state(0.95);
 
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 5000);
@@ -660,16 +660,16 @@ TEST_DECLARE(adapt_compute_hysteresis_blocks) {
     cfg.hysteresis_pct = 20;  /* 20% threshold */
     cfg.window_quantum = 0;
 
-    /* density = 1.0, target = 10000 → candidate = 10000 */
+    /* density = 1.0, target = 10000 -> candidate = 10000 */
     tl_adaptive_state_t state = make_initialized_state(1.0);
 
-    /* current = 9000, candidate = 10000 → 11% change < 20% threshold */
+    /* current = 9000, candidate = 10000 -> 11% change < 20% threshold */
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 9000);
     TEST_ASSERT_EQ(9000, result);  /* Hysteresis blocks change */
 }
 
 TEST_DECLARE(adapt_compute_full_pipeline) {
-    /* Test all stages: compute → backoff → guardrails → hysteresis → quantum */
+    /* Test all stages: compute -> backoff -> guardrails -> hysteresis -> quantum */
     tl_adaptive_config_t cfg = make_test_config();
     cfg.target_records = 10000;
     cfg.min_window = 1000;
@@ -682,7 +682,7 @@ TEST_DECLARE(adapt_compute_full_pipeline) {
     cfg.failure_backoff_threshold = 3;
     cfg.failure_backoff_pct = 20;
 
-    /* density = 2.0, target = 10000 → candidate = 5000 */
+    /* density = 2.0, target = 10000 -> candidate = 5000 */
     tl_adaptive_state_t state = make_initialized_state(2.0);
 
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 10000);
@@ -701,7 +701,7 @@ TEST_DECLARE(adapt_failure_backoff_trigger) {
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 0;
 
-    /* density = 2.0, target = 10000 → candidate = 5000 */
+    /* density = 2.0, target = 10000 -> candidate = 5000 */
     tl_adaptive_state_t state = make_initialized_state(2.0);
     state.consecutive_failures = 3;  /* At threshold */
 
@@ -713,7 +713,7 @@ TEST_DECLARE(adapt_failure_backoff_trigger) {
 TEST_DECLARE(adapt_failure_backoff_clamp) {
     tl_adaptive_config_t cfg = make_test_config();
     cfg.failure_backoff_threshold = 1;
-    cfg.failure_backoff_pct = 1000;  /* 1000% increase → way above max */
+    cfg.failure_backoff_pct = 1000;  /* 1000% increase -> way above max */
     cfg.max_window = 10000;
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 0;
@@ -748,16 +748,16 @@ TEST_DECLARE(adapt_failure_increment) {
  *===========================================================================*/
 
 TEST_DECLARE(adapt_prop_monotonicity) {
-    /* ↑density → ↓window (inverse relationship) */
+    /* updensity -> downwindow (inverse relationship) */
     tl_adaptive_config_t cfg = make_test_config();
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 0;
 
-    /* Low density → large window */
+    /* Low density -> large window */
     tl_adaptive_state_t state_low = make_initialized_state(0.5);
     tl_ts_t window_low = tl_adaptive_compute_candidate(&state_low, &cfg, 5000);
 
-    /* High density → small window */
+    /* High density -> small window */
     tl_adaptive_state_t state_high = make_initialized_state(5.0);
     tl_ts_t window_high = tl_adaptive_compute_candidate(&state_high, &cfg, 5000);
 
@@ -783,13 +783,13 @@ TEST_DECLARE(adapt_inv_within_guardrails) {
     cfg.hysteresis_pct = 0;
     cfg.window_quantum = 0;
 
-    /* Test with very low density → would want huge window */
+    /* Test with very low density -> would want huge window */
     tl_adaptive_state_t state1 = make_initialized_state(0.001);
     tl_ts_t result1 = tl_adaptive_compute_candidate(&state1, &cfg, 5000);
     TEST_ASSERT(result1 <= 8000);
     TEST_ASSERT(result1 >= 2000);
 
-    /* Test with very high density → would want tiny window */
+    /* Test with very high density -> would want tiny window */
     tl_adaptive_state_t state2 = make_initialized_state(100000.0);
     tl_ts_t result2 = tl_adaptive_compute_candidate(&state2, &cfg, 5000);
     TEST_ASSERT(result2 <= 8000);
@@ -831,7 +831,7 @@ TEST_DECLARE(adapt_edge_inf_density) {
     tl_adaptive_state_t state = make_initialized_state(INFINITY);
 
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 5000);
-    /* Inf density → zero window → fallback */
+    /* Inf density -> zero window -> fallback */
     TEST_ASSERT(result > 0);
 }
 

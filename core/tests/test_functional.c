@@ -585,7 +585,7 @@ TEST_DECLARE(func_count_respects_tombstone_watermark_tie) {
     /* Reinsert at higher watermark (active source, treated as visible). */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
 
-    /* Second tombstone at seq 4: max_seq(4) > reinsert seq(3) → reinsert is
+    /* Second tombstone at seq 4: max_seq(4) > reinsert seq(3) -> reinsert is
      * tombstoned. Both the original (L0, watermark=1) and the reinsert (active,
      * watermark=3) are covered by the coalesced tombstone [100,101) max_seq=4. */
     TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
@@ -1183,7 +1183,7 @@ TEST_DECLARE(func_iter_tombstone_multi_segment) {
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 100));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
-    /* Delete [25, 45) — removes ts=30, ts=40 */
+    /* Delete [25, 45) - removes ts=30, ts=40 */
     TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 25, 45));
 
     tl_snapshot_t* snap = NULL;
@@ -1440,7 +1440,7 @@ TEST_DECLARE(func_stats_with_tombstones) {
     tl_stats_t stats;
     TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
 
-    /* Active buffers now filtered: ts=200 covered by [150,250) → 2 visible.
+    /* Active buffers now filtered: ts=200 covered by [150,250) -> 2 visible.
      * Tombstone count remains 1 (raw). */
     TEST_ASSERT_EQ(2, stats.records_estimate);
     TEST_ASSERT_EQ(1, stats.tombstone_count);
@@ -2077,18 +2077,18 @@ TEST_DECLARE(func_compact_on_drop_handle_invoked) {
 }
 
 /*===========================================================================
- * C-10: Window Grid Freeze Test
+ * Window Grid Freeze Test
  *
  * Verifies that after L1 segments are created, subsequent compactions
- * maintain L1 non-overlap invariant (which C-10 protects by freezing the
+ * maintain L1 non-overlap invariant (protected by freezing the
  * window grid once L1 exists).
  *===========================================================================*/
 
 TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     /*
-     * C-10 TEST: Verify L1 non-overlap is maintained across multiple compactions.
+     * Verify L1 non-overlap is maintained across multiple compactions.
      *
-     * The C-10 fix freezes the window grid after first L1 creation, preventing
+     * The freeze keeps window boundaries stable after first L1 creation, preventing
      * adaptive segmentation from changing window boundaries mid-stream. This
      * test verifies the invariant is preserved by:
      * 1. Creating L1 segments through compaction
@@ -2116,7 +2116,7 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
     /* Compact - should create L1 segment for window 0 */
-    /* After this, window_grid_frozen should be true (C-10) */
+    /* After this, window_grid_frozen should be true. */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     while (tl_maint_step(tl) == TL_OK) {}
 
@@ -2131,7 +2131,7 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
     /* Compact again - should create L1 segment for window 1 */
-    /* C-10 ensures window boundaries don't change, maintaining non-overlap */
+    /* Frozen grid keeps window boundaries stable and preserves non-overlap. */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     while (tl_maint_step(tl) == TL_OK) {}
 
@@ -2575,10 +2575,10 @@ TEST_DECLARE(func_smoke_high_volume_append_iterate) {
 }
 
 /*===========================================================================
- * Skip-Ahead Seek Tests (C-02 Fix Verification)
+ * Skip-Ahead Seek Tests
  *
  * These tests verify that tl_kmerge_iter_seek() correctly preserves buffered
- * records >= target timestamp. The bug (C-02 / QUERY-1.1) was that seek()
+ * records >= target timestamp. A prior regression was that seek()
  * cleared the entire heap, losing prefetched records that should be preserved.
  *===========================================================================*/
 
@@ -2808,7 +2808,7 @@ TEST_DECLARE(func_seek_multiple_sources_all_below_target) {
 }
 
 /*===========================================================================
- * T-23: Tombstone Skip-Ahead Correctness
+ * Tombstone Skip-Ahead Correctness
  *
  * Records at [10,15,20,25,30]. Delete [12,22). Query full range.
  * Verify records 10, 25, 30 are returned (15, 20 are tombstoned).
@@ -2829,7 +2829,7 @@ TEST_DECLARE(func_tombstone_skip_ahead_correctness) {
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 25, 25));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
 
-    /* Delete range [12, 22) — covers ts=15 and ts=20 */
+    /* Delete range [12, 22) - covers ts=15 and ts=20 */
     TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 12, 22));
 
     /* Flush to create L0 segment with tombstones */
@@ -2863,9 +2863,9 @@ TEST_DECLARE(func_tombstone_skip_ahead_correctness) {
 }
 
 /*===========================================================================
- * T-37: Segment Refcount Leak Detection (Full Lifecycle)
+ * Segment Refcount Leak Detection (Full Lifecycle)
  *
- * Full lifecycle: append → seal → flush → compact → close.
+ * Full lifecycle: append -> seal -> flush -> compact -> close.
  * Verify no crashes or leaks (ASan will catch actual leaks).
  *===========================================================================*/
 
@@ -2898,7 +2898,7 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
 
     tl_snapshot_release(snap);
 
-    /* Phase 3: Compact L0 → L1 */
+    /* Phase 3: Compact L0 -> L1 */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     tl_status_t st;
     do {
@@ -2924,15 +2924,15 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
     tl_iter_destroy(it);
     tl_snapshot_release(snap);
 
-    /* Phase 5: Close — ASan will catch any refcount leaks */
+    /* Phase 5: Close - ASan will catch any refcount leaks */
     tl_close(tl);
 }
 
 /*===========================================================================
- * T-40: Snapshot Isolation + Drop Callback
+ * Snapshot Isolation + Drop Callback
  *
- * Append → snapshot S1 → delete range → compact → S1 still sees records
- * → release S1.
+ * Append -> snapshot S1 -> delete range -> compact -> S1 still sees records
+ * -> release S1.
  *===========================================================================*/
 
 TEST_DECLARE(func_snapshot_isolation_with_drop_callback) {
@@ -2958,7 +2958,7 @@ TEST_DECLARE(func_snapshot_isolation_with_drop_callback) {
     tl_snapshot_t* snap_before = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap_before));
 
-    /* Delete range [150, 250) — covers ts=200 */
+    /* Delete range [150, 250) - covers ts=200 */
     TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 150, 250));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
@@ -3013,7 +3013,7 @@ TEST_DECLARE(func_snapshot_isolation_with_drop_callback) {
 }
 
 /*===========================================================================
- * T-28: Multi-Source Determinism (Same Timestamp)
+ * Multi-Source Determinism (Same Timestamp)
  *
  * Insert records at the same timestamp across multiple components
  * (memtable + flushed segments). Verify stable deterministic output.
@@ -3182,7 +3182,7 @@ void run_functional_tests(void) {
     /* Compaction callback tests (1 test) - uses on_drop callback */
     RUN_TEST(func_compact_on_drop_handle_invoked);
 
-    /* C-10: Window grid freeze test (1 test) - verifies L1 non-overlap invariant */
+    /* Window grid freeze test (1 test) - verifies L1 non-overlap invariant */
     RUN_TEST(func_compact_c10_l1_nonoverlap_preserved);
 
     /* Failure handling tests (4 tests) - uses allocator/log hooks */
@@ -3194,22 +3194,22 @@ void run_functional_tests(void) {
     /* Stress smoke test (small scale, always-on) */
     RUN_TEST(func_smoke_high_volume_append_iterate);
 
-    /* Skip-ahead seek tests (4 tests) - C-02 fix verification */
+    /* Skip-ahead seek tests (4 tests) */
     RUN_TEST(func_seek_preserves_buffered_records_multi_source);
     RUN_TEST(func_seek_preserves_entry_at_exact_target);
     RUN_TEST(func_seek_mixed_preserve_and_pop);  /* Core bug scenario */
     RUN_TEST(func_seek_multiple_sources_all_below_target);
 
-    /* Tombstone skip-ahead correctness (1 test) - T-23 */
+    /* Tombstone skip-ahead correctness (1 test) */
     RUN_TEST(func_tombstone_skip_ahead_correctness);
 
-    /* Full lifecycle refcount leak detection (1 test) - T-37 */
+    /* Full lifecycle refcount leak detection (1 test) */
     RUN_TEST(func_lifecycle_no_segment_refcount_leak);
 
-    /* Snapshot isolation with drop callback (1 test) - T-40 */
+    /* Snapshot isolation with drop callback (1 test) */
     RUN_TEST(func_snapshot_isolation_with_drop_callback);
 
-    /* Multi-source determinism (1 test) - T-28 */
+    /* Multi-source determinism (1 test) */
     RUN_TEST(func_determinism_multi_source_same_timestamp);
 
     /*

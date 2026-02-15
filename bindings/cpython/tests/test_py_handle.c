@@ -1,6 +1,6 @@
 /**
  * @file test_py_handle.c
- * @brief Unit tests for Python handle context (LLD-B1)
+ * @brief Unit tests for Python handle context
  *
  * Tests the lock-free queue, pin tracking, and drain logic
  * without requiring a running Timelog instance.

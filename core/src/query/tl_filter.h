@@ -12,7 +12,7 @@
  * Uses a cursor-based approach for efficient filtering with amortized O(1)
  * per-record cost.
  *
- * Algorithm (Read Path LLD Section 7):
+ * Algorithm:
  * 1. Get next record from merge iterator
  * 2. Check if record's timestamp is deleted using tombstone cursor
  * 3. If deleted, skip and repeat
@@ -25,8 +25,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Underlying merge iterator must remain valid
- *
- * Reference: Read Path LLD Section 7
  *===========================================================================*/
 
 typedef struct tl_filter_iter {
@@ -75,9 +73,7 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out);
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_filter_iter_done(const tl_filter_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;

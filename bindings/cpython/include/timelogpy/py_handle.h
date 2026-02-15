@@ -1,6 +1,6 @@
 /**
  * @file py_handle.h
- * @brief Python handle and lifetime management subsystem (LLD-B1)
+ * @brief Python handle and lifetime management subsystem
  *
  * This module provides the handle encoding/decoding and lifetime management
  * for storing CPython objects as tl_handle_t values in Timelog.
@@ -216,11 +216,8 @@ uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx);
 /*===========================================================================
  * On-Drop Callback (Invariant I4)
  *
- * Registered with Timelog via tl_config_t.on_drop_handle.
- * Called from flush or maintenance thread when records are physically reclaimed.
- *
- * CRITICAL: This function does NOT acquire GIL, does NOT call Python C-API,
- * and does NOT re-enter Timelog. It only enqueues to the lock-free stack.
+ * Called from flush/maintenance thread when records are physically reclaimed.
+ * Does NOT acquire GIL or call Python C-API. Enqueues to lock-free stack.
  *===========================================================================*/
 
 /**

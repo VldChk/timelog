@@ -31,14 +31,7 @@
  * Range Overlap
  *---------------------------------------------------------------------------*/
 
-/**
- * Compute intersection of two half-open ranges.
- *
- * Returns true if the intersection is non-empty, storing the result in
- * out_lo / out_hi / out_hi_unbounded.
- *
- * Both ranges can be bounded [a1, a2) or unbounded [a1, +inf).
- */
+/** Compute intersection of two half-open ranges. Returns true if non-empty. */
 TL_INLINE bool tl__range_overlap_half_open(tl_ts_t a1,
                                                    tl_ts_t a2,
                                                    bool a2_unbounded,
@@ -69,9 +62,7 @@ TL_INLINE bool tl__range_overlap_half_open(tl_ts_t a1,
  * Sorted-Array Binary Search Count
  *---------------------------------------------------------------------------*/
 
-/**
- * Count records in sorted array within [t1, t2) or [t1, +inf).
- */
+/** Count records in sorted array within [t1, t2) or [t1, +inf). */
 TL_INLINE uint64_t tl__count_records_sorted_range(
         const tl_record_t* data,
         size_t len,
@@ -94,10 +85,7 @@ TL_INLINE uint64_t tl__count_records_sorted_range(
  * Memrun Record Counting
  *---------------------------------------------------------------------------*/
 
-/**
- * Count records in memrun within [t1, t2) or [t1, +inf).
- * Sums across in-order run + all OOO runs.
- */
+/** Count records in memrun within [t1, t2). Sums run + OOO runs. */
 TL_INLINE uint64_t tl__count_records_in_memrun_range(
         const tl_memrun_t* mr,
         tl_ts_t t1,
@@ -119,10 +107,7 @@ TL_INLINE uint64_t tl__count_records_in_memrun_range(
     return total;
 }
 
-/**
- * Compute record bounds (min_ts, max_ts) for a memrun.
- * Returns false if the memrun has no records.
- */
+/** Compute record bounds for a memrun. Returns false if empty. */
 TL_INLINE bool tl__memrun_record_bounds(const tl_memrun_t* mr,
                                                 tl_ts_t* out_min,
                                                 tl_ts_t* out_max) {
@@ -160,13 +145,7 @@ TL_INLINE bool tl__memrun_record_bounds(const tl_memrun_t* mr,
  * Full-Extent Visible Counting (for tl_stats)
  *---------------------------------------------------------------------------*/
 
-/**
- * Count visible records in a segment (full extent).
- *
- * Gross = total records in segment.
- * Deduction = records in overlap of segment and tombstone where
- * tomb_seq > watermark.
- */
+/** Count visible records in a segment (full extent, tombstone-deducted). */
 TL_INLINE uint64_t tl__visible_records_in_segment(
         const tl_segment_t* seg,
         const tl_interval_t* tombs,
@@ -209,9 +188,7 @@ TL_INLINE uint64_t tl__visible_records_in_segment(
     return gross;
 }
 
-/**
- * Count visible records in a memrun (full extent).
- */
+/** Count visible records in a memrun (full extent, tombstone-deducted). */
 TL_INLINE uint64_t tl__visible_records_in_memrun(
         const tl_memrun_t* mr,
         const tl_interval_t* tombs,
@@ -260,13 +237,8 @@ TL_INLINE uint64_t tl__visible_records_in_memrun(
  *---------------------------------------------------------------------------*/
 
 /**
- * Count visible records in segment in [t1, t2) or [t1, +inf).
- *
- * Algorithm:
- * 1. Compute effective range = intersection of query [t1,t2) and source extent
- * 2. Gross = records in effective range (O(log P) via page fences)
- * 3. For each tombstone fragment: deduct records in triple-intersect
- *    (query intersect source intersect tombstone) where tomb_seq > watermark
+ * Count visible records in segment within [t1, t2).
+ * Uses triple-intersect (query x source x tombstone) for deductions.
  */
 TL_INLINE uint64_t tl__visible_records_in_segment_range(
         const tl_segment_t* seg,
@@ -323,12 +295,7 @@ TL_INLINE uint64_t tl__visible_records_in_segment_range(
     return gross;
 }
 
-/**
- * Count visible records in memrun in [t1, t2) or [t1, +inf).
- *
- * Same triple-intersect algorithm as segments but uses binary-search
- * on sorted record arrays instead of page fences.
- */
+/** Count visible records in memrun within [t1, t2). Triple-intersect via binary search. */
 TL_INLINE uint64_t tl__visible_records_in_memrun_range(
         const tl_memrun_t* mr,
         const tl_interval_t* tombs,
@@ -495,17 +462,8 @@ TL_INLINE uint64_t tl__count_active_visible_range(
                 continue;
             }
 
-            /*
-             * OOO runs have a source-level watermark, not per-record seqs.
-             * For counting, treat each record as having the run's applied_seq.
-             * But we do not have a seqs array; use the same watermark-based
-             * approach as immutable sources: if all tombstones have
-             * tomb_seq <= run.applied_seq, the run is fully visible in range.
-             * Otherwise we must scan record-by-record.
-             *
-             * Potential future optimization: could skip the per-record
-             * scan when all tombstones have max_seq <= run_watermark.
-             */
+            /* OOO runs have a source-level watermark, not per-record seqs.
+             * Must check each record against tombstone cursor individually. */
             tl_seq_t run_watermark = tl_ooorun_applied_seq(run);
             const tl_record_t* rdata = tl_ooorun_records(run);
             size_t rlen = tl_ooorun_len(run);

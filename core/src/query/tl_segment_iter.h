@@ -24,8 +24,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Segment must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 5.1
  *===========================================================================*/
 
 typedef struct tl_segment_iter {
@@ -104,9 +102,7 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target);
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_segment_iter_done(const tl_segment_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;

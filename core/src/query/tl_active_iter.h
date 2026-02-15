@@ -18,8 +18,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Memview must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 5.2
  *===========================================================================*/
 
 typedef struct tl_active_iter {
@@ -60,9 +58,7 @@ tl_status_t tl_active_iter_init(tl_active_iter_t* it,
                                  bool t2_unbounded,
                                  tl_alloc_ctx_t* alloc);
 
-/**
- * Destroy active iterator and free internal resources.
- */
+/** Destroy active iterator and free internal resources. */
 void tl_active_iter_destroy(tl_active_iter_t* it);
 
 /*===========================================================================
@@ -92,9 +88,7 @@ tl_status_t tl_active_iter_seek(tl_active_iter_t* it, tl_ts_t target);
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_active_iter_done(const tl_active_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;

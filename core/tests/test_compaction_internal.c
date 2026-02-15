@@ -1,10 +1,10 @@
 /*===========================================================================
  * test_compaction_internal.c - Compaction Internal Tests
  *
- * These tests verify LLD-level invariants and internal API behavior for
+ * These tests verify internal invariants and internal API behavior for
  * the compaction subsystem: selection, merge, publication, and retry logic.
  *
- * CLASSIFICATION: Internal (LLD-Driven)
+ * CLASSIFICATION: Internal
  * These are IMPLEMENTATION tests, not SPEC tests.
  *
  * If these tests fail, the cause could be:
@@ -12,8 +12,6 @@
  * 2. An intentional internal refactor (update test accordingly)
  *
  * These tests do NOT verify public API contracts - see test_functional.c.
- *
- * Part of Phase 10: Test Suite Reorganization
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -786,7 +784,7 @@ TEST_DECLARE(cint_delete_debt_unbounded_returns_max) {
     tl_close(tl);
 }
 /**
- * T-33: Delete Debt Extreme Range
+ * Delete Debt Extreme Range
  *
  * Tombstone covering extreme timestamp range [TL_TS_MIN, TL_TS_MAX).
  * Verify delete debt calculation doesn't overflow or crash.
@@ -1025,7 +1023,7 @@ void run_compaction_internal_tests(void) {
 #ifdef TL_TEST_HOOKS
     RUN_TEST(cint_delete_debt_matches_reference);
     RUN_TEST(cint_delete_debt_unbounded_returns_max);
-    /* Delete debt extreme range (1 test) - T-33 */
+    /* Delete debt extreme range (1 test) */
     RUN_TEST(cint_delete_debt_extreme_range);
     /* Delete debt + retry limit tests (3 tests) */
     RUN_TEST(cint_one_exhausts_retries);

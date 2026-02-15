@@ -38,9 +38,7 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out) {
         return st;
     }
 
-    /* Loop until we find a visible record or exhaust the merge iterator */
     for (;;) {
-        /* Fetch next record from merge iterator */
         tl_record_t rec;
         tl_seq_t watermark = 0;
         tl_status_t st = tl_kmerge_iter_next(it->merge, &rec, &watermark);
@@ -51,7 +49,6 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out) {
         }
 
         if (st != TL_OK) {
-            /* Propagate any error */
             it->done = true;
             return st;
         }
@@ -76,7 +73,6 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out) {
             continue;
         }
 
-        /* Record is visible - return it */
         *out = rec;
         return TL_OK;
     }

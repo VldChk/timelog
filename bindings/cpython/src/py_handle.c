@@ -2,7 +2,7 @@
  * @file py_handle.c
  * @brief Python handle and lifetime management subsystem implementation
  *
- * Implements the LLD-B1 specification for storing CPython objects as
+ * Implements the mechanism for storing CPython objects as
  * tl_handle_t values with correct lifetime management.
  *
  * Key design decisions:
@@ -17,9 +17,6 @@
  * - Pin decrement: RELEASE (ensures iterator operations visible to drain)
  * - Stack push CAS: RELEASE (make node fields visible)
  * - Stack exchange (drain): ACQ_REL (see all pushed nodes)
- *
- * See: docs/V2/timelog_v2_engineering_plan.md
- *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #include "timelogpy/py_handle.h"
@@ -178,11 +175,7 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
         return;
     }
 
-    /*
-     * Caller should have drained the queue before destruction.
-     * If not, we have a leak but cannot safely DECREF without GIL.
-     * Log a warning in debug builds.
-     */
+    /* Warn on leaked resources (cannot DECREF without GIL). */
 #ifndef NDEBUG
     tl_py_drop_node_t* remaining = atomic_load_explicit(
         &ctx->retired_head, memory_order_relaxed);
@@ -232,26 +225,13 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
 
 void tl_py_pins_enter(tl_py_handle_ctx_t* ctx)
 {
-    /*
-     * Memory ordering: RELAXED is sufficient here.
-     *
-     * The critical synchronization point is tl_snapshot_acquire() which
-     * has its own memory barriers. The pin increment just needs to be
-     * visible before any subsequent drain checks.
-     *
-     * See LLD-B1 Section 7.2: "increment pins **before** acquiring a
-     * Timelog snapshot" - the protocol, not the ordering, provides safety.
-     */
+    /* RELAXED: snapshot acquisition provides the actual memory barrier. */
     atomic_fetch_add_explicit(&ctx->pins, 1, memory_order_relaxed);
 }
 
 void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    /*
-     * GIL enforcement: drain may run, which calls Py_DECREF.
-     * PyGILState_Check() returns 1 if current thread holds the GIL.
-     */
     assert(PyGILState_Check() &&
            "tl_py_pins_exit_and_maybe_drain requires GIL");
 #endif
@@ -260,18 +240,11 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
         &ctx->pins, 1, memory_order_release);
 
 #ifndef NDEBUG
-    /*
-     * Pin underflow detection: if old_pins was 0, we wrapped to UINT64_MAX.
-     * This indicates a misuse (exit without enter) and will deadlock drain.
-     */
     assert(old_pins > 0 &&
-           "Pin underflow: tl_py_pins_exit called without matching enter");
+           "Pin underflow: exit called without matching enter");
 #endif
 
-    /*
-     * If we were the last pin holder (old_pins == 1 means new pins == 0),
-     * opportunistically drain retired objects.
-     */
+    /* Last pin holder: opportunistically drain retired objects. */
     if (old_pins == 1) {
         (void)tl_py_drain_retired(ctx, 0);
     }
@@ -279,11 +252,7 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 
 uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx)
 {
-    /*
-     * Cast away const for atomic_load_explicit.
-     * This is safe because atomic load doesn't modify semantic state.
-     * The const qualifier on ctx is for API clarity, not memory safety.
-     */
+    /* Cast away const: atomic_load does not modify semantic state. */
     return atomic_load_explicit(
         (_Atomic(uint64_t)*)&ctx->pins,
         memory_order_relaxed);
@@ -317,40 +286,21 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 
     tl_py_handle_ctx_t* ctx = (tl_py_handle_ctx_t*)on_drop_ctx;
 
-    /*
-     * Allocate node with libc malloc.
-     * We cannot use Python allocators here because:
-     * 1. We don't hold the GIL
-     * 2. Python allocator state may not be thread-safe without GIL
-     */
+    /* libc malloc -- no GIL held, cannot use Python allocators. */
     tl_py_drop_node_t* node = (tl_py_drop_node_t*)malloc(sizeof(*node));
     if (node == NULL) {
-        /*
-         * Allocation failure: increment counter and leak the object.
-         * This is unfortunate but necessary to avoid use-after-free.
-         * The object will never be DECREF'd, causing a memory leak.
-         *
-         * Policy rationale: leaking is safer than UAF. If we cannot
-         * enqueue the drop, we cannot safely DECREF (no GIL), and we
-         * cannot defer DECREF because we have nowhere to record it.
-         */
+        /* Leak the object rather than risk UAF without GIL. */
         atomic_fetch_add_explicit(&ctx->alloc_failures, 1, memory_order_relaxed);
         return;
     }
 
-    /* Initialize node fields BEFORE making visible via CAS */
+    /* Initialize fields before CAS publication. */
     node->obj = tl_py_handle_decode(handle);
     node->ts = ts;
 
     /*
-     * Treiber stack push (lock-free)
-     *
-     * Memory ordering:
-     * - RELAXED load of head: no ordering needed, just reading current value
-     * - RELEASE CAS: makes node fields visible to drain thread
-     * - RELAXED failure: will retry with updated expected value
-     *
-     * Using weak CAS is fine since we're in a loop anyway.
+     * Treiber stack push: RELEASE CAS makes node visible to drain.
+     * Weak CAS is fine since we loop on failure.
      */
     tl_py_drop_node_t* head;
     do {
@@ -363,7 +313,7 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
                 memory_order_release,
                 memory_order_relaxed));
 
-    /* Update metrics (relaxed is fine for counters) */
+    /* Metrics counter (relaxed). */
     atomic_fetch_add_explicit(&ctx->retired_count, 1, memory_order_relaxed);
 }
 
@@ -371,29 +321,17 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
  * Drain Implementation
  *
  * PRECONDITION: Caller must hold the GIL.
- *
- * This function performs the actual Py_DECREF operations for retired
- * objects. It runs on a Python thread to ensure:
- * 1. Finalizers (__del__) run on a proper Python thread
- * 2. No GIL acquisition needed (already held)
- * 3. Proper integration with Python's GC
+ * Performs deferred Py_DECREF for retired objects on a Python thread.
  *===========================================================================*/
 
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 {
 #ifndef NDEBUG
-    /*
-     * GIL enforcement: Py_DECREF can run arbitrary Python code via __del__.
-     * This MUST be called from a Python thread holding the GIL.
-     */
     assert(PyGILState_Check() &&
            "tl_py_drain_retired requires GIL");
 #endif
 
-    /*
-     * Reentrancy guard: prevent nested drains triggered via __del__.
-     * If already draining, bail out immediately.
-     */
+    /* Reentrancy guard: __del__ during Py_DECREF could re-enter drain. */
     if (atomic_flag_test_and_set_explicit(
             &ctx->drain_guard, memory_order_acquire)) {
         return 0;
@@ -402,29 +340,15 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
     size_t count = 0;
 
     /*
-     * Check pin count before draining.
-     *
-     * If pins > 0, snapshots/iterators are active and might still yield
-     * objects from the retired queue. Draining would cause use-after-free.
-     *
-     * Exception: force=1 is used during close() after verifying all
-     * iterators are released.
+     * Drain blocked while pins > 0 (active snapshots may reference
+     * retired objects). force=1 bypasses this during close().
      */
     uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_acquire);
     if (pins != 0 && !force) {
         goto out;
     }
 
-    /*
-     * Atomically claim the entire retired list.
-     *
-     * Memory ordering:
-     * - ACQ_REL: acquire semantics to see node fields written by on_drop,
-     *            release semantics to make our NULL write visible
-     *
-     * This makes the queue empty for subsequent on_drop calls.
-     * We process the claimed list exclusively.
-     */
+    /* Atomically claim entire list (ACQ_REL: see on_drop writes). */
     tl_py_drop_node_t* list = atomic_exchange_explicit(
         &ctx->retired_head, NULL, memory_order_acq_rel);
 
@@ -437,23 +361,13 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
         list_tail = list_tail->next;
     }
 
-    /*
-     * Batch limit: 0 = unlimited.
-     * When force=1 (close path), always drain everything regardless of limit.
-     * This prevents leaking objects when ctx is about to be destroyed.
-     */
+    /* force=1 overrides batch limit to prevent leaks at close. */
     uint32_t batch_limit = force ? 0 : ctx->drain_batch_limit;
 
     while (list != NULL) {
-        /* Check batch limit (0 = unlimited) */
         if (batch_limit != 0 && count >= batch_limit) {
-            /*
-             * Batch limit reached. Re-attach remaining nodes to queue.
-             * Must be done atomically in case on_drop is concurrent.
-             */
+            /* Re-attach remaining nodes atomically (on_drop may be concurrent). */
             tl_py_drop_node_t* remaining = list;
-
-            /* Atomically prepend remaining to current queue head */
             tl_py_drop_node_t* current_head;
             do {
                 current_head = atomic_load_explicit(
@@ -468,33 +382,21 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
             break;
         }
 
-        /* Process one node */
         tl_py_drop_node_t* node = list;
         list = node->next;
         if (list == NULL) {
             list_tail = NULL;
         }
 
-        /* Update live tracking before DECREF */
         tl_py_live_note_drop(ctx, node->obj);
 
-        /*
-         * CRITICAL: Py_DECREF may run arbitrary Python code via __del__.
-         *
-         * This is safe because:
-         * 1. We hold the GIL (precondition)
-         * 2. We're on a Python thread
-         * 3. The object is no longer reachable from Timelog
-         * 4. pins == 0 (no iterator can yield this object)
-         */
+        /* Safe: GIL held, object unreachable from Timelog, pins == 0. */
         Py_DECREF(node->obj);
 
-        /* Free the node (allocated with libc malloc) */
-        free(node);
+        free(node);  /* libc malloc'd in on_drop */
         count++;
     }
 
-    /* Update metrics */
     atomic_fetch_add_explicit(&ctx->drained_count, count, memory_order_relaxed);
 
 out:
@@ -681,11 +583,7 @@ void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx)
 
 uint64_t tl_py_retired_queue_len(const tl_py_handle_ctx_t* ctx)
 {
-    /*
-     * Cast away const for atomic_load_explicit.
-     * Note: drained_count is updated after re-attachment in batch mode,
-     * so this metric may briefly undercount. This is documented as approximate.
-     */
+    /* Approximate: may briefly undercount during batch re-attachment. */
     uint64_t retired = atomic_load_explicit(
         (_Atomic(uint64_t)*)&ctx->retired_count,
         memory_order_relaxed);
@@ -693,7 +591,7 @@ uint64_t tl_py_retired_queue_len(const tl_py_handle_ctx_t* ctx)
         (_Atomic(uint64_t)*)&ctx->drained_count,
         memory_order_relaxed);
 
-    /* Underflow protection (should never happen but defensive) */
+    /* Defensive underflow protection. */
     if (drained > retired) {
         return 0;
     }

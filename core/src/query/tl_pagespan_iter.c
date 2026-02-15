@@ -10,8 +10,6 @@
  * - Each view owns a reference to the owner
  * - Owner refcount is plain uint32_t (caller serialization required)
  * - Free owner before calling release hook (allocator lifetime safety)
- *
- * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
  *===========================================================================*/
 
 #include "tl_pagespan_iter.h"
@@ -177,7 +175,6 @@ void tl_pagespan_owner_decref(tl_pagespan_owner_t* owner) {
 /*===========================================================================
  * Segment Cursor Initialization
  *
- * Canonical algorithm from tl_segment_iter_init (Section 5.3 of plan).
  * Finds the page range [first, last) that overlaps with [t1, t2).
  *===========================================================================*/
 
@@ -253,7 +250,7 @@ static bool advance_to_next_segment(tl_pagespan_iter_t* it) {
                  * Correctness proof: L1 segments have strictly increasing min_ts.
                  * Invariants: (1) L1 sorted by window_start
                  *             (2) Non-overlapping: window_start[i] >= window_end[i-1]
-                 *             (3) Records in bounds: min_ts >= window_start (H-12)
+                 *             (3) Records in bounds: min_ts >= window_start
                  * Chain: min_ts[i] >= window_start[i] >= window_end[i-1] > max_ts[i-1]
                  *
                  * Therefore if min_ts >= t2, all later segments also have min_ts >= t2.
@@ -459,14 +456,11 @@ tl_status_t tl_pagespan_iter_next(
             const tl_page_t* page = meta->page;
 
             /*
-             * Page flag validation (B4/V1 constraint):
+             * Page flag validation:
              *
-             * V1/B4 only supports TL_PAGE_FULLY_LIVE. Any other state indicates
-             * corruption or a bug. We error out loudly rather than silently
-             * skipping, which could hide data loss.
-             *
-             * If V2 introduces PARTIAL_DELETED pages with row bitmaps, this
-             * code must be updated to handle visibility splitting.
+             * Current page-span iteration supports TL_PAGE_FULLY_LIVE pages.
+             * Any other state indicates corruption or an unsupported format,
+             * so fail loudly instead of silently skipping rows.
              */
             if (page->flags != TL_PAGE_FULLY_LIVE) {
                 /* Corruption or unsupported page state - internal error */
@@ -520,7 +514,7 @@ void tl_pagespan_iter_close(tl_pagespan_iter_t* it) {
     it->closed = true;
 
     /*
-     * CRITICAL: Free iterator BEFORE releasing owner reference (C-03 fix).
+     * Free iterator before releasing the owner reference.
      *
      * The owner's release hook may Py_DECREF the timelog, which owns the
      * allocator. If owner decref triggers destroy -> hook -> allocator freed,

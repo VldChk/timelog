@@ -12,8 +12,6 @@
  * These tests validate the foundational concurrency building blocks
  * that all higher-level components depend on.
  *
- * Part of Phase 10: Integration Testing and Hardening
- *
  * Migration Status: COMPLETE (migrated from test_phase1.c)
  * Note: Test names prefixed with "sync_" to avoid conflicts during migration.
  *===========================================================================*/

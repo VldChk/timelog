@@ -18,8 +18,6 @@
  * Usage pattern:
  *   if (tl_ts_before_end(ts, t2, t2_unbounded)) { ... }
  *   if (tl_range_overlaps(min, max, t1, t2, t2_unbounded)) { ... }
- *
- * Reference: plan_phase5.md Section 5.0
  *===========================================================================*/
 
 /**

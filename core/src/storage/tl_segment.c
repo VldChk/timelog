@@ -19,32 +19,21 @@ static void compute_tombstone_bounds(const tl_interval_t* tombstones, size_t n,
                                       tl_ts_t* out_min, tl_ts_t* out_max) {
     TL_ASSERT(n > 0 && tombstones != NULL);
 
-    /*
-     * M-04 fix: Single-pass algorithm with invariant-based assertion.
-     *
-     * Tombstones are canonicalized (non-empty, non-overlapping, sorted).
-     * For bounded intervals: end > start >= TL_TS_MIN, so end > TL_TS_MIN.
-     * This makes (end - 1) safe without saturation.
-     */
+    /* Tombstones are canonicalized, so end > start >= TL_TS_MIN
+     * and (end - 1) is always safe. */
     tl_ts_t min_ts = TL_TS_MAX;
     tl_ts_t max_ts = TL_TS_MIN;
 
     for (size_t i = 0; i < n; i++) {
         const tl_interval_t* t = &tombstones[i];
 
-        /* Track minimum start */
         if (t->start < min_ts) {
             min_ts = t->start;
         }
 
-        /* Track maximum end (inclusive) */
         if (t->end_unbounded) {
             max_ts = TL_TS_MAX;
         } else {
-            /*
-             * Invariant: tombstones are canonicalized, so t->end > t->start >= TL_TS_MIN.
-             * Therefore t->end > TL_TS_MIN, making (t->end - 1) safe.
-             */
             TL_ASSERT(t->end > t->start && "Tombstone must be non-empty (canonicalized)");
             tl_ts_t end_inclusive = t->end - 1;
             if (end_inclusive > max_ts) {
@@ -105,23 +94,18 @@ static void segment_destroy(tl_segment_t* seg) {
     TL_ASSERT(seg != NULL);
     tl_alloc_ctx_t* alloc = seg->alloc;
 
-    /* Destroy all pages */
     for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
         tl_page_t* page = seg->catalog.pages[i].page;
         tl_page_destroy(page, alloc);
     }
 
-    /* Destroy catalog (frees metadata array, not pages) */
     tl_page_catalog_destroy(&seg->catalog);
 
     if (seg->page_prefix_counts != NULL) {
         TL_FREE(alloc, seg->page_prefix_counts);
     }
 
-    /* Destroy tombstones */
     destroy_tombstones(seg->tombstones, alloc);
-
-    /* Free segment itself */
     TL_FREE(alloc, seg);
 }
 
@@ -140,20 +124,14 @@ static tl_status_t build_pages(tl_segment_t* seg,
     tl_page_builder_init(&pb, alloc, target_page_bytes);
 
     size_t cap = pb.records_per_page;
-    /*
-     * M-05 fix: Overflow-safe ceiling division.
-     * The naive (a + b - 1) / b can overflow if a + b - 1 > SIZE_MAX.
-     * This equivalent form avoids overflow: a/b + (a%b != 0 ? 1 : 0)
-     */
+    /* Overflow-safe ceiling division */
     size_t n_pages = record_count / cap + (record_count % cap != 0 ? 1 : 0);
 
-    /* Reserve catalog space */
     tl_status_t st = tl_page_catalog_reserve(&seg->catalog, n_pages);
     if (st != TL_OK) {
         return st;
     }
 
-    /* Build pages */
     size_t offset = 0;
     while (offset < record_count) {
         size_t chunk = record_count - offset;
@@ -212,7 +190,6 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
 
-    /* Must have either records or tombstones */
     if (record_count == 0 && tombstones_len == 0) {
         return TL_EINVAL;
     }
@@ -220,15 +197,11 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
-    /* Check tombstones_len overflow */
     if (tombstones_len > UINT32_MAX) {
         return TL_EINVAL;
     }
 
-    /*
-     * Validate pointers when counts are non-zero (C-04 fix).
-     * memcpy with NULL src is undefined behavior per C17 §7.1.4.
-     */
+    /* NULL pointer with non-zero count is UB for memcpy */
     if (tombstones_len > 0 && tombstones == NULL) {
         return TL_EINVAL;
     }
@@ -236,8 +209,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
-    /* Validate tombstone intervals for release builds as well.
-     * This protects callers that bypass debug-only validators. */
+    /* Validate tombstone intervals (release-mode safety) */
     for (size_t i = 0; i < tombstones_len; i++) {
         const tl_interval_t* cur = &tombstones[i];
         if (cur->max_seq == 0 || cur->max_seq > applied_seq) {
@@ -268,7 +240,6 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         }
     }
 
-    /* Allocate segment */
     tl_segment_t* seg = TL_NEW(alloc, tl_segment_t);
     if (seg == NULL) {
         return TL_ENOMEM;
@@ -280,7 +251,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->applied_seq = applied_seq;
     seg->window_start = 0;
     seg->window_end = 0;
-    seg->window_end_unbounded = false;  /* L0 doesn't use windows */
+    seg->window_end_unbounded = false;
     seg->record_min_ts = 0;
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
@@ -288,24 +259,15 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
-    /* Initialize catalog */
     tl_page_catalog_init(&seg->catalog, alloc);
 
-    /* Create tombstones (copies the array) */
     tl_status_t st = create_tombstones(alloc, tombstones, tombstones_len, &seg->tombstones);
     if (st != TL_OK) {
-        /*
-         * Cleanup: destroy catalog for consistency with build_pages error path.
-         * Note: catalog.pages is NULL at this point (no reserve called yet),
-         * so destroy is a no-op. However, calling it maintains consistent
-         * cleanup patterns and is defensive against future changes.
-         */
         tl_page_catalog_destroy(&seg->catalog);
         TL_FREE(alloc, seg);
         return st;
     }
 
-    /* Build pages if we have records */
     if (record_count > 0) {
         TL_ASSERT(records != NULL);
         st = build_pages(seg, records, record_count, target_page_bytes);
@@ -317,7 +279,6 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         }
     }
 
-    /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
 
@@ -340,14 +301,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         }
     }
 
-    /*
-     * Compute bounds.
-     *
-     * L0 segment bounds must cover BOTH records AND tombstones.
-     * This is required for correct query planning and compaction selection.
-     * A read in range [A, B) must consider any L0 segment whose bounds
-     * overlap [A, B), and tombstones affect what data is visible.
-     */
+    /* L0 bounds must cover both records and tombstones for correct overlap checks */
     if (record_count > 0) {
         seg->record_min_ts = seg->catalog.pages[0].min_ts;
         seg->record_max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
@@ -358,15 +312,12 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     }
 
     if (record_count > 0 && tombstones_len > 0) {
-        /* Both records and tombstones: union of bounds */
         seg->min_ts = TL_MIN(seg->record_min_ts, seg->tomb_min_ts);
         seg->max_ts = TL_MAX(seg->record_max_ts, seg->tomb_max_ts);
     } else if (record_count > 0) {
-        /* Records only: bounds from pages */
         seg->min_ts = seg->record_min_ts;
         seg->max_ts = seg->record_max_ts;
     } else {
-        /* Tombstone-only: bounds from tombstones */
         TL_ASSERT(tombstones_len > 0);
         seg->min_ts = seg->tomb_min_ts;
         seg->max_ts = seg->tomb_max_ts;
@@ -390,11 +341,11 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  tl_segment_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
-    *out = NULL;  /* Defensive initialization per C-05 fix */
+    *out = NULL;  /* Defensive initialization */
 
-    /* C-05 fix: Runtime check for L1 unbounded invariant.
+    /* Runtime check for L1 unbounded invariant.
      * TL_ASSERT becomes UB in release builds, so this defensive check
-     * ensures future callers cannot create invalid L1 segments.
+     * ensures callers cannot create invalid L1 segments.
      * Invariant: window_end_unbounded implies window_end == TL_TS_MAX */
     if (window_end_unbounded && window_end != TL_TS_MAX) {
         return TL_EINVAL;
@@ -409,7 +360,6 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
         return TL_EINVAL;
     }
 
-    /* Allocate segment */
     tl_segment_t* seg = TL_NEW(alloc, tl_segment_t);
     if (seg == NULL) {
         return TL_ENOMEM;
@@ -422,7 +372,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->window_start = window_start;
     seg->window_end = window_end;
     seg->window_end_unbounded = window_end_unbounded;
-    seg->tombstones = NULL;  /* L1 never has tombstones */
+    seg->tombstones = NULL;
     seg->record_min_ts = 0;
     seg->record_max_ts = 0;
     seg->tomb_min_ts = 0;
@@ -430,10 +380,8 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
-    /* Initialize catalog */
     tl_page_catalog_init(&seg->catalog, alloc);
 
-    /* Build pages */
     tl_status_t st = build_pages(seg, records, record_count, target_page_bytes);
     if (st != TL_OK) {
         tl_page_catalog_destroy(&seg->catalog);
@@ -441,7 +389,6 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
         return st;
     }
 
-    /* Set counts */
     seg->record_count = (uint64_t)record_count;
     seg->page_count = seg->catalog.n_pages;
 
@@ -463,13 +410,13 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
         }
     }
 
-    /* Bounds from pages */
+    /* L1 has no tombstones, so bounds == page bounds */
     seg->record_min_ts = seg->catalog.pages[0].min_ts;
     seg->record_max_ts = seg->catalog.pages[seg->catalog.n_pages - 1].max_ts;
     seg->min_ts = seg->record_min_ts;
     seg->max_ts = seg->record_max_ts;
 
-    /* H-12: Enforce records within window in release builds */
+    /* Release-mode validation: records must be within window [start, end) */
     if (seg->min_ts < window_start ||
         (!window_end_unbounded && seg->max_ts >= window_end)) {
         segment_destroy(seg);
@@ -502,7 +449,7 @@ void tl_segment_release(tl_segment_t* seg) {
      * Release ordering ensures all prior writes to segment data are visible
      * to the thread that will destroy the segment.
      *
-     * M-08: The atomic fetch_sub + post-assertion is correct and race-free.
+     * The atomic fetch_sub + post-assertion is correct and race-free.
      * Do NOT add a pre-check load (TOCTOU race). If old==0 after decrement,
      * this indicates a double-release bug which the assertion catches.
      */
@@ -520,34 +467,12 @@ void tl_segment_release(tl_segment_t* seg) {
 /* Include for tl_intervals_arr_validate */
 #include "../internal/tl_intervals.h"
 
-/**
- * Validate segment invariants.
- *
- * L0 Invariants:
- * 1. window_start == window_end == 0
- * 2. Tombstones allowed (validated via shared validator)
- * 3. Bounds COVER both page bounds AND tombstone bounds
- *
- * L1 Invariants:
- * 1. tombstones MUST be NULL (not just n==0)
- * 2. window_start < window_end OR window_end == TL_TS_MAX (unbounded)
- * 3. Records within window: min_ts >= window_start, max_ts < window_end
- *    (except for unbounded window_end == TL_TS_MAX)
- * 4. Bounds EQUAL page bounds (no tombstones to widen)
- *
- * Common Invariants:
- * 1. Valid level (L0 or L1)
- * 2. min_ts <= max_ts
- * 3. Page catalog validates
- * 4. Record count matches sum of page counts
- * 5. page_count == catalog.n_pages
- */
+/** Validate segment invariants (level-specific + common checks). */
 bool tl_segment_validate(const tl_segment_t* seg) {
     if (seg == NULL) {
         return false;
     }
 
-    /* Common: Check level is valid */
     if (seg->level != TL_SEG_L0 && seg->level != TL_SEG_L1) {
         return false;
     }
@@ -555,13 +480,7 @@ bool tl_segment_validate(const tl_segment_t* seg) {
         return false;
     }
 
-    /*
-     * CRITICAL: Validate page_count == catalog.n_pages BEFORE any indexing.
-     *
-     * If a segment is corrupted with page_count > 0 but catalog.n_pages == 0,
-     * we must detect this before attempting to access catalog.pages[0].
-     * Validation should return false, not crash.
-     */
+    /* Validate before indexing to avoid OOB on corrupted state */
     if (seg->page_count != seg->catalog.n_pages) {
         return false;
     }
@@ -570,12 +489,10 @@ bool tl_segment_validate(const tl_segment_t* seg) {
      * L0-Specific Validation
      *=========================================================================*/
     if (seg->level == TL_SEG_L0) {
-        /* L0: window bounds must be 0 */
         if (seg->window_start != 0 || seg->window_end != 0) {
             return false;
         }
 
-        /* L0: validate tombstones if present (using shared validator) */
         if (seg->tombstones != NULL && seg->tombstones->n > 0) {
             if (!tl_intervals_arr_validate(seg->tombstones->v, seg->tombstones->n)) {
                 return false;
@@ -588,21 +505,13 @@ bool tl_segment_validate(const tl_segment_t* seg) {
         }
 
         /*
-         * L0: Compute required coverage bounds from BOTH pages AND tombstones.
-         *
-         * The segment's min_ts/max_ts must COVER all content - i.e., they must
-         * be <= the minimum and >= the maximum of all pages and tombstones.
-         *
-         * IMPORTANT: We use an explicit has_content flag rather than sentinel
-         * checks like (required_min != TL_TS_MAX) because TL_TS_MAX is a valid
-         * timestamp. A segment with a single record at TL_TS_MAX must still
-         * have its bounds validated.
+         * Verify bounds cover all content (pages + tombstones).
+         * Use has_content flag since TL_TS_MAX is a valid timestamp.
          */
         bool has_content = false;
         tl_ts_t required_min = TL_TS_MAX;
         tl_ts_t required_max = TL_TS_MIN;
 
-        /* Page bounds contribute to required coverage */
         if (seg->catalog.n_pages > 0) {
             const tl_page_meta_t* first = &seg->catalog.pages[0];
             const tl_page_meta_t* last = &seg->catalog.pages[seg->catalog.n_pages - 1];
@@ -617,7 +526,6 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             has_content = true;
         }
 
-        /* Tombstone bounds ALSO contribute to required coverage */
         if (seg->tombstones != NULL && seg->tombstones->n > 0) {
             tl_ts_t tomb_min_check, tomb_max_check;
             compute_tombstone_bounds(seg->tombstones->v, seg->tombstones->n,
@@ -628,19 +536,16 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             if (seg->tomb_max_ts != tomb_max_check) {
                 return false;
             }
-            /* Minimum: first tombstone's start (tombstones are sorted) */
             tl_ts_t tomb_min = seg->tombstones->v[0].start;
             if (!has_content || tomb_min < required_min) {
                 required_min = tomb_min;
             }
 
-            /* Maximum: last tombstone's end (or TL_TS_MAX if unbounded) */
             const tl_interval_t* last_tomb = &seg->tombstones->v[seg->tombstones->n - 1];
             tl_ts_t tomb_max;
             if (last_tomb->end_unbounded) {
                 tomb_max = TL_TS_MAX;
             } else {
-                /* end is exclusive, max is inclusive: max_ts = end - 1 */
                 tomb_max = last_tomb->end - 1;
             }
             if (!has_content || tomb_max > required_max) {
@@ -649,17 +554,16 @@ bool tl_segment_validate(const tl_segment_t* seg) {
             has_content = true;
         }
 
-        /* L0: segment bounds must COVER all content */
         if (has_content) {
             if (seg->min_ts > required_min) {
-                return false;  /* Segment min doesn't cover content min */
+                return false;
             }
             if (seg->max_ts < required_max) {
-                return false;  /* Segment max doesn't cover content max */
+                return false;
             }
         }
 
-        /* L0 tombstone-only: must have tombstones if no pages/records */
+        /* Tombstone-only L0 must actually have tombstones */
         if (seg->catalog.n_pages == 0 && seg->record_count == 0) {
             if (seg->tombstones == NULL || seg->tombstones->n == 0) {
                 return false;
@@ -671,57 +575,37 @@ bool tl_segment_validate(const tl_segment_t* seg) {
      * L1-Specific Validation
      *=========================================================================*/
     else if (seg->level == TL_SEG_L1) {
-        /*
-         * L1: tombstones MUST be NULL (not just n==0)
-         *
-         * This is a strict invariant. L1 segments have tombstones folded
-         * during compaction - the pointer itself should be NULL.
-         */
+        /* L1 tombstones folded at compaction; pointer must be NULL */
         if (seg->tombstones != NULL) {
             return false;
         }
 
-        /* L1: must have records */
         if (seg->record_count == 0) {
             return false;
         }
 
-        /*
-         * L1: window bounds validation
-         *
-         * Normal case: window_start < window_end
-         * Unbounded-end: window_end_unbounded == true (covers all future timestamps)
-         *
-         * Invariant: window_end_unbounded implies window_end == TL_TS_MAX
-         */
         if (seg->window_end_unbounded) {
             if (seg->window_end != TL_TS_MAX) {
-                return false;  /* Invariant violation */
+                return false;
             }
         } else {
             if (seg->window_start >= seg->window_end) {
-                return false;  /* Bounded window must have start < end */
+                return false;
             }
         }
 
-        /* L1: records within window and bounds must EQUAL page bounds */
+        /* Records must be within window; bounds must equal page bounds */
         if (seg->catalog.n_pages > 0) {
-            /* min_ts must be >= window_start */
             if (seg->min_ts < seg->window_start) {
                 return false;
             }
 
-            /*
-             * For bounded windows: max_ts must be < window_end (half-open interval)
-             * For unbounded windows: no upper bound check needed
-             */
             if (!seg->window_end_unbounded) {
                 if (seg->max_ts >= seg->window_end) {
                     return false;
                 }
             }
 
-            /* L1: bounds must EQUAL page bounds (no tombstones to widen) */
             const tl_page_meta_t* first = &seg->catalog.pages[0];
             const tl_page_meta_t* last = &seg->catalog.pages[seg->catalog.n_pages - 1];
 
@@ -744,14 +628,10 @@ bool tl_segment_validate(const tl_segment_t* seg) {
      * Common Validation
      *=========================================================================*/
 
-    /* Common: min_ts <= max_ts */
     if (seg->min_ts > seg->max_ts) {
         return false;
     }
 
-    /* page_count == catalog.n_pages already validated at function entry */
-
-    /* Common: record count matches sum of page counts */
     uint64_t computed_records = 0;
     for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
         computed_records += seg->catalog.pages[i].count;
@@ -760,7 +640,6 @@ bool tl_segment_validate(const tl_segment_t* seg) {
         return false;
     }
 
-    /* Common: page catalog validates */
     if (!tl_page_catalog_validate(&seg->catalog)) {
         return false;
     }

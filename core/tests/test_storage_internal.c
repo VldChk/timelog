@@ -1,10 +1,10 @@
 /*===========================================================================
  * test_storage_internal.c - Storage Layer Internal Tests
  *
- * These tests verify LLD-level invariants and internal API behavior for
+ * These tests verify internal invariants and internal API behavior for
  * the storage layer: windows, pages, catalogs, segments, and manifests.
  *
- * CLASSIFICATION: Internal (LLD-Driven)
+ * CLASSIFICATION: Internal
  * These are IMPLEMENTATION tests, not SPEC tests.
  *
  * If these tests fail, the cause could be:
@@ -12,8 +12,6 @@
  * 2. An intentional internal refactor (update test accordingly)
  *
  * These tests do NOT verify public API contracts - see test_functional.c.
- *
- * Part of Phase 10: Test Suite Reorganization
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -78,7 +76,7 @@ TEST_DECLARE(storage_window_default_size) {
     TEST_ASSERT_EQ(TL_WINDOW_1H_NS, tl_window_default_size(TL_TIME_NS));
 }
 
-/* M-06 fix test: Unknown enum returns safe default */
+/* Unknown enum returns safe default */
 TEST_DECLARE(storage_window_default_size_unknown_enum) {
     /* Invalid enum value should return safe default (1 hour in seconds) */
     TEST_ASSERT_EQ(TL_WINDOW_1H_S, tl_window_default_size((tl_time_unit_t)99));
@@ -205,7 +203,7 @@ TEST_DECLARE(storage_window_bounds_for_ts_overflow) {
         tl_window_bounds_for_ts(INT64_MAX, 1000, INT64_MIN, &start, &end, &unbounded));
 }
 
-/* C-06 fix tests: window_size <= 0 should return TL_EINVAL or safe values */
+/* window_size <= 0 should return TL_EINVAL or safe values. */
 TEST_DECLARE(storage_window_id_zero_size_invalid) {
     int64_t id;
     TEST_ASSERT_STATUS(TL_EINVAL, tl_window_id_for_ts(100, 0, 0, &id));
@@ -311,7 +309,7 @@ TEST_DECLARE(storage_page_builder_count_zero) {
     tl__alloc_destroy(&alloc);
 }
 
-/* M-07 fix test: NULL records with non-zero count returns TL_EINVAL */
+/* NULL records with non-zero count returns TL_EINVAL */
 TEST_DECLARE(storage_page_builder_null_records_nonzero_count) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -606,7 +604,7 @@ TEST_DECLARE(storage_segment_build_l0_empty_invalid) {
 }
 
 /*
- * C-04 fix: tombstones_len > 0 with NULL pointer must return TL_EINVAL.
+ * tombstones_len > 0 with NULL pointer must return TL_EINVAL.
  * Before fix, this would cause memcpy with NULL src (undefined behavior).
  */
 TEST_DECLARE(storage_segment_build_l0_null_tombstones_invalid) {
@@ -617,7 +615,7 @@ TEST_DECLARE(storage_segment_build_l0_null_tombstones_invalid) {
     tl_record_t records[2] = {{100, 1}, {200, 2}};
 
     tl_segment_t* seg = NULL;
-    /* tombstones_len=2 but tombstones=NULL => TL_EINVAL (C-04 fix) */
+    /* tombstones_len=2 but tombstones=NULL => TL_EINVAL */
     TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, records, 2,
                                                        NULL, 2,  /* NULL with len > 0 */
                                                        TL_DEFAULT_TARGET_PAGE_BYTES,
@@ -628,7 +626,7 @@ TEST_DECLARE(storage_segment_build_l0_null_tombstones_invalid) {
 }
 
 /*
- * C-04 fix: record_count > 0 with NULL pointer must return TL_EINVAL.
+ * record_count > 0 with NULL pointer must return TL_EINVAL.
  * Before fix, TL_ASSERT would catch this in debug, but release builds had UB.
  * This variant has tombstones present (records-only validation still works).
  */
@@ -640,7 +638,7 @@ TEST_DECLARE(storage_segment_build_l0_null_records_invalid) {
     tl_interval_t tombs[1] = {{100, 200, false, 1}};
 
     tl_segment_t* seg = NULL;
-    /* record_count=3 but records=NULL => TL_EINVAL (C-04 fix) */
+    /* record_count=3 but records=NULL => TL_EINVAL */
     TEST_ASSERT_STATUS(TL_EINVAL, tl_segment_build_l0(&alloc, NULL, 3,
                                                        tombs, 1,
                                                        TL_DEFAULT_TARGET_PAGE_BYTES,
@@ -651,7 +649,7 @@ TEST_DECLARE(storage_segment_build_l0_null_records_invalid) {
 }
 
 /*
- * C-04 fix: record_count > 0 with NULL pointer, no tombstones.
+ * record_count > 0 with NULL pointer, no tombstones.
  * Covers the case where records validation is the ONLY thing preventing UB.
  */
 TEST_DECLARE(storage_segment_build_l0_null_records_no_tombstones_invalid) {
@@ -783,7 +781,7 @@ TEST_DECLARE(storage_segment_build_pages_rejects_cross_page_out_of_order) {
     tl__alloc_destroy(&alloc);
 }
 
-/* C-05 fix test: unbounded mismatch should return TL_EINVAL */
+/* unbounded mismatch should return TL_EINVAL */
 TEST_DECLARE(storage_segment_build_l1_unbounded_mismatch_invalid) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -800,7 +798,7 @@ TEST_DECLARE(storage_segment_build_l1_unbounded_mismatch_invalid) {
     tl__alloc_destroy(&alloc);
 }
 
-/* C-05 fix test: valid unbounded config should succeed */
+/* valid unbounded config should succeed */
 TEST_DECLARE(storage_segment_build_l1_unbounded_valid) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -1603,11 +1601,11 @@ TEST_DECLARE(storage_manifest_builder_remove_duplicate) {
 }
 
 /*===========================================================================
- * Edge Case Tests (T-03, T-08)
+ * Edge Case Tests
  *===========================================================================*/
 
 /**
- * T-03: Invalid tombstone interval (end <= start) should be rejected.
+ * Invalid tombstone interval (end <= start) should be rejected.
  * Tombstone canonicalization requires half-open [start, end) with start < end.
  * Passing an invalid interval violates invariant #5.
  */
@@ -1697,7 +1695,7 @@ TEST_DECLARE(storage_segment_build_l0_invalid_tombstone_order_contract) {
 }
 
 /**
- * T-08: Very small target_page_bytes should clamp to minimum page rows.
+ * Very small target_page_bytes should clamp to minimum page rows.
  * Building a segment with target_page_bytes=1 should still produce valid
  * pages with at least TL_MIN_PAGE_ROWS records each.
  */
@@ -1860,7 +1858,7 @@ TEST_DECLARE(storage_manifest_validate_correct) {
 void run_storage_internal_tests(void) {
     /* Window mapping tests (15 tests) */
     RUN_TEST(storage_window_default_size);
-    RUN_TEST(storage_window_default_size_unknown_enum);  /* M-06 fix test */
+    RUN_TEST(storage_window_default_size_unknown_enum);
     RUN_TEST(storage_window_id_positive);
     RUN_TEST(storage_window_id_negative);
     RUN_TEST(storage_window_id_negative_exact);
@@ -1885,7 +1883,7 @@ void run_storage_internal_tests(void) {
     /* Page tests (9 tests) */
     RUN_TEST(storage_page_builder_single_page);
     RUN_TEST(storage_page_builder_count_zero);
-    RUN_TEST(storage_page_builder_null_records_nonzero_count);  /* M-07 fix test */
+    RUN_TEST(storage_page_builder_null_records_nonzero_count);
     RUN_TEST(storage_page_capacity_tiny_target);
     RUN_TEST(storage_page_capacity_zero_target);
     RUN_TEST(storage_page_lower_bound_found);
@@ -1941,7 +1939,7 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_manifest_builder_remove_nonexistent);
     RUN_TEST(storage_manifest_builder_remove_duplicate);
 
-    /* Edge case tests (T-03, T-08) */
+    /* Edge case tests */
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_interval);
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_seq_contract);
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_order_contract);

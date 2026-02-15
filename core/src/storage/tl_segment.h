@@ -13,8 +13,6 @@
  * Segments are classified by their level:
  * - L0 (delta layer): Flush outputs, may overlap, may carry tombstones
  * - L1 (main layer): Compaction outputs, non-overlapping, no tombstones
- *
- * Reference: Storage LLD Section 3.6
  *===========================================================================*/
 
 typedef enum tl_segment_level {
@@ -25,7 +23,6 @@ typedef enum tl_segment_level {
 /*===========================================================================
  * Tombstones (Immutable Interval Set)
  *
- * Matches Storage LLD Section 3.5 exactly.
  * Segment holds a POINTER to this struct (NULL if no tombstones).
  *
  * Invariants:
@@ -59,8 +56,6 @@ typedef struct tl_tombstones {
  * - page_count = 0, record_count = 0
  * - tombstones != NULL && tombstones->n > 0
  * - min_ts/max_ts derived from tombstones
- *
- * Reference: Storage LLD Section 3.6, Section 5
  *===========================================================================*/
 
 typedef struct tl_segment {
@@ -133,7 +128,7 @@ typedef struct tl_segment {
 /**
  * Build an L0 segment from sorted records and optional tombstones.
  *
- * Used by flush builder (Write Path LLD Section 4.3).
+ * Used by flush builder.
  *
  * @param alloc             Allocator context
  * @param records           Sorted record array (may be NULL if tombstone-only)
@@ -167,7 +162,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
 /**
  * Build an L1 segment from sorted records within a window.
  *
- * Used by compaction builder (Compaction Policy LLD Section 7).
+ * Used by compaction builder.
  *
  * @param alloc               Allocator context
  * @param records             Sorted record array (must not be NULL, count > 0)
@@ -215,7 +210,6 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
  *       destroy(obj);
  *   }
  *
- * Reference: Implementation Notes Section 7.2, 7.3
  *===========================================================================*/
 
 /**

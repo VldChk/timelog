@@ -12,7 +12,7 @@
  *
  * Implements L0 -> L1 compaction for the LSM-style storage layer.
  *
- * Goals (Compaction Policy LLD Section 1):
+ * Goals:
  * 1. Bound read amplification: L0 count <= max_delta_segments
  * 2. Enforce L1 non-overlap: L1 segments aligned to time windows
  * 3. Fold tombstones: L1 segments are tombstone-free
@@ -45,7 +45,6 @@
  * - User must implement their own epoch/RCU/hazard-pointer scheme if they
  *   need safe payload reclamation (see tl_on_drop_fn docs in timelog.h)
  *
- * Reference: timelog_v1_lld_compaction_policy.md
  *===========================================================================*/
 
 /* Forward declarations */
@@ -76,7 +75,7 @@ typedef struct tl_compact_ctx {
     tl_snapshot_t*      snapshot;        /* Pinned snapshot (for tombs + seq) */
     tl_seq_t            applied_seq;     /* Tombstone watermark for outputs */
 
-    /* Effective tombstone sets (M-10: two distinct sets with different purposes)
+    /* Effective tombstone sets (two distinct sets with different purposes)
      *
      * tombs:         Union of tombstones from INPUT segments only (unclipped).
      *                Used for: residual tombstone computation (tombstones that
@@ -160,7 +159,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  *===========================================================================*/
 
 /**
- * Phase 1: Check if compaction is needed.
+ * Check if compaction is needed.
  *
  * Returns true if:
  * - L0 count >= max_delta_segments
@@ -207,9 +206,9 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
 bool tl_compact_needed(const tl_timelog_t* tl);
 
 /**
- * Phase 2: Select segments for compaction.
+ * Select segments for compaction.
  *
- * Implements baseline policy (Compaction Policy LLD Section 6.1):
+ * Implements baseline policy:
  * 1. Pin current manifest
  * 2. Select all L0 segments
  * 3. Compute covered time range (records + tombstones)
@@ -229,9 +228,9 @@ bool tl_compact_needed(const tl_timelog_t* tl);
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 
 /**
- * Phase 3: Execute compaction merge.
+ * Execute compaction merge.
  *
- * Implements merge algorithm (Compaction Policy LLD Section 7):
+ * Implements merge algorithm:
  * 1. Build effective tombstone set
  * 2. K-way merge all input segments
  * 3. Skip deleted records (tombstone filtering)
@@ -251,9 +250,9 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx);
 
 /**
- * Phase 4: Publish compaction results.
+ * Publish compaction results.
  *
- * Implements publication protocol (Compaction Policy LLD Section 8):
+ * Implements publication protocol:
  * 1. Build new manifest (OFF-LOCK - this is the expensive part)
  * 2. Acquire writer_mu + seqlock
  * 3. Verify manifest unchanged (abort if changed)

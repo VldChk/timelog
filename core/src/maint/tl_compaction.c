@@ -136,7 +136,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
 
 #ifndef NDEBUG
 /**
- * M-21: Validate that L0 segments are ordered by generation.
+ * Validate that L0 segments are ordered by generation.
  *
  * L0 segments should be ordered by generation (older first) since they
  * are added in flush order. This invariant ensures correct tie-breaking
@@ -159,9 +159,9 @@ static void tl__validate_l0_generation_order(const tl_manifest_t* m) {
 }
 
 /**
- * M-28: Validate that L1 segments in manifest are non-overlapping by window.
+ * Validate that L1 segments in manifest are non-overlapping by window.
  *
- * This is a critical system invariant per CLAUDE.md:
+ * This is a critical system invariant:
  * "L1 non-overlap: L1 segments are non-overlapping by time window"
  *
  * Uses O(n) linear scan since L1 segments are sorted by window_start
@@ -194,18 +194,14 @@ static void tl__validate_l1_non_overlap(const tl_manifest_t* m) {
  * Delete Debt Computation (Internal)
  *===========================================================================*/
 
-/**
- * Helper: Union immutable tombstones into mutable accumulator.
- * Uses temp buffer for proper tl_intervals_union_imm() semantics.
- */
+/** Union immutable tombstones into mutable accumulator via temp buffer. */
 static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
                                          tl_intervals_imm_t add,
                                          tl_alloc_ctx_t* alloc) {
     if (add.len == 0) {
-        return TL_OK;  /* Nothing to add */
+        return TL_OK;
     }
 
-    /* Union into temp, then swap */
     tl_intervals_t temp;
     tl_intervals_init(&temp, alloc);
 
@@ -217,22 +213,17 @@ static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
         return st;
     }
 
-    /* Swap temp into accum */
     tl_intervals_destroy(accum);
     *accum = temp;
     return TL_OK;
 }
 
-/**
- * Compute maximum delete debt ratio across all windows.
- * Used for delete_debt_threshold trigger.
- */
+/** Compute max delete debt ratio across all windows. */
 static double tl__compute_delete_debt(const tl_timelog_t* tl,
                                        const tl_manifest_t* m) {
     tl_intervals_t tombs;
     tl_intervals_init(&tombs, (tl_alloc_ctx_t*)&tl->alloc);
 
-    /* Collect all tombstones from L0 using the safe union helper. */
     for (uint32_t i = 0; i < tl_manifest_l0_count(m); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(m, i);
         if (tl_segment_has_tombstones(seg)) {
@@ -251,7 +242,6 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         return 0.0;
     }
 
-    /* Find max delete debt ratio per window */
     double max_ratio = 0.0;
     tl_ts_t window_size = tl->effective_window_size;
 
@@ -265,17 +255,13 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         return 1.0;  /* Maximum debt - forces compaction trigger */
     }
 
-    /* All tombstones are bounded - safe to iterate.
-     * Use tomb_max = end - 1 for half-open semantics: tombstone [start, end)
-     * covers timestamps up to end-1, so we need the window containing end-1,
-     * not the window containing end (which may be the NEXT window). */
+    /* tomb_max = end - 1: half-open [start, end) covers up to end-1 */
     tl_ts_t tomb_min = tl_intervals_get(&tombs, 0)->start;
     tl_ts_t tomb_max = (last_tomb->end > TL_TS_MIN) ? (last_tomb->end - 1) : TL_TS_MIN;
 
     int64_t min_wid, max_wid;
     tl_status_t st;
 
-    /* Handle window ID computation with overflow protection */
     st = tl_window_id_for_ts(tomb_min, window_size, tl->config.window_origin, &min_wid);
     if (st != TL_OK) {
         /* On overflow, conservatively return max debt to trigger compaction */
@@ -289,12 +275,7 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         return 1.0;
     }
 
-    /* Cap window iteration to prevent DoS from adversarial inputs.
-     * If span is huge, assume max debt - this is a heuristic anyway.
-     *
-     * C-12 fix: Use overflow-safe subtraction for window span.
-     * Direct subtraction can overflow if window IDs have opposite signs
-     * (e.g., min_wid = -INT64_MAX/2, max_wid = INT64_MAX/2). */
+    /* Cap iteration to TL_MAX_DEBT_WINDOWS with overflow-safe subtraction. */
     int64_t debt_span;
     if (tl_sub_overflow_i64(max_wid, min_wid, &debt_span)) {
         /* Overflow - conservatively assume high debt */
@@ -377,7 +358,7 @@ double tl_test_compute_delete_debt(const tl_timelog_t* tl,
 #endif
 
 /*===========================================================================
- * Phase 1: Trigger Logic
+ * Trigger Logic
  *===========================================================================*/
 
 bool tl_compact_needed(const tl_timelog_t* tl) {
@@ -403,24 +384,17 @@ bool tl_compact_needed(const tl_timelog_t* tl) {
     /* Now we can safely read from the pinned manifest */
     bool needed = false;
 
-    /* Trigger 1: L0 count threshold */
     if (tl_manifest_l0_count(m) >= tl->config.max_delta_segments) {
         needed = true;
         goto done;
     }
 
-    /* Trigger 2: Delete debt threshold (optional) */
     if (tl->config.delete_debt_threshold > 0.0) {
-        /* Compute per-window delete debt
-         * This is expensive - only do if threshold is configured */
         if (tl__compute_delete_debt(tl, m) >= tl->config.delete_debt_threshold) {
             needed = true;
             goto done;
         }
     }
-
-    /* Trigger 3: Explicit request via tl_compact() sets compact_pending
-     * This is checked by caller (worker loop) via pending flag */
 
 done:
     tl_manifest_release(m);
@@ -428,7 +402,7 @@ done:
 }
 
 /*===========================================================================
- * Phase 2: Selection
+ * Selection
  *===========================================================================*/
 
 /**
@@ -485,23 +459,12 @@ static bool tl__l1_overlaps_window_range(const tl_segment_t* seg,
  *===========================================================================*/
 
 /**
- * Select overlapping L1 segments using WINDOW BOUNDS.
- *
- * Per Compaction Policy LLD Section 6.1: "Select all L1 segments whose
- * windows intersect those window_ids". This must use window bounds
- * (window_start/window_end), NOT record bounds (min_ts/max_ts).
- *
- * CRITICAL INVARIANT: L1 selection must be based on window bounds to
- * maintain L1 non-overlap. Using min_ts/max_ts would cause spurious
- * overlap detection and potential correctness issues.
- *
- * @param ctx  Context with output_min_wid/output_max_wid already set
- * @param m    Pinned manifest to select from
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * Select L1 segments whose WINDOWS overlap the output range.
+ * Must use window bounds (not record bounds) to preserve L1 non-overlap.
  */
 static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
                                           const tl_manifest_t* m) {
-    /* Compute output WINDOW bounds for L1 selection */
+    /* Compute output window bounds */
     tl_ts_t output_first_wstart, output_first_wend;
     bool output_first_unbounded;
     tl_window_bounds(ctx->output_min_wid, ctx->window_size, ctx->window_origin,
@@ -512,13 +475,11 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
     tl_window_bounds(ctx->output_max_wid, ctx->window_size, ctx->window_origin,
                       &output_last_wstart, &output_last_wend, &output_last_unbounded);
 
-    /* Count and pin overlapping L1 segments */
     uint32_t n_l1 = tl_manifest_l1_count(m);
     if (n_l1 == 0) {
-        return TL_OK;  /* No L1 segments to select */
+        return TL_OK;
     }
 
-    /* Count overlapping L1 segments first */
     size_t overlap_count = 0;
     for (uint32_t i = 0; i < n_l1; i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(m, i);
@@ -529,10 +490,9 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
     }
 
     if (overlap_count == 0) {
-        return TL_OK;  /* No overlapping L1 segments */
+        return TL_OK;
     }
 
-    /* M-25 fix: Check allocation size won't overflow */
     if (tl__alloc_would_overflow(overlap_count, sizeof(tl_segment_t*))) {
         return TL_EOVERFLOW;
     }
@@ -543,7 +503,6 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
         return TL_ENOMEM;
     }
 
-    /* Pin overlapping L1 segments */
     for (uint32_t i = 0; i < n_l1; i++) {
         tl_segment_t* seg = tl_manifest_l1_get(m, i);
         if (tl__l1_overlaps_window_range(seg, output_first_wstart,
@@ -596,21 +555,8 @@ static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
 }
 
 /**
- * Greedy L0 selection (original algorithm).
- *
- * Accumulates L0 segments until one of the caps is hit:
- * - max_compaction_inputs
- * - max_compaction_windows (via expanding bounds check)
- * - compaction_target_bytes
- *
- * IMPORTANT: This function MUST NOT re-pin manifest or re-increment next_gen.
- * The caller (tl_compact_select) has already done this. The manifest is passed
- * as parameter to make this explicit.
- *
- * @param ctx        Context with base_manifest already pinned
- * @param m          Pinned manifest (same as ctx->base_manifest)
- * @param max_inputs Max L0 inputs (0 = unlimited)
- * @return TL_OK on success, TL_EOF if no L0s, TL_ENOMEM/TL_EOVERFLOW on error
+ * Greedy L0 selection: accumulate L0 segments until an input/window/byte cap
+ * is hit. Caller has already pinned manifest and incremented next_gen.
  */
 static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
                                                const tl_manifest_t* m,
@@ -741,14 +687,14 @@ static tl_status_t tl__compact_select_greedy(tl_compact_ctx_t* ctx,
 }
 
 /*===========================================================================
- * Phase 2: Selection - Entry Point
+ * Selection - Entry Point
  *===========================================================================*/
 
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
     tl_timelog_t* tl = ctx->tl;
     tl_status_t st;
 
-    /* M-23: Selection observability - count attempts */
+    /* Selection observability - count attempts */
     tl_atomic_inc_u64(&tl->compaction_select_calls);
 
     /* Acquire snapshot for consistent tombstones + op_seq watermark */
@@ -791,7 +737,7 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx) {
 }
 
 /*===========================================================================
- * Phase 3: Merge - Helpers
+ * Merge Helpers
  *===========================================================================*/
 
 /**
@@ -1036,7 +982,7 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
 }
 
 /*===========================================================================
- * Phase 3: Merge
+ * Merge
  *===========================================================================*/
 
 tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
@@ -1045,13 +991,8 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         return TL_EINVAL;
     }
 
-    /* ===================================================================
-     * Step 1: Build effective tombstone set
-     * Per Compaction Policy LLD Section 7.2
-     *
-     * Note: tombs was initialized in ctx_init; use clear() not init()
-     * to avoid leak if merge is called multiple times.
-     * =================================================================== */
+    /* Step 1: Build effective tombstone set.
+     * Use clear(), not init(), because tombs was initialized in ctx_init(). */
     tl_intervals_clear(&ctx->tombs);
 
     /* Collect tombstones from L0 segments */
@@ -1079,12 +1020,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         }
     }
 
-    /* Step 1b: Build clipped tombstone set for filtering.
-     * Use snapshot tombstones so deletes outside the compaction inputs
-     * still apply correctly to records in those inputs. */
+    /* Step 1b: Clipped tombstones for filtering.
+     * Use snapshot tombs so deletes outside inputs still apply. */
     tl_intervals_clear(&ctx->tombs_clipped);
 
-    /* Compute output window bounds for clipping */
+    /* Compute output window bounds for clipping. */
     tl_ts_t first_start, first_end;
     bool first_unbounded;
     tl_window_bounds(ctx->output_min_wid, ctx->window_size, ctx->window_origin,
@@ -1116,17 +1056,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         }
     }
 
-    /* ===================================================================
-     * Step 2: Build input iterators and initialize K-way merge
-     *
-     * We use segment iterators directly + heap for custom merge.
-     * Cannot reuse tl_kmerge_iter_t (expects query plan sources).
-     * =================================================================== */
+    /* Step 2: Build input iterators and initialize K-way merge.
+     * Uses segment iterators directly (cannot reuse tl_kmerge_iter_t). */
     size_t total_inputs = ctx->input_l0_len + ctx->input_l1_len;
 
-    /* M-26 fix: Bounds check for tie_break_key which is uint32_t.
-     * In practice this is unreachable (would need 4B+ segments), but
-     * prevents undefined behavior from size_t -> uint32_t truncation. */
+    /* Bounds check: tie_break_key is uint32_t. */
     if (total_inputs > UINT32_MAX) {
         return TL_EOVERFLOW;
     }
@@ -1148,7 +1082,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         return TL_ENOMEM;
     }
 
-    /* Initialize segment iterators (unbounded range - all records) */
+    /* Initialize segment iterators (unbounded range). */
     size_t iter_idx = 0;
     for (size_t i = 0; i < ctx->input_l0_len; i++) {
         tl_segment_iter_init(&iters[iter_idx], ctx->input_l0[i],
@@ -1163,7 +1097,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         iter_idx++;
     }
 
-    /* Build heap for K-way merge. */
+    /* Build heap for K-way merge */
     tl_heap_t heap;
     tl_heap_init(&heap, ctx->alloc);
     st = tl_heap_reserve(&heap, total_inputs);
@@ -1173,7 +1107,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         return st;
     }
 
-    /* Prime heap with first record from each iterator. */
+    /* Prime heap with first record from each iterator */
     for (size_t i = 0; i < total_inputs; i++) {
         tl_record_t rec;
         if (tl_segment_iter_next(&iters[i], &rec) == TL_OK) {
@@ -1182,7 +1116,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                 .handle = rec.handle,
                 .tie_break_key = (uint32_t)i,
                 .watermark = watermarks[i],
-                .iter = &iters[i]  /* Store iterator pointer for refill */
+                .iter = &iters[i]
             };
             st = tl_heap_push(&heap, &entry);
             if (st != TL_OK) {
@@ -1194,15 +1128,13 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         }
     }
 
-    /* ===================================================================
-     * Step 3: K-way merge with tombstone filtering and window partitioning
-     * =================================================================== */
+    /* Step 3: K-way merge with tombstone filtering and window partitioning */
 
-    /* Initialize tombstone cursor for filtering (use CLIPPED tombstones) */
+    /* Tombstone cursor uses CLIPPED tombstones for filtering */
     tl_intervals_cursor_t tomb_cursor;
     tl_intervals_cursor_init(&tomb_cursor, tl_intervals_as_imm(&ctx->tombs_clipped));
 
-    /* Window state for output partitioning */
+    /* Window state for output partitioning. */
     int64_t current_wid = ctx->output_min_wid;
     tl_ts_t current_window_start, current_window_end;
     bool current_end_unbounded;
@@ -1210,13 +1142,10 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                       &current_window_start, &current_window_end,
                       &current_end_unbounded);
 
-    /* Current window accumulator */
+    /* Output grows dynamically; pre-allocating by window span would fail
+     * for TL_TS_MAX records (trillions of windows with default 1h size). */
     tl_recvec_t window_records;
     tl_recvec_init(&window_records, ctx->alloc);
-
-    /* Output array starts empty and grows dynamically via tl__ensure_output_capacity().
-     * This avoids pre-allocating based on window span, which would fail for
-     * TL_TS_MAX records (trillions of windows with default 1-hour size). */
 
     /* Process merged stream */
     while (!tl_heap_is_empty(&heap)) {
@@ -1226,7 +1155,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             goto cleanup;
         }
 
-        /* Refill heap from the source that provided this record */
+        /* Refill heap from the source that produced this record */
         tl_segment_iter_t* source_iter = (tl_segment_iter_t*)min_entry.iter;
         tl_record_t next_rec;
         if (tl_segment_iter_next(source_iter, &next_rec) == TL_OK) {
@@ -1249,15 +1178,9 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, min_entry.ts);
         }
         if (tomb_seq > min_entry.watermark) {
-            /* Record is deleted - collect for deferred callback.
-             *
-             * CRITICAL: We do NOT invoke on_drop_handle here because:
-             * 1. Compaction may fail (ENOMEM) after this point
-             * 2. Publish may fail (EBUSY) requiring retry
-             * 3. If we fire callbacks now and then fail, user code may
-             *    free payloads for records that are STILL VISIBLE
-             *
-             * Callbacks are fired only after successful publish. */
+            /* Record deleted; defer callback until successful publish.
+             * Firing now would allow user to free payloads for records
+             * still visible if merge or publish later fails. */
             if (ctx->on_drop_handle != NULL) {
                 st = tl__push_dropped_record(ctx, min_entry.ts, min_entry.handle);
                 if (st != TL_OK) {
@@ -1267,13 +1190,9 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             continue;  /* Skip this record */
         }
 
-        /*
-         * Determine window membership.
-         *
-         * M-24 fix: Avoid per-record division when records stay within the
-         * current window. Only compute window_id when ts is beyond the current
-         * window end (bounded case).
-         */
+        /* Determine window membership.
+         * Avoid per-record division; recompute window_id only when ts
+         * exceeds current window end. */
         if (!current_end_unbounded && min_entry.ts >= current_window_end) {
             int64_t rec_wid;
             st = tl_window_id_for_ts(min_entry.ts, ctx->window_size,
@@ -1282,13 +1201,10 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                 goto cleanup;
             }
 
-            /* If we've moved to a new window, flush the current window and jump.
-             * IMPORTANT: We jump directly to rec_wid instead of iterating through
-             * empty intermediate windows. This makes compaction O(records) instead
-             * of O(windows), which matters for sparse data spanning wide time ranges
-             * (e.g., records at ts=0 and ts=TL_TS_MAX). */
+            /* Jump directly to rec_wid; skipping empty intermediate windows
+             * keeps compaction O(records) not O(windows). */
             if (current_wid < rec_wid) {
-                /* Flush current window (may be empty - that's fine) */
+                /* Flush current window */
                 st = tl__flush_window_records(ctx, &window_records,
                                                current_window_start, current_window_end,
                                                current_end_unbounded);
@@ -1296,7 +1212,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                     goto cleanup;
                 }
 
-                /* Jump directly to the window containing this record */
+                /* Advance to window containing this record */
                 current_wid = rec_wid;
                 tl_window_bounds(current_wid, ctx->window_size, ctx->window_origin,
                                   &current_window_start, &current_window_end,
@@ -1304,15 +1220,14 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
             }
         }
 
-        /* Add record to current window accumulator.
-         * tl_recvec_push takes (ts, handle) separately, not a record struct. */
+        /* Add record to current window accumulator */
         st = tl_recvec_push(&window_records, min_entry.ts, min_entry.handle);
         if (st != TL_OK) {
             goto cleanup;
         }
     }
 
-    /* Flush final window (may be unbounded if contains TL_TS_MAX records) */
+    /* Flush final window */
     st = tl__flush_window_records(ctx, &window_records,
                                    current_window_start, current_window_end,
                                    current_end_unbounded);
@@ -1320,9 +1235,7 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         goto cleanup;
     }
 
-    /* ===================================================================
-     * Step 4: Handle residual tombstones
-     * =================================================================== */
+    /* Step 4: Handle residual tombstones */
     st = tl__build_residual_tombstones(ctx);
     if (st != TL_OK) {
         goto cleanup;
@@ -1338,16 +1251,7 @@ cleanup:
     return st;
 }
 
-/**
- * Build a manifest with our compaction changes applied.
- *
- * This is the "off-lock" expensive work for L0→L1 compaction.
- *
- * @param ctx           Compaction context
- * @param base          Base manifest to build from
- * @param out           Output manifest pointer
- * @return TL_OK on success, TL_ENOMEM on failure
- */
+/** Build a manifest with compaction changes applied (off-lock). */
 static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
                                                    const tl_manifest_t* base,
                                                    tl_manifest_t** out) {
@@ -1355,7 +1259,7 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
     tl_manifest_builder_t builder;
     tl_manifest_builder_init(&builder, ctx->alloc, base);
 
-    /* Queue removal of input L0 segments */
+    /* Remove input segments, add output segments */
     for (size_t i = 0; i < ctx->input_l0_len; i++) {
         st = tl_manifest_builder_remove_l0(&builder, ctx->input_l0[i]);
         if (st != TL_OK) {
@@ -1364,7 +1268,6 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
         }
     }
 
-    /* Queue removal of input L1 segments */
     for (size_t i = 0; i < ctx->input_l1_len; i++) {
         st = tl_manifest_builder_remove_l1(&builder, ctx->input_l1[i]);
         if (st != TL_OK) {
@@ -1373,7 +1276,6 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
         }
     }
 
-    /* Queue addition of output L1 segments */
     for (size_t i = 0; i < ctx->output_l1_len; i++) {
         st = tl_manifest_builder_add_l1(&builder, ctx->output_l1[i]);
         if (st != TL_OK) {
@@ -1382,7 +1284,6 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
         }
     }
 
-    /* Add residual tombstone segment (if any) */
     if (ctx->residual_tomb != NULL) {
         st = tl_manifest_builder_add_l0(&builder, ctx->residual_tomb);
         if (st != TL_OK) {
@@ -1391,14 +1292,13 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
         }
     }
 
-    /* Build new manifest */
     st = tl_manifest_builder_build(&builder, out);
     tl_manifest_builder_destroy(&builder);
     return st;
 }
 
 /*===========================================================================
- * Phase 4: Publication
+ * Publication
  *===========================================================================*/
 
 tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
@@ -1406,50 +1306,32 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
     tl_status_t st;
 
 #ifdef TL_TEST_HOOKS
-    /* Test hook: force EBUSY returns for deterministic retry exhaustion testing.
-     * Decrement counter and return EBUSY without doing any work. */
+    /* Test hook: force EBUSY for retry exhaustion testing */
     if (tl_test_force_ebusy_count > 0) {
         tl_test_force_ebusy_count--;
         return TL_EBUSY;
     }
 #endif
 
-    /*
-     * Phase 1: Build new manifest OFF-LOCK (allocation happens here).
-     * Build assuming base_manifest is still current.
-     * Per timelog_v1_lld_background_maintenance.md: "Long-running build
-     * phases must not hold writer_mu."
-     */
+    /* Build new manifest off-lock (must not hold writer_mu). */
     tl_manifest_t* new_manifest = NULL;
     st = tl__build_compaction_manifest(ctx, ctx->base_manifest, &new_manifest);
     if (st != TL_OK) {
         return st;
     }
 
-    /*
-     * Phase 2: Validate and swap under lock.
-     * NO ALLOCATION beyond this point (all builds happen off-lock).
-     */
+    /* Validate and swap under lock. No allocation beyond this point. */
     TL_LOCK_WRITER(tl);
 
-    /* C-09: Strict publish validation.
-     *
-     * Check if manifest changed during merge (concurrent flush or compaction).
-     * If changed, return TL_EBUSY to force retry from fresh selection.
-     *
-     * This is the "strict publish" protocol (V1):
-     * - Discards merge result if manifest diverged
-     * - Caller retries with new selection or fails after max_retries
-     *
-     * See tl__compact_one_step() for retry logic and Phase-2 deferred notes. */
+    /* Strict publish: if manifest changed during merge (concurrent
+     * flush), discard result and return EBUSY to force caller retry. */
     if (tl->manifest != ctx->base_manifest) {
-        /* Manifest changed - caller must retry with fresh selection */
         TL_UNLOCK_WRITER(tl);
         tl_manifest_release(new_manifest);
         return TL_EBUSY;
     }
 
-    /* Enter seqlock region for actual swap */
+    /* Seqlock region for manifest swap */
     tl_seqlock_write_begin(&tl->view_seq);
 
     /* Swap manifest */
@@ -1459,47 +1341,25 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx) {
     tl_seqlock_write_end(&tl->view_seq);
 
 #ifndef NDEBUG
-    /* C-13 fix: Pin the exact manifest we just published for validation.
-     * MUST happen before unlock - a concurrent flush could otherwise
-     * replace and release new_manifest before we validate it.
-     *
-     * Race condition prevented:
-     * Without this pin, a concurrent flush could:
-     * 1. Acquire writer_mu after we release it
-     * 2. Replace tl->manifest with flush_manifest
-     * 3. Release old = new_manifest (refcnt goes to 0)
-     * 4. Free new_manifest
-     * Then our validation call below would be UAF.
-     *
-     * By acquiring before unlock, we ensure refcnt >= 2 while we hold it,
-     * so even if flush replaces and releases, our copy survives. */
+    /* Pin the published manifest before unlock to prevent UAF.
+     * Without pin, a concurrent flush could replace+release it
+     * before our validation call below. */
     tl_manifest_t* validate_m = tl_manifest_acquire(new_manifest);
 #endif
 
     TL_UNLOCK_WRITER(tl);
 
-    /* Release old manifest (safe after unlock) */
+    /* Release old manifest */
     tl_manifest_release(old_manifest);
 
 #ifndef NDEBUG
-    /* Validate the exact manifest we published (not current tl->manifest).
-     * Using validate_m ensures we check what we built, not what a concurrent
-     * flush might have replaced it with. */
+    /* Validate what we published, not current tl->manifest */
     tl__validate_l1_non_overlap(validate_m);
     tl__validate_l0_generation_order(validate_m);
     tl_manifest_release(validate_m);
 #endif
 
-    /* NOTE: We do NOT clear output_l1_len or residual_tomb here.
-     *
-     * Ownership semantics:
-     * - ctx built output segments (ctx has refs)
-     * - manifest_builder_build() acquired refs (manifest has refs)
-     * - Both refs are valid and independent
-     *
-     * ctx_destroy will release ctx's refs, leaving manifest's refs.
-     * This is correct reference counting semantics. */
-
+    /* ctx_destroy will release ctx's refs; manifest holds its own refs. */
     return TL_OK;
 }
 
@@ -1511,18 +1371,8 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     TL_ASSERT(tl != NULL);
     TL_ASSERT(max_retries > 0);  /* Ensures publish loop executes at least once */
 
-    /*-----------------------------------------------------------------------
-     * Adaptive Segmentation Integration
-     *
-     * 1. Compute candidate window BEFORE ctx_init (under maint_mu)
-     * 2. Set effective_window_size for ctx to use
-     * 3. After compaction completes: record success/failure under maint_mu
-     * 4. On failure: restore original window (under maint_mu)
-     *
-     * Lock note: ALL reads and writes of effective_window_size and adaptive
-     * state occur under maint_mu to avoid data races, even though the
-     * maintenance thread is typically the only accessor.
-     *-----------------------------------------------------------------------*/
+    /* Adaptive integration: compute candidate window under maint_mu,
+     * commit only after successful publish, record failure on exhaustion. */
     tl_ts_t original_window;
     tl_ts_t candidate_window;
 
@@ -1530,17 +1380,14 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     original_window = tl->effective_window_size;
     candidate_window = original_window;
 
-    /* C-10: Only compute adaptive candidate if grid is NOT frozen.
-     * Once L1 segments exist, the window grid is frozen to prevent
-     * L1 overlap violations from window size changes. */
+    /* Skip adaptive selection when the grid is frozen (L1 segments exist). */
     if (!tl->window_grid_frozen && tl->config.adaptive.target_records > 0) {
-        /* Compute candidate under maint_mu (reads adaptive state) */
+        /* Compute candidate under maint_mu */
         candidate_window = tl_adaptive_compute_candidate(
             &tl->adaptive,
             &tl->config.adaptive,
             original_window);
-        /* Note: DO NOT set effective_window_size here - LLD-strict commit
-         * only after successful publish. Override ctx.window_size instead. */
+        /* Do not commit yet; commit only after successful publish. */
     }
     TL_UNLOCK_MAINT(tl);
 
@@ -1549,69 +1396,28 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
 
     tl_status_t st;
 
-    /* Phase 1: Selection */
     st = tl_compact_select(&ctx);
     if (st != TL_OK) {
         tl_compact_ctx_destroy(&ctx);
-        /* M-27: ENOMEM is environmental, not policy failure - don't record.
-         * TL_EOF (no work) is also not a failure. Only EBUSY after retries
-         * is a policy failure (handled at retry exhaustion). */
-        return st;  /* TL_EOF = no work, TL_ENOMEM = error */
-    }
-
-    /* Phase 2: Merge */
-    st = tl_compact_merge(&ctx);
-    if (st != TL_OK) {
-        tl_compact_ctx_destroy(&ctx);
-        /* M-27: ENOMEM is environmental - don't record as adaptive failure */
         return st;
     }
 
-    /* Phase 3: Publish with retries
-     *
-     * C-09 Documentation: STRICT PUBLISH vs REBASE
-     *
-     * Current behavior (V1): Strict publish with bounded retries.
-     * If the manifest changed during merge (concurrent flush), we:
-     * 1. Discard the merge result (return TL_EBUSY)
-     * 2. Retry from fresh selection (up to max_retries attempts)
-     * 3. If retries exhausted, compaction fails and returns TL_EBUSY
-     *
-     * Alternative (Phase-2 deferred): Rebase strategy.
-     * Instead of discarding, rebuild manifest incorporating the concurrent
-     * change while preserving our merge result. This avoids wasted work
-     * under high flush rates but adds complexity.
-     *
-     * V1 rationale:
-     * - Simplicity: Strict publish is straightforward to implement correctly
-     * - Correctness: No risk of ordering bugs in rebase logic
-     * - Acceptable for typical workloads: Concurrent flush during compaction
-     *   is rare unless flush rate exceeds compaction rate significantly
-     *
-     * Livelock risk:
-     * - Under extreme flush rates, compaction may repeatedly fail to publish
-     * - max_retries (3) bounds wasted CPU, but L0 segments accumulate
-     * - Mitigation: Increase flush_interval or reduce memtable size to lower
-     *   flush rate relative to compaction time
-     *
-     * Reference: Compaction LLD Section 8.2 (Publication Protocol)
-     */
+    st = tl_compact_merge(&ctx);
+    if (st != TL_OK) {
+        tl_compact_ctx_destroy(&ctx);
+        return st;
+    }
+
+    /* Strict publish with bounded retries.
+     * On EBUSY (manifest changed during merge), re-select and re-merge.
+     * This keeps semantics simple at the cost of possible repeated work. */
     tl_status_t publish_st = TL_EBUSY;
     for (int attempt = 0; attempt < max_retries; attempt++) {
         publish_st = tl_compact_publish(&ctx);
         if (publish_st != TL_EBUSY) {
-            /* Success or fatal error - stop retrying */
             if (publish_st == TL_OK) {
-                /* Publication succeeded - NOW fire deferred drop callbacks.
-                 *
-                 * CRITICAL: These callbacks are only safe to fire AFTER
-                 * successful publication because:
-                 * 1. Records are now truly retired from the newest manifest
-                 * 2. No retry will re-process these records
-                 * 3. User code can safely begin their reclamation process
-                 *
-                 * Note: Existing snapshots may still reference these records
-                 * until released - user must use epoch/RCU/grace period. */
+                /* Fire deferred drop callbacks; this is safe only after successful
+                 * publish (records truly retired from newest manifest). */
                 if (ctx.on_drop_handle != NULL) {
                     for (size_t i = 0; i < ctx.dropped_len; i++) {
                         ctx.on_drop_handle(ctx.on_drop_ctx,
@@ -1620,29 +1426,19 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
                     }
                 }
 
-                /* Increment compaction counter */
+                /* Bump compaction counter */
                 tl_atomic_inc_u64(&tl->compactions_total);
 
-                /* Post-publish maint_mu block: C-10 grid freeze + adaptive updates.
-                 *
-                 * C-10: Freeze window grid after first L1 creation.
-                 * Once frozen, adaptive segmentation cannot change window size.
-                 *
-                 * Adaptive: Commit window and record success.
-                 * THIS is when we commit effective_window_size (LLD-strict).
-                 *
-                 * Both checks in one lock acquisition for efficiency. */
+                /* Grid freeze and adaptive commit under one maint lock hold. */
                 if (ctx.output_l1_len > 0 || tl->config.adaptive.target_records > 0) {
                     TL_LOCK_MAINT(tl);
 
-                    /* C-10: Freeze grid after first L1 creation.
-                     * This prevents future adaptive changes from breaking
-                     * L1 non-overlap invariant with existing segments. */
+                    /* Freeze grid after first L1 creation. */
                     if (ctx.output_l1_len > 0) {
                         tl->window_grid_frozen = true;
                     }
 
-                    /* Adaptive: commit window and record success */
+                    /* Adaptive: commit candidate window */
                     if (tl->config.adaptive.target_records > 0) {
                         tl->effective_window_size = candidate_window;
                         tl_adaptive_record_success(&tl->adaptive);
@@ -1651,43 +1447,38 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
                     TL_UNLOCK_MAINT(tl);
                 }
             }
-            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             tl_compact_ctx_destroy(&ctx);
             return publish_st;
         }
 
-        /* Publish returned EBUSY (manifest changed). Count and retry. */
+        /* EBUSY: count and retry from a fresh selection. */
         tl_atomic_inc_u64(&tl->compaction_publish_ebusy);
         if (attempt + 1 < max_retries) {
             tl_atomic_inc_u64(&tl->compaction_retries);
         }
 
-        /* Manifest changed - re-select and re-merge for retry.
-         * This is expensive but correct - ensures we don't publish
-         * stale outputs. */
+        /* Re-select and re-merge from current manifest */
         tl_compact_ctx_destroy(&ctx);
         tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
 
         st = tl_compact_select(&ctx);
         if (st != TL_OK) {
             tl_compact_ctx_destroy(&ctx);
-            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             return st;
         }
 
         st = tl_compact_merge(&ctx);
         if (st != TL_OK) {
             tl_compact_ctx_destroy(&ctx);
-            /* M-27: ENOMEM is environmental - don't record as adaptive failure */
             return st;
         }
     }
 
-    /* Retries exhausted - EBUSY is counted as failure per LLD */
+    /* Retries exhausted; record an adaptive failure. */
     tl_compact_ctx_destroy(&ctx);
     if (tl->config.adaptive.target_records > 0) {
         TL_LOCK_MAINT(tl);
-        tl_adaptive_record_failure(&tl->adaptive);  /* EBUSY counts as failure */
+        tl_adaptive_record_failure(&tl->adaptive);
         TL_UNLOCK_MAINT(tl);
     }
     return publish_st;

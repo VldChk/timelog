@@ -31,9 +31,7 @@ typedef struct tl_submerge {
     tl_alloc_ctx_t* alloc;
 } tl_submerge_t;
 
-/**
- * Initialize sub-merge source bounds for a sorted record array.
- */
+/** Initialize source bounds via binary search for [t1, t2). */
 TL_INLINE void tl_submerge_src_init(tl_subsrc_t* src,
                                      const tl_record_t* data,
                                      const tl_seq_t* seqs,
@@ -61,40 +59,25 @@ TL_INLINE void tl_submerge_src_init(tl_subsrc_t* src,
     }
 }
 
-/**
- * Initialize sub-merge with a fixed number of sources.
- * Allocates source array and initializes heap.
- */
+/** Initialize sub-merge with a fixed number of sources. */
 tl_status_t tl_submerge_init(tl_submerge_t* sm,
                               tl_alloc_ctx_t* alloc,
                               size_t src_count);
 
-/**
- * Destroy sub-merge and free internal resources.
- */
+/** Destroy sub-merge and free internal resources. */
 void tl_submerge_destroy(tl_submerge_t* sm);
 
-/**
- * Build heap from configured sources.
- * Caller must populate sm->srcs and sm->src_count before calling.
- */
+/** Build heap from populated sources. */
 tl_status_t tl_submerge_build(tl_submerge_t* sm);
 
-/**
- * Advance to next record.
- * @return TL_OK if record available, TL_EOF if exhausted
- */
+/** Advance to next record. Returns TL_OK or TL_EOF. */
 tl_status_t tl_submerge_next(tl_submerge_t* sm, tl_record_t* out,
                               tl_seq_t* out_watermark);
 
-/**
- * Seek to first record with ts >= target (forward-only).
- */
+/** Seek to first record with ts >= target (forward-only). */
 tl_status_t tl_submerge_seek(tl_submerge_t* sm, tl_ts_t target);
 
-/**
- * Check if merge is exhausted.
- */
+/** Check if merge is exhausted. */
 TL_INLINE bool tl_submerge_done(const tl_submerge_t* sm) {
     return sm == NULL || tl_heap_is_empty(&sm->heap);
 }

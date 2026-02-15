@@ -114,7 +114,7 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
  * Sort the record vector by (ts, handle) (non-decreasing).
  * Uses stdlib qsort. O(n log n) complexity.
  *
- * C-14 fix: Supports deferred sort strategy where OOO records are
+ * Supports deferred sort strategy where out-of-order records are
  * appended unsorted during insertion and sorted once at seal/capture time.
  * This gives O(n) + O(n log n) total vs O(n^2) for sorted insert.
  *

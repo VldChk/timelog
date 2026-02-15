@@ -20,8 +20,6 @@
  * - The owner refcount is NOT atomic (B4 constraint)
  * - All incref/decref operations MUST be serialized by the caller
  * - For CPython bindings, the GIL provides this serialization
- *
- * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
  */
 
 #include "timelog/timelog.h"

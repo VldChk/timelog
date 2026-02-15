@@ -201,54 +201,21 @@ typedef struct tl_allocator {
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 
 /**
- * Handle drop callback (invoked after physical deletes during compaction
- * and during flush when tombstones remove sealed records).
+ * Handle drop callback -- "retire" notification for physically deleted records.
  *
- * WHEN INVOKED:
- * - Only for records PHYSICALLY dropped during compaction or flush
- *   (tombstone application)
- * - NOT called for logical tombstone insertion (tl_delete_range/tl_delete_before)
- * - NOT called during tl_close() - caller retains ownership of all remaining handles
- * - Callbacks are DEFERRED until after successful manifest publish, ensuring
- *   that only truly committed drops trigger the callback
+ * Invoked after successful manifest publish when compaction or flush physically
+ * removes a record covered by a tombstone. NOT called during tl_close(),
+ * logical tombstone insertion, or segment release.
  *
- * SNAPSHOT SAFETY (read carefully):
- * This callback indicates a record is being RETIRED from the newest manifest,
- * NOT that it's safe to free immediately. Existing snapshots acquired before
- * compaction may still reference this handle until those snapshots are released.
- * CONTRACT:
- * - Called ONLY when a record is physically deleted during compaction or flush
- *   (tombstone coverage).
- * - Called ONLY after successful manifest publish (never speculatively).
- * - NOT called by tl_close() or segment release.
- * - Handles not covered by tombstones are never reported here; callers
- *   must track them if cleanup-at-close is required.
+ * WARNING: Existing snapshots may still reference the handle. Do NOT free
+ * the payload immediately. Use epoch-based reclamation or reference counting.
  *
- * THREADING:
- * - May be called from the maintenance worker thread (background mode)
- * - May be called from the thread invoking tl_maint_step(), tl_flush(),
- *   or any API path that publishes physical drops
+ * Threading: May be called from the maintenance worker or any thread that
+ * invokes tl_flush()/tl_maint_step(). Must not call back into timelog APIs.
  *
- * Treat this as a "retire" notification, not a "free now" signal.
- *
- * SAFE usage patterns:
- * - Epoch-based reclamation: track callback timestamp, defer free until all
- *   snapshots older than that epoch are released
- * - Reference counting: callback decrements refcount, actual free when zero
- * - Grace period: callback adds to deferred-free queue with timestamp
- *
- * UNSAFE usage (can cause use-after-free):
- * - Immediately freeing user payload in this callback
- *
- * The callback is invoked after manifest publish completes, without holding
- * timelog internal locks. It must not call back into timelog APIs.
- * If compaction/flush/seal fails before publish/commit, callbacks from that
- * attempt are not emitted.
- *
- * LIFETIME (H-05 contract clarification):
- * - Caller retains ownership of handles not covered by tombstones
- * - At tl_close(), records in the log are NOT notified via this callback
- * - If cleanup-at-close is needed, caller must track inserted handles independently
+ * Lifetime: Caller retains ownership of handles not covered by tombstones.
+ * At tl_close(), remaining records are NOT reported via this callback;
+ * track inserted handles independently if cleanup-at-close is needed.
  *
  * @param ctx    User-provided context (from tl_config_t.on_drop_ctx)
  * @param ts     Timestamp of the dropped record
@@ -257,15 +224,9 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 typedef void (*tl_on_drop_fn)(void* ctx, tl_ts_t ts, tl_handle_t handle);
 
 /**
- * Adaptive segmentation configuration.
- * Embedded in tl_config_t as `tl_config_t.adaptive`.
- * All zeros = disabled (preserves existing behavior).
- *
- * Adaptive segmentation dynamically adjusts compaction window sizes based on
- * data density to maintain approximately constant segment sizes.
- *
- * Field naming: Uses short names inside nested struct.
- * LLD's `adaptive_target_records` == `config.adaptive.target_records`
+ * Adaptive segmentation configuration (embedded in tl_config_t).
+ * All zeros = disabled. When enabled, dynamically adjusts compaction window
+ * sizes based on data density to maintain approximately constant segment sizes.
  */
 typedef struct tl_adaptive_config {
     uint64_t    target_records;             /**< 0 = disabled, >0 = target records per segment */
@@ -318,6 +279,7 @@ typedef struct tl_config {
     void*           on_drop_ctx;
 } tl_config_t;
 
+/** Initialize cfg to default values. cfg must not be NULL. */
 TL_API tl_status_t tl_config_init_defaults(tl_config_t* cfg);
 
 /*===========================================================================
@@ -405,22 +367,24 @@ typedef enum tl_append_flags {
     TL_APPEND_HINT_MOSTLY_ORDER  = TL_APPEND_HINT_MOSTLY_IN_ORDER /* alias */
 } tl_append_flags_t;
 
+/** Append a single record. See backpressure/error semantics above. */
 TL_API tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
 
-/*
- * Batch sequencing contract:
- * a single internal operation sequence is assigned to the whole batch.
+/**
+ * Append a batch of records atomically (all-or-nothing on failure).
+ * A single internal sequence number is assigned to the whole batch.
+ * @param flags  Bitwise OR of tl_append_flags_t values
  */
 TL_API tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                                    size_t n, uint32_t flags);
 
-/*
- * Delete range [t1, t2). Unbounded delete-to-infinity is not exposed publicly.
- * Note: half-open ranges cannot represent a single-point delete at TL_TS_MAX.
+/**
+ * Insert a tombstone covering [t1, t2). Returns TL_EINVAL if t1 >= t2.
+ * Cannot express a point-delete at TL_TS_MAX (half-open overflow).
  */
 TL_API tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
 
-/* Delete [MIN_TS, cutoff) */
+/** Insert a tombstone covering [TL_TS_MIN, cutoff). No-op if cutoff == TL_TS_MIN. */
 TL_API tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
 
 /**
@@ -435,16 +399,17 @@ TL_API tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
  */
 TL_API tl_status_t tl_flush(tl_timelog_t* tl);
 
-/* Request compaction; actual work performed by maintenance. */
+/** Request compaction. Sets compact_pending flag; actual merge runs in maintenance. */
 TL_API tl_status_t tl_compact(tl_timelog_t* tl);
 
 /*===========================================================================
  * Snapshot API (read isolation)
  *===========================================================================*/
 
+/** Acquire a consistent read snapshot. Thread-safe (multiple concurrent readers). */
 TL_API tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out);
 
-/* Release snapshot; all iterators derived from it must be destroyed first. */
+/** Release snapshot. All iterators derived from it must be destroyed first. */
 TL_API void tl_snapshot_release(tl_snapshot_t* s);
 
 /*===========================================================================
@@ -463,24 +428,19 @@ TL_API tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
 TL_API tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
                                  tl_iter_t** out);
 
-/*
- * Iterate all records with timestamp == ts (range form with overflow guard).
- * A row is filtered only when max_tombstone_seq(ts) > row_watermark.
- */
+/** Iterate all records with timestamp == ts (range-based, handles TL_TS_MAX overflow). */
 TL_API tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);
 
-/**
- * Create an iterator over all records with timestamp == ts.
- *
- * Duplicates are returned; tie order is unspecified.
- * A row is filtered only when max_tombstone_seq(ts) > row_watermark.
- */
+/** Point lookup: iterate all records with timestamp == ts via fast path.
+ *  Duplicates are returned; tie order is unspecified. */
 TL_API tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);
 
+/** Advance iterator and write next record to out. Returns TL_EOF when exhausted. */
 TL_API tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out);
 
+/** Destroy iterator. NULL is safe. */
 TL_API void tl_iter_destroy(tl_iter_t* it);
 
 /*===========================================================================
@@ -494,6 +454,7 @@ typedef enum tl_scan_decision {
 
 typedef tl_scan_decision_t (*tl_scan_fn)(void* ctx, const tl_record_t* rec);
 
+/** Scan records in [t1, t2), calling fn for each. Stops early if fn returns TL_SCAN_STOP. */
 TL_API tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
                                  tl_scan_fn fn, void* ctx);
 
@@ -698,13 +659,13 @@ typedef struct tl_stats {
     uint64_t compactions_total;        /* Total compaction operations completed */
     uint64_t compaction_retries;       /* Compaction publish retries */
     uint64_t compaction_publish_ebusy; /* Publish attempts returning TL_EBUSY */
-    /* Compaction selection observability (M-23) */
+    /* Compaction selection observability */
     uint64_t compaction_select_calls;      /* Selection attempts */
     uint64_t compaction_select_l0_inputs;  /* Total L0 inputs selected */
     uint64_t compaction_select_l1_inputs;  /* Total L1 inputs selected */
     uint64_t compaction_select_no_work;    /* Selections with no L0s */
 
-    /* Adaptive segmentation metrics (V-Next)
+    /* Adaptive segmentation metrics.
      * Only populated when adaptive.target_records > 0 in config. */
     tl_ts_t  adaptive_window;          /* Current effective window size */
     double   adaptive_ewma_density;    /* EWMA density (records per time unit) */
@@ -712,8 +673,10 @@ typedef struct tl_stats {
     uint32_t adaptive_failures;        /* Consecutive compaction failures */
 } tl_stats_t;
 
+/** Gather aggregate statistics from a snapshot into out. */
 TL_API tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);
 
+/** Validate snapshot invariants. Debug builds run full checks; release returns TL_OK. */
 TL_API tl_status_t tl_validate(const tl_snapshot_t* snap);
 
 #ifdef __cplusplus

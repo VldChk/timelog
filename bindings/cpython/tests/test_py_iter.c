@@ -1,11 +1,9 @@
 /**
  * @file test_py_iter.c
- * @brief Unit tests for PyTimelogIter CPython extension (LLD-B3)
+ * @brief Unit tests for PyTimelogIter CPython extension
  *
  * TDD-driven tests for the PyTimelogIter iterator type.
  * Tests run with Python initialized and GIL held.
- *
- * See: docs/V2/timelog_v2_lld_read_path.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -275,7 +273,7 @@ static PyObject* make_range_args(long t1, long t2)
 }
 
 /*===========================================================================
- * Test Suite: Direct Instantiation Blocked (Phase 1)
+ * Test Suite: Direct Instantiation Blocked
  *===========================================================================*/
 
 TEST(direct_instantiation_blocked)
@@ -300,7 +298,7 @@ TEST(direct_instantiation_blocked)
 }
 
 /*===========================================================================
- * Test Suite: Basic Iteration (Phase 2)
+ * Test Suite: Basic Iteration
  *===========================================================================*/
 
 TEST(range_basic)
@@ -526,7 +524,7 @@ TEST(iter_on_closed_timelog)
 }
 
 /*===========================================================================
- * Test Suite: Factory Methods (Phase 3)
+ * Test Suite: Factory Methods
  *===========================================================================*/
 
 TEST(since_basic)
@@ -747,7 +745,7 @@ TEST(point_basic)
 }
 
 /*===========================================================================
- * Test Suite: Iterator Close & Cleanup (Phase 4)
+ * Test Suite: Iterator Close & Cleanup
  *===========================================================================*/
 
 TEST(close_drops_pin)
@@ -1142,7 +1140,7 @@ TEST(close_timelog_with_live_iterator)
 }
 
 /*===========================================================================
- * Test Suite: Context Manager (Phase 5)
+ * Test Suite: Context Manager
  *===========================================================================*/
 
 TEST(context_manager_normal)
@@ -1202,7 +1200,7 @@ TEST(context_manager_normal)
 }
 
 /*===========================================================================
- * Test Suite: next_batch (Phase 8)
+ * Test Suite: next_batch
  *===========================================================================*/
 
 TEST(next_batch_full)
@@ -1548,11 +1546,11 @@ int main(int argc, char* argv[])
 
     printf("Running py_iter tests...\n");
 
-    /* Phase 1: Direct Instantiation Blocked */
+    /* Direct Instantiation Blocked */
     printf("\n[Direct Instantiation Blocked]\n");
     run_direct_instantiation_blocked();
 
-    /* Phase 2: Basic Iteration */
+    /* Basic Iteration */
     printf("\n[Basic Iteration]\n");
     run_range_basic();
     run_empty_range();
@@ -1560,7 +1558,7 @@ int main(int argc, char* argv[])
     run_yield_tuple_format();
     run_iter_on_closed_timelog();
 
-    /* Phase 3: Factory Methods */
+    /* Factory Methods */
     printf("\n[Factory Methods]\n");
     run_since_basic();
     run_until_basic();
@@ -1568,7 +1566,7 @@ int main(int argc, char* argv[])
     run_equal_basic();
     run_point_basic();
 
-    /* Phase 4: Close & Cleanup */
+    /* Close & Cleanup */
     printf("\n[Close & Cleanup]\n");
     run_close_drops_pin();
     run_close_is_idempotent();
@@ -1576,18 +1574,18 @@ int main(int argc, char* argv[])
     run_closed_property();
     run_exhaust_clears_resources();
 
-    /* Phase 4b: Multiple Concurrent Iterators */
+    /* Multiple Concurrent Iterators */
     printf("\n[Multiple Concurrent Iterators]\n");
     run_two_iterators_two_pins();
     run_close_one_keeps_other();
     run_snapshot_boundary();
     run_close_timelog_with_live_iterator();
 
-    /* Phase 5: Context Manager */
+    /* Context Manager */
     printf("\n[Context Manager]\n");
     run_context_manager_normal();
 
-    /* Phase 8: next_batch */
+    /* next_batch */
     printf("\n[next_batch]\n");
     run_next_batch_full();
     run_next_batch_partial();

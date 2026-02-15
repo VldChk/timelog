@@ -17,8 +17,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Memrun must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 5.2
  *===========================================================================*/
 
 typedef struct tl_memrun_iter {
@@ -59,9 +57,7 @@ tl_status_t tl_memrun_iter_init(tl_memrun_iter_t* it,
                                  bool t2_unbounded,
                                  tl_alloc_ctx_t* alloc);
 
-/**
- * Destroy memrun iterator and free internal resources.
- */
+/** Destroy memrun iterator and free internal resources. */
 void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
 
 /*===========================================================================
@@ -95,9 +91,7 @@ tl_status_t tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target);
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_memrun_iter_done(const tl_memrun_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;

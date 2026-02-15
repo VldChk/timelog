@@ -20,13 +20,12 @@
  * - Sealed queue operations require tl_timelog.memtable_mu (external)
  * - The memtable does NOT own its lock; tl_timelog_t provides it
  *
- * Lock Ordering (from HLD):
+ * Lock ordering:
  * - maint_mu -> flush_mu -> writer_mu -> memtable_mu
  *
  * CRITICAL: sealed[] is preallocated to sealed_max_runs at init.
  * This eliminates realloc on the seal hot path and simplifies failure handling.
  *
- * Reference: Write Path LLD Section 3.2
  *===========================================================================*/
 
 struct tl_memtable {
@@ -60,7 +59,7 @@ struct tl_memtable {
     size_t          sealed_len;       /* Current queue length */
     size_t          sealed_max_runs;  /* Fixed capacity (from config) */
     /*
-     * M-09: sealed_epoch is protected by memtable_mu only.
+     * sealed_epoch is protected by memtable_mu only.
      * Updated atomically when sealed queue changes (seal, pop).
      * Used for flush synchronization and memview cache invalidation.
      */
@@ -78,7 +77,7 @@ struct tl_memtable {
      * Metadata
      *-----------------------------------------------------------------------*/
     /*
-     * M-09: epoch is protected by writer_mu only.
+     * epoch is protected by writer_mu only.
      * Incremented on every write operation (insert, tombstone).
      * Used for memview cache invalidation - snapshot caching checks if
      * epoch changed to determine if cached memview is still valid.
@@ -132,7 +131,7 @@ void tl_memtable_destroy(tl_memtable_t* mt);
 /**
  * Insert a single record.
  *
- * Algorithm (Write Path LLD Section 3.6, updated for OOO head):
+ * Algorithm:
  * - If ts >= last_inorder_ts: append to active_run (fast path)
  * - Else: append to ooo_head (unsorted, sorted on flush/seal)
  *
@@ -180,7 +179,7 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
 /**
  * Insert a tombstone interval [t1, t2).
  *
- * Semantics (Write Path LLD Section 3.8):
+ * Semantics:
  * - t1 > t2:  Returns TL_EINVAL (invalid interval)
  * - t1 == t2: Returns TL_OK (no-op, empty interval)
  * - t1 < t2:  Inserts and coalesces
@@ -364,7 +363,7 @@ TL_INLINE tl_memrun_t* tl_memtable_sealed_at(const tl_memtable_t* mt, size_t idx
 }
 
 /*===========================================================================
- * Backpressure (Write Path LLD Section 6.1)
+ * Backpressure
  *===========================================================================*/
 
 /**

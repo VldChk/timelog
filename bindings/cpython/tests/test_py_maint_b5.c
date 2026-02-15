@@ -1,6 +1,6 @@
 /**
  * @file test_py_maint_b5.c
- * @brief LLD-B5 compliance tests for maintenance + threading integration
+ * @brief Maintenance + threading integration tests
  *
  * Test Categories:
  * - Handle-only tests: Use tl_py_handle_ctx_t directly
@@ -10,8 +10,6 @@
  * - Use PyDict_New() NOT PyLong_FromLong() because small integers are
  *   immortal on Python 3.12+ (their refcount doesn't change)
  * - Tests for LIFO Treiber stack behavior (not FIFO)
- *
- * See: docs/V2/timelog_v2_lld_background_maintenance.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -328,7 +326,7 @@ static void close_and_dealloc(PyTimelog* self)
 }
 
 /*===========================================================================
- * Phase 1: Drain Mechanism Tests (Handle-only)
+ * Drain Mechanism Tests (Handle-only)
  *
  * These tests use tl_py_handle_ctx_t directly without PyTimelog.
  *===========================================================================*/
@@ -481,7 +479,7 @@ TEST(metrics_queue_len_accuracy)
 }
 
 /*===========================================================================
- * Phase 2: Close Path Tests (Mixed)
+ * Close Path Tests (Mixed)
  *
  * Tests verifying close sequence behavior with retired queue.
  *===========================================================================*/
@@ -572,7 +570,7 @@ TEST(dealloc_with_pins_warning)
 }
 
 /*===========================================================================
- * Phase 3: Worker Lifecycle Tests (PyTimelog)
+ * Worker Lifecycle Tests (PyTimelog)
  *
  * Tests for maintenance worker start/stop behavior.
  *===========================================================================*/
@@ -679,7 +677,7 @@ TEST(stress_start_stop_cycles)
 }
 
 /*===========================================================================
- * Phase 4: EBUSY Integration Tests (PyTimelog)
+ * EBUSY Integration Tests (PyTimelog)
  *
  * Tests for TL_EBUSY (backpressure) handling.
  *
@@ -857,7 +855,7 @@ TEST(ebusy_extend_partial_commit)
 }
 
 /*===========================================================================
- * Phase 5: Error Mapping Tests
+ * Error Mapping Tests
  *===========================================================================*/
 
 TEST(error_mapping_overflow)
@@ -880,35 +878,35 @@ TEST(error_mapping_enomem)
 
 static void run_handle_only_tests(void)
 {
-    printf("\n=== Phase 1: Drain Mechanism (Handle-only) ===\n");
+    printf("\n=== Drain Mechanism (Handle-only) ===\n");
     run_drain_batch_limit_exact();
     run_drain_reattach_remaining();
     run_force_drain_ignores_batch_limit();
     run_metrics_queue_len_accuracy();
 
-    printf("\n=== Phase 2a: Close Path (Handle-only) ===\n");
+    printf("\n=== Close Path (Handle-only) ===\n");
     run_close_drains_injected_queue();
     run_close_force_drain_with_batch_limit();
 }
 
 static void run_pytimelog_tests(void)
 {
-    printf("\n=== Phase 2b: Close Path (PyTimelog) ===\n");
+    printf("\n=== Close Path (PyTimelog) ===\n");
     run_dealloc_with_pins_warning();
 
-    printf("\n=== Phase 3: Worker Lifecycle ===\n");
+    printf("\n=== Worker Lifecycle ===\n");
     run_maint_start_idempotent();
     run_maint_stop_without_start();
     run_stress_start_stop_cycles();
 
-    printf("\n=== Phase 4: EBUSY Integration ===\n");
+    printf("\n=== EBUSY Integration ===\n");
     run_ebusy_raise_exception();
     run_ebusy_raise_triggers_exception();
     run_ebusy_silent_no_exception();
     run_ebusy_flush_triggers_segment();
     run_ebusy_extend_partial_commit();
 
-    printf("\n=== Phase 5: Error Mapping ===\n");
+    printf("\n=== Error Mapping ===\n");
     run_error_mapping_overflow();
     run_error_mapping_enomem();
 }
@@ -922,7 +920,7 @@ int main(int argc, char* argv[])
     (void)argc;
     (void)argv;
 
-    printf("test_py_maint_b5 (LLD-B5 compliance):\n");
+    printf("test_py_maint_b5 (maintenance compliance):\n");
 
     /* Single Python initialization for all phases */
     if (tlpy_init_python_full() < 0) {

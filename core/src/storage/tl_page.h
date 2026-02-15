@@ -9,8 +9,6 @@
  *
  * These flags indicate the delete status of a page for read-path pruning.
  * V1 only produces FULLY_LIVE pages; other values are reserved for V2.
- *
- * Reference: Storage LLD Section 3.1
  *===========================================================================*/
 
 typedef enum tl_page_del_flags {
@@ -24,8 +22,6 @@ typedef enum tl_page_del_flags {
  *
  * V1 does not emit per-page delete masks. These types are defined for
  * forward compatibility but are never instantiated in V1.
- *
- * Reference: Storage LLD Section 3.2
  *===========================================================================*/
 
 typedef enum tl_rowdel_kind {
@@ -63,8 +59,6 @@ typedef struct tl_rowbitset {
  * - count > 0 => min_ts == ts[0] && max_ts == ts[count-1]
  * - flags == FULLY_LIVE in V1
  * - row_del == NULL in V1
- *
- * Reference: Storage LLD Section 3.3
  *===========================================================================*/
 
 typedef struct tl_page {
@@ -91,8 +85,6 @@ typedef struct tl_page {
  * Page Builder
  *
  * Constructs immutable pages from a sorted record stream.
- *
- * Reference: Storage LLD Section 4
  *===========================================================================*/
 
 typedef struct tl_page_builder {
@@ -105,10 +97,7 @@ typedef struct tl_page_builder {
  * Lifecycle
  *---------------------------------------------------------------------------*/
 
-/**
- * Initialize page builder with target page size.
- * Computes records_per_page with underflow protection.
- */
+/** Initialize page builder with target page size. */
 void tl_page_builder_init(tl_page_builder_t* pb, tl_alloc_ctx_t* alloc,
                           size_t target_page_bytes);
 
@@ -175,8 +164,6 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc);
  * For point queries (all records with ts == target):
  * - start = lower_bound(target)
  * - end   = upper_bound(target)
- *
- * Reference: Read Path LLD Section 5.1
  *===========================================================================*/
 
 /**
@@ -272,8 +259,6 @@ bool tl_page_validate(const tl_page_t* page);
  *
  * Stores per-page summary for fence-pointer navigation.
  * Used by tl_page_catalog_t.
- *
- * Reference: Storage LLD Section 3.4
  *===========================================================================*/
 
 typedef struct tl_page_meta {
@@ -304,8 +289,6 @@ typedef struct tl_page_meta {
  * Ownership:
  * - Catalog does NOT own pages; segment owns both catalog and pages.
  * - tl_page_catalog_destroy() only frees the metadata array.
- *
- * Reference: Storage LLD Section 3.4
  *===========================================================================*/
 
 typedef struct tl_page_catalog {

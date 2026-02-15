@@ -25,9 +25,7 @@
  * - Capture acquires memtable_mu internally (for sealed queue)
  * - After capture, fully immutable - no synchronization needed
  *
- * Lock Ordering: writer_mu -> memtable_mu (per Phase 4 lock hierarchy)
- *
- * Reference: Read Path LLD Section 5.1, Engineering Plan Section 5.1
+ * Lock ordering: writer_mu -> memtable_mu
  *===========================================================================*/
 
 struct tl_memview {
@@ -93,7 +91,7 @@ typedef struct tl_memview_shared {
  * state access). This function acquires memtable_mu internally for sealed
  * queue access.
  *
- * Lock ordering: writer_mu -> memtable_mu (Phase 4 lock hierarchy)
+ * Lock ordering: writer_mu -> memtable_mu
  *
  * Copies active buffers (run, OOO head, tombs) and pins sealed memruns via
  * tl_memrun_acquire. The OOO head may be sorted later via tl_memview_sort_head

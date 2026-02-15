@@ -105,20 +105,14 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     *out_dropped = NULL;
     *out_dropped_len = 0;
 
-    /*
-     * Step 1: Addition overflow check FIRST.
-     * If run_len + ooo_len would overflow size_t, reject early.
-     */
+    /* Step 1: Overflow check for total record count */
     if (mr->run_len > SIZE_MAX - mr->ooo_total_len) {
         return TL_EOVERFLOW;
     }
 
     size_t total_records = mr->run_len + mr->ooo_total_len;
 
-    /*
-     * Step 2: Handle tombstone-only case.
-     * If no records but tombstones exist, build tombstone-only L0 segment.
-     */
+    /* Step 2: Handle tombstone-only case */
     if (total_records == 0) {
         if (mr->tombs_len > 0) {
             /* Tombstone-only segment */
@@ -130,22 +124,16 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                                         ctx->applied_seq,
                                         out_seg);
         } else {
-            /* Empty memrun should never reach here (invariant violation) */
             return TL_EINVAL;
         }
     }
 
-    /*
-     * Step 3: Multiplication overflow check.
-     * total_records * sizeof(tl_record_t) must not overflow.
-     */
+    /* Step 3: Allocation overflow check */
     if (total_records > SIZE_MAX / sizeof(tl_record_t)) {
         return TL_EOVERFLOW;
     }
 
-    /*
-     * Step 4: Allocate merged buffer.
-     */
+    /* Step 4: Allocate merged buffer */
     size_t merged_size = total_records * sizeof(tl_record_t);
     tl_record_t* merged = tl__malloc(ctx->alloc, merged_size);
     if (merged == NULL) {
@@ -156,10 +144,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     size_t dropped_len = 0;
     size_t dropped_cap = 0;
 
-    /*
-     * Step 5: K-way merge run + OOO runs into merged[].
-     * Stable tie-break: run first, then OOO runs by gen order.
-     */
+    /* Step 5: K-way merge (stable: run first, then OOO by gen order) */
     size_t run_count = mr->ooo_run_count;
     if (run_count > UINT32_MAX - 1) {
         tl__free(ctx->alloc, merged);
@@ -264,7 +249,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         if (ctx->tombs.len > 0) {
             tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, top->ts);
         }
-        /* Tie semantics: tomb_seq == watermark → record kept (strict >).
+        /* Tie semantics: tomb_seq == watermark -> record kept (strict >).
          * The tombstone was already applied at build time and this record survived. */
         if (tomb_seq <= top->watermark) {
             merged[i].ts = top->ts;
@@ -320,9 +305,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
 
     size_t kept = i;
 
-    /*
-     * Step 6: Build L0 segment from merged records and tombstones.
-     */
+    /* Step 6: Build L0 segment */
     if (kept == 0) {
         if (mr->tombs_len > 0) {
             st = tl_segment_build_l0(ctx->alloc,
@@ -346,9 +329,7 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                                  out_seg);
     }
 
-    /*
-     * Step 7: Free merged buffer regardless of build result.
-     */
+    /* Step 7: Free merged buffer */
     tl__free(ctx->alloc, merged);
 
     if (st != TL_OK) {

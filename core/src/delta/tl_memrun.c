@@ -2,7 +2,7 @@
 #include "../internal/tl_refcount.h"
 
 /*===========================================================================
- * Bounds Computation (M-11: Public for reuse)
+ * Bounds computation (public for reuse by tl_memtable.c)
  *
  * CRITICAL: Bounds MUST include tombstones, not just records.
  * This ensures tombstones outside record bounds are NOT pruned during
@@ -10,32 +10,27 @@
  *===========================================================================*/
 
 void tl__memrun_compute_bounds(tl_memrun_t* mr) {
-    /* Start with invalid bounds */
     tl_ts_t min_ts = TL_TS_MAX;
     tl_ts_t max_ts = TL_TS_MIN;
 
-    /* Record bounds from run (sorted, so first/last are min/max) */
     if (mr->run_len > 0) {
         min_ts = TL_MIN(min_ts, mr->run[0].ts);
         max_ts = TL_MAX(max_ts, mr->run[mr->run_len - 1].ts);
     }
 
-    /* Record bounds from OOO runs (precomputed min/max) */
     if (mr->ooo_total_len > 0) {
         min_ts = TL_MIN(min_ts, mr->ooo_min_ts);
         max_ts = TL_MAX(max_ts, mr->ooo_max_ts);
     }
 
-    /* Tombstone bounds (CRITICAL for read-path correctness) */
+    /* Tombstones widen bounds to prevent pruning during overlap checks */
     for (size_t i = 0; i < mr->tombs_len; i++) {
         const tl_interval_t* tomb = &mr->tombs[i];
         min_ts = TL_MIN(min_ts, tomb->start);
 
         if (tomb->end_unbounded) {
-            /* Unbounded tombstone [start, +inf) => max_ts = TL_TS_MAX */
             max_ts = TL_TS_MAX;
         } else {
-            /* Bounded tombstone [start, end) => max covered ts is end-1 */
             max_ts = TL_MAX(max_ts, tomb->end - 1);
         }
     }
@@ -48,13 +43,7 @@ void tl__memrun_compute_bounds(tl_memrun_t* mr) {
  * Creation
  *===========================================================================*/
 
-/**
- * Initialize a pre-allocated memrun in-place.
- *
- * Takes ownership of the provided arrays (run, ooo, tombs).
- * Caller must ensure at least one array is non-empty.
- * Sets refcnt to 1.
- */
+/** Initialize pre-allocated memrun. Takes ownership of arrays. */
 tl_status_t tl_memrun_init(tl_memrun_t* mr,
                             tl_alloc_ctx_t* alloc,
                             tl_record_t* run, size_t run_len,
@@ -77,7 +66,6 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
         return TL_EINVAL;
     }
 
-    /* Take ownership of arrays */
     mr->run = run;
     mr->run_len = run_len;
     mr->ooo_runs = ooo_runs;
@@ -89,10 +77,7 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
     mr->tombs_len = tombs_len;
     mr->applied_seq = applied_seq;
 
-    /* Store allocator */
     mr->alloc = alloc;
-
-    /* Initialize reference count to 1 (caller owns) */
     tl_atomic_init_u32(&mr->refcnt, 1);
 
     if (mr->ooo_total_len > 0) {
@@ -103,7 +88,6 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
         }
     }
 
-    /* Compute bounds (includes tombstones) */
     tl__memrun_compute_bounds(mr);
     return TL_OK;
 }
@@ -119,7 +103,6 @@ tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
 
     *out = NULL;
 
-    /* All empty is invalid */
     if (run_len == 0 && ooo_runs == NULL && tombs_len == 0) {
         return TL_EINVAL;
     }
@@ -174,7 +157,6 @@ tl_memrun_t* tl_memrun_acquire(tl_memrun_t* mr) {
         return NULL;
     }
 
-    /* Relaxed: we already have a reference, so no ordering needed for increment */
     tl_atomic_fetch_add_u32(&mr->refcnt, 1, TL_MO_RELAXED);
     return mr;
 }
@@ -204,9 +186,6 @@ void tl_memrun_release(tl_memrun_t* mr) {
 
 #ifdef TL_DEBUG
 
-/**
- * Check if record array is sorted by timestamp (non-decreasing).
- */
 static bool is_records_sorted_ts(const tl_record_t* arr, size_t len) {
     if (len <= 1) {
         return true;
@@ -235,9 +214,6 @@ static bool is_records_sorted_ts_handle(const tl_record_t* arr, size_t len) {
     return true;
 }
 
-/**
- * Check if tombstone array is sorted, non-overlapping, and coalesced.
- */
 static bool is_tombs_valid(const tl_interval_t* arr, size_t len) {
     if (len <= 1) {
         return true;
@@ -246,22 +222,16 @@ static bool is_tombs_valid(const tl_interval_t* arr, size_t len) {
         const tl_interval_t* curr = &arr[i];
         const tl_interval_t* next = &arr[i + 1];
 
-        /* Must be sorted by start */
         if (curr->start > next->start) {
             return false;
         }
-
-        /* If current is unbounded, nothing should follow */
         if (curr->end_unbounded) {
             return false;
         }
-
-        /* Must not overlap: curr->end <= next->start */
         if (curr->end > next->start) {
             return false;
         }
-
-        /* Must not be adjacent with same max_seq (should be coalesced) */
+        /* Adjacent with same seq should have been coalesced */
         if (curr->end == next->start && curr->max_seq == next->max_seq) {
             return false;
         }
@@ -274,22 +244,18 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
         return false;
     }
 
-    /* Reference count must be positive */
     if (tl_memrun_refcnt(mr) == 0) {
         return false;
     }
 
-    /* At least one component must be non-empty */
     if (mr->run_len == 0 && mr->ooo_total_len == 0 && mr->tombs_len == 0) {
         return false;
     }
 
-    /* Check run sorted by ts (handle order is unspecified for in-order path) */
     if (!is_records_sorted_ts(mr->run, mr->run_len)) {
         return false;
     }
 
-    /* Check OOO runset */
     if (mr->ooo_total_len > 0) {
         if (mr->ooo_runs == NULL || mr->ooo_run_count == 0) {
             return false;
@@ -336,12 +302,10 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
         return false;
     }
 
-    /* Check tombs valid */
     if (!is_tombs_valid(mr->tombs, mr->tombs_len)) {
         return false;
     }
 
-    /* Verify min_ts */
     tl_ts_t expected_min = TL_TS_MAX;
     if (mr->run_len > 0) {
         expected_min = TL_MIN(expected_min, mr->run[0].ts);
@@ -356,7 +320,6 @@ bool tl_memrun_validate(const tl_memrun_t* mr) {
         return false;
     }
 
-    /* Verify max_ts */
     tl_ts_t expected_max = TL_TS_MIN;
     if (mr->run_len > 0) {
         expected_max = TL_MAX(expected_max, mr->run[mr->run_len - 1].ts);

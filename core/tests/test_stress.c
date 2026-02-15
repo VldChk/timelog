@@ -20,7 +20,6 @@
  * For CI/quick validation, set TIMELOG_SHORT_STRESS=1 to run abbreviated
  * versions with reduced iteration counts.
  *
- * Part of Phase 10: Integration Testing and Hardening
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -140,7 +139,7 @@ static void stress_srand(uint32_t seed) {
 }
 
 /*===========================================================================
- * Stress Tests (Phase 10)
+ * Stress Tests
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -793,7 +792,7 @@ void run_stress_tests(void) {
         printf("  [INFO] Running stress tests in FULL mode\n");
     }
 
-    /* Phase 10 stress tests - all respect single-writer contract */
+    /* Stress tests - all respect single-writer contract */
     RUN_TEST(stress_high_volume_append_query);
     RUN_TEST(stress_heavy_ooo_ingestion);
     RUN_TEST(stress_delete_churn);

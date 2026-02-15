@@ -18,17 +18,15 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
 
     memset(mt, 0, sizeof(*mt));
 
-    /* Store allocator */
     mt->alloc = alloc;
 
-    /* Initialize active buffers */
     tl_recvec_init(&mt->active_run, alloc);
     tl_seqvec_init(&mt->active_run_seqs, alloc);
     tl_recvec_init(&mt->ooo_head, alloc);
     tl_seqvec_init(&mt->ooo_head_seqs, alloc);
     tl_intervals_init(&mt->active_tombs, alloc);
 
-    /* Preallocate sealed queue (CRITICAL: no realloc on seal path) */
+    /* Preallocate: seal path must not realloc */
     mt->sealed = TL_NEW_ARRAY(alloc, tl_memrun_t*, sealed_max_runs);
     if (mt->sealed == NULL) {
         tl_recvec_destroy(&mt->active_run);
@@ -43,13 +41,11 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
     mt->sealed_max_runs = sealed_max_runs;
     mt->sealed_epoch = 0;
 
-    /* Store configuration */
     mt->memtable_max_bytes = memtable_max_bytes;
     mt->ooo_budget_bytes = ooo_budget_bytes;
     mt->ooo_chunk_records = 0;  /* Derived below */
     mt->ooo_run_limit = TL_DEFAULT_OOO_RUN_LIMIT;
 
-    /* Initialize metadata */
     mt->last_inorder_ts = TL_TS_MIN;
     mt->active_bytes_est = 0;
     mt->epoch = 0;
@@ -87,7 +83,6 @@ void tl_memtable_destroy(tl_memtable_t* mt) {
         return;
     }
 
-    /* Release all sealed memruns */
     for (size_t i = 0; i < mt->sealed_len; i++) {
         size_t idx = tl_memtable_sealed_index(mt, i);
         if (mt->sealed[idx] != NULL) {
@@ -95,7 +90,6 @@ void tl_memtable_destroy(tl_memtable_t* mt) {
         }
     }
 
-    /* Free sealed queue array */
     if (mt->sealed != NULL) {
         tl__free(mt->alloc, (void*)mt->sealed);
         mt->sealed = NULL;
@@ -104,7 +98,6 @@ void tl_memtable_destroy(tl_memtable_t* mt) {
     mt->sealed_head = 0;
     mt->sealed_epoch = 0;
 
-    /* Destroy active buffers */
     tl_recvec_destroy(&mt->active_run);
     tl_seqvec_destroy(&mt->active_run_seqs);
     tl_recvec_destroy(&mt->ooo_head);
@@ -418,10 +411,9 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
 
     tl_status_t st;
 
-    /* Route to appropriate buffer based on timestamp ordering */
     if (tl_recvec_len(&mt->active_run) == 0 ||
         ts >= mt->last_inorder_ts) {
-        /* In-order: fast path to run */
+        /* In-order: append to run */
         size_t run_len = tl_recvec_len(&mt->active_run);
         if (run_len == SIZE_MAX) {
             return TL_ENOMEM;
@@ -460,7 +452,6 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
         ooo_head_note_append(mt, ts, handle);
     }
 
-    /* Update metadata AFTER successful insert */
     mt->epoch++;
     memtable_add_record_bytes(mt, 1);
 
@@ -476,11 +467,7 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
     return TL_OK;
 }
 
-/**
- * Check if entire batch is sorted (non-decreasing by timestamp).
- * Returns true if batch is sorted, false otherwise.
- * FULL CHECK, NO SAMPLING - sampling could miss unsorted sections.
- */
+/** Check if batch is sorted by timestamp (full scan, no sampling). */
 static bool batch_is_sorted(const tl_record_t* records, size_t n) {
     if (n <= 1) {
         return true;
@@ -543,19 +530,9 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
             return st;
         }
 
-        /* Copy all records (cannot fail after reserve).
-         *
-         * ATOMICITY: push_n is a memcpy-based operation that cannot partially
-         * fail after successful reserve. If it returns error (shouldn't happen),
-         * no records were inserted (memcpy is all-or-nothing). Therefore we
-         * return without updating metadata - this maintains consistency.
-         *
-         * If push_n ever changed to allow partial writes, this would need
-         * to handle partial metadata updates like the slow path does. */
+        /* Cannot fail after reserve (memcpy is all-or-nothing) */
         st = tl_recvec_push_n(&mt->active_run, records, n);
         if (st != TL_OK) {
-            /* Reserve succeeded but push_n failed - should never happen.
-             * No records were inserted, return without metadata update. */
             return st;
         }
         st = tl_seqvec_push_n_const(&mt->active_run_seqs, seq, n);
@@ -564,18 +541,7 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
         mt->last_inorder_ts = records[n - 1].ts;
         inserted = n;
     } else {
-        /* Slow path: per-record insert
-         *
-         * C-08 fix: Pre-reserve both vectors to guarantee all-or-nothing semantics.
-         * This ensures that if any allocation would fail, we fail BEFORE inserting
-         * any records. Callers can then safely rollback INCREF on all input handles.
-         *
-         * TRADEOFF: We reserve up to 2N slots total (worst case: all go to run OR
-         * all go to ooo). This may fail earlier under memory pressure than actual
-         * inserts would, but guarantees atomicity which is more important for API
-         * correctness. Memory is virtual, so over-reservation doesn't waste physical
-         * RAM immediately.
-         */
+        /* Slow path: pre-reserve both vectors for all-or-nothing semantics */
         size_t run_len = tl_recvec_len(&mt->active_run);
         size_t ooo_len = tl_recvec_len(&mt->ooo_head);
 
@@ -628,7 +594,6 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
         }
     }
 
-    /* Update metadata ONCE at end (all records inserted successfully) */
     mt->epoch++;
     memtable_add_record_bytes(mt, inserted);
 
@@ -687,12 +652,10 @@ tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt, tl_ts_t t1
 bool tl_memtable_should_seal(const tl_memtable_t* mt) {
     TL_ASSERT(mt != NULL);
 
-    /* Check total active bytes */
     if (mt->active_bytes_est >= mt->memtable_max_bytes) {
         return true;
     }
 
-    /* Check OOO bytes specifically (skip if budget is 0 = unlimited) */
     if (mt->ooo_budget_bytes > 0) {
         size_t ooo_bytes = memtable_ooo_bytes_est(mt);
         if (ooo_bytes >= mt->ooo_budget_bytes) {
@@ -744,12 +707,12 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     size_t dropped_len = 0;
     size_t dropped_cap = 0;
 
-    /* Step 1: Check if anything to seal (no lock needed - under writer_mu) */
+    /* Step 1: Nothing to seal? */
     if (tl_memtable_is_active_empty(mt)) {
         return TL_OK; /* Nothing to seal */
     }
 
-    /* Step 2: Check queue capacity FIRST (under memtable_mu) */
+    /* Step 2: Check queue capacity */
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
@@ -757,45 +720,15 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     }
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
-    /*
-     * Step 3: Take ownership of active arrays FIRST.
-     * We do this before allocating memrun so that if tl_memrun_create
-     * fails, we can restore the arrays to the memtable.
-     * However, tl_recvec_take and tl_intervals_take reset the vectors,
-     * so we need to be careful about rollback.
-     *
-     * DESIGN: The plan says "check capacity, allocate memrun, then take".
-     * But tl_memrun_create handles allocation internally. We must
-     * try tl_memrun_create first (which allocates internally), and if
-     * it fails due to TL_ENOMEM, we've already detached the arrays.
-     *
-     * SOLUTION: Take arrays, try create. If create fails:
-     * - For TL_EINVAL: shouldn't happen (checked non-empty above)
-     * - For TL_ENOMEM: arrays were taken but memrun alloc failed.
-     *   We must restore them. But tl_recvec has no "restore" API.
-     *
-     * REVISED SOLUTION: We know we're non-empty. Take the arrays,
-     * and tl_memrun_create will succeed unless OOM. On OOM, we lose
-     * the arrays (they're freed in cleanup). This violates "preserve
-     * active state on ENOMEM".
-     *
-     * CORRECT SOLUTION: Attempt a dummy allocation first to test if
-     * memory is available, OR accept that on OOM during seal, data
-     * may be lost. The plan says "active preserved on ENOMEM".
-     *
-     * IMPLEMENTATION: Pre-allocate the memrun struct (just the struct,
-     * not with tl_memrun_create). Then take arrays, initialize manually,
-     * compute bounds. This matches the plan exactly.
-     */
-
-    /* Step 3: Pre-allocate memrun struct BEFORE detaching arrays */
+    /* Step 3: Pre-allocate memrun struct before detaching arrays.
+     * This preserves active state on ENOMEM (arrays not yet taken). */
     tl_memrun_t* mr = NULL;
     tl_status_t alloc_st = tl_memrun_alloc(mt->alloc, &mr);
     if (alloc_st != TL_OK) {
         return TL_ENOMEM; /* Active state PRESERVED */
     }
 
-    /* Step 4: Flush OOO head (required at seal) */
+    /* Step 4: Flush OOO head */
     tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq,
                                                    &dropped, &dropped_len, &dropped_cap);
     if (flush_st != TL_OK) {
@@ -806,7 +739,7 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         return flush_st; /* Active state PRESERVED */
     }
 
-    /* Step 5: Take ownership of active arrays and runset */
+    /* Step 5: Take ownership of active arrays */
     size_t run_len = 0;
     size_t run_seqs_len = 0;
     size_t tombs_len = 0;
@@ -859,7 +792,7 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         run_seqs = NULL;
     }
 
-    /* Step 6: Initialize memrun in-place (no allocations) */
+    /* Step 6: Initialize memrun in-place */
     tl_status_t init_st = tl_memrun_init(mr, mt->alloc,
                                          run, run_len,
                                          ooo_runs,
@@ -875,14 +808,8 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         return TL_EINTERNAL;
     }
 
-    /* Step 7: Push to sealed queue (under memtable_mu) */
+    /* Step 7: Push to sealed queue */
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
-    /*
-     * M-10 fix: Runtime check for queue capacity (defensive).
-     * Single writer means this should never fail, but we check defensively
-     * in case of future code changes. On failure, release memrun and return
-     * TL_EBUSY without corrupting the queue.
-     */
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
         tl_memrun_release(mr);
@@ -896,7 +823,7 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     mt->sealed_epoch++;
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
-    /* Step 8: Reset active metadata AFTER successful enqueue */
+    /* Step 8: Reset active state */
     mt->last_inorder_ts = TL_TS_MIN;
     mt->active_bytes_est = 0;
     mt->epoch++;  /* Memtable state changed (active -> sealed) */
@@ -1043,9 +970,6 @@ bool tl_memtable_wait_for_space(const tl_memtable_t* mt, tl_mutex_t* mu,
 
 #ifdef TL_DEBUG
 
-/**
- * Check if record array is sorted.
- */
 static bool debug_records_sorted(const tl_record_t* arr, size_t len) {
     if (len <= 1) return true;
     for (size_t i = 0; i < len - 1; i++) {
@@ -1059,7 +983,6 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
         return false;
     }
 
-    /* Check active_run is sorted */
     if (!debug_records_sorted(tl_recvec_data(&mt->active_run),
                               tl_recvec_len(&mt->active_run))) {
         return false;
@@ -1072,15 +995,12 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
         return false;
     }
 
-    /* OOO head is unsorted during append; do NOT check sortedness here.
-     * Sortedness is enforced on head flush or seal. */
+    /* OOO head is unsorted during append; sorted on flush/seal */
 
-    /* Check active_tombs is valid */
     if (!tl_intervals_validate(&mt->active_tombs)) {
         return false;
     }
 
-    /* Check sealed queue bounds */
     if (mt->sealed_len > mt->sealed_max_runs) {
         return false;
     }
@@ -1088,7 +1008,6 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
         return false;
     }
 
-    /* Check sealed entries are non-NULL */
     for (size_t i = 0; i < mt->sealed_len; i++) {
         if (tl_memtable_sealed_at(mt, i) == NULL) {
             return false;

@@ -230,16 +230,16 @@ extern void run_stress_tests(void);
 /* Snapshot lifetime tests */
 extern void run_snapshot_lifetime_tests(void);
 
-/* Storage layer internal tests (LLD-driven) */
+/* Storage layer internal tests */
 extern void run_storage_internal_tests(void);
 
-/* Delta layer internal tests (LLD-driven) */
+/* Delta layer internal tests */
 extern void run_delta_internal_tests(void);
 
-/* Compaction internal tests (LLD-driven) */
+/* Compaction internal tests */
 extern void run_compaction_internal_tests(void);
 
-/* PageSpan core API tests (V2 binding support) */
+/* PageSpan core API tests */
 extern void run_pagespan_iter_tests(void);
 
 /* Adaptive Segmentation internal tests (V-Next) */
@@ -256,13 +256,13 @@ int main(int argc, char* argv[]) {
     const char* groups = getenv("TL_TEST_GROUPS");
     g_test_filter = getenv("TL_TEST_FILTER");
 
-    printf("Timelog V1 Test Suite\n");
+    printf("Timelog Test Suite\n");
     printf("========================================\n\n");
 
     test_init();
 
     /*-----------------------------------------------------------------------
-     * Internal Tests (LLD-driven implementation verification)
+     * Internal Tests
      *-----------------------------------------------------------------------*/
 
     if (test_group_enabled(groups, "internal_sync")) {

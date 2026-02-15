@@ -1,9 +1,4 @@
-"""
-Tests for the Python facade layer (LLD-B7).
-
-This test suite drives the implementation using TDD principles.
-Tests are ordered by dependency: foundational tests first.
-"""
+"""Tests for the Python facade layer."""
 
 import gc
 import weakref
@@ -61,7 +56,6 @@ class TestReexports:
 
 
 class TestVersion:
-    """Test version metadata."""
 
     def test_version_defined(self):
         """__version__ must be a non-empty string."""

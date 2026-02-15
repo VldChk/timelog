@@ -4,7 +4,7 @@
 #include "tl_sync.h"
 
 /*===========================================================================
- * Lock Ordering (from timelog_v1_engineering_plan.md)
+ * Lock Ordering
  *
  * Strict order: maint_mu -> flush_mu -> writer_mu -> memtable_mu
  *

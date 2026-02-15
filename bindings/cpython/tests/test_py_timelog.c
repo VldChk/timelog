@@ -1,11 +1,9 @@
 /**
  * @file test_py_timelog.c
- * @brief Unit tests for PyTimelog CPython extension (LLD-B2)
+ * @brief Unit tests for PyTimelog CPython extension
  *
  * TDD-driven tests for the PyTimelog wrapper type.
  * Tests run with Python initialized and GIL held.
- *
- * See: docs/V2/timelog_v2_engineering_plan.md
  */
 
 #define PY_SSIZE_T_CLEAN

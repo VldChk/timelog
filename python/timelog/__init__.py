@@ -1,53 +1,17 @@
-"""
-Timelog: Time-indexed storage engine for Python.
+"""Timelog: in-memory time-indexed storage engine for Python.
 
-This module provides the Timelog class for storing and querying
-time-indexed (timestamp, object) records with:
+Stores (timestamp, object) records with fast range queries, snapshot
+isolation, and automatic background compaction. See the ``Timelog`` class
+for full API documentation.
 
-- Sub-millisecond timestamp resolution (s/ms/us/ns)
-- Fast range queries: [t1, t2), since(t), until(t)
-- Time-based eviction: delete_before(cutoff), cutoff(ts)
-- Snapshot isolation for concurrent reads
-- Zero-copy bulk timestamp access via PageSpan
-- Dict-style access: log[ts] = obj, del log[ts], log[ts]
+Example::
 
-Example:
     >>> from timelog import Timelog
-    >>>
     >>> with Timelog() as log:
     ...     log.append("hello")           # auto-timestamp
     ...     log[1000] = "explicit ts"     # dict-style insert
-    ...     log.extend([2000, 3000], ["a", "b"])          # dual-list
-    ...
     ...     for ts, obj in log[1000:]:
     ...         print(ts, obj)
-
-Reopening:
-    Timelog supports reopen() / configure() after close for reconfiguration.
-    For the cleanest semantics, creating a new instance is still preferred.
-
-Thread Safety:
-    Single-writer model. All write/maintenance calls must be externally
-    serialized. Snapshot-based iterators are safe for concurrent reads,
-    but the Timelog object is not generally thread-safe and some methods
-    (flush/compact/close) release the GIL. The binding serializes core
-    calls to avoid concurrent use during GIL-released operations, but
-    this is not a full thread-safety guarantee. Use external coordination
-    if the same instance can be touched from multiple threads. This
-    binding requires the CPython GIL and is not supported on
-    free-threaded/no-GIL Python builds.
-
-Resource Management:
-    Call close() or use the context manager for deterministic cleanup.
-    If you forget to call close(), the object will be automatically
-    finalized on GC (best-effort). During interpreter shutdown, Python-
-    level cleanup may be skipped, so explicit close() is recommended for
-    deterministic release.
-    Note: close() will drop any unflushed records (data loss) but will
-    release all Python objects still owned by the engine. For data safety,
-    call flush() to materialize pending writes before close().
-    In maintenance="disabled" mode, use maint_step() to run compaction
-    manually when needed.
 """
 
 from __future__ import annotations
@@ -61,7 +25,6 @@ except Exception:
 
 from typing import Iterator
 
-# Re-export from extension with clear error if not available
 try:
     from timelog._timelog import (
         TimelogError,
@@ -78,10 +41,8 @@ except ImportError as e:
         "Ensure the package is properly installed."
     ) from e
 
-# Import helpers
 from timelog._api import _coerce_ts, _slice_to_iter, _now_ts, TL_TS_MIN, TL_TS_MAX
 
-# Type aliases
 Record = tuple[int, object]
 RecordIter = Iterator[Record]
 RecordBatch = list[Record]
@@ -90,59 +51,30 @@ _SENTINEL = object()
 
 
 class Timelog(_CTimelog):
-    """
-    Time-indexed multimap for (timestamp, object) records.
+    """Time-indexed multimap for (timestamp, object) records.
 
-    A Timelog stores records indexed by timestamp with support for:
-
-    - Fast time-range queries using half-open intervals [t1, t2)
-    - Python slicing syntax: log[t1:t2], log[t1:], log[:t2]
-    - Dict-style access: log[ts] = obj, log[ts], del log[ts]
-    - Auto-timestamped append: log.append(obj)
-    - Time-based eviction: cutoff(ts), delete(t1, t2)
-    - Out-of-order ingestion with LSM-style compaction
-    - Snapshot isolation for concurrent reads
-    - Zero-copy bulk timestamp access via views()
-
-    Reopening:
-        Timelog supports reopen() / configure() after close. For the
-        cleanest semantics, creating a new instance is still preferred.
+    Supports slicing (``log[t1:t2]``), dict-style access (``log[ts] = obj``),
+    auto-timestamped append, time-based eviction, out-of-order ingestion,
+    snapshot-isolated reads, and zero-copy bulk access via ``views()``.
 
     Thread Safety:
-        Single-writer. Access from multiple threads requires external
+        Single-writer. Multiple-thread access requires external
         synchronization. Iterators are snapshot-based and safe for
-        concurrent reads, but the Timelog object is not generally
-        thread-safe because some methods release the GIL. The binding
-        serializes core calls during GIL-released operations, but this
-        does not make the API fully thread-safe. This binding requires
-        the CPython GIL and is not supported on free-threaded builds.
+        concurrent reads. Requires the CPython GIL (no free-threaded
+        builds).
 
     Warning:
-        close() drops any unflushed records (data loss) but releases all
-        Python objects still owned by the engine. Call flush() before close()
-        if you need to materialize all records. If close() is not called
-        explicitly, GC finalization will attempt cleanup (best-effort).
+        ``close()`` drops unflushed records. Call ``flush()`` first to
+        materialize pending writes. Use the context manager for
+        deterministic cleanup.
 
-    Manual maintenance:
-        In maintenance="disabled" mode, use maint_step() to perform flush/
-        compaction work explicitly. compact() only requests work.
+    Example::
 
-    Preset constructors:
-        For common use cases, consider using a preset instead of tuning
-        individual parameters::
-
-            Timelog.for_streaming()     # background maint, default sizing
-            Timelog.for_bulk_ingest()   # disabled maint, large memtable
-            Timelog.for_low_latency()   # background maint, small memtable
-
-    Example:
         >>> with Timelog(time_unit="ms") as log:
-        ...     log.append({"event": "start"})         # auto-timestamp
-        ...     log[2000] = {"event": "end"}            # dict-style
-        ...     log.extend([1000, 3000], ["a", "b"])    # dual-list
-        ...
-        ...     print(log[2000])                        # point query
-        ...     del log[1000]                           # point delete
+        ...     log.append({"event": "start"})
+        ...     log[2000] = {"event": "end"}
+        ...     for ts, obj in log[1000:]:
+        ...         print(ts, obj)
 
     Args (Essential):
         time_unit: Timestamp resolution. One of "s", "ms", "us", "ns".
@@ -248,12 +180,7 @@ class Timelog(_CTimelog):
             super().delete_before(min_ts_val)
 
     def reopen(self, *, min_ts=_SENTINEL, mostly_ordered_default=_SENTINEL, **kwargs):
-        """
-        Reopen a closed Timelog with new configuration.
-
-        Requires the instance to be closed. Calls the C-layer initializer
-        again and reapplies min_ts/mostly_ordered defaults.
-        """
+        """Reopen a closed Timelog with new configuration."""
         if not self.closed:
             raise TimelogError("Timelog must be closed to reopen")
         if min_ts is _SENTINEL:
@@ -283,21 +210,7 @@ class Timelog(_CTimelog):
 
     @classmethod
     def for_streaming(cls, **overrides) -> "Timelog":
-        """
-        Create a Timelog configured for streaming writes.
-
-        Uses background maintenance with default sizing. This is the
-        standard configuration for most use cases.
-
-        Args:
-            **overrides: Any Timelog kwargs to override defaults.
-
-        Returns:
-            A new Timelog instance.
-
-        Example:
-            >>> log = Timelog.for_streaming(time_unit="us")
-        """
+        """Create a Timelog for streaming writes (background maintenance, default sizing)."""
         defaults = dict(
             maintenance="background",
             busy_policy="flush",
@@ -307,25 +220,9 @@ class Timelog(_CTimelog):
 
     @classmethod
     def for_bulk_ingest(cls, **overrides) -> "Timelog":
-        """
-        Create a Timelog configured for bulk data ingestion.
+        """Create a Timelog for bulk ingestion (no background maintenance, large memtable).
 
-        Disables background maintenance to avoid contention during
-        heavy writes. Uses a large memtable and flush-on-busy policy.
-        After bulk loading, call ``flush()`` and consider switching to
-        a streaming-mode instance.
-
-        Args:
-            **overrides: Any Timelog kwargs to override defaults.
-
-        Returns:
-            A new Timelog instance.
-
-        Example:
-            >>> with Timelog.for_bulk_ingest() as log:
-            ...     for ts, obj in large_dataset:
-            ...         log.append(ts, obj)
-            ...     log.flush()
+        Call ``flush()`` after loading to materialize pending writes.
         """
         defaults = dict(
             maintenance="disabled",
@@ -337,22 +234,7 @@ class Timelog(_CTimelog):
 
     @classmethod
     def for_low_latency(cls, **overrides) -> "Timelog":
-        """
-        Create a Timelog configured for low-latency reads.
-
-        Uses a small memtable to keep flush times short and background
-        maintenance for automatic compaction. Write backpressure raises
-        immediately so callers can react.
-
-        Args:
-            **overrides: Any Timelog kwargs to override defaults.
-
-        Returns:
-            A new Timelog instance.
-
-        Example:
-            >>> log = Timelog.for_low_latency(time_unit="ns")
-        """
+        """Create a Timelog for low-latency reads (small memtable, immediate backpressure)."""
         defaults = dict(
             maintenance="background",
             busy_policy="raise",
@@ -380,13 +262,7 @@ class Timelog(_CTimelog):
         return ts
 
     def _filtered_pairs(self, iterable):
-        """
-        Yield valid (ts, obj) pairs; skip invalid timestamps.
-
-        Structural errors (non-pairs) raise ValueError to avoid silent
-        data loss. Timestamp coercion failures are skipped when
-        insert_on_error=True.
-        """
+        """Yield (ts, obj) pairs, skipping type/overflow errors but raising on non-pairs and min_ts."""
         for item in iterable:
             try:
                 ts, obj = item
@@ -403,20 +279,13 @@ class Timelog(_CTimelog):
     # ------------------------------------------------------------------
 
     def append(self, obj_or_ts, obj_or_none=_SENTINEL, *, ts=None):
-        """
-        Append a record.
+        """Append a record.
 
-        Signatures:
-            append(obj)                  -- auto-timestamp from wall clock
-            append(obj, ts=1000)         -- explicit timestamp via kwarg
-            append(ts, obj)              -- C-style positional (legacy)
+        Signatures::
 
-        Args:
-            obj_or_ts: The object to store (single-arg) or timestamp
-                (two-arg legacy form).
-            obj_or_none: The object when using two-arg legacy form.
-            ts: Explicit timestamp (keyword-only). If None and single-arg,
-                uses current wall-clock time in the log's time_unit.
+            append(obj)              # auto-timestamp from wall clock
+            append(obj, ts=1000)     # explicit keyword timestamp
+            append(ts, obj)          # positional (legacy)
 
         Note:
             TimelogBusyError means the record WAS committed; do not retry.
@@ -437,26 +306,18 @@ class Timelog(_CTimelog):
 
     def extend(self, ts_or_iterable, objects=None, *,
                mostly_ordered=None, insert_on_error=True):
-        """
-        Append multiple records.
+        """Append multiple records.
 
-        Signatures:
-            extend([(ts, obj), ...])              -- list of pairs
-            extend(timestamps, objects)            -- dual-list form
-            extend(generator)                      -- lazy generator
+        Signatures::
+
+            extend([(ts, obj), ...])         # list of pairs
+            extend(timestamps, objects)      # dual-list form
+            extend(generator)                # lazy generator
 
         Args:
-            ts_or_iterable: An iterable of (ts, obj) pairs, or a sequence
-                of timestamps when ``objects`` is also provided.
-            objects: If provided, a sequence of objects parallel to
-                ``ts_or_iterable`` (dual-list form).
-            mostly_ordered: Hint for OOO handling. Default True.
-            insert_on_error: If True (default), invalid timestamps are skipped
-                and valid records are inserted as they come (best-effort).
-                Structural errors (non-pairs) raise ValueError even in
-                streaming mode to avoid silent data loss. If False,
-                pre-validate ALL records before inserting any (pre-validated mode).
-                Generators are not supported in pre-validated mode (raises TypeError).
+            insert_on_error: If True (default), skip invalid timestamps
+                but raise on structural errors. If False, pre-validate
+                all records before inserting any (generators not supported).
 
         Note:
             TimelogBusyError means the records WERE committed; do not retry.
@@ -519,13 +380,7 @@ class Timelog(_CTimelog):
                        mostly_ordered=mostly_ordered)
 
     def __setitem__(self, ts, obj):
-        """
-        Insert a record at the given timestamp: ``log[ts] = obj``.
-
-        Args:
-            ts: Integer timestamp.
-            obj: The object to store.
-        """
+        """Insert a record: ``log[ts] = obj``."""
         ts = self._coerce_and_guard(ts)
         super().append(ts, obj)
 
@@ -534,12 +389,7 @@ class Timelog(_CTimelog):
     # ------------------------------------------------------------------
 
     def __len__(self):
-        """
-        Return approximate record count.
-
-        This is an estimate that may include records marked for deletion
-        but not yet compacted. For exact counts, iterate and count.
-        """
+        """Return tombstone-aware record count (takes a fresh snapshot each call)."""
         s = self.stats()
         return int(s["storage"]["records_estimate"])
 
@@ -548,45 +398,23 @@ class Timelog(_CTimelog):
     # ------------------------------------------------------------------
 
     def __iter__(self) -> TimelogIter:
-        """
-        Return an iterator over all records.
-
-        Equivalent to calling self.all().
-
-        Returns:
-            TimelogIter yielding (timestamp, object) tuples.
-
-        Example:
-            >>> for ts, obj in log:
-            ...     print(ts, obj)
-        """
+        """Return an iterator over all records (equivalent to ``all()``)."""
         return self.all()
 
     def __getitem__(self, key):
-        """
-        Query by timestamp or time range.
+        """Query by timestamp or time range.
 
-        Supported patterns:
+        ::
+
             log[ts]    -> list of objects at exact timestamp ts
-            log[t1:t2] -> iterator over records in [t1, t2)
-            log[t1:]   -> iterator over records with ts >= t1
-            log[:t2]   -> iterator over records with ts < t2
-            log[:]     -> iterator over all records
+            log[t1:t2] -> TimelogIter over [t1, t2)
+            log[t1:]   -> TimelogIter over ts >= t1
+            log[:t2]   -> TimelogIter over ts < t2
+            log[:]     -> TimelogIter over all records
 
-        Note that timestamps are DATA VALUES, not indices. Negative
-        timestamps are valid data, not reverse indexing.
-
-        Args:
-            key: An integer timestamp (point query) or slice (range query).
-
-        Returns:
-            For int key: list of objects at that timestamp.
-            For slice: TimelogIter for the specified range.
-
-        Notes:
-            ``len(log[t1:t2])`` is supported and returns remaining visible
-            rows in that iterator's snapshot (decreases as the iterator is
-            consumed), not a live global timelog count.
+        Timestamps are data values, not indices; negative values are
+        valid timestamps, not reverse indexing. ``len(log[t1:t2])``
+        returns remaining rows in the iterator's snapshot.
 
         Raises:
             ValueError: If slice step is not None or 1.
@@ -597,22 +425,7 @@ class Timelog(_CTimelog):
         return [obj for _, obj in self.point(ts)]
 
     def at(self, ts: int):
-        """
-        Return objects at exact timestamp ts.
-
-        This is an alias for log[ts], provided for readability.
-
-        Args:
-            ts: The exact timestamp to query.
-
-        Returns:
-            list of objects stored at this timestamp.
-
-        Example:
-            >>> # Get all records at timestamp 1000
-            >>> for obj in log.at(1000):
-            ...     print(obj)
-        """
+        """Return list of objects at exact timestamp ts (alias for ``log[ts]``)."""
         return self[_coerce_ts(ts)]
 
     # ------------------------------------------------------------------
@@ -628,31 +441,14 @@ class Timelog(_CTimelog):
         super().delete_range(ts, ts + 1)
 
     def cutoff(self, ts):
-        """
-        Delete all records before timestamp ts.
-
-        Equivalent to delete_before(ts). Installs a tombstone covering
-        [TL_TS_MIN, ts).
-
-        Args:
-            ts: Cutoff timestamp. All records with ts < cutoff are deleted.
-        """
+        """Delete all records before ts (tombstone over ``[TL_TS_MIN, ts)``)."""
         super().delete_before(_coerce_ts(ts))
 
     def delete(self, t1, t2=None):
-        """
-        Delete records at a point or in a range.
-
-        Signatures:
-            delete(ts)       -- delete all records at exact timestamp ts
-            delete(t1, t2)   -- delete records in [t1, t2)
-
-        Args:
-            t1: Timestamp (point delete) or range start.
-            t2: Range end (exclusive). If None, does point delete.
+        """Delete records at a point (``delete(ts)``) or range (``delete(t1, t2)``).
 
         Raises:
-            ValueError: If point delete is requested at TL_TS_MAX.
+            ValueError: If point delete at TL_TS_MAX (not representable as half-open).
         """
         t1 = _coerce_ts(t1)
         if t2 is None:
@@ -661,18 +457,10 @@ class Timelog(_CTimelog):
             super().delete_range(t1, _coerce_ts(t2))
 
     def __delitem__(self, key):
-        """
-        Delete records: ``del log[ts]`` or ``del log[t1:t2]``.
-
-        Note:
-            Half-open delete ranges cannot represent a single-point delete
-            at `TL_TS_MAX`.
-
-        Args:
-            key: Integer timestamp (point delete) or slice (range delete).
+        """Delete records: ``del log[ts]`` or ``del log[t1:t2]``.
 
         Raises:
-            ValueError: If slice step is not None or 1.
+            ValueError: If slice step is not None or 1, or point delete at TL_TS_MAX.
         """
         if isinstance(key, slice):
             if key.step is not None:
@@ -690,27 +478,10 @@ class Timelog(_CTimelog):
     # ------------------------------------------------------------------
 
     def views(self, t1=None, t2=None, *, kind="segment"):
-        """
-        Return a PageSpanIter for zero-copy timestamp access.
+        """Return a PageSpanIter for zero-copy timestamp access.
 
-        Signatures:
-            views()              -- all records
-            views(t1, t2)        -- records in [t1, t2)
-
-        Args:
-            t1: Range start (inclusive). If None, uses TL_TS_MIN.
-            t2: Range end (exclusive). If None, uses TL_TS_MAX.
-            kind: Span kind. Currently only "segment" is supported.
-
-        Returns:
-            PageSpanIter yielding PageSpan objects.
-
-        Notes:
-            `views()` reflects physical storage spans (page ranges), not
-            tombstone-filtered logical rows.
-            Because ranges are half-open, `views()` uses `[TL_TS_MIN, TL_TS_MAX)`;
-            a single-point `TL_TS_MAX` query should use `log[TL_TS_MAX]` or
-            `log.point(TL_TS_MAX)`.
+        Call with no args for all records, or ``views(t1, t2)`` for [t1, t2).
+        Reflects physical storage spans, not tombstone-filtered rows.
 
         Raises:
             ValueError: If only one of t1/t2 is provided.

@@ -552,7 +552,7 @@ TEST_DECLARE(delta_memtable_insert_ooo) {
     TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
     TEST_ASSERT_EQ(2, tl_memtable_ooo_head_len(&mt));
 
-    /* C-14: OOO is UNSORTED during append - verify insertion order preserved.
+    /* OOO is unsorted during append; verify insertion order is preserved.
      * Records are sorted at seal/capture time, not during insert.
      * Here we inserted 10, then 20, so insertion order is [10, 20]. */
     const tl_record_t* ooo = tl_memtable_ooo_head_data(&mt);
@@ -2084,7 +2084,7 @@ TEST_DECLARE(delta_flush_build_tombstone_only) {
  *
  * These test the ctx.tombs filtering path in tl_flush_build (tl_flush.c:260-298).
  * The K-way merge checks each record against ctx.tombs via cursor.
- * Filtering semantics: tomb_seq > watermark → drop (strict greater-than).
+ * Filtering semantics: tomb_seq > watermark -> drop (strict greater-than).
  *===========================================================================*/
 
 /**
@@ -2122,7 +2122,7 @@ static tl_record_t* collect_segment_records(tl_alloc_ctx_t* alloc,
  *
  * Setup: 4 records in main run at ts={10,20,30,40}.
  *        ctx.tombs = [15, 35) with max_seq=5.
- *        mr->applied_seq=3 (< 5, so tomb is newer → records dropped).
+ *        mr->applied_seq=3 (< 5, so tomb is newer -> records dropped).
  *
  * Expected: records at ts=20,30 are covered by [15,35) and dropped.
  *           Segment has 2 records (ts=10,40). dropped_len=2.
@@ -2144,7 +2144,7 @@ TEST_DECLARE(delta_flush_ctx_tombs_filter_records) {
     /* Override applied_seq to a known value (test wrapper auto-generates it) */
     mr->applied_seq = 3;
 
-    /* ctx.tombs: [15, 35) with max_seq=5 — newer than watermark 3 */
+    /* ctx.tombs: [15, 35) with max_seq=5 - newer than watermark 3 */
     tl_interval_t ctx_tombs_arr[1] = {
         {.start = 15, .end = 35, .end_unbounded = false, .max_seq = 5}
     };
@@ -2192,7 +2192,7 @@ TEST_DECLARE(delta_flush_ctx_tombs_filter_records) {
 }
 
 /*---------------------------------------------------------------------------
- * Test 2: Watermark tie semantics — tomb_seq == watermark → record KEPT.
+ * Test 2: Watermark tie semantics - tomb_seq == watermark -> record KEPT.
  *
  * Setup: 3 records at ts={100,200,300}.
  *        ctx.tombs = [0, 400) with max_seq=7.
@@ -2233,7 +2233,7 @@ TEST_DECLARE(delta_flush_watermark_tie_preserves_records) {
     size_t dropped_len = 0;
     TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
 
-    /* All records kept — tie semantics */
+    /* All records kept - tie semantics */
     TEST_ASSERT_NOT_NULL(seg);
     TEST_ASSERT_EQ(3, (size_t)seg->record_count);
     TEST_ASSERT_EQ(0, dropped_len);
@@ -2249,7 +2249,7 @@ TEST_DECLARE(delta_flush_watermark_tie_preserves_records) {
  *
  * Setup: 3 records at ts={100,200,300}.
  *        ctx.tombs = [0, 400) with max_seq=7.
- *        mr->applied_seq=6 (< 7, so tomb is NEWER → all dropped).
+ *        mr->applied_seq=6 (< 7, so tomb is NEWER -> all dropped).
  *        No mr->tombs, so no tombstone-only segment built.
  *
  * Expected: out_seg=NULL (no records, no mr->tombs). 3 dropped.
@@ -2266,7 +2266,7 @@ TEST_DECLARE(delta_flush_newer_tomb_drops_all) {
 
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 3, NULL, NULL, 0, &mr));
-    mr->applied_seq = 6;  /* tomb_seq(7) > watermark(6) → drops */
+    mr->applied_seq = 6;  /* tomb_seq(7) > watermark(6) -> drops */
 
     tl_interval_t ctx_tombs_arr[1] = {
         {.start = 0, .end = 400, .end_unbounded = false, .max_seq = 7}
@@ -2287,7 +2287,7 @@ TEST_DECLARE(delta_flush_newer_tomb_drops_all) {
     size_t dropped_len = 0;
     TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
 
-    /* No records survive, no mr->tombs → NULL segment */
+    /* No records survive, no mr->tombs -> NULL segment */
     TEST_ASSERT_NULL(seg);
     TEST_ASSERT_EQ(3, dropped_len);
     TEST_ASSERT_EQ(100, dropped[0].ts);
@@ -2310,8 +2310,8 @@ TEST_DECLARE(delta_flush_newer_tomb_drops_all) {
  *   OOO run:  ts=200 h=2, applied_seq=3  (watermark=3)
  *   ctx.tombs = [0, 300) with max_seq=8.
  *
- * For main run record (ts=100): tomb_seq=8, watermark=10 → 8<=10 → KEPT.
- * For OOO run record (ts=200):  tomb_seq=8, watermark=3  → 8>3  → DROPPED.
+ * For main run record (ts=100): tomb_seq=8, watermark=10 -> 8<=10 -> KEPT.
+ * For OOO run record (ts=200):  tomb_seq=8, watermark=3  -> 8>3  -> DROPPED.
  *
  * Expected: 1 record in segment (ts=100), 1 dropped (ts=200).
  *---------------------------------------------------------------------------*/
@@ -2397,12 +2397,12 @@ TEST_DECLARE(delta_flush_per_source_watermark_filtering) {
  *        mr->applied_seq=3 (< 5, so both tombs are newer).
  *
  * Expected:
- *   ts=5:  not covered → KEPT
- *   ts=15: in [10,20) → DROPPED
- *   ts=25: not covered → KEPT
- *   ts=35: in [30,40) → DROPPED
- *   ts=45: not covered → KEPT
- *   ts=55: not covered → KEPT
+ *   ts=5:  not covered -> KEPT
+ *   ts=15: in [10,20) -> DROPPED
+ *   ts=25: not covered -> KEPT
+ *   ts=35: in [30,40) -> DROPPED
+ *   ts=45: not covered -> KEPT
+ *   ts=55: not covered -> KEPT
  *   Segment: 4 records. Dropped: 2.
  *---------------------------------------------------------------------------*/
 TEST_DECLARE(delta_flush_multiple_tombs_cursor_advance) {
@@ -2506,7 +2506,7 @@ TEST_DECLARE(delta_flush_collect_drops_false) {
     size_t dropped_len = 0;
     TEST_ASSERT_STATUS(TL_OK, tl_flush_build(&ctx, mr, &seg, &dropped, &dropped_len));
 
-    /* Records still filtered — only 2 survive */
+    /* Records still filtered - only 2 survive */
     TEST_ASSERT_NOT_NULL(seg);
     TEST_ASSERT_EQ(2, (size_t)seg->record_count);
 
@@ -2585,7 +2585,7 @@ TEST_DECLARE(delta_flush_unbounded_tombstone) {
 }
 
 /*---------------------------------------------------------------------------
- * Test 8: Record exactly at tombstone boundary — half-open [start, end).
+ * Test 8: Record exactly at tombstone boundary - half-open [start, end).
  *
  * Verifies half-open semantics: start is included, end is excluded.
  *
@@ -2730,12 +2730,12 @@ TEST_DECLARE(delta_memview_validate_bounds) {
 #endif /* TL_DEBUG */
 
 /*===========================================================================
- * T-16, T-21, T-22, T-47, T-49, T-50, T-45, T-46:
+ * Coverage:
  * OOO, Batch, and Overflow Edge Case Tests
  *===========================================================================*/
 
 /**
- * T-16: Batch insert with n so large that n * sizeof(tl_record_t)
+ * Batch insert with n so large that n * sizeof(tl_record_t)
  * would overflow size_t. Should return TL_EOVERFLOW.
  */
 TEST_DECLARE(delta_memtable_batch_insert_overflow) {
@@ -2770,7 +2770,7 @@ TEST_DECLARE(delta_memtable_batch_insert_overflow) {
 }
 
 /**
- * T-21: Fully out-of-order batch. All records have timestamps lower than
+ * Fully out-of-order batch. All records have timestamps lower than
  * the current last_inorder_ts, so all go to OOO head.
  */
 TEST_DECLARE(delta_memtable_fully_ooo_batch) {
@@ -2815,7 +2815,7 @@ TEST_DECLARE(delta_memtable_fully_ooo_batch) {
 }
 
 /**
- * T-22: Reverse-sorted batch. All records in strictly decreasing order.
+ * Reverse-sorted batch. All records in strictly decreasing order.
  * Tests worst case for OOO head sorting at seal time.
  */
 TEST_DECLARE(delta_memtable_reverse_sorted_batch) {
@@ -2858,7 +2858,7 @@ TEST_DECLARE(delta_memtable_reverse_sorted_batch) {
 }
 
 /**
- * T-49: Interleaved OOO batch. Mix of in-order and out-of-order records.
+ * Interleaved OOO batch. Mix of in-order and out-of-order records.
  */
 TEST_DECLARE(delta_memtable_interleaved_ooo_batch) {
     tl_alloc_ctx_t alloc;
@@ -2890,7 +2890,7 @@ TEST_DECLARE(delta_memtable_interleaved_ooo_batch) {
 }
 
 /**
- * T-50: OOO records at extreme timestamp values (TL_TS_MIN and near TL_TS_MAX).
+ * OOO records at extreme timestamp values (TL_TS_MIN and near TL_TS_MAX).
  */
 TEST_DECLARE(delta_memtable_ooo_boundary_timestamps) {
     tl_alloc_ctx_t alloc;
@@ -2923,7 +2923,7 @@ TEST_DECLARE(delta_memtable_ooo_boundary_timestamps) {
 }
 
 /**
- * T-47: Batch insert all-or-nothing on OOM.
+ * Batch insert all-or-nothing on OOM.
  * Uses failure-injection allocator to fail during reserve.
  * Verifies 0 records were inserted.
  */
@@ -2976,7 +2976,7 @@ TEST_DECLARE(delta_memtable_batch_all_or_nothing_on_oom) {
 }
 
 /**
- * T-45: tl_records_copy overflow detection.
+ * tl_records_copy overflow detection.
  * When len * sizeof(tl_record_t) would overflow size_t, returns TL_EOVERFLOW.
  */
 TEST_DECLARE(delta_memview_copy_overflow_detection) {
@@ -2996,7 +2996,7 @@ TEST_DECLARE(delta_memview_copy_overflow_detection) {
 }
 
 /**
- * T-46: Flush build overflow when run_len + ooo_total_len > SIZE_MAX.
+ * Flush build overflow when run_len + ooo_total_len > SIZE_MAX.
  * Directly construct a memrun with artificially large sizes.
  */
 TEST_DECLARE(delta_flush_build_run_ooo_overflow) {
@@ -3043,15 +3043,15 @@ TEST_DECLARE(delta_flush_build_run_ooo_overflow) {
 }
 
 /*===========================================================================
- * C-14: Deferred OOO Sort Tests
+ * Deferred OOO Sort Tests
  *
- * These tests specifically validate the C-14 fix: OOO records are unsorted
+ * These tests verify deferred OOO sort behavior: OOO records are unsorted
  * during append but sorted at seal time.
  *===========================================================================*/
 
 TEST_DECLARE(delta_memtable_c14_ooo_unsorted_during_append) {
     /*
-     * C-14 TEST: Verify OOO head is UNSORTED during append.
+     * Verify OOO head is unsorted during append.
      * Insert OOO records in reverse timestamp order (worst case).
      * Verify they appear in insertion order (not sorted).
      */
@@ -3072,7 +3072,7 @@ TEST_DECLARE(delta_memtable_c14_ooo_unsorted_during_append) {
     TEST_ASSERT_EQ(1, tl_memtable_run_len(&mt));
     TEST_ASSERT_EQ(3, tl_memtable_ooo_head_len(&mt));
 
-    /* C-14: OOO should be in INSERTION order during append (500, 300, 100) */
+    /* OOO should be in insertion order during append (500, 300, 100). */
     const tl_record_t* ooo = tl_memtable_ooo_head_data(&mt);
     TEST_ASSERT_EQ(500, ooo[0].ts);  /* First OOO insert */
     TEST_ASSERT_EQ(300, ooo[1].ts);  /* Second OOO insert */
@@ -3084,7 +3084,7 @@ TEST_DECLARE(delta_memtable_c14_ooo_unsorted_during_append) {
 
 TEST_DECLARE(delta_memtable_c14_ooo_sorted_at_seal) {
     /*
-     * C-14 TEST: Verify OOO records are SORTED at seal time.
+     * Verify OOO records are sorted at seal time.
      * Insert OOO records in reverse order, seal, then verify sealed
      * memrun has them in sorted order.
      */
@@ -3116,7 +3116,7 @@ TEST_DECLARE(delta_memtable_c14_ooo_sorted_at_seal) {
     TEST_ASSERT_EQ(1, tl_memrun_run_len(mr));
     TEST_ASSERT_EQ(3, tl_memrun_ooo_len(mr));
 
-    /* C-14: Sealed memrun's OOO run should be SORTED (100, 300, 500) */
+    /* Sealed memrun OOO run should be sorted (100, 300, 500). */
     TEST_ASSERT_EQ(1, tl_memrun_ooo_run_count(mr));
     const tl_ooorun_t* ooo_run = tl_memrun_ooo_run_at(mr, 0);
     TEST_ASSERT_EQ(3, ooo_run->len);
@@ -3230,7 +3230,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memview_validate_bounds);
 #endif
 
-    /* C-14: Deferred OOO sort tests (2 tests) */
+    /* Deferred OOO sort tests (2 tests) */
     RUN_TEST(delta_memtable_c14_ooo_unsorted_during_append);
     RUN_TEST(delta_memtable_c14_ooo_sorted_at_seal);
 

@@ -16,7 +16,7 @@ tl_status_t tl_active_iter_init(tl_active_iter_t* it,
     TL_ASSERT(it != NULL);
     TL_ASSERT(mv != NULL);
     TL_ASSERT(alloc != NULL);
-    /* D-07: OOO head must be sorted before iteration */
+    /* OOO head must be sorted before iteration. */
     TL_ASSERT(mv->active_ooo_head_sorted);
 
     memset(it, 0, sizeof(*it));

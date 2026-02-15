@@ -1,6 +1,6 @@
 /**
  * @file py_iter.h
- * @brief PyTimelogIter CPython extension type declaration (LLD-B3)
+ * @brief PyTimelogIter CPython extension type declaration
  *
  * This module provides the PyTimelogIter type which wraps a core
  * tl_iter_t* plus snapshot for snapshot-isolated iteration.
@@ -64,13 +64,8 @@ typedef struct {
 
     /**
      * Strong reference to owner PyTimelog.
-     *
-     * DESIGN NOTE (HLD Divergence):
-     * HLD specifies borrowed ref + open iterators counter on PyTimelog.
-     * We use strong ref + pin tracking instead because:
-     * 1. handle_ctx is EMBEDDED in PyTimelog (not pointer)
-     * 2. Strong ref prevents UAF if user drops PyTimelog ref while iterator exists
-     * 3. Pin tracking provides equivalent semantics for close() blocking
+     * Prevents UAF if user drops PyTimelog ref while iterator exists.
+     * Pin tracking replaces HLD's open-iterator counter.
      */
     PyObject* owner;
 
