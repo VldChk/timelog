@@ -1282,7 +1282,6 @@ static tl_status_t tl__build_compaction_manifest(tl_compact_ctx_t* ctx,
             tl_manifest_builder_destroy(&builder);
             return st;
         }
-    }
 
     if (ctx->residual_tomb != NULL) {
         st = tl_manifest_builder_add_l0(&builder, ctx->residual_tomb);
