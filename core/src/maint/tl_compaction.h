@@ -12,7 +12,7 @@
  *
  * Implements L0 -> L1 compaction for the LSM-style storage layer.
  *
- * Goals (Compaction Policy LLD Section 1):
+ * Goals:
  * 1. Bound read amplification: L0 count <= max_delta_segments
  * 2. Enforce L1 non-overlap: L1 segments aligned to time windows
  * 3. Fold tombstones: L1 segments are tombstone-free
@@ -37,6 +37,11 @@
  * - Long-running merge happens without locks
  * - consecutive_reshapes accessed only by maintenance thread (single-threaded)
  *
+ * Trigger Coupling with Flush (Background Mode):
+ * - tl_compact_needed() is only called when flush work is pending
+ * - This is safe because compaction triggers depend on segment state
+ * - See tl_compact_needed() documentation for full details
+ *
  * Handle Drop Callback Semantics:
  * - Callbacks are DEFERRED until AFTER successful publication
  * - During merge, dropped records are collected but NOT fired
@@ -47,12 +52,13 @@
  * - User must implement their own epoch/RCU/hazard-pointer scheme if they
  *   need safe payload reclamation (see tl_on_drop_fn docs in timelog.h)
  *
- * Reference: timelog_v1_lld_compaction_policy.md, timelog_vnext_ooo_scaling_lld_c17.md
  *===========================================================================*/
 
-/* Forward declaration - actual struct in tl_timelog_internal.h */
+/* Forward declarations */
 struct tl_timelog;
 typedef struct tl_timelog tl_timelog_t;
+struct tl_snapshot;
+typedef struct tl_snapshot tl_snapshot_t;
 
 /*===========================================================================
  * Compaction Context
@@ -73,10 +79,25 @@ typedef struct tl_compact_ctx {
 
     /* Manifest snapshot at selection time */
     tl_manifest_t*      base_manifest;   /* Pinned base manifest */
+    tl_snapshot_t*      snapshot;        /* Pinned snapshot (for tombs + seq) */
+    tl_seq_t            applied_seq;     /* Tombstone watermark for outputs */
 
-    /* Effective tombstone set */
-    tl_intervals_t      tombs;           /* Union of all tombstones (unclipped) */
-    tl_intervals_t      tombs_clipped;   /* Tombstones clipped to output range */
+    /* Effective tombstone sets (two distinct sets with different purposes)
+     *
+     * tombs:         Union of tombstones from INPUT segments only (unclipped).
+     *                Used for: residual tombstone computation (tombstones that
+     *                extend beyond the merged output window range).
+     *
+     * tombs_clipped: Tombstones from snapshot (global), clipped to output
+     *                window range [first_window_start, last_window_end).
+     *                Used for: record filtering during the K-way merge.
+     *
+     * Using the wrong set causes incorrect results:
+     * - tombs_clipped for residuals → misses tombstones outside window
+     * - tombs for filtering → applies tombstones from outside compaction scope
+     */
+    tl_intervals_t      tombs;           /* From input segments, unclipped */
+    tl_intervals_t      tombs_clipped;   /* From snapshot, clipped to output range */
 
     /* Output segments */
     tl_segment_t**      output_l1;       /* New L1 segments */
@@ -117,23 +138,6 @@ typedef struct tl_compact_ctx {
     tl_ts_t             output_max_ts;
     int64_t             output_min_wid;  /* First output window ID */
     int64_t             output_max_wid;  /* Last output window ID (inclusive) */
-
-    /*-----------------------------------------------------------------------
-     * Phase 2 OOO Scaling: Reshape support
-     *
-     * When is_reshape is true, compaction produces L0 segments (not L1).
-     * Reshape splits wide L0 segments into window-contained pieces without
-     * merging with L1. This reduces fan-in for subsequent L0→L1 compaction.
-     *
-     * Tombstone handling: Records-only L0 segments are produced per window,
-     * plus ONE tombstone-only L0 segment containing the full tombstone union.
-     * This "Option B" approach avoids tombstone loss in gap windows (windows
-     * that have tombstones but no records).
-     *-----------------------------------------------------------------------*/
-    bool                is_reshape;      /* True if L0->L0 reshape mode */
-    tl_segment_t**      output_l0;       /* Output L0 segments (reshape only) */
-    size_t              output_l0_len;
-    size_t              output_l0_cap;
 } tl_compact_ctx_t;
 
 /*===========================================================================
@@ -143,10 +147,13 @@ typedef struct tl_compact_ctx {
 /**
  * Initialize compaction context.
  * Does NOT select segments - call tl_compact_select() next.
+ *
+ * @param window_size Effective window size (caller must read under maint_mu)
  */
 void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
                           tl_timelog_t* tl,
-                          tl_alloc_ctx_t* alloc);
+                          tl_alloc_ctx_t* alloc,
+                          tl_ts_t window_size);
 
 /**
  * Destroy compaction context and release all pinned resources.
@@ -159,7 +166,7 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  *===========================================================================*/
 
 /**
- * Phase 1: Check if compaction is needed.
+ * Check if compaction is needed.
  *
  * Returns true if:
  * - L0 count >= max_delta_segments
@@ -168,13 +175,47 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  *
  * Briefly acquires writer_mu to pin manifest (prevents UAF).
  * This is an advisory check; selection re-validates.
+ *
+ * Flush/Compaction Trigger Coupling (Background Mode):
+ * =====================================================
+ * In background mode, the worker loop only calls this function when:
+ *   - do_flush is true (flush work pending), AND
+ *   - do_compact is false (compact_pending was NOT already set)
+ *
+ * See tl_timelog.c:1749: `if (!do_compact && do_flush)`
+ *
+ * This is an optimization based on the invariant:
+ *
+ *   "Compaction triggers can only change when segments change"
+ *
+ * Segment state changes only via:
+ * - Flush: creates new L0 segments (increases L0 count, adds tombstones)
+ * - Compaction: removes L0/L1, creates L1 (decreases L0 count)
+ *
+ * On idle periodic wakes with no pending work, calling this is wasteful
+ * because triggers are unchanged from the previous check.
+ *
+ * When compact_pending is already set (explicit tl_compact() request), this
+ * function is SKIPPED because we already know compaction should run.
+ *
+ * IMPORTANT: This coupling means delete-debt compaction won't be triggered
+ * on pure idle wakes without write activity. Users wanting prompt delete-debt
+ * response should either:
+ * - Use tl_compact() for explicit compaction requests
+ * - Ensure continued write activity
+ *
+ * This coupling does NOT affect:
+ * - Explicit requests via compact_pending flag (bypasses this check entirely)
+ * - Manual mode (tl_maint_step always checks triggers unconditionally)
+ *
+ * Reference: tl_timelog.c worker loop (tl__maint_worker_entry)
  */
 bool tl_compact_needed(const tl_timelog_t* tl);
 
 /**
- * Phase 2: Select segments for compaction.
+ * Select segments for compaction.
  *
- * Implements baseline policy (Compaction Policy LLD Section 6.1):
+ * Implements baseline policy:
  * 1. Pin current manifest
  * 2. Select all L0 segments
  * 3. Compute covered time range (records + tombstones)
@@ -194,9 +235,9 @@ bool tl_compact_needed(const tl_timelog_t* tl);
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 
 /**
- * Phase 3: Execute compaction merge.
+ * Execute compaction merge.
  *
- * Implements merge algorithm (Compaction Policy LLD Section 7):
+ * Implements merge algorithm:
  * 1. Build effective tombstone set
  * 2. K-way merge all input segments
  * 3. Skip deleted records (tombstone filtering)
@@ -216,9 +257,9 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx);
 
 /**
- * Phase 4: Publish compaction results.
+ * Publish compaction results.
  *
- * Implements publication protocol (Compaction Policy LLD Section 8):
+ * Implements publication protocol:
  * 1. Build new manifest (OFF-LOCK - this is the expensive part)
  * 2. Acquire writer_mu + seqlock
  * 3. Verify manifest unchanged (abort if changed)
@@ -239,15 +280,6 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
  * Convenience function that runs select -> merge -> publish.
  * On TL_EBUSY from publish, retries up to max_retries times.
  *
- * Phase 2 OOO Scaling: Supports AUTO/RESHAPE/L0_L1 strategies.
- * In AUTO mode, may trigger reshape (L0→L0) or L0→L1 based on
- * segment count, window span, and cooldown counter.
- *
- * CONCURRENCY: This function accesses tl->consecutive_reshapes
- * without holding writer_mu, relying on external serialization.
- * When called from the maintenance worker (normal case), maint_mu
- * provides serialization. Direct calls must be externally serialized.
- *
  * @param tl          Timelog instance
  * @param max_retries Max publish retries (default 3)
  * @return TL_OK on success
@@ -257,5 +289,14 @@ tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
  *         TL_EOVERFLOW if window span too large
  */
 tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries);
+
+#ifdef TL_TEST_HOOKS
+/**
+ * Test-only: compute delete debt ratio for a manifest.
+ * Exposes internal heuristic for unit testing.
+ */
+double tl_test_compute_delete_debt(const tl_timelog_t* tl,
+                                   const tl_manifest_t* m);
+#endif
 
 #endif /* TL_COMPACTION_H */

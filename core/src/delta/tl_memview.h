@@ -25,20 +25,24 @@
  * - Capture acquires memtable_mu internally (for sealed queue)
  * - After capture, fully immutable - no synchronization needed
  *
- * Lock Ordering: writer_mu -> memtable_mu (per Phase 4 lock hierarchy)
- *
- * Reference: Read Path LLD Section 5.1, Engineering Plan Section 5.1
+ * Lock ordering: writer_mu -> memtable_mu
  *===========================================================================*/
 
 struct tl_memview {
     /*-----------------------------------------------------------------------
      * Active Buffers (copied from memtable - immutable after capture)
      *-----------------------------------------------------------------------*/
-    tl_record_t*    active_run;      /* Copy of active_run data */
+    tl_record_t*    active_run;      /* Copy of active_run data (sorted) */
     size_t          active_run_len;
+    tl_seq_t*       active_run_seqs; /* Copy of active_run seqs */
 
-    tl_record_t*    active_ooo;      /* Copy of active_ooo data */
-    size_t          active_ooo_len;
+    tl_record_t*    active_ooo_head; /* Copy of OOO head data (sorted after capture) */
+    size_t          active_ooo_head_len;
+    bool            active_ooo_head_sorted;
+    tl_seq_t*       active_ooo_head_seqs; /* Copy of OOO head seqs */
+
+    tl_ooorunset_t* active_ooo_runs; /* Pinned OOO runset */
+    size_t          active_ooo_total_len;
 
     tl_interval_t*  active_tombs;    /* Copy of active_tombs data */
     size_t          active_tombs_len;
@@ -87,24 +91,31 @@ typedef struct tl_memview_shared {
  * state access). This function acquires memtable_mu internally for sealed
  * queue access.
  *
- * Lock ordering: writer_mu -> memtable_mu (Phase 4 lock hierarchy)
+ * Lock ordering: writer_mu -> memtable_mu
  *
- * Copies active buffers (run, ooo, tombs) and pins sealed memruns via
- * tl_memrun_acquire. The memview is then immutable and can be used for
- * queries without holding any locks.
+ * Copies active buffers (run, OOO head, tombs) and pins sealed memruns via
+ * tl_memrun_acquire. The OOO head may be sorted later via tl_memview_sort_head
+ * (off-lock). The memview is then immutable and can be used for queries
+ * without holding any locks.
  *
  * @param mv          Output memview (caller-allocated, zero-initialized)
  * @param mt          Memtable to capture from
  * @param memtable_mu Mutex protecting sealed queue (from tl_timelog)
  * @param alloc       Allocator for copies
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW/TL_EINVAL on failure
  *
  * On failure, memview is left in a valid but empty state (safe to destroy).
  */
 tl_status_t tl_memview_capture(tl_memview_t* mv,
-                                tl_memtable_t* mt,
+                                const tl_memtable_t* mt,
                                 tl_mutex_t* memtable_mu,
                                 tl_alloc_ctx_t* alloc);
+
+/**
+ * Sort the copied OOO head in-place (off-lock).
+ * Safe to call multiple times.
+ */
+tl_status_t tl_memview_sort_head(tl_memview_t* mv);
 
 /**
  * Destroy memview and release all resources.
@@ -129,10 +140,10 @@ void tl_memview_destroy(tl_memview_t* mv);
  * @param memtable_mu  Mutex protecting sealed queue
  * @param alloc        Allocator for memview and shared wrapper
  * @param epoch        Memtable epoch at capture time
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW/TL_EINVAL on failure
  */
 tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
-                                       tl_memtable_t* mt,
+                                       const tl_memtable_t* mt,
                                        tl_mutex_t* memtable_mu,
                                        tl_alloc_ctx_t* alloc,
                                        uint64_t epoch);
@@ -246,19 +257,35 @@ TL_INLINE const tl_record_t* tl_memview_run_data(const tl_memview_t* mv) {
     return mv->active_run;
 }
 
+TL_INLINE const tl_seq_t* tl_memview_run_seqs(const tl_memview_t* mv) {
+    return mv->active_run_seqs;
+}
+
 TL_INLINE size_t tl_memview_run_len(const tl_memview_t* mv) {
     return mv->active_run_len;
 }
 
 /**
- * Get active OOO data.
+ * Get active OOO head data (sorted).
  */
-TL_INLINE const tl_record_t* tl_memview_ooo_data(const tl_memview_t* mv) {
-    return mv->active_ooo;
+TL_INLINE const tl_record_t* tl_memview_ooo_head_data(const tl_memview_t* mv) {
+    return mv->active_ooo_head;
 }
 
-TL_INLINE size_t tl_memview_ooo_len(const tl_memview_t* mv) {
-    return mv->active_ooo_len;
+TL_INLINE const tl_seq_t* tl_memview_ooo_head_seqs(const tl_memview_t* mv) {
+    return mv->active_ooo_head_seqs;
+}
+
+TL_INLINE size_t tl_memview_ooo_head_len(const tl_memview_t* mv) {
+    return mv->active_ooo_head_len;
+}
+
+TL_INLINE const tl_ooorunset_t* tl_memview_ooo_runs(const tl_memview_t* mv) {
+    return mv->active_ooo_runs;
+}
+
+TL_INLINE size_t tl_memview_ooo_total_len(const tl_memview_t* mv) {
+    return mv->active_ooo_total_len;
 }
 
 /**
@@ -282,10 +309,11 @@ TL_INLINE size_t tl_memview_tomb_len(const tl_memview_t* mv) {
  *
  * Invariants:
  * 1. active_run is sorted (non-decreasing timestamps)
- * 2. active_ooo is sorted (non-decreasing timestamps)
- * 3. active_tombs is valid (sorted, non-overlapping, coalesced)
- * 4. sealed memrun pointers non-NULL
- * 5. has_data consistent with actual content
+ * 2. active_ooo_head is sorted (by ts, handle)
+ * 3. active_ooo_runs (if any) are valid and sorted
+ * 4. active_tombs is valid (sorted, non-overlapping, coalesced)
+ * 5. sealed memrun pointers non-NULL
+ * 6. has_data consistent with actual content
  *
  * Uses accessor functions for field access.
  *

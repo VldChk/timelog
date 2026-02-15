@@ -1,45 +1,13 @@
 #include "tl_recvec.h"
+#include <stdlib.h>  /* qsort */
 #include <string.h>
 
 /*===========================================================================
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Check if allocation size would overflow.
- * @param count Number of elements
- * @param elem_size Size of each element
- * @return true if count * elem_size would overflow size_t
- */
-TL_INLINE bool alloc_would_overflow(size_t count, size_t elem_size) {
-    return elem_size != 0 && count > SIZE_MAX / elem_size;
-}
-
-/**
- * Compute next capacity >= required using 2x growth.
- * Returns SIZE_MAX on overflow (will fail allocation).
- *
- * Overflow handling:
- * - Check before multiply to avoid UB
- * - SIZE_MAX / 2 is the largest value that can safely double
- */
-static size_t next_capacity(size_t current, size_t required) {
-    /* Minimum initial capacity */
-    static const size_t MIN_CAPACITY = 16;
-
-    /* Start with minimum capacity or current */
-    size_t new_cap = (current == 0) ? MIN_CAPACITY : current;
-
-    while (new_cap < required) {
-        /* Check for overflow BEFORE multiplying */
-        if (new_cap > SIZE_MAX / 2) {
-            return SIZE_MAX; /* Overflow sentinel - will fail allocation */
-        }
-        new_cap *= 2;
-    }
-
-    return new_cap;
-}
+/** Minimum initial capacity for record vector (larger - batches can be big) */
+static const size_t RECVEC_MIN_CAPACITY = 16;
 
 /*===========================================================================
  * Lifecycle
@@ -87,10 +55,8 @@ tl_status_t tl_recvec_reserve(tl_recvec_t* rv, size_t min_cap) {
         return TL_OK; /* Already have enough capacity */
     }
 
-    size_t new_cap = next_capacity(rv->cap, min_cap);
-
-    /* Check for byte-size overflow */
-    if (alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+    size_t new_cap = tl__grow_capacity(rv->cap, min_cap, RECVEC_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
         return TL_ENOMEM;
     }
 
@@ -208,6 +174,93 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
     rv->data[idx].ts = ts;
     rv->data[idx].handle = handle;
     rv->len++;
+    return TL_OK;
+}
+
+/*===========================================================================
+ * Sorting
+ *===========================================================================*/
+
+/**
+ * Comparison function for qsort.
+ * Sorts records by (ts, handle) in non-decreasing order.
+ */
+static int cmp_record_ts(const void* a, const void* b) {
+    const tl_record_t* ra = (const tl_record_t*)a;
+    const tl_record_t* rb = (const tl_record_t*)b;
+
+    /* Use explicit comparison to avoid integer overflow in subtraction.
+     * For signed int64_t, (ra->ts - rb->ts) could overflow if the values
+     * span a large range. Explicit comparison is safe. */
+    if (ra->ts < rb->ts) return -1;
+    if (ra->ts > rb->ts) return 1;
+    if (ra->handle < rb->handle) return -1;
+    if (ra->handle > rb->handle) return 1;
+    return 0;
+}
+
+void tl_recvec_sort(tl_recvec_t* rv) {
+    TL_ASSERT(rv != NULL);
+
+    if (rv->len <= 1) {
+        return;  /* Already sorted */
+    }
+
+    qsort(rv->data, rv->len, sizeof(tl_record_t), cmp_record_ts);
+}
+
+/*===========================================================================*/
+/* Sorting With Seq */
+/*===========================================================================*/
+
+typedef struct tl_recseq_pair {
+    tl_record_t rec;
+    tl_seq_t    seq;
+} tl_recseq_pair_t;
+
+static int cmp_recseq_pair(const void* a, const void* b) {
+    const tl_recseq_pair_t* ra = (const tl_recseq_pair_t*)a;
+    const tl_recseq_pair_t* rb = (const tl_recseq_pair_t*)b;
+
+    if (ra->rec.ts < rb->rec.ts) return -1;
+    if (ra->rec.ts > rb->rec.ts) return 1;
+    if (ra->rec.handle < rb->rec.handle) return -1;
+    if (ra->rec.handle > rb->rec.handle) return 1;
+    if (ra->seq < rb->seq) return -1;
+    if (ra->seq > rb->seq) return 1;
+    return 0;
+}
+
+tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs) {
+    TL_ASSERT(rv != NULL);
+    TL_ASSERT(seqs != NULL);
+
+    if (rv->len <= 1) {
+        return TL_OK;
+    }
+
+    if (tl__alloc_would_overflow(rv->len, sizeof(tl_recseq_pair_t))) {
+        return TL_ENOMEM;
+    }
+
+    tl_recseq_pair_t* tmp = tl__malloc(rv->alloc, rv->len * sizeof(tl_recseq_pair_t));
+    if (tmp == NULL) {
+        return TL_ENOMEM;
+    }
+
+    for (size_t i = 0; i < rv->len; i++) {
+        tmp[i].rec = rv->data[i];
+        tmp[i].seq = seqs[i];
+    }
+
+    qsort(tmp, rv->len, sizeof(tl_recseq_pair_t), cmp_recseq_pair);
+
+    for (size_t i = 0; i < rv->len; i++) {
+        rv->data[i] = tmp[i].rec;
+        seqs[i] = tmp[i].seq;
+    }
+
+    tl__free(rv->alloc, tmp);
     return TL_OK;
 }
 

@@ -1,5 +1,6 @@
 #include "tl_segment_iter.h"
 #include "../internal/tl_range.h"
+#include "tl_segment_range.h"
 #include <string.h>
 
 /*===========================================================================
@@ -55,18 +56,6 @@ static bool advance_to_next_page(tl_segment_iter_t* it) {
     return false;
 }
 
-/**
- * Load the current record from the current page and row.
- */
-static void load_current_record(tl_segment_iter_t* it) {
-    const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
-    const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
-    const tl_page_t* page = meta->page;
-
-    tl_page_get_record(page, it->row_idx, &it->current);
-    it->has_current = true;
-}
-
 /*===========================================================================
  * Lifecycle
  *===========================================================================*/
@@ -84,12 +73,8 @@ void tl_segment_iter_init(tl_segment_iter_t* it,
     it->t2 = t2;
     it->t2_unbounded = t2_unbounded;
     it->done = false;
-    it->has_current = false;
 
-    /*
-     * Check segment bounds first (pruning).
-     * Use tl_range_overlaps for correct unbounded handling.
-     */
+    /* Prune if segment doesn't overlap query range */
     if (!tl_range_overlaps(seg->min_ts, seg->max_ts, t1, t2, t2_unbounded)) {
         it->done = true;
         return;
@@ -101,34 +86,18 @@ void tl_segment_iter_init(tl_segment_iter_t* it,
         return;
     }
 
-    const tl_page_catalog_t* cat = tl_segment_catalog(seg);
-
-    /*
-     * Find first page with max_ts >= t1.
-     * This is the first page that might contain records >= t1.
-     */
-    it->page_idx = tl_page_catalog_find_first_ge(cat, t1);
-
-    /*
-     * Find last page with min_ts < t2 (exclusive end).
-     * For unbounded queries, include all pages to the end.
-     */
-    if (t2_unbounded) {
-        it->page_end = tl_page_catalog_count(cat);
-    } else {
-        it->page_end = tl_page_catalog_find_start_ge(cat, t2);
-    }
-
-    /* No overlapping pages */
-    if (it->page_idx >= it->page_end) {
+    size_t first = 0;
+    size_t last = 0;
+    if (!tl_segment_page_range(seg, t1, t2, t2_unbounded, &first, &last)) {
         it->done = true;
         return;
     }
 
-    /* Initialize first page bounds */
+    it->page_idx = first;
+    it->page_end = last;
+
     init_page_bounds(it);
 
-    /* If first page has no rows in range, advance to next page */
     if (it->row_idx >= it->row_end) {
         if (!advance_to_next_page(it)) {
             it->done = true;
@@ -148,7 +117,6 @@ tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out) {
     }
 
     for (;;) {
-        /* Ensure current page bounds are valid */
         if (it->row_idx >= it->row_end) {
             if (!advance_to_next_page(it)) {
                 it->done = true;
@@ -166,20 +134,14 @@ tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out) {
             continue;
         }
 
-        /* Load current record */
-        load_current_record(it);
-
-        /* Output the record if requested */
+        tl_record_t rec;
+        tl_page_get_record(page, it->row_idx, &rec);
         if (out != NULL) {
-            *out = it->current;
+            *out = rec;
         }
 
-        /* Advance to next row */
         it->row_idx++;
-
-        /* Check if we've exhausted the current page */
         if (it->row_idx >= it->row_end) {
-            /* Try to advance to next page */
             if (!advance_to_next_page(it)) {
                 it->done = true;
             }
@@ -196,46 +158,29 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
         return;
     }
 
-    /*
-     * If target is before or at current position, do nothing.
-     * We can only seek forward.
-     */
+    /* Forward-only: no-op if target is at or before range start */
     if (target <= it->t1) {
         return;
     }
 
-    /*
-     * Check if target is past the query range end.
-     */
     if (!it->t2_unbounded && target >= it->t2) {
         it->done = true;
         return;
     }
 
-    /*
-     * Check if target is past the segment's max_ts.
-     */
     if (target > it->seg->max_ts) {
         it->done = true;
         return;
     }
 
-    /*
-     * Save current position for monotonicity clamping.
-     * Seek must NEVER go backwards - this is a critical invariant.
-     */
+    /* Save position for monotonicity clamping (seek must never go backwards) */
     size_t old_page_idx = it->page_idx;
     size_t old_row_idx = it->row_idx;
 
     const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
 
-    /*
-     * Find the first page that might contain target.
-     * This is the page with max_ts >= target.
-     */
     size_t new_page_idx = tl_page_catalog_find_first_ge(cat, target);
 
-    /* Make sure we don't go backwards or past the end */
     if (new_page_idx < it->page_idx) {
         new_page_idx = it->page_idx;
     }
@@ -245,10 +190,7 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
         return;
     }
 
-    /* Update position */
     it->page_idx = new_page_idx;
-
-    /* Reinitialize page bounds with new t1 = target */
     const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
     const tl_page_t* page = meta->page;
 
@@ -284,6 +226,4 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
         }
     }
 
-    /* Clear has_current since we've moved */
-    it->has_current = false;
 }

@@ -72,8 +72,9 @@ A query sees three data sources:
 
 3) Memview:
    - active_run (sorted)
-   - active_ooo (sorted vector)
-   - sealed memruns (run + ooo sorted)
+   - ooo_head (sorted in memview)
+   - ooo_runs (immutable sorted runs)
+   - sealed memruns (run + OOO runs)
 
 All component iterators must yield non-decreasing ts.
 
@@ -102,7 +103,7 @@ Segment iterator uses page catalog (fence pointers):
 ### 4.3 Memview overlap
 
 Active buffers:
-- compute active_min/active_max from active_run and active_ooo
+- compute active_min/active_max from active_run, ooo_head, and ooo_runs
 - include if overlap with [t1, t2)
 
 Sealed memruns:
@@ -141,15 +142,15 @@ V1 note: PARTIAL_DELETED pages are not emitted in V1; this path is defensive.
 
 ### 5.2 Memrun iterator
 
-Each memrun has run[] and ooo[] (both sorted). Two-way merge:
-- advance the smaller ts
-- ties unspecified
-- seek uses binary search in both arrays
+Each memrun has run[] and OOO runs (all sorted). Internal K-way merge:
+- heap over run + OOO runs
+- ties resolved by run-first, then OOO run generation
+- seek uses selective pop + per-source lower_bound (forward-only)
 
 ### 5.3 Active memview iterator
 
-Active_run and active_ooo are both sorted (per new memtable design). Use the
-same two-way merge logic as memrun.
+Active_run, ooo_head (sorted copy), and ooo_runs are merged with the same
+internal K-way merge logic as memrun (run-first tie-break).
 
 ### 5.4 Memview iterator
 
@@ -226,8 +227,9 @@ Algorithm:
    - scan overlapping L0 segments; for each:
      - binary search page catalog and ts[] as above
 5) For memview:
-   - binary search active_run and active_ooo
-   - for each sealed memrun, binary search run and ooo
+   - binary search active_run and ooo_head
+   - for each active OOO run, binary search run array
+   - for each sealed memrun, binary search run and each OOO run
 6) Concatenate results from all components (duplicates preserved).
 
 This avoids the full k-way merge when the query is a single timestamp.

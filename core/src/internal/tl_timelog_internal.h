@@ -28,7 +28,7 @@ struct tl_memview_shared;
 typedef struct tl_memview_shared tl_memview_shared_t;
 
 /*===========================================================================
- * Maintenance Worker State Machine (Phase 7)
+ * Maintenance Worker State Machine
  *
  * Protected by maint_mu. State transitions:
  *   STOPPED  -> RUNNING  (tl_maint_start)
@@ -59,7 +59,17 @@ struct tl_timelog {
      *-----------------------------------------------------------------------*/
     tl_config_t     config;
 
-    /* Computed/normalized config values */
+    /*-----------------------------------------------------------------------
+     * Effective Values (initialized from config at open)
+     *
+     * effective_ooo_budget: Derived once at init, immutable thereafter.
+     *                       Computed from config.ooo_budget_bytes or default.
+     *
+     * effective_window_size: Runtime state. Initial value from config,
+     *                        but MUTATED by adaptive segmentation during
+     *                        compaction. See tl_adaptive.h for details.
+     *                        Protected by maint_mu during updates.
+     *-----------------------------------------------------------------------*/
     tl_ts_t         effective_window_size;
     size_t          effective_ooo_budget;
 
@@ -70,7 +80,7 @@ struct tl_timelog {
     tl_log_ctx_t    log;
 
     /*-----------------------------------------------------------------------
-     * Synchronization (Phase 1)
+     * Synchronization
      *
      * Lock ordering: maint_mu -> flush_mu -> writer_mu -> memtable_mu
      *-----------------------------------------------------------------------*/
@@ -88,6 +98,7 @@ struct tl_timelog {
 
     /* Memtable mutex: protects sealed memrun queue. */
     tl_mutex_t      memtable_mu;
+    tl_cond_t       memtable_cond;  /* Backpressure: sealed queue has space */
 
     /* Seqlock for snapshot consistency. Even = idle, odd = publish in progress. */
     tl_seqlock_t    view_seq;
@@ -101,7 +112,7 @@ struct tl_timelog {
     bool            is_open;
 
     /*-----------------------------------------------------------------------
-     * Maintenance State (Phase 7)
+     * Maintenance State
      *
      * CRITICAL: All fields in this section are protected by maint_mu.
      * NO atomics are used. This eliminates the lost-work race condition
@@ -129,18 +140,37 @@ struct tl_timelog {
     tl_adaptive_state_t adaptive;
 
     /*-----------------------------------------------------------------------
-     * Delta Layer (Phase 4)
+     * Window Grid Freeze Flag (C-10)
+     *
+     * Protected by maint_mu. Once L1 segments exist, the window grid is
+     * frozen and adaptive segmentation cannot change effective_window_size.
+     * This prevents L1 overlap violations from window size changes.
+     *
+     * Set to true:
+     * - During tl_open() if manifest already has L1 segments
+     * - After first successful L1 creation in tl_compact_one()
+     *
+     * Checked in tl_compact_one() before computing adaptive candidate.
+     * Once frozen, remains frozen for the lifetime of the instance.
+     *-----------------------------------------------------------------------*/
+    bool window_grid_frozen;
+
+    /*-----------------------------------------------------------------------
+     * Delta Layer
      *-----------------------------------------------------------------------*/
 
     /* Memtable: mutable write buffer for inserts and tombstones */
     tl_memtable_t   memtable;
+
+    /* Monotonic operation sequence (writer_mu protected) */
+    tl_seq_t        op_seq;
 
     /* Snapshot memview cache (for reuse when memtable epoch unchanged) */
     tl_memview_shared_t* memview_cache;
     uint64_t             memview_cache_epoch;
 
     /*-----------------------------------------------------------------------
-     * Storage Layer (Phase 5)
+     * Storage Layer
      *
      * The manifest is the atomic publication root for storage.
      * Swapped atomically under writer_mu + seqlock during flush/compaction.
@@ -160,51 +190,13 @@ struct tl_timelog {
     tl_atomic_u64   backpressure_waits; /* Writer blocked on sealed queue */
     tl_atomic_u64   flushes_total;      /* Flush operations completed */
     tl_atomic_u64   compactions_total;  /* Compaction operations completed */
-
-    /*-----------------------------------------------------------------------
-     * OOO Scaling Counters (Phase 1)
-     *
-     * Atomic counters for watermark-based scheduling metrics.
-     * Incremented by maintenance thread, read by stats queries.
-     *-----------------------------------------------------------------------*/
-    tl_atomic_u64   flush_first_cycles;   /* Times watermark triggered flush-first */
-    tl_atomic_u64   compaction_deferred;  /* Times compaction deferred (sealed > lo_wm) */
-    tl_atomic_u64   compaction_forced;    /* Times compaction forced (L0 debt cap) */
-
-    /*-----------------------------------------------------------------------
-     * OOO Scaling Counters (Phase 2)
-     *
-     * Atomic counters for reshape and rebase publish metrics.
-     * Incremented by maintenance thread, read by stats queries.
-     *-----------------------------------------------------------------------*/
-    tl_atomic_u64   reshape_compactions_total;  /* L0->L0 reshape operations */
-    tl_atomic_u64   rebase_publish_success;     /* Successful rebase publishes */
-    tl_atomic_u64   rebase_publish_fallback;    /* Rebase fell back to retry */
-    tl_atomic_u64   window_bound_exceeded;      /* Wide L0 exceeded cap (observability) */
-    tl_atomic_u64   rebase_l1_conflict;         /* Rebase rejected due to L1 conflict */
-
-    /*-----------------------------------------------------------------------
-     * Reshape Cooldown (maintenance thread only)
-     *
-     * Tracks consecutive reshape operations to prevent infinite loops when
-     * workload is inherently wide. Reset to 0 after any L0→L1 compaction.
-     *
-     * CONCURRENCY: Read in tl__should_reshape and written in tl_compact_publish.
-     * Both are called only from the maintenance thread (maint_mu serialization)
-     * or from tl_maint_step which is documented as single-threaded. No locks
-     * are held during access; callers must ensure single-threaded usage.
-     *-----------------------------------------------------------------------*/
-    uint32_t        consecutive_reshapes;
-
-    /*-----------------------------------------------------------------------
-     * Effective Watermarks (computed at init, immutable after)
-     *
-     * These are computed from config during normalize_config() and are
-     * read-only thereafter. No synchronization needed for reads.
-     *-----------------------------------------------------------------------*/
-    size_t          effective_sealed_hi_wm;
-    size_t          effective_sealed_lo_wm;
-    bool            watermarks_enabled;
+    tl_atomic_u64   compaction_retries;       /* Compaction publish retries */
+    tl_atomic_u64   compaction_publish_ebusy; /* Publish EBUSY returns */
+    /* Compaction selection observability */
+    tl_atomic_u64   compaction_select_calls;   /* Selection attempts */
+    tl_atomic_u64   compaction_select_l0_inputs; /* Total L0 inputs selected */
+    tl_atomic_u64   compaction_select_l1_inputs; /* Total L1 inputs selected */
+    tl_atomic_u64   compaction_select_no_work; /* Selections with no L0s */
 
 #ifdef TL_DEBUG
     /*-----------------------------------------------------------------------

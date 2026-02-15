@@ -1,6 +1,6 @@
 /**
  * @file test_py_errors.c
- * @brief LLD-B6 compliance tests for error model subsystem
+ * @brief Error model subsystem tests
  *
  * Systematic validation of:
  * - Exception type initialization (TlPy_InitErrors, TlPy_FiniErrors)
@@ -14,8 +14,6 @@
  * 3. Message Format (4 tests)
  * 4. Return Value and State (3 tests)
  * 5. Integration (4 tests)
- *
- * See: docs/timelog_v2_lld_B6_error_model_subsystem.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -623,7 +621,7 @@ TEST(exception_preserved_across_cleanup)
     /*
      * Test: Exception preservation pattern verification.
      *
-     * The LLD-B6 documents that cleanup code should use PyErr_Fetch/Restore
+     * Cleanup code should use PyErr_Fetch/Restore
      * to preserve any pending exceptions. This test verifies the pattern
      * conceptually by checking that:
      * 1. Iterators can be closed cleanly
@@ -692,7 +690,7 @@ TEST(ebusy_semantics_documented)
      * This test documents the EBUSY semantics rather than triggering
      * actual backpressure (which requires complex setup).
      *
-     * Per LLD-B6 Section 5.1:
+     * EBUSY semantics:
      * - TL_EBUSY means record WAS inserted
      * - Do NOT rollback INCREF on EBUSY
      * - busy_policy="raise" raises TimelogBusyError
@@ -719,7 +717,7 @@ TEST(ebusy_semantics_documented)
 
 int main(void)
 {
-    printf("test_py_errors (LLD-B6 compliance):\n\n");
+    printf("test_py_errors (error model compliance):\n\n");
 
     if (tlpy_init_python() < 0) {
         fprintf(stderr, "FATAL: Python initialization failed\n");

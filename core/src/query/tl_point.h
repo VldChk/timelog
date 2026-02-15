@@ -12,11 +12,11 @@
  * Uses direct binary search on each component to find all records with
  * the exact timestamp.
  *
- * Algorithm (Read Path LLD Section 8):
- * 1. Tombstone check: if any tombstone covers ts, return empty immediately
+ * Algorithm:
+ * 1. Tombstone watermark check: tomb_seq(ts) compared per row watermark
  * 2. L1 lookup: binary search window, catalog, page for ts
  * 3. L0 lookup: scan overlapping segments with binary search
- * 4. Memview lookup: binary search active_run, active_ooo, sealed memruns
+ * 4. Memview lookup: binary search active_run, OOO head, OOO runs, sealed memruns
  * 5. Concatenate results (duplicates preserved, order unspecified)
  *
  * Complexity:
@@ -28,8 +28,6 @@
  * Thread Safety:
  * - Snapshot must remain valid for the lifetime of the result
  * - Result array is owned by caller
- *
- * Reference: Read Path LLD Section 8, timelog_v1_c_software_design_spec.md
  *===========================================================================*/
 
 /**
@@ -53,8 +51,8 @@ typedef struct tl_point_result {
  * Finds all visible records with record.ts == ts in the snapshot.
  * Uses direct binary search on each component (no K-way merge).
  *
- * If any tombstone covers ts, returns empty result (not an error).
- * This is correct: the timestamp is deleted.
+ * Records are filtered using watermark semantics:
+ * a row is deleted only when tomb_seq(ts) > row_watermark.
  *
  * @param result  Output result (caller-allocated, zero-initialized)
  * @param snap    Snapshot to search
@@ -79,16 +77,12 @@ void tl_point_result_destroy(tl_point_result_t* result);
  * Accessors
  *===========================================================================*/
 
-/**
- * Check if result is empty.
- */
+/** Check if result is empty. */
 TL_INLINE bool tl_point_result_empty(const tl_point_result_t* result) {
     return result->count == 0;
 }
 
-/**
- * Get record by index.
- */
+/** Get record by index. */
 TL_INLINE const tl_record_t* tl_point_result_get(const tl_point_result_t* result,
                                                   size_t idx) {
     TL_ASSERT(idx < result->count);

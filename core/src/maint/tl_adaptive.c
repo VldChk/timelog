@@ -4,10 +4,10 @@
  * Implements adaptive window size computation for L1 segmentation based on
  * data density. Pure policy module with no allocation in the computation loop.
  *
- * Reference: docs/timelog_adaptive_segmentation_lld_c17.md (draft-5)
  *===========================================================================*/
 
 #include "tl_adaptive.h"
+#include "../internal/tl_timelog_internal.h"  /* For tl_timelog_t internals */
 #include "../storage/tl_window.h"  /* For tl_floor_div_i64, tl_sub_overflow_i64 */
 
 #include <math.h>   /* llround, isnan, isinf, fabs */
@@ -156,7 +156,7 @@ bool tl__adaptive_hysteresis_skip(double candidate,
  * Apply nearest-quantum snapping.
  * Returns snapped value, or current_window if snapping fails.
  *
- * Algorithm (per LLD):
+ * Algorithm:
  * 1. wi = llround(candidate)
  * 2. qid = floor_div(wi, quantum)
  * 3. snapped = qid * quantum
@@ -198,7 +198,14 @@ tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
     int64_t q = (int64_t)window_quantum;
     int64_t qid = tl_floor_div_i64(wi, q);
 
-    /* Step 3: Compute snapped value */
+    /* Defensive overflow check for qid * q.
+     * Mathematically, qid * q <= wi < INT64_MAX, so overflow is impossible.
+     * Defensive check: prevents propagation of invalid density values. */
+    if (qid > 0 && q > INT64_MAX / qid) {
+        return current_window;  /* Overflow - should never happen */
+    }
+
+    /* Step 3: compute snapped value after overflow checks. */
     int64_t snapped = qid * q;
 
     /* Step 4: Compute remainder */
@@ -393,4 +400,47 @@ void tl_adaptive_record_failure(tl_adaptive_state_t* state) {
     if (state->consecutive_failures < UINT32_MAX) {
         state->consecutive_failures++;
     }
+}
+
+/*===========================================================================
+ * Advisory Resize Query
+ *
+ * THREADING NOTE: This function intentionally reads fields without holding
+ * maint_mu. This is safe because:
+ *
+ * 1. This is an ADVISORY function - it returns a hint, not a decision.
+ *    The actual resize decision happens under maint_mu in tl_compact_one().
+ *
+ * 2. window_grid_frozen is monotonic (false -> true, never back).
+ *    A stale read of 'false' when it's actually 'true' just means we might
+ *    consider resizing when we shouldn't, but the actual resize path will
+ *    catch this under lock.
+ *
+ * 3. flush_count only increases. A stale read means we might return false
+ *    when we could return true (miss an opportunity), but the next call
+ *    will see the updated value. No correctness issue.
+ *
+ * 4. config.adaptive.* fields are immutable after tl_open().
+ *
+ * Taking maint_mu here would add unnecessary contention on a hot path.
+ *===========================================================================*/
+
+bool tl_adaptive_wants_resize(const tl_timelog_t* tl) {
+    TL_ASSERT(tl != NULL);
+
+    /* Grid frozen means no resizing possible.
+     * (Advisory read - actual resize path re-checks under maint_mu) */
+    if (tl->window_grid_frozen) {
+        return false;
+    }
+
+    /* Adaptive disabled (immutable after config) */
+    if (tl->config.adaptive.target_records == 0) {
+        return false;
+    }
+
+    /* Check if we have completed warmup (minimum flushes for resize consideration).
+     * This is the same check as compute_candidate's warmup.
+     * (Advisory read - flush_count is monotonically increasing) */
+    return tl->adaptive.flush_count >= tl->config.adaptive.warmup_flushes;
 }

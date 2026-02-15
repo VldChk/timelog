@@ -1,11 +1,9 @@
 /**
  * @file test_py_iter.c
- * @brief Unit tests for PyTimelogIter CPython extension (LLD-B3)
+ * @brief Unit tests for PyTimelogIter CPython extension
  *
  * TDD-driven tests for the PyTimelogIter iterator type.
  * Tests run with Python initialized and GIL held.
- *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -20,6 +18,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef TL_PY_ITER_TEST_HOOKS
+/* Test-only failpoints from py_iter.c */
+extern void tl_py_iter_test_reset_failpoints(void);
+extern void tl_py_iter_test_fail_iternext_once(void);
+extern void tl_py_iter_test_fail_next_batch_once(void);
+#endif
 
 /*===========================================================================
  * Test Framework (same as test_py_timelog.c)
@@ -268,7 +273,7 @@ static PyObject* make_range_args(long t1, long t2)
 }
 
 /*===========================================================================
- * Test Suite: Direct Instantiation Blocked (Phase 1)
+ * Test Suite: Direct Instantiation Blocked
  *===========================================================================*/
 
 TEST(direct_instantiation_blocked)
@@ -293,7 +298,7 @@ TEST(direct_instantiation_blocked)
 }
 
 /*===========================================================================
- * Test Suite: Basic Iteration (Phase 2)
+ * Test Suite: Basic Iteration
  *===========================================================================*/
 
 TEST(range_basic)
@@ -412,8 +417,7 @@ TEST(empty_range)
 TEST(reversed_range_empty)
 {
     /*
-     * range(10, 5) should return empty iterator (mirrors core behavior)
-     * No ValueError - just empty.
+     * range(10, 5) should raise ValueError (t1 > t2)
      */
     PyTimelog* tl = create_timelog_default();
     ASSERT_NOT_NULL(tl);
@@ -437,14 +441,8 @@ TEST(reversed_range_empty)
     Py_DECREF(t1);
     Py_DECREF(range_method);
 
-    ASSERT_NOT_NULL(iter);  /* Should succeed, not raise */
-
-    /* Iterate - should get nothing (empty iterator) */
-    PyObject* item = PyIter_Next(iter);
-    ASSERT_NULL(item);
-    ASSERT(!PyErr_Occurred());  /* StopIteration, not error */
-
-    Py_DECREF(iter);
+    ASSERT_NULL(iter);
+    ASSERT_EXCEPTION(PyExc_ValueError);
     Py_DECREF(obj);
     close_and_dealloc(tl);
 }
@@ -526,7 +524,7 @@ TEST(iter_on_closed_timelog)
 }
 
 /*===========================================================================
- * Test Suite: Factory Methods (Phase 3)
+ * Test Suite: Factory Methods
  *===========================================================================*/
 
 TEST(since_basic)
@@ -747,7 +745,7 @@ TEST(point_basic)
 }
 
 /*===========================================================================
- * Test Suite: Iterator Close & Cleanup (Phase 4)
+ * Test Suite: Iterator Close & Cleanup
  *===========================================================================*/
 
 TEST(close_drops_pin)
@@ -1142,7 +1140,7 @@ TEST(close_timelog_with_live_iterator)
 }
 
 /*===========================================================================
- * Test Suite: Context Manager (Phase 5)
+ * Test Suite: Context Manager
  *===========================================================================*/
 
 TEST(context_manager_normal)
@@ -1202,7 +1200,7 @@ TEST(context_manager_normal)
 }
 
 /*===========================================================================
- * Test Suite: next_batch (Phase 8)
+ * Test Suite: next_batch
  *===========================================================================*/
 
 TEST(next_batch_full)
@@ -1397,6 +1395,114 @@ TEST(next_batch_closed)
     close_and_dealloc(tl);
 }
 
+TEST(iternext_alloc_failure_is_fail_closed)
+{
+#ifdef TL_PY_ITER_TEST_HOOKS
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* obj = PyDict_New();
+    ASSERT_NOT_NULL(obj);
+    ASSERT_EQ(append_record(tl, 1, obj), 0);
+    ASSERT_EQ(append_record(tl, 2, obj), 0);
+
+    PyObject* range_method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* args = make_range_args(0, 100);
+    PyObject* iter = PyObject_Call(range_method, args, NULL);
+    Py_DECREF(args);
+    Py_DECREF(range_method);
+    ASSERT_NOT_NULL(iter);
+
+    ASSERT_EQ(PyObject_Length(iter), 2);
+
+    tl_py_iter_test_reset_failpoints();
+    tl_py_iter_test_fail_iternext_once();
+
+    PyObject* item = PyIter_Next(iter);
+    ASSERT_NULL(item);
+    ASSERT_EXCEPTION(PyExc_MemoryError);
+
+    PyObject* closed = PyObject_GetAttrString(iter, "closed");
+    ASSERT_NOT_NULL(closed);
+    ASSERT(closed == Py_True);
+    Py_DECREF(closed);
+
+    ASSERT_EQ(PyObject_Length(iter), 0);
+
+    /* Closed iterator: stop iteration, no error. */
+    item = PyIter_Next(iter);
+    ASSERT_NULL(item);
+    ASSERT(!PyErr_Occurred());
+
+    tl_py_iter_test_reset_failpoints();
+    Py_DECREF(iter);
+    Py_DECREF(obj);
+    close_and_dealloc(tl);
+#else
+    ASSERT(0);
+#endif
+}
+
+TEST(next_batch_alloc_failure_is_fail_closed)
+{
+#ifdef TL_PY_ITER_TEST_HOOKS
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* obj = PyDict_New();
+    ASSERT_NOT_NULL(obj);
+    ASSERT_EQ(append_record(tl, 1, obj), 0);
+    ASSERT_EQ(append_record(tl, 2, obj), 0);
+    ASSERT_EQ(append_record(tl, 3, obj), 0);
+
+    PyObject* range_method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* args = make_range_args(0, 100);
+    PyObject* iter = PyObject_Call(range_method, args, NULL);
+    Py_DECREF(args);
+    Py_DECREF(range_method);
+    ASSERT_NOT_NULL(iter);
+
+    ASSERT_EQ(PyObject_Length(iter), 3);
+
+    tl_py_iter_test_reset_failpoints();
+    tl_py_iter_test_fail_next_batch_once();
+
+    PyObject* batch_method = PyObject_GetAttrString(iter, "next_batch");
+    ASSERT_NOT_NULL(batch_method);
+    PyObject* n = PyLong_FromLong(2);
+    ASSERT_NOT_NULL(n);
+    PyObject* batch = PyObject_CallOneArg(batch_method, n);
+    Py_DECREF(n);
+    ASSERT_NULL(batch);
+    ASSERT_EXCEPTION(PyExc_MemoryError);
+
+    PyObject* closed = PyObject_GetAttrString(iter, "closed");
+    ASSERT_NOT_NULL(closed);
+    ASSERT(closed == Py_True);
+    Py_DECREF(closed);
+
+    ASSERT_EQ(PyObject_Length(iter), 0);
+
+    /* Closed iterator returns empty batch. */
+    n = PyLong_FromLong(5);
+    ASSERT_NOT_NULL(n);
+    batch = PyObject_CallOneArg(batch_method, n);
+    Py_DECREF(n);
+    ASSERT_NOT_NULL(batch);
+    ASSERT(PyList_Check(batch));
+    ASSERT_EQ(PyList_Size(batch), 0);
+
+    tl_py_iter_test_reset_failpoints();
+    Py_DECREF(batch);
+    Py_DECREF(batch_method);
+    Py_DECREF(iter);
+    Py_DECREF(obj);
+    close_and_dealloc(tl);
+#else
+    ASSERT(0);
+#endif
+}
+
 /*===========================================================================
  * Test Runner
  *===========================================================================*/
@@ -1440,11 +1546,11 @@ int main(int argc, char* argv[])
 
     printf("Running py_iter tests...\n");
 
-    /* Phase 1: Direct Instantiation Blocked */
+    /* Direct Instantiation Blocked */
     printf("\n[Direct Instantiation Blocked]\n");
     run_direct_instantiation_blocked();
 
-    /* Phase 2: Basic Iteration */
+    /* Basic Iteration */
     printf("\n[Basic Iteration]\n");
     run_range_basic();
     run_empty_range();
@@ -1452,7 +1558,7 @@ int main(int argc, char* argv[])
     run_yield_tuple_format();
     run_iter_on_closed_timelog();
 
-    /* Phase 3: Factory Methods */
+    /* Factory Methods */
     printf("\n[Factory Methods]\n");
     run_since_basic();
     run_until_basic();
@@ -1460,7 +1566,7 @@ int main(int argc, char* argv[])
     run_equal_basic();
     run_point_basic();
 
-    /* Phase 4: Close & Cleanup */
+    /* Close & Cleanup */
     printf("\n[Close & Cleanup]\n");
     run_close_drops_pin();
     run_close_is_idempotent();
@@ -1468,24 +1574,26 @@ int main(int argc, char* argv[])
     run_closed_property();
     run_exhaust_clears_resources();
 
-    /* Phase 4b: Multiple Concurrent Iterators */
+    /* Multiple Concurrent Iterators */
     printf("\n[Multiple Concurrent Iterators]\n");
     run_two_iterators_two_pins();
     run_close_one_keeps_other();
     run_snapshot_boundary();
     run_close_timelog_with_live_iterator();
 
-    /* Phase 5: Context Manager */
+    /* Context Manager */
     printf("\n[Context Manager]\n");
     run_context_manager_normal();
 
-    /* Phase 8: next_batch */
+    /* next_batch */
     printf("\n[next_batch]\n");
     run_next_batch_full();
     run_next_batch_partial();
     run_next_batch_zero();
     run_next_batch_negative();
     run_next_batch_closed();
+    run_iternext_alloc_failure_is_fail_closed();
+    run_next_batch_alloc_failure_is_fail_closed();
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
 

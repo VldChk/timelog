@@ -1,10 +1,7 @@
-"""
-Tests for the Python facade layer (LLD-B7).
+"""Tests for the Python facade layer."""
 
-This test suite drives the implementation using TDD principles.
-Tests are ordered by dependency: foundational tests first.
-"""
-
+import gc
+import weakref
 import pytest
 
 
@@ -59,7 +56,6 @@ class TestReexports:
 
 
 class TestVersion:
-    """Test version metadata."""
 
     def test_version_defined(self):
         """__version__ must be a non-empty string."""
@@ -116,6 +112,18 @@ class TestCoercion:
             _coerce_ts(3.14)
         with pytest.raises(TypeError):
             _coerce_ts("123")
+
+    def test_coerce_int64_bounds_checked(self):
+        """Values outside signed int64 range must raise OverflowError."""
+        from timelog._api import _coerce_ts, TL_TS_MIN, TL_TS_MAX
+
+        assert _coerce_ts(TL_TS_MIN) == TL_TS_MIN
+        assert _coerce_ts(TL_TS_MAX) == TL_TS_MAX
+
+        with pytest.raises(OverflowError, match="outside int64 range"):
+            _coerce_ts(TL_TS_MIN - 1)
+        with pytest.raises(OverflowError, match="outside int64 range"):
+            _coerce_ts(TL_TS_MAX + 1)
 
 
 # =============================================================================
@@ -216,19 +224,75 @@ class TestSlicing:
             with pytest.raises(ValueError, match="step"):
                 log[0:10:1.0]
 
-    def test_slice_non_slice_error(self):
-        """log[t] (non-slice) raises TypeError with guidance."""
+
+    def test_slice_iter_len_reports_remaining_snapshot_rows(self):
+        """len(log[t1:t2]) returns remaining rows for that iterator snapshot."""
+        from timelog import Timelog
+
+        with Timelog() as log:
+            log.extend([(i, f"item{i}") for i in range(6)])
+            it = log[1:5]
+
+            assert len(it) == 4
+            assert next(it) == (1, "item1")
+            assert len(it) == 3
+
+            # Iterator length tracks the snapshot captured at iterator creation,
+            # not subsequent live appends.
+            log.append(2, "late")
+            assert len(it) == 3
+
+            assert list(it) == [(2, "item2"), (3, "item3"), (4, "item4")]
+            assert len(it) == 0
+
+
+    def test_slice_iter_len_closed_iterator_is_zero(self):
+        """len(iter) is 0 after close() because no rows remain yieldable."""
+        from timelog import Timelog
+
+        with Timelog() as log:
+            log.extend([(i, f"item{i}") for i in range(4)])
+            it = log[1:4]
+            assert len(it) == 3
+            it.close()
+            assert len(it) == 0
+
+
+
+    def test_point_max_timestamp_len_matches_equal(self):
+        """len(log.point(TL_TS_MAX)) handles max timestamp without range overflow."""
+        from timelog import Timelog
+        from timelog._api import TL_TS_MAX
+
+        with Timelog() as log:
+            log.append(TL_TS_MAX, "max")
+            assert len(log.point(TL_TS_MAX)) == 1
+            assert len(log.equal(TL_TS_MAX)) == 1
+
+    def test_int_key_returns_list(self):
+        """log[t] returns list of objects at that timestamp."""
         from timelog import Timelog
 
         with Timelog() as log:
             log.append(100, "x")
-            with pytest.raises(TypeError, match="slices"):
-                log[100]
+            log.append(100, "y")
+            result = log[100]
+            assert isinstance(result, list)
+            assert set(result) == {"x", "y"}
+
+    def test_int_key_empty(self):
+        """log[t] returns empty list when no records at timestamp."""
+        from timelog import Timelog
+
+        with Timelog() as log:
+            log.append(100, "x")
+            assert log[999] == []
 
 
 # =============================================================================
 # Category 5: Iteration
 # =============================================================================
+
 
 
 class TestIteration:
@@ -273,19 +337,17 @@ class TestAt:
     """Test at() convenience method."""
 
     def test_at_basic(self):
-        """at(ts) returns same results as point(ts)."""
+        """at(ts) returns list of objects at that timestamp."""
         from timelog import Timelog
 
         with Timelog() as log:
             log.append(100, "x")
             log.append(200, "y")
-            via_at = list(log.at(100))
-            via_point = list(log.point(100))
-            assert via_at == via_point
-            assert via_at == [(100, "x")]
+            via_at = log.at(100)
+            assert via_at == ["x"]
 
     def test_at_with_duplicates(self):
-        """at(ts) returns all records at that timestamp."""
+        """at(ts) returns all objects at that timestamp."""
         from timelog import Timelog
 
         with Timelog() as log:
@@ -293,17 +355,17 @@ class TestAt:
             log.append(100, "b")
             log.append(100, "c")
             log.append(200, "d")
-            result = [obj for _, obj in log.at(100)]
+            result = log.at(100)
             assert set(result) == {"a", "b", "c"}
             assert len(result) == 3
 
     def test_at_empty(self):
-        """at(ts) with no match returns empty iterator."""
+        """at(ts) with no match returns empty list."""
         from timelog import Timelog
 
         with Timelog() as log:
             log.append(100, "x")
-            result = list(log.at(999))
+            result = log.at(999)
             assert result == []
 
 
@@ -351,7 +413,7 @@ class TestIntegration:
         with Timelog() as log:
             log.extend([(i, i) for i in range(100)])
             log.flush()
-            with log.page_spans(0, 100) as spans_iter:
+            with log.views(0, 100) as spans_iter:
                 assert isinstance(spans_iter, PageSpanIter)
 
     def test_type_aliases_defined(self):
@@ -376,17 +438,6 @@ class TestIntegration:
 class TestErrorMessages:
     """Test that error messages provide good guidance."""
 
-    def test_non_slice_suggests_at(self):
-        """TypeError for non-slice suggests using .at() or .point()."""
-        from timelog import Timelog
-
-        with Timelog() as log:
-            log.append(100, "x")
-            with pytest.raises(TypeError) as exc_info:
-                log[100]
-            msg = str(exc_info.value).lower()
-            assert "at" in msg or "point" in msg
-
     def test_bool_error_clear(self):
         """Bool rejection error is clear about the issue."""
         from timelog._api import _coerce_ts
@@ -394,3 +445,36 @@ class TestErrorMessages:
         with pytest.raises(TypeError) as exc_info:
             _coerce_ts(True)
         assert "bool" in str(exc_info.value).lower()
+
+
+# =============================================================================
+# Category 9: Finalization (Auto-close)
+# =============================================================================
+
+
+class TestFinalization:
+    """Validate best-effort cleanup on GC when close() is not called."""
+
+    def test_gc_finalizes_timelog(self):
+        """Dropping Timelog should release engine-owned object refs."""
+        from timelog import Timelog
+
+        class Obj:
+            pass
+
+        obj = Obj()
+        ref = weakref.ref(obj)
+
+        log = Timelog()
+        log.append(1, obj)
+
+        # Timelog should own a strong reference after append
+        del obj
+        assert ref() is not None
+
+        # Drop the timelog and force GC
+        log = None
+        gc.collect()
+        gc.collect()
+
+        assert ref() is None

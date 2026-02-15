@@ -12,7 +12,6 @@
  * These tests validate that concurrent operations are safe and
  * don't cause data races, deadlocks, or visibility issues.
  *
- * Part of Phase 10: Integration Testing and Hardening
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -67,7 +66,7 @@ static inline void wait_for_start(concurrency_test_ctx_t* ctx) {
 }
 
 /*===========================================================================
- * Concurrency Tests (Phase 10)
+ * Concurrency Tests
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -578,7 +577,7 @@ TEST_DECLARE(conc_view_seq_validation) {
  *===========================================================================*/
 
 void run_concurrency_tests(void) {
-    /* Phase 10 concurrency tests */
+    /* Concurrency tests */
     RUN_TEST(conc_snapshot_stability_during_flush);
     RUN_TEST(conc_snapshot_stability_during_compaction);
     RUN_TEST(conc_snapshot_acquire_during_publication);

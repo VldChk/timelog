@@ -1,10 +1,8 @@
 /**
  * @file py_iter.c
- * @brief PyTimelogIter CPython extension type implementation (LLD-B3)
+ * @brief PyTimelogIter CPython extension type implementation
  *
  * Implements snapshot-based iteration over timelog records.
- *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -13,6 +11,7 @@
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
+#include "timelogpy/py_span_iter.h"
 #include "timelog/timelog.h"
 
 /*===========================================================================
@@ -20,6 +19,65 @@
  *===========================================================================*/
 
 static void pytimelogiter_cleanup(PyTimelogIter* self);
+
+/*===========================================================================
+ * Test-Only Failpoints
+ *
+ * These hooks are compiled only for the py_iter C test target. They allow
+ * deterministic simulation of allocation failure AFTER tl_iter_next consumes
+ * a row, so we can validate fail-closed iterator behavior.
+ *===========================================================================*/
+
+#ifdef TL_PY_ITER_TEST_HOOKS
+volatile int tl_py_iter_fail_after_fetch_iternext = 0;
+volatile int tl_py_iter_fail_after_fetch_next_batch = 0;
+
+void tl_py_iter_test_reset_failpoints(void)
+{
+    tl_py_iter_fail_after_fetch_iternext = 0;
+    tl_py_iter_fail_after_fetch_next_batch = 0;
+}
+
+void tl_py_iter_test_fail_iternext_once(void)
+{
+    tl_py_iter_fail_after_fetch_iternext = 1;
+}
+
+void tl_py_iter_test_fail_next_batch_once(void)
+{
+    tl_py_iter_fail_after_fetch_next_batch = 1;
+}
+
+static int tl_py_iter_test_should_fail_iternext(void)
+{
+    if (tl_py_iter_fail_after_fetch_iternext > 0) {
+        tl_py_iter_fail_after_fetch_iternext--;
+        PyErr_NoMemory();
+        return 1;
+    }
+    return 0;
+}
+
+static int tl_py_iter_test_should_fail_next_batch(void)
+{
+    if (tl_py_iter_fail_after_fetch_next_batch > 0) {
+        tl_py_iter_fail_after_fetch_next_batch--;
+        PyErr_NoMemory();
+        return 1;
+    }
+    return 0;
+}
+#else
+static int tl_py_iter_test_should_fail_iternext(void)
+{
+    return 0;
+}
+
+static int tl_py_iter_test_should_fail_next_batch(void)
+{
+    return 0;
+}
+#endif
 
 /*===========================================================================
  * Block Direct Construction
@@ -60,28 +118,24 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     }
     self->closed = 1;
 
-    /*
-     * Clear pointers BEFORE operations that may run Python code.
-     * This prevents reentrancy issues if Py_DECREF triggers __del__.
-     */
+    /* Clear pointers before Py_DECREF to prevent reentrancy via __del__. */
     tl_iter_t* it = self->iter;
     self->iter = NULL;
 
-    tl_snapshot_t* snap = self->snapshot;
-    self->snapshot = NULL;
+    tl_snapshot_t* snap = self->pinned_snapshot;
+    self->pinned_snapshot = NULL;
+
+    self->remaining_count = 0;
 
     tl_py_handle_ctx_t* ctx = self->handle_ctx;
-    /* Don't NULL handle_ctx - it's borrowed, and we need it for pin exit */
+    /* handle_ctx is borrowed; keep for pin exit below */
 
     PyObject* owner = self->owner;
     self->owner = NULL;
 
     /*
-     * Release resources in order:
-     * 1. Destroy iterator (no Python code)
-     * 2. Release snapshot (no Python code)
-     * 3. Exit pins - may drain retired objects (runs Python code via Py_DECREF)
-     * 4. DECREF owner (runs Python code)
+     * Release order: iter/snapshot first (C only), then pins_exit/DECREF
+     * (may run Python code). Preserve exception state across the latter.
      */
     if (it) {
         tl_iter_destroy(it);
@@ -91,13 +145,7 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
         tl_snapshot_release(snap);
     }
 
-    /*
-     * Preserve exception state across operations that may run arbitrary Python
-     * code (drain, owner DECREF). This ensures:
-     * - TL_EOF path stays a clean StopIteration (no exception)
-     * - __exit__ path doesn't corrupt the propagating exception
-     * - Bad finalizers in __del__ don't clobber our exception state
-     */
+    /* Preserve exception state across Py_DECREF / drain. */
     PyObject *exc_type, *exc_value, *exc_tb;
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
 
@@ -139,10 +187,7 @@ static void PyTimelogIter_dealloc(PyTimelogIter* self)
 
 static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 {
-    /*
-     * Closed iterator returns NULL with no exception set.
-     * Per CPython convention, this signals StopIteration.
-     */
+    /* NULL without exception signals StopIteration (CPython convention). */
     if (self->closed) {
         return NULL;
     }
@@ -151,12 +196,18 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     tl_status_t st = tl_iter_next(self->iter, &rec);
 
     if (st == TL_OK) {
-        /* Decode handle to PyObject* and take new reference */
+        /* Fail closed on materialization error to avoid silent row loss. */
+        if (tl_py_iter_test_should_fail_iternext()) {
+            pytimelogiter_cleanup(self);
+            return NULL;
+        }
+
         PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
         PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
         if (!ts) {
             Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
             return NULL;
         }
 
@@ -164,19 +215,23 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
         if (!tup) {
             Py_DECREF(ts);
             Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
             return NULL;
         }
 
-        /* PyTuple_SET_ITEM steals references */
-        PyTuple_SET_ITEM(tup, 0, ts);
+        PyTuple_SET_ITEM(tup, 0, ts);  /* steals ref */
         PyTuple_SET_ITEM(tup, 1, obj);
+
+        if (self->remaining_valid && self->remaining_count > 0) {
+            self->remaining_count--;
+        }
+
         return tup;
     }
 
     if (st == TL_EOF) {
-        /* Exhaustion - cleanup and signal StopIteration */
         pytimelogiter_cleanup(self);
-        return NULL;  /* No exception = StopIteration */
+        return NULL;  /* StopIteration */
     }
 
     /* Error path - cleanup and raise */
@@ -215,7 +270,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         return NULL;  /* Conversion error */
     }
 
-    /* Negative n is an error (unlike zero which returns empty list) */
+    /* Negative is an error; zero returns empty list. */
     if (n < 0) {
         PyErr_SetString(PyExc_ValueError, "next_batch size must be >= 0");
         return NULL;
@@ -236,11 +291,18 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         tl_status_t st = tl_iter_next(self->iter, &rec);
 
         if (st == TL_OK) {
+            /* Fail closed on materialization error to avoid silent row loss. */
+            if (tl_py_iter_test_should_fail_next_batch()) {
+                pytimelogiter_cleanup(self);
+                goto fail;
+            }
+
             PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
             PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
             if (!ts) {
                 Py_DECREF(obj);
+                pytimelogiter_cleanup(self);
                 goto fail;
             }
 
@@ -248,12 +310,17 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
             if (!tup) {
                 Py_DECREF(ts);
                 Py_DECREF(obj);
+                pytimelogiter_cleanup(self);
                 goto fail;
             }
 
             PyTuple_SET_ITEM(tup, 0, ts);
             PyTuple_SET_ITEM(tup, 1, obj);
             PyList_SET_ITEM(list, i, tup);
+
+            if (self->remaining_valid && self->remaining_count > 0) {
+                self->remaining_count--;
+            }
             continue;
         }
 
@@ -268,7 +335,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         goto fail;
     }
 
-    /* Shrink list if early EOF */
+    /* Trim list if exhausted before n. */
     if (i < n) {
         if (PyList_SetSlice(list, i, n, NULL) < 0) {
             goto fail;
@@ -286,6 +353,23 @@ fail:
  * Getters/Setters
  *===========================================================================*/
 
+static Py_ssize_t PyTimelogIter_len(PyTimelogIter* self)
+{
+    if (!self->remaining_valid) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "iterator remaining length is unavailable");
+        return -1;
+    }
+
+    if (self->remaining_count > (uint64_t)PY_SSIZE_T_MAX) {
+        PyErr_SetString(PyExc_OverflowError,
+            "iterator length does not fit in Py_ssize_t");
+        return -1;
+    }
+
+    return (Py_ssize_t)self->remaining_count;
+}
+
 static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
 {
     (void)closure;
@@ -296,12 +380,27 @@ static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
  * Method/GetSet Tables
  *===========================================================================*/
 
+static PyObject* PyTimelogIter_view(PyTimelogIter* self, PyObject* Py_UNUSED(noargs))
+{
+    if (self->closed) {
+        PyErr_SetString(PyExc_ValueError, "iterator is closed");
+        return NULL;
+    }
+    if (!self->owner) {
+        PyErr_SetString(PyExc_RuntimeError, "iterator owner is no longer available");
+        return NULL;
+    }
+    return PyPageSpanIter_Create(self->owner, self->range_t1, self->range_t2, "segment");
+}
+
 static PyMethodDef PyTimelogIter_methods[] = {
     {"close", (PyCFunction)PyTimelogIter_close, METH_NOARGS,
      "close() -> None\n\nRelease iterator resources. Idempotent."},
     {"next_batch", (PyCFunction)PyTimelogIter_next_batch, METH_O,
      "next_batch(n) -> list[tuple[int, object]]\n\n"
      "Return up to n records. Empty list on exhaustion."},
+    {"view", (PyCFunction)PyTimelogIter_view, METH_NOARGS,
+     "view() -> PageSpanIter\n\nReturn a PageSpanIter for the same time range."},
     {"__enter__", (PyCFunction)PyTimelogIter_enter, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyTimelogIter_exit, METH_VARARGS,
@@ -315,6 +414,10 @@ static PyGetSetDef PyTimelogIter_getset[] = {
     {NULL, NULL, NULL, NULL, NULL}
 };
 
+static PySequenceMethods timelogiter_as_sequence = {
+    .sq_length = (lenfunc)PyTimelogIter_len,
+};
+
 /*===========================================================================
  * Type Object
  *===========================================================================*/
@@ -325,7 +428,9 @@ PyTypeObject PyTimelogIter_Type = {
     .tp_doc = PyDoc_STR(
         "Snapshot-based iterator over timelog records.\n\n"
         "Yields (timestamp, object) tuples. Cannot be instantiated directly;\n"
-        "use Timelog.range(), .since(), .until(), .all() factory methods."
+        "use Timelog.range(), .since(), .until(), .all() factory methods.\n\n"
+        "len(iter) reports remaining visible rows in the iterator snapshot,\n"
+        "not a live global timelog count."
     ),
     .tp_basicsize = sizeof(PyTimelogIter),
     .tp_itemsize = 0,
@@ -337,6 +442,7 @@ PyTypeObject PyTimelogIter_Type = {
     .tp_free = PyObject_GC_Del,         /* Explicit for GC-allocated types */
     .tp_iter = PyObject_SelfIter,
     .tp_iternext = (iternextfunc)PyTimelogIter_iternext,
+    .tp_as_sequence = &timelogiter_as_sequence,
     .tp_methods = PyTimelogIter_methods,
     .tp_getset = PyTimelogIter_getset,
 };

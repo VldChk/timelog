@@ -26,6 +26,7 @@
 
 /* Internal headers required for test threading scaffolding. */
 #include "internal/tl_sync.h"
+#include "query/tl_snapshot.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -342,6 +343,58 @@ TEST_DECLARE(func_iter_point_with_tombstone) {
     tl_close(tl);
 }
 
+TEST_DECLARE(func_reinsert_visible_after_delete) {
+    tl_timelog_t* tl = NULL;
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert, delete, then reinsert same timestamp */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 200));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+
+    /* Visible before flush */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Flush to L0 and verify visibility */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Compaction and verify again */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_point(snap, 100, &it));
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    tl_close(tl);
+}
+
 TEST_DECLARE(func_iter_point_at_ts_max) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
@@ -501,6 +554,440 @@ TEST_DECLARE(func_scan_range_early_stop) {
     tl_close(tl);
 }
 
+
+TEST_DECLARE(func_count_range_basic) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 20, 40, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_respects_tombstone_watermark_tie) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Segment watermark will be seq 1 after first flush. */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* First tombstone at seq 2 should hide ts=100 in newer snapshots. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
+
+    /* Reinsert at higher watermark (active source, treated as visible). */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+
+    /* Second tombstone at seq 4: max_seq(4) > reinsert seq(3) -> reinsert is
+     * tombstoned. Both the original (L0, watermark=1) and the reinsert (active,
+     * watermark=3) are covered by the coalesced tombstone [100,101) max_seq=4. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 101));
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 100, 101, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_snapshot_isolation) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Mutate after snapshot acquisition. */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, TL_TS_MIN, &it));
+
+    uint64_t snap_count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        snap_count++;
+    }
+    TEST_ASSERT_EQ(1, (long long)snap_count);
+    tl_iter_destroy(it);
+
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Optimized Count Path Tests
+ *
+ * Verify the O(S*T*log P) count path produces correct results across
+ * mixed sources (memtable + flushed segments), OOO records, boundary
+ * conditions, and cross-validates against O(N) iterator scan.
+ *===========================================================================*/
+
+TEST_DECLARE(func_count_range_mixed_sources) {
+    /* Insert records, flush to L0, insert more into memtable.
+     * Verify count_range spans both sources correctly. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Phase 1: records that will be flushed to L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Phase 2: records in memtable */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 5));
+
+    /* Full range: all 5 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(5, (long long)count);
+
+    /* Spanning both sources: [15, 45) => ts=20,30,40 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 15, 45, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Only segment: [10, 35) => ts=10,20,30 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 10, 35, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Only memtable: [35, 55) => ts=40,50 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 35, 55, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_with_ooo) {
+    /* Insert OOO records, verify count handles multi-run memview. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 2));   /* OOO */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 75, 4));   /* OOO */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 5));
+
+    /* Full count: 5 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(5, (long long)count);
+
+    /* Range [60, 160) => ts=75,100,150 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 60, 160, &count));
+    TEST_ASSERT_EQ(3, (long long)count);
+
+    /* Range [50, 51) => just ts=50 */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 50, 51, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_ts_max_boundary) {
+    /* Insert record at TL_TS_MAX, verify no overflow from ts+1. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX - 1, 2));
+
+    /* Full count: 2 records */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(2, (long long)count);
+
+    /* Range [TL_TS_MAX, TL_TS_MAX+1) expressed as count_range */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, TL_TS_MAX, 0,
+                                                       true, &count));
+    TEST_ASSERT_EQ(1, (long long)count);
+    tl_snapshot_release(snap);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_range_empty) {
+    /* Verify count returns 0 for empty log and out-of-range queries. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Empty log */
+    uint64_t count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_count(tl, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 0, 100, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    /* Insert records, then query out of range */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 100, 200, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    /* Empty range [10, 10) */
+    TEST_ASSERT_STATUS(TL_OK, tl_count_range(tl, 10, 10, &count));
+    TEST_ASSERT_EQ(0, (long long)count);
+
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_matches_iter_scan) {
+    /* Cross-validation: count must match manual iterator scan count.
+     * Insert diverse records with tombstones, compare both paths. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert records spanning a wide range */
+    for (tl_ts_t ts = 0; ts < 100; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Flush half to L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Insert more (in memtable) */
+    for (tl_ts_t ts = 100; ts < 150; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Add some OOO records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 5, 200));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 201));
+
+    /* Delete a range covering some records */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 200, 500));
+
+    /* Now compare count vs scan for several query ranges */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Test several range queries */
+    tl_ts_t ranges[][2] = {
+        {0, 1500},       /* Full range */
+        {200, 500},      /* Exactly the deleted range */
+        {0, 200},        /* Before deletion */
+        {500, 1500},     /* After deletion */
+        {100, 600},      /* Overlapping deletion */
+    };
+
+    for (size_t r = 0; r < sizeof(ranges) / sizeof(ranges[0]); r++) {
+        tl_ts_t qt1 = ranges[r][0];
+        tl_ts_t qt2 = ranges[r][1];
+
+        /* Optimized count */
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, qt1, qt2,
+                                                           false, &opt_count));
+
+        /* Manual scan count */
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, qt1, qt2, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) {
+            scan_count++;
+        }
+        tl_iter_destroy(it);
+
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_cross_validate_l1) {
+    /* Cross-validation with L1 segments: flush, compact, then compare
+     * optimized count vs iterator scan for diverse query ranges including
+     * unbounded and records at TL_TS_MAX. */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records and flush to create L0 segments */
+    for (tl_ts_t ts = 0; ts < 50; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    for (tl_ts_t ts = 50; ts < 100; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add two disjoint tombstones with different seqs */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 100, 250));  /* seq=101 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 400, 550));  /* seq=102 */
+
+    /* Compact L0 -> L1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do { st = tl_maint_step(tl); } while (st == TL_OK);
+    TEST_ASSERT_STATUS(TL_EOF, st);
+
+    /* Insert more records in memtable (some in tombstoned range) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 999));  /* in tombstoned range */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 1500, 998));  /* outside */
+
+    /* Snapshot and compare optimized count vs scan */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Verify L1 segments exist */
+    tl_stats_t stats;
+    tl_stats(snap, &stats);
+    TEST_ASSERT(stats.segments_l1 > 0);
+
+    /* Test bounded ranges */
+    tl_ts_t ranges[][2] = {
+        {0, 2000},       /* Full range */
+        {100, 250},      /* Exactly first tombstone */
+        {400, 550},      /* Exactly second tombstone */
+        {0, 100},        /* Before all tombstones */
+        {550, 2000},     /* After all tombstones */
+        {200, 500},      /* Spanning gap between tombstones */
+    };
+    for (size_t r = 0; r < sizeof(ranges) / sizeof(ranges[0]); r++) {
+        tl_ts_t qt1 = ranges[r][0];
+        tl_ts_t qt2 = ranges[r][1];
+
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, qt1, qt2,
+                                                           false, &opt_count));
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, qt1, qt2, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+        tl_iter_destroy(it);
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    /* Test unbounded range [200, +inf) */
+    {
+        uint64_t opt_count = 0;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 200, 0,
+                                                           true, &opt_count));
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 200, &it));
+        uint64_t scan_count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+        tl_iter_destroy(it);
+        TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+    }
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_count_ooo_runs_with_tombstones) {
+    /* Verify count correctly handles OOO runs in active buffer with tombstones.
+     * OOO runs use per-record cursor scan with run-level watermark. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Insert in-order records first */
+    for (tl_ts_t ts = 0; ts < 20; ts++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts * 10, (tl_handle_t)(ts + 1)));
+    }
+
+    /* Insert OOO records that fall between in-order records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 5, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 101));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 25, 102));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 35, 103));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 45, 104));
+
+    /* Delete range covering some OOO and some in-order records */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 10, 40));
+
+    /* Compare optimized count vs scan */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Full range cross-validate */
+    uint64_t opt_count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 0, 200,
+                                                       false, &opt_count));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, 0, 200, &it));
+    uint64_t scan_count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) { scan_count++; }
+    tl_iter_destroy(it);
+
+    TEST_ASSERT_EQ((long long)scan_count, (long long)opt_count);
+
+    /* Targeted range that's purely inside tombstoned area */
+    uint64_t tomb_count = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_count_range_internal(snap, 10, 40,
+                                                       false, &tomb_count));
+    tl_iter_t* it2 = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, 10, 40, &it2));
+    uint64_t tomb_scan = 0;
+    while (tl_iter_next(it2, &rec) == TL_OK) { tomb_scan++; }
+    tl_iter_destroy(it2);
+
+    TEST_ASSERT_EQ((long long)tomb_scan, (long long)tomb_count);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_stats_active_memtable_filtered) {
+    /* Insert records, add tombstone covering some active records,
+     * verify tl_stats().records_estimate excludes tombstoned active records. */
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
+
+    /* Delete ts=20 and ts=30 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 20, 40));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* records_estimate should be 2 (ts=10 and ts=40 visible) */
+    TEST_ASSERT_EQ(2, (long long)stats.records_estimate);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Timestamp Navigation Tests (migrated from test_phase5.c)
  *===========================================================================*/
@@ -577,6 +1064,22 @@ TEST_DECLARE(func_next_prev_ts_basic) {
     tl_close(tl);
 }
 
+TEST_DECLARE(func_next_ts_at_ts_max_eof) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, TL_TS_MAX, 1));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_ts_t ts = 0;
+    TEST_ASSERT_STATUS(TL_EOF, tl_next_ts(snap, TL_TS_MAX, &ts));
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 /*===========================================================================
  * Post-Flush Read Tests (migrated from test_phase5.c)
  *===========================================================================*/
@@ -646,6 +1149,70 @@ TEST_DECLARE(func_iter_tombstone_after_flush) {
     TEST_ASSERT_EQ(30, rec.ts);
 
     TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*
+ * BUG REPRO: Tombstone filter drops first record of each subsequent segment.
+ * Two segments flushed, then delete range in first segment's range.
+ * The merge iterator's skip-ahead optimization drops ts=60.
+ */
+TEST_DECLARE(func_iter_tombstone_multi_segment) {
+    tl_config_t cfg = {0};
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Segment 1: [10, 20, 30, 40, 50] */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 50));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Segment 2: [60, 70, 80, 90, 100] */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 60, 60));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 70, 70));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 80, 80));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 90, 90));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Delete [25, 45) - removes ts=30, ts=40 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 25, 45));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    /* Expected: 10, 20, 50, 60, 70, 80, 90, 100 (8 records) */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, TL_TS_MIN, &it));
+
+    tl_record_t rec;
+    int count = 0;
+    int64_t expected[] = {10, 20, 50, 60, 70, 80, 90, 100};
+    int64_t got[16] = {0};
+
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        if (count < 16) got[count] = rec.ts;
+        count++;
+    }
+
+    printf("    Got %d records:", count);
+    for (int i = 0; i < count && i < 16; i++) {
+        printf(" %lld", (long long)got[i]);
+    }
+    printf("\n");
+
+    TEST_ASSERT_EQ(8, count);
+    for (int i = 0; i < 8; i++) {
+        TEST_ASSERT_EQ(expected[i], got[i]);
+    }
 
     tl_iter_destroy(it);
     tl_snapshot_release(snap);
@@ -873,8 +1440,9 @@ TEST_DECLARE(func_stats_with_tombstones) {
     tl_stats_t stats;
     TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
 
-    /* Should have 3 RAW records and 1 tombstone */
-    TEST_ASSERT_EQ(3, stats.records_estimate);
+    /* Active buffers now filtered: ts=200 covered by [150,250) -> 2 visible.
+     * Tombstone count remains 1 (raw). */
+    TEST_ASSERT_EQ(2, stats.records_estimate);
     TEST_ASSERT_EQ(1, stats.tombstone_count);
 
     tl_snapshot_release(snap);
@@ -909,6 +1477,60 @@ TEST_DECLARE(func_stats_after_flush) {
     tl_close(tl);
 }
 
+
+TEST_DECLARE(func_stats_after_flush_with_newer_tombstones) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* First flush creates immutable source with watermark W0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Newer tombstone overlaps two immutable rows (100,200). */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 250));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* Immutable visible count should subtract newer skyline overlap: only ts=300 remains. */
+    TEST_ASSERT_EQ(1, stats.records_estimate);
+    TEST_ASSERT(stats.tombstone_count >= 1);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+TEST_DECLARE(func_stats_after_flush_overlapping_newer_tombstones_no_double_subtract) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Two overlapping deletes should still subtract each row once after skyline merge. */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 250));
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 150, 300));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
+
+    /* Overlap at ts=200 must not be double-subtracted; ts=400 survives. */
+    TEST_ASSERT_EQ(1, stats.records_estimate);
+
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
 TEST_DECLARE(func_stats_null_checks) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
@@ -928,158 +1550,17 @@ TEST_DECLARE(func_stats_null_checks) {
     tl_close(tl);
 }
 
-TEST_DECLARE(func_stats_ooo_scaling_counters) {
-    /* OOO Scaling Phase 1: Verify new stats fields are present and zeroed
-     * initially. Watermarks are ENABLED by default for better OOO handling. */
-    tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
-
-    tl_snapshot_t* snap = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
-
-    tl_stats_t stats;
-    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
-
-    /* OOO Scaling counters should be zero initially (no maintenance yet) */
-    TEST_ASSERT_EQ(0, stats.flush_first_cycles);
-    TEST_ASSERT_EQ(0, stats.compaction_deferred_cycles);
-    TEST_ASSERT_EQ(0, stats.compaction_forced_cycles);
-
-    tl_snapshot_release(snap);
-    tl_close(tl);
-}
-
 /*===========================================================================
- * Watermark Functional Tests (OOO Scaling Phase 1)
- *
- * These tests verify watermark-based scheduling behavior:
- * - Auto-derive: watermarks computed from sealed_max_runs (75%/25%)
- * - Flush-first: prioritize flush when sealed >= hi_wm
- * - Compaction deferral: defer compaction when sealed > lo_wm
- * - Safety valve: force compaction when L0 >= max_delta_segments
+ * Maintenance Configuration Tests
  *===========================================================================*/
-
-TEST_DECLARE(func_watermark_auto_derive_enabled) {
-    /* Verify watermarks are ENABLED by default via auto-derive.
-     * With default config (sealed_max_runs=4), we get:
-     * hi_wm = ceil(75% * 4) = 3, lo_wm = floor(25% * 4) = 1
-     * This test verifies the timelog opens successfully with watermarks. */
-    tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
-
-    /* Verify stats fields exist (watermarks are enabled) */
-    tl_snapshot_t* snap = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
-
-    tl_stats_t stats;
-    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
-
-    /* Counters should be zero initially, but the fields exist */
-    TEST_ASSERT_EQ(0, stats.flush_first_cycles);
-    TEST_ASSERT_EQ(0, stats.compaction_deferred_cycles);
-    TEST_ASSERT_EQ(0, stats.compaction_forced_cycles);
-
-    tl_snapshot_release(snap);
-    tl_close(tl);
-}
-
-TEST_DECLARE(func_watermark_explicit_config) {
-    /* Verify explicit watermark configuration is accepted.
-     * Uses hi_wm=3, lo_wm=1 with sealed_max_runs=4. */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.sealed_max_runs = 4;
-    cfg.sealed_hi_wm = 3;     /* Explicit: 75% */
-    cfg.sealed_lo_wm = 1;     /* Explicit: 25% */
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-
-    tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
-
-    /* Insert some data to verify timelog is functional */
-    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
-    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
-
-    /* Verify stats accessible */
-    tl_snapshot_t* snap = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
-
-    tl_stats_t stats;
-    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
-    TEST_ASSERT_EQ(2, stats.records_estimate);
-
-    tl_snapshot_release(snap);
-    tl_close(tl);
-}
-
-TEST_DECLARE(func_flush_first_background_integration) {
-    /* Integration test: Verify background maintenance with watermarks.
-     *
-     * This test exercises the background worker with watermark logic:
-     * 1. Configure with small memtable to trigger seals quickly
-     * 2. Use background maintenance mode
-     * 3. Generate enough records to trigger multiple seals
-     * 4. Wait briefly for worker to process
-     * 5. Verify data integrity (counts match)
-     *
-     * Note: We don't assert specific counter values since timing varies,
-     * but we verify the system works correctly end-to-end with watermarks. */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-
-    /* Small memtable to trigger seals quickly */
-    cfg.memtable_max_bytes = 512; /* Small memtable - seals with ~32 records */
-    cfg.target_page_bytes = 256;  /* Minimum valid page size (16 records * 16 bytes) */
-    cfg.ooo_budget_bytes = 128;   /* Small OOO budget */
-    cfg.sealed_max_runs = 4;
-    cfg.sealed_hi_wm = 3;         /* Flush-first at 75% */
-    cfg.sealed_lo_wm = 1;         /* Drain to 25% */
-    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
-    cfg.maintenance_wakeup_ms = 10;  /* Fast wake for testing */
-
-    tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
-
-    /* Generate enough records to trigger multiple seals and flushes */
-    const int record_count = 500;
-    for (int i = 0; i < record_count; i++) {
-        tl_status_t st = tl_append(tl, (tl_ts_t)(1000 + i), (tl_handle_t)(i + 1));
-        /* TL_OK or TL_EBUSY (backpressure) both mean record was inserted */
-        TEST_ASSERT(st == TL_OK || st == TL_EBUSY);
-    }
-
-    /* Give background worker time to process (flushes, potentially compaction) */
-    tl_sleep_ms(100);
-
-    /* Acquire snapshot and verify data integrity */
-    tl_snapshot_t* snap = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
-
-    tl_stats_t stats;
-    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
-
-    /* All records should be present */
-    TEST_ASSERT_EQ((uint64_t)record_count, stats.records_estimate);
-
-    /* With watermarks enabled, some maintenance work should have happened.
-     * We don't assert specific counter values due to timing variability,
-     * but we verify the system completed work successfully. */
-    TEST_ASSERT(stats.seals_total > 0 || stats.flushes_total > 0);
-
-    tl_snapshot_release(snap);
-    tl_close(tl);
-}
 
 TEST_DECLARE(func_compaction_safety_valve_config) {
     /* Verify safety valve config: max_delta_segments sets hard limit for L0.
-     * When L0 >= max_delta_segments, compaction MUST proceed even if
-     * flush pressure is high. This test verifies the config is accepted. */
+     * When L0 >= max_delta_segments, compaction must run. */
     tl_config_t cfg;
     tl_config_init_defaults(&cfg);
     cfg.max_delta_segments = 4;   /* Low limit for testing */
     cfg.sealed_max_runs = 4;
-    cfg.sealed_hi_wm = 3;
-    cfg.sealed_lo_wm = 1;
     cfg.maintenance_mode = TL_MAINT_DISABLED;
 
     tl_timelog_t* tl = NULL;
@@ -1121,98 +1602,6 @@ TEST_DECLARE(func_periodic_wake_config) {
     tl_close(tl);
 }
 
-TEST_DECLARE(func_watermark_scheduling_counters) {
-    /* Targeted test: Verify scheduling counters increment correctly.
-     *
-     * Strategy:
-     * 1. Configure with small memtable and explicit watermarks
-     * 2. Use background maintenance with fast wakeup
-     * 3. Generate enough data to trigger multiple seals (fill sealed queue)
-     * 4. Wait for worker to process
-     * 5. Verify counters track scheduling decisions
-     *
-     * Counter coverage:
-     * - flush_first_cycles: MUST be > 0 (sealed queue will exceed hi_wm)
-     * - compaction_deferred_cycles: MAY be > 0 (depends on timing - whether
-     *   compaction is needed when sealed > lo_wm)
-     * - compaction_forced_cycles: UNLIKELY to trigger (requires L0 >= max_delta_segments
-     *   while sealed > lo_wm, which needs specific timing)
-     *
-     * This test guarantees flush_first_cycles fires. The other counters are
-     * verified to be accessible and non-negative (no UB), but their exact
-     * values depend on race conditions between writer and maintenance worker. */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-
-    /* Configure for fast seal/flush cycle */
-    cfg.memtable_max_bytes = 512;     /* Small: seals with ~32 records */
-    cfg.target_page_bytes = 256;      /* Minimum valid page size */
-    cfg.ooo_budget_bytes = 128;
-
-    /* Explicit watermarks: hi_wm=2, lo_wm=1 with sealed_max_runs=3
-     * This means flush-first triggers when sealed_len >= 2 */
-    cfg.sealed_max_runs = 3;
-    cfg.sealed_hi_wm = 2;
-    cfg.sealed_lo_wm = 1;
-
-    /* Low max_delta_segments increases chance of hitting safety valve,
-     * but we don't guarantee it (timing-dependent) */
-    cfg.max_delta_segments = 4;
-
-    cfg.maintenance_mode = TL_MAINT_BACKGROUND;
-    cfg.maintenance_wakeup_ms = 10;   /* Fast wakeup */
-
-    tl_timelog_t* tl = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
-
-    /* Generate enough records to trigger multiple seals.
-     * With 512-byte memtable and 16-byte records, ~32 records per seal.
-     * Generate 300 records = ~10 seals. With sealed_max_runs=3 and hi_wm=2,
-     * the worker WILL enter flush-first mode multiple times. */
-    const int record_count = 300;
-    for (int i = 0; i < record_count; i++) {
-        tl_status_t st = tl_append(tl, (tl_ts_t)(1000 + i), (tl_handle_t)(i + 1));
-        TEST_ASSERT(st == TL_OK || st == TL_EBUSY);
-    }
-
-    /* Wait for worker to process */
-    tl_sleep_ms(200);
-
-    /* Verify counters */
-    tl_snapshot_t* snap = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
-
-    tl_stats_t stats;
-    TEST_ASSERT_STATUS(TL_OK, tl_stats(snap, &stats));
-
-    /* All records should be present */
-    TEST_ASSERT_EQ((uint64_t)record_count, stats.records_estimate);
-
-    /* flush_first_cycles MUST be > 0 (worker entered flush-first mode).
-     * This is guaranteed because:
-     * - ~10 seals created from 300 records
-     * - sealed_max_runs=3 with hi_wm=2 means flush-first triggers frequently */
-    TEST_ASSERT(stats.flush_first_cycles > 0);
-
-    /* compaction_deferred_cycles and compaction_forced_cycles are
-     * timing-dependent. We verify they are accessible and non-negative.
-     * They MAY be 0 if compaction never ran while pressure was high, or
-     * > 0 if the timing aligned to trigger these paths. */
-    TEST_ASSERT(stats.compaction_deferred_cycles >= 0);  /* Always true for uint64 */
-    TEST_ASSERT(stats.compaction_forced_cycles >= 0);    /* Always true for uint64 */
-
-    /* Log counter values for diagnostic purposes (visible in verbose output) */
-    /* Note: These are informational, not assertions */
-    (void)stats.compaction_deferred_cycles;  /* Silence unused warning */
-    (void)stats.compaction_forced_cycles;
-
-    /* Maintenance should have done work */
-    TEST_ASSERT(stats.seals_total > 0);
-    TEST_ASSERT(stats.flushes_total > 0);
-
-    tl_snapshot_release(snap);
-    tl_close(tl);
-}
 
 /*===========================================================================
  * Compaction Tests
@@ -1688,6 +2077,93 @@ TEST_DECLARE(func_compact_on_drop_handle_invoked) {
 }
 
 /*===========================================================================
+ * Window Grid Freeze Test
+ *
+ * Verifies that after L1 segments are created, subsequent compactions
+ * maintain L1 non-overlap invariant (protected by freezing the
+ * window grid once L1 exists).
+ *===========================================================================*/
+
+TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
+    /*
+     * Verify L1 non-overlap is maintained across multiple compactions.
+     *
+     * The freeze keeps window boundaries stable after first L1 creation, preventing
+     * adaptive segmentation from changing window boundaries mid-stream. This
+     * test verifies the invariant is preserved by:
+     * 1. Creating L1 segments through compaction
+     * 2. Adding more data and compacting again
+     * 3. Verifying all data is still queryable (L1 non-overlap maintained)
+     */
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 2;  /* Trigger compaction with 2 L0 segments */
+    cfg.window_size = 100;       /* Small window for easy L1 creation */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Phase 1: Create first L1 segment */
+    /* Insert records in window 0 [0, 100) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Insert more in same window */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 40));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact - should create L1 segment for window 0 */
+    /* After this, window_grid_frozen should be true. */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    /* Phase 2: Add more data in different window and compact again */
+    /* Insert records in window 1 [100, 200) */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 110, 110));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 120, 120));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 130, 130));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 140, 140));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact again - should create L1 segment for window 1 */
+    /* Frozen grid keeps window boundaries stable and preserves non-overlap. */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    /* Phase 3: Verify all data is queryable (L1 non-overlap maintained) */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    tl_ts_t expected_ts[] = {10, 20, 30, 40, 110, 120, 130, 140};
+    tl_handle_t expected_h[] = {10, 20, 30, 40, 110, 120, 130, 140};
+    size_t n_expected = sizeof(expected_ts) / sizeof(expected_ts[0]);
+
+    for (size_t i = 0; i < n_expected; i++) {
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+        TEST_ASSERT_EQ(expected_ts[i], rec.ts);
+        TEST_ASSERT_EQ(expected_h[i], rec.handle);
+    }
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    /* Phase 4: Verify validation passes (L1 non-overlap invariant) */
+#ifdef TL_DEBUG
+    TEST_ASSERT_STATUS(TL_OK, tl_validate(snap));
+#endif
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Failure Handling Tests (migrated from test_phase9.c)
  *===========================================================================*/
 
@@ -2099,6 +2575,506 @@ TEST_DECLARE(func_smoke_high_volume_append_iterate) {
 }
 
 /*===========================================================================
+ * Skip-Ahead Seek Tests
+ *
+ * These tests verify that tl_kmerge_iter_seek() correctly preserves buffered
+ * records >= target timestamp. A prior regression was that seek()
+ * cleared the entire heap, losing prefetched records that should be preserved.
+ *===========================================================================*/
+
+/**
+ * Test: seek during tombstone filtering preserves buffered records >= target.
+ *
+ * Bug scenario: With multiple sources (L0 segment + memtable), the merge heap
+ * contains prefetched records from each. When a tombstone triggers skip-ahead,
+ * seek() must preserve heap entries with ts >= target.
+ *
+ * Setup:
+ * - L0 segment: [100, 300] (from flush)
+ * - Active memtable: [150, 350]
+ * - Tombstone: [0, 200)  <- triggers skip-ahead past 150, 100
+ *
+ * After merge init, heap has: {ts=100, L0}, {ts=150, memtable}
+ * Tombstone skip-ahead seeks to ts=200:
+ * - Entry {100} < 200: pop, seek L0 to 200, re-prime with 300
+ * - Entry {150} < 200: pop, seek memtable to 200, re-prime with 350
+ *
+ * Expected output: ts=300, ts=350 (both records visible after tombstone)
+ *
+ * The bug would lose ts=300 if seek() incorrectly cleared and re-sought L0.
+ */
+TEST_DECLARE(func_seek_preserves_buffered_records_multi_source) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create L0 segment with records at ts=100, ts=300 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add records to active memtable at ts=150, ts=350 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 150, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 350, 4));
+
+    /* Add tombstone [0, 200) - triggers skip-ahead past 100 and 150 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 200));
+
+    /* Query all records */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Should see ts=300 and ts=350 (records after tombstone) */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+    TEST_ASSERT_EQ(3, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(350, rec.ts);
+    TEST_ASSERT_EQ(4, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek preserves heap entry exactly at target timestamp.
+ *
+ * If heap has entry {ts=200} and we seek to target=200, the entry should
+ * be preserved (200 >= 200), not popped and re-fetched.
+ */
+TEST_DECLARE(func_seek_preserves_entry_at_exact_target) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create records: 100, 200, 300 in L0 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add tombstone [50, 200) - seek target is exactly 200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 50, 200));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* ts=100 is deleted by tombstone.
+     * After skip-ahead to 200, heap should have entry for ts=200.
+     * ts=200 is NOT deleted (tombstone is [50, 200), half-open). */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(200, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek preserves some entries while popping others (MIXED case).
+ *
+ * This is the CORE BUG scenario - one source has entry >= target that must
+ * be preserved while another source has entry < target that must be popped.
+ *
+ * Setup:
+ * - L0 segment: [100, 400]
+ * - Active memtable: [250, 500]
+ *
+ * After merge init, heap has: {ts=100, L0}, {ts=250, memtable}
+ * Tombstone [0, 200) triggers seek to 200:
+ * - Entry {100} < 200: pop, seek L0 to 200, re-prime with 400
+ * - Entry {250} >= 200: PRESERVE (this is the key case!)
+ *
+ * Expected: 250, 400, 500 (250 preserved, not lost)
+ *
+ * The OLD buggy code would lose 250 because it cleared the entire heap.
+ */
+TEST_DECLARE(func_seek_mixed_preserve_and_pop) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create L0 segment with records at ts=100, ts=400 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Add records to active memtable at ts=250, ts=500 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 250, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 500, 5));
+
+    /* Tombstone [0, 200) - triggers seek.
+     * Entry {100} < 200: pop and re-seek
+     * Entry {250} >= 200: PRESERVE */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 200));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Key assertion: ts=250 MUST be returned first (preserved, not lost) */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(250, rec.ts);
+    TEST_ASSERT_EQ(2, rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(400, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(500, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/**
+ * Test: seek with interleaved records from multiple sources.
+ *
+ * Three sources with interleaved timestamps:
+ * - L0-a: [100, 400]
+ * - L0-b: [200, 500]
+ * - Active: [300, 600]
+ *
+ * Tombstone [0, 350) triggers seek to 350.
+ * After init, heap has {100, 200, 300}.
+ * All three entries are < 350, so all sources should be re-seeked.
+ *
+ * Expected: 400, 500, 600 (sorted order from all sources)
+ */
+TEST_DECLARE(func_seek_multiple_sources_all_below_target) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+
+    /* Create first L0 segment */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 400, 4));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Create second L0 segment */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 500, 5));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Active memtable */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 600, 6));
+
+    /* Tombstone [0, 350) */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 0, 350));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_since(snap, 0, &it));
+
+    /* Should see 400, 500, 600 in sorted order */
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(400, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(500, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(600, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Tombstone Skip-Ahead Correctness
+ *
+ * Records at [10,15,20,25,30]. Delete [12,22). Query full range.
+ * Verify records 10, 25, 30 are returned (15, 20 are tombstoned).
+ *===========================================================================*/
+
+TEST_DECLARE(func_tombstone_skip_ahead_correctness) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 15, 15));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 25, 25));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
+
+    /* Delete range [12, 22) - covers ts=15 and ts=20 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 12, 22));
+
+    /* Flush to create L0 segment with tombstones */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    /* Should see 10, 25, 30 (15 and 20 tombstoned by [12,22)) */
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(10, rec.ts);
+    TEST_ASSERT_EQ(10, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(25, rec.ts);
+    TEST_ASSERT_EQ(25, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(30, rec.ts);
+    TEST_ASSERT_EQ(30, (long long)rec.handle);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Segment Refcount Leak Detection (Full Lifecycle)
+ *
+ * Full lifecycle: append -> seal -> flush -> compact -> close.
+ * Verify no crashes or leaks (ASan will catch actual leaks).
+ *===========================================================================*/
+
+TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 100;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Phase 1: Append records across multiple flushes */
+    for (int batch = 0; batch < 3; batch++) {
+        for (int i = 0; i < 10; i++) {
+            tl_ts_t ts = (tl_ts_t)(batch * 1000 + i * 10);
+            TEST_ASSERT_STATUS(TL_OK, tl_append(tl, ts, (tl_handle_t)(ts + 1)));
+        }
+        TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    }
+
+    /* Phase 2: Take snapshot, verify data */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+    tl_stats_t stats;
+    tl_stats(snap, &stats);
+    TEST_ASSERT_EQ(3, stats.segments_l0);
+    TEST_ASSERT(stats.records_estimate >= 30);
+
+    tl_snapshot_release(snap);
+
+    /* Phase 3: Compact L0 -> L1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do {
+        st = tl_maint_step(tl);
+    } while (st == TL_OK);
+
+    /* Phase 4: Verify L1 exists, L0 consumed */
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_stats(snap, &stats);
+    TEST_ASSERT_EQ(0, stats.segments_l0);
+    TEST_ASSERT(stats.segments_l1 > 0);
+
+    /* Verify all data still readable */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+    int count = 0;
+    tl_record_t rec;
+    while (tl_iter_next(it, &rec) == TL_OK) {
+        count++;
+    }
+    TEST_ASSERT_EQ(30, count);
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap);
+
+    /* Phase 5: Close - ASan will catch any refcount leaks */
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Snapshot Isolation + Drop Callback
+ *
+ * Append -> snapshot S1 -> delete range -> compact -> S1 still sees records
+ * -> release S1.
+ *===========================================================================*/
+
+TEST_DECLARE(func_snapshot_isolation_with_drop_callback) {
+    func_drop_tracker_t tracker = {0};
+
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+    cfg.max_delta_segments = 100;
+    cfg.on_drop_handle = func_track_dropped_handle;
+    cfg.on_drop_ctx = &tracker;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Take snapshot BEFORE deletion */
+    tl_snapshot_t* snap_before = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap_before));
+
+    /* Delete range [150, 250) - covers ts=200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_delete_range(tl, 150, 250));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Compact to physically drop ts=200 */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+    tl_status_t st;
+    do {
+        st = tl_maint_step(tl);
+    } while (st == TL_OK);
+
+    /* Drop callback should have fired for ts=200 */
+    TEST_ASSERT_EQ(1, (long long)tracker.dropped_count);
+    TEST_ASSERT_EQ(200, tracker.dropped_ts[0]);
+    TEST_ASSERT_EQ(2, (long long)tracker.dropped_handle[0]);
+
+    /* snap_before (taken before delete) should still see ALL records */
+    tl_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap_before, TL_TS_MIN, TL_TS_MAX, &it));
+
+    tl_record_t rec;
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(200, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap_before);
+
+    /* New snapshot should NOT see ts=200 */
+    tl_snapshot_t* snap_after = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap_after));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap_after, TL_TS_MIN, TL_TS_MAX, &it));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(100, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_OK, tl_iter_next(it, &rec));
+    TEST_ASSERT_EQ(300, rec.ts);
+
+    TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
+
+    tl_iter_destroy(it);
+    tl_snapshot_release(snap_after);
+    tl_close(tl);
+}
+
+/*===========================================================================
+ * Multi-Source Determinism (Same Timestamp)
+ *
+ * Insert records at the same timestamp across multiple components
+ * (memtable + flushed segments). Verify stable deterministic output.
+ *===========================================================================*/
+
+TEST_DECLARE(func_determinism_multi_source_same_timestamp) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Flush 1: records at ts=100 with handle=1 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Flush 2: records at ts=100 with handle=2 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+
+    /* Active memtable: ts=100 with handle=3 */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 3));
+
+    /* Query twice and verify same order both times */
+    tl_handle_t first_run[3] = {0};
+    tl_handle_t second_run[3] = {0};
+
+    for (int pass = 0; pass < 2; pass++) {
+        tl_snapshot_t* snap = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+
+        tl_iter_t* it = NULL;
+        TEST_ASSERT_STATUS(TL_OK, tl_iter_range(snap, TL_TS_MIN, TL_TS_MAX, &it));
+
+        int count = 0;
+        tl_record_t rec;
+        while (tl_iter_next(it, &rec) == TL_OK) {
+            TEST_ASSERT_EQ(100, rec.ts);
+            if (pass == 0) {
+                first_run[count] = rec.handle;
+            } else {
+                second_run[count] = rec.handle;
+            }
+            count++;
+        }
+        TEST_ASSERT_EQ(3, count);
+
+        tl_iter_destroy(it);
+        tl_snapshot_release(snap);
+    }
+
+    /* Verify deterministic ordering: both passes must yield same sequence */
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_EQ((long long)first_run[i], (long long)second_run[i]);
+    }
+
+    tl_close(tl);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -2132,11 +3108,12 @@ void run_functional_tests(void) {
     RUN_TEST(func_iter_since_basic);
     RUN_TEST(func_iter_until_basic);
 
-    /* Point lookup tests (5 tests) - migrated from test_phase5.c */
+    /* Point lookup tests (6 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_equal_basic);
     RUN_TEST(func_iter_point_not_found);
     RUN_TEST(func_iter_point_fast_path);
     RUN_TEST(func_iter_point_with_tombstone);
+    RUN_TEST(func_reinsert_visible_after_delete);
     RUN_TEST(func_iter_point_at_ts_max);
 
     /* Tombstone tests (2 tests) - migrated from test_phase5.c */
@@ -2146,15 +3123,30 @@ void run_functional_tests(void) {
     /* Scan tests (2 tests) - migrated from test_phase5.c */
     RUN_TEST(func_scan_range_basic);
     RUN_TEST(func_scan_range_early_stop);
+    RUN_TEST(func_count_range_basic);
+    RUN_TEST(func_count_respects_tombstone_watermark_tie);
+    RUN_TEST(func_count_snapshot_isolation);
+
+    /* Optimized count path tests (8 tests) */
+    RUN_TEST(func_count_range_mixed_sources);
+    RUN_TEST(func_count_range_with_ooo);
+    RUN_TEST(func_count_range_ts_max_boundary);
+    RUN_TEST(func_count_range_empty);
+    RUN_TEST(func_count_matches_iter_scan);
+    RUN_TEST(func_count_cross_validate_l1);
+    RUN_TEST(func_count_ooo_runs_with_tombstones);
+    RUN_TEST(func_stats_active_memtable_filtered);
 
     /* Timestamp navigation tests (3 tests) - migrated from test_phase5.c */
     RUN_TEST(func_min_max_ts_basic);
     RUN_TEST(func_min_max_ts_empty);
     RUN_TEST(func_next_prev_ts_basic);
+    RUN_TEST(func_next_ts_at_ts_max_eof);
 
     /* Post-flush tests (2 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_after_flush);
     RUN_TEST(func_iter_tombstone_after_flush);
+    RUN_TEST(func_iter_tombstone_multi_segment);
 
     /* Edge case tests (5 tests) - migrated from test_phase5.c */
     RUN_TEST(func_iter_at_ts_max);
@@ -2163,21 +3155,18 @@ void run_functional_tests(void) {
     RUN_TEST(func_iter_unbounded_range);
     RUN_TEST(func_tombstone_coalescing);
 
-    /* Statistics tests (6 tests) - uses tl_stats */
+    /* Statistics tests (5 tests) - uses tl_stats */
     RUN_TEST(func_stats_empty_timelog);
     RUN_TEST(func_stats_with_records);
     RUN_TEST(func_stats_with_tombstones);
     RUN_TEST(func_stats_after_flush);
+    RUN_TEST(func_stats_after_flush_with_newer_tombstones);
+    RUN_TEST(func_stats_after_flush_overlapping_newer_tombstones_no_double_subtract);
     RUN_TEST(func_stats_null_checks);
-    RUN_TEST(func_stats_ooo_scaling_counters);
 
-    /* Watermark functional tests (5 tests) - OOO Scaling Phase 1 */
-    RUN_TEST(func_watermark_auto_derive_enabled);
-    RUN_TEST(func_watermark_explicit_config);
-    RUN_TEST(func_flush_first_background_integration);
+    /* Maintenance config tests (2 tests) */
     RUN_TEST(func_compaction_safety_valve_config);
     RUN_TEST(func_periodic_wake_config);
-    RUN_TEST(func_watermark_scheduling_counters);
 
     /* Compaction end-to-end tests (6 tests) - uses tl_compact + tl_maint_step */
     RUN_TEST(func_compact_one_basic);
@@ -2193,6 +3182,9 @@ void run_functional_tests(void) {
     /* Compaction callback tests (1 test) - uses on_drop callback */
     RUN_TEST(func_compact_on_drop_handle_invoked);
 
+    /* Window grid freeze test (1 test) - verifies L1 non-overlap invariant */
+    RUN_TEST(func_compact_c10_l1_nonoverlap_preserved);
+
     /* Failure handling tests (4 tests) - uses allocator/log hooks */
     RUN_TEST(func_flush_build_survives_enomem);
     RUN_TEST(func_publish_phase_enomem);
@@ -2202,8 +3194,26 @@ void run_functional_tests(void) {
     /* Stress smoke test (small scale, always-on) */
     RUN_TEST(func_smoke_high_volume_append_iterate);
 
+    /* Skip-ahead seek tests (4 tests) */
+    RUN_TEST(func_seek_preserves_buffered_records_multi_source);
+    RUN_TEST(func_seek_preserves_entry_at_exact_target);
+    RUN_TEST(func_seek_mixed_preserve_and_pop);  /* Core bug scenario */
+    RUN_TEST(func_seek_multiple_sources_all_below_target);
+
+    /* Tombstone skip-ahead correctness (1 test) */
+    RUN_TEST(func_tombstone_skip_ahead_correctness);
+
+    /* Full lifecycle refcount leak detection (1 test) */
+    RUN_TEST(func_lifecycle_no_segment_refcount_leak);
+
+    /* Snapshot isolation with drop callback (1 test) */
+    RUN_TEST(func_snapshot_isolation_with_drop_callback);
+
+    /* Multi-source determinism (1 test) */
+    RUN_TEST(func_determinism_multi_source_same_timestamp);
+
     /*
-     * Total: ~55 tests (public API only)
+     * Total: ~62 tests (public API only)
      *
      * Internal tests moved to:
      * - test_storage_internal.c (~43 tests): window, page, catalog, segment, manifest

@@ -9,7 +9,7 @@
  * - TL_OK / TL_EOF   -> No exception (success)
  * - TL_EINVAL        -> ValueError
  * - TL_ESTATE        -> TimelogError (API usage error)
- * - TL_EBUSY         -> TimelogBusyError (resource busy, caller should retry)
+ * - TL_EBUSY         -> TimelogBusyError (context-dependent busy/backpressure)
  * - TL_ENOMEM        -> MemoryError
  * - TL_EOVERFLOW     -> OverflowError
  * - TL_EINTERNAL     -> SystemError (bug in timelog)
@@ -45,14 +45,13 @@ extern "C" {
 extern PyObject* TlPy_TimelogError;
 
 /**
- * Exception for resource busy / backpressure conditions (TL_EBUSY).
+ * Exception for TL_EBUSY (backpressure / resource busy).
  * Inherits from TimelogError.
  *
- * This exception indicates a transient condition where the caller
- * should retry the operation after a short delay. Typical causes:
- * - Sealed memrun queue is full (backpressure)
- * - Maintenance stop in progress
- * - Manifest contention during publish
+ * Context-dependent semantics:
+ * - WRITE ops: record/tombstone WAS inserted. DO NOT RETRY.
+ * - flush/compact/maint_step: publish retry exhausted; safe to retry.
+ * - start_maintenance: stop in progress; safe to retry.
  */
 extern PyObject* TlPy_TimelogBusyError;
 

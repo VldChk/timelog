@@ -12,16 +12,7 @@
  * Exception Types
  *===========================================================================*/
 
-/**
- * Base TimelogError exception.
- * All Timelog-specific errors inherit from this.
- */
 PyObject* TlPy_TimelogError = NULL;
-
-/**
- * TimelogBusyError exception for TL_EBUSY.
- * Inherits from TimelogError. Indicates a transient condition.
- */
 PyObject* TlPy_TimelogBusyError = NULL;
 
 /*===========================================================================
@@ -30,19 +21,7 @@ PyObject* TlPy_TimelogBusyError = NULL;
 
 int TlPy_InitErrors(PyObject* module)
 {
-    /*
-     * Create TimelogError exception type.
-     *
-     * The qualified name should match the module that exposes it.
-     * For a package structure like:
-     *   timelog/
-     *     __init__.py  (imports from _timelog)
-     *     _timelog.so  (C extension)
-     *
-     * We use "timelog._timelog.TimelogError" since CMake installs the
-     * extension as timelog/_timelog. Python __init__.py re-exports it
-     * as "timelog.TimelogError".
-     */
+    /* Qualified name matches installed module path (timelog/_timelog). */
     TlPy_TimelogError = PyErr_NewException(
         "timelog._timelog.TimelogError",  /* name (installed path: timelog/_timelog) */
         NULL,                              /* base (Exception) */
@@ -53,20 +32,16 @@ int TlPy_InitErrors(PyObject* module)
         return -1;
     }
 
-    /* Add to module */
     if (PyModule_AddObject(module, "TimelogError", TlPy_TimelogError) < 0) {
         Py_DECREF(TlPy_TimelogError);
         TlPy_TimelogError = NULL;
         return -1;
     }
 
-    /* Note: PyModule_AddObject steals reference on success */
+    /* PyModule_AddObject steals ref on success; keep our own. */
     Py_INCREF(TlPy_TimelogError);
 
-    /*
-     * Create TimelogBusyError as a subclass of TimelogError.
-     * Used for TL_EBUSY (backpressure / resource busy).
-     */
+    /* TimelogBusyError: subclass for TL_EBUSY conditions. */
     TlPy_TimelogBusyError = PyErr_NewException(
         "timelog._timelog.TimelogBusyError",  /* name */
         TlPy_TimelogError,                     /* base (TimelogError) */
@@ -102,18 +77,7 @@ void TlPy_FiniErrors(void)
  * Error Translation
  *===========================================================================*/
 
-/**
- * Map tl_status_t to Python exception type.
- *
- * Mapping rationale:
- * - TL_EINVAL   -> ValueError (bad arguments from user)
- * - TL_ESTATE   -> TimelogError (API usage error)
- * - TL_EBUSY    -> TimelogBusyError (transient, caller should retry)
- * - TL_ENOMEM   -> MemoryError (system resource)
- * - TL_EOVERFLOW-> OverflowError (arithmetic)
- * - TL_EINTERNAL-> SystemError (bug in timelog)
- * - Others      -> TimelogError (catch-all)
- */
+/** Map tl_status_t to Python exception type (see py_errors.h for mapping). */
 static PyObject* status_to_exception_type(tl_status_t status)
 {
     switch (status) {
@@ -121,7 +85,6 @@ static PyObject* status_to_exception_type(tl_status_t status)
             return PyExc_ValueError;
 
         case TL_EBUSY:
-            /* Transient condition: backpressure, stop in progress, etc. */
             return TlPy_TimelogBusyError ? TlPy_TimelogBusyError
                                           : PyExc_RuntimeError;
 
@@ -136,7 +99,6 @@ static PyObject* status_to_exception_type(tl_status_t status)
 
         case TL_ESTATE:
         default:
-            /* Use our custom exception for Timelog-specific errors */
             return TlPy_TimelogError ? TlPy_TimelogError : PyExc_RuntimeError;
     }
 }
@@ -144,7 +106,6 @@ static PyObject* status_to_exception_type(tl_status_t status)
 PyObject* TlPy_RaiseFromStatus(tl_status_t status)
 {
 #ifndef NDEBUG
-    /* Defensive: caller should not pass success codes */
     assert(status != TL_OK && status != TL_EOF &&
            "TlPy_RaiseFromStatus called with success status");
 #endif
@@ -160,7 +121,6 @@ PyObject* TlPy_RaiseFromStatusFmt(tl_status_t status,
                                    const char* format, ...)
 {
 #ifndef NDEBUG
-    /* Defensive: caller should not pass success codes */
     assert(status != TL_OK && status != TL_EOF &&
            "TlPy_RaiseFromStatusFmt called with success status");
 #endif
@@ -170,19 +130,12 @@ PyObject* TlPy_RaiseFromStatusFmt(tl_status_t status,
     va_list args;
     va_start(args, format);
 
-    /*
-     * Build message string.
-     * Format: "user message: tl_strerror(status)"
-     */
+    /* Format: "user message: tl_strerror(status)" */
     char buffer[512];
     int n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
     va_end(args);
 
-    /*
-     * Append status message if there's room.
-     * Note: n < 0 indicates encoding error; n >= sizeof - 64 means truncated.
-     * In both cases, we still set the error with what we have.
-     */
+    /* Append status string if there's room (truncation is harmless). */
     if (n >= 0 && (size_t)n < sizeof(buffer) - 64) {
         const char* status_msg = tl_strerror(status);
         size_t remaining = sizeof(buffer) - (size_t)n;

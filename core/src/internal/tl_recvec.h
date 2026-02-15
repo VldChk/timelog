@@ -14,8 +14,9 @@
  *
  * Used by:
  * - tl_memtable_t.active_run (append-only sorted records)
- * - tl_memtable_t.active_ooo (sorted out-of-order records)
- * - tl_memrun_t.run and tl_memrun_t.ooo (sealed arrays)
+ * - tl_memtable_t.ooo_head (append-only OOO head; may be unsorted)
+ * - tl_memrun_t.run (sealed array, always sorted)
+ * - OOO runs (sorted arrays created from head flush)
  * - Page builder (sorted record stream)
  *
  * Thread Safety:
@@ -106,6 +107,34 @@ tl_status_t tl_recvec_push_n(tl_recvec_t* rv, const tl_record_t* records, size_t
 tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_t handle);
 
 /*---------------------------------------------------------------------------
+ * Sorting
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Sort the record vector by (ts, handle) (non-decreasing).
+ * Uses stdlib qsort. O(n log n) complexity.
+ *
+ * Supports deferred sort strategy where out-of-order records are
+ * appended unsorted during insertion and sorted once at seal/capture time.
+ * This gives O(n) + O(n log n) total vs O(n^2) for sorted insert.
+ *
+ * @param rv Vector to sort (modified in place)
+ */
+void tl_recvec_sort(tl_recvec_t* rv);
+
+/**
+ * Sort the record vector by (ts, handle) and reorder parallel seq array.
+ *
+ * The seqs array must be aligned with rv->data (same length).
+ * Uses a temporary buffer to keep records and seqs paired during sort.
+ *
+ * @param rv   Vector to sort (modified in place)
+ * @param seqs Parallel seq array (len == rv->len)
+ * @return TL_OK on success, TL_ENOMEM on allocation failure
+ */
+tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs);
+
+/*---------------------------------------------------------------------------
  * Binary Search (for sorted vectors)
  *---------------------------------------------------------------------------*/
 
@@ -134,6 +163,28 @@ size_t tl_recvec_upper_bound(const tl_recvec_t* rv, tl_ts_t ts);
  */
 void tl_recvec_range_bounds(const tl_recvec_t* rv, tl_ts_t t1, tl_ts_t t2,
                             size_t* lo, size_t* hi);
+
+/*---------------------------------------------------------------------------
+ * Validation Helpers (Debug)
+ *---------------------------------------------------------------------------*/
+
+/**
+ * Validate that all records are within [min_ts, max_ts] (inclusive).
+ * Returns true if bounds are satisfied or len == 0.
+ */
+TL_INLINE bool tl_records_validate_bounds(const tl_record_t* records, size_t len,
+                                          tl_ts_t min_ts, tl_ts_t max_ts) {
+    if (len == 0) {
+        return true;
+    }
+    TL_ASSERT(records != NULL);
+    for (size_t i = 0; i < len; i++) {
+        if (records[i].ts < min_ts || records[i].ts > max_ts) {
+            return false;
+        }
+    }
+    return true;
+}
 
 /*---------------------------------------------------------------------------
  * Accessors

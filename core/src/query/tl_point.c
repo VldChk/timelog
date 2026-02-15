@@ -1,6 +1,7 @@
 #include "tl_point.h"
 #include "tl_snapshot.h"
 #include "../internal/tl_intervals.h"
+#include "../internal/tl_search.h"
 #include "../storage/tl_manifest.h"
 #include "../storage/tl_segment.h"
 #include "../storage/tl_page.h"
@@ -18,9 +19,7 @@
  * Internal Helpers
  *===========================================================================*/
 
-/**
- * Ensure result has capacity for additional records.
- */
+/** Grow result array if needed. */
 static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional) {
     size_t needed = result->count + additional;
     if (needed <= result->capacity) {
@@ -36,12 +35,7 @@ static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional)
         new_cap *= 2;
     }
 
-    /* Overflow guard for allocation size */
-    if (new_cap > SIZE_MAX / sizeof(tl_record_t)) {
-        return TL_ENOMEM;
-    }
-
-    tl_record_t* new_arr = tl__malloc(result->alloc, new_cap * sizeof(tl_record_t));
+    tl_record_t* new_arr = tl__mallocarray(result->alloc, new_cap, sizeof(tl_record_t));
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
@@ -56,9 +50,7 @@ static tl_status_t ensure_capacity(tl_point_result_t* result, size_t additional)
     return TL_OK;
 }
 
-/**
- * Add a record to the result.
- */
+/** Append a record to the result. */
 static tl_status_t add_record(tl_point_result_t* result, tl_ts_t ts, tl_handle_t handle) {
     tl_status_t st = ensure_capacity(result, 1);
     if (st != TL_OK) {
@@ -71,41 +63,29 @@ static tl_status_t add_record(tl_point_result_t* result, tl_ts_t ts, tl_handle_t
     return TL_OK;
 }
 
-/**
- * Binary search for lower bound in a sorted record array.
- * Returns index of first record with ts >= target.
- */
-static size_t records_lower_bound(const tl_record_t* data, size_t len, tl_ts_t target) {
-    size_t lo = 0;
-    size_t hi = len;
 
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (data[mid].ts < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    return lo;
-}
-
-/**
- * Collect all records with exact timestamp from a sorted array.
- */
+/** Collect all records with exact timestamp from a sorted array. */
 static tl_status_t collect_from_sorted(tl_point_result_t* result,
-                                        const tl_record_t* data, size_t len,
-                                        tl_ts_t ts) {
+                                        const tl_record_t* data,
+                                        const tl_seq_t* seqs,
+                                        size_t len,
+                                        tl_ts_t ts,
+                                        tl_seq_t watermark,
+                                        tl_seq_t tomb_seq) {
     if (len == 0 || data == NULL) {
         return TL_OK;
     }
 
     /* Binary search to find first occurrence */
-    size_t idx = records_lower_bound(data, len, ts);
+    size_t idx = tl_record_lower_bound(data, len, ts);
 
     /* Collect all matching records */
     while (idx < len && data[idx].ts == ts) {
+        tl_seq_t w = (seqs != NULL) ? seqs[idx] : watermark;
+        if (tomb_seq > w) {
+            idx++;
+            continue;
+        }
         tl_status_t st = add_record(result, data[idx].ts, data[idx].handle);
         if (st != TL_OK) {
             return st;
@@ -116,12 +96,12 @@ static tl_status_t collect_from_sorted(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a page.
- */
+/** Collect matching records from a page. */
 static tl_status_t collect_from_page(tl_point_result_t* result,
                                       const tl_page_t* page,
-                                      tl_ts_t ts) {
+                                      tl_ts_t ts,
+                                      tl_seq_t watermark,
+                                      tl_seq_t tomb_seq) {
     /* Binary search to find first occurrence */
     size_t idx = tl_page_lower_bound(page, ts);
 
@@ -137,6 +117,10 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
         if (rec.ts != ts) {
             break;
         }
+        if (tomb_seq > watermark) {
+            idx++;
+            continue;
+        }
         tl_status_t st = add_record(result, rec.ts, rec.handle);
         if (st != TL_OK) {
             return st;
@@ -147,14 +131,17 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a segment.
- */
+/** Collect matching records from a segment. */
 static tl_status_t collect_from_segment(tl_point_result_t* result,
                                          const tl_segment_t* seg,
-                                         tl_ts_t ts) {
+                                         tl_ts_t ts,
+                                         tl_seq_t tomb_seq) {
     /* Check if segment contains ts */
     if (ts < seg->min_ts || ts > seg->max_ts) {
+        return TL_OK;
+    }
+
+    if (tomb_seq > seg->applied_seq) {
         return TL_OK;
     }
 
@@ -190,7 +177,8 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
         }
 
         /* Collect from this page */
-        tl_status_t st = collect_from_page(result, meta->page, ts);
+        tl_status_t st = collect_from_page(result, meta->page, ts,
+                                           seg->applied_seq, tomb_seq);
         if (st != TL_OK) {
             return st;
         }
@@ -201,12 +189,11 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
     return TL_OK;
 }
 
-/**
- * Collect matching records from a memrun.
- */
+/** Collect matching records from a memrun. */
 static tl_status_t collect_from_memrun(tl_point_result_t* result,
                                         const tl_memrun_t* mr,
-                                        tl_ts_t ts) {
+                                        tl_ts_t ts,
+                                        tl_seq_t tomb_seq) {
     /* Check if memrun contains ts */
     if (!tl_memrun_has_records(mr)) {
         return TL_OK;
@@ -223,94 +210,148 @@ static tl_status_t collect_from_memrun(tl_point_result_t* result,
     /* Collect from run (sorted) */
     st = collect_from_sorted(result,
                              tl_memrun_run_data(mr),
+                             NULL,
                              tl_memrun_run_len(mr),
-                             ts);
+                             ts,
+                             tl_memrun_applied_seq(mr),
+                             tomb_seq);
     if (st != TL_OK) {
         return st;
     }
 
-    /* Collect from ooo (sorted) */
-    st = collect_from_sorted(result,
-                             tl_memrun_ooo_data(mr),
-                             tl_memrun_ooo_len(mr),
-                             ts);
-    if (st != TL_OK) {
-        return st;
+    /* Collect from OOO runs (sorted) */
+    size_t run_count = tl_memrun_ooo_run_count(mr);
+    for (size_t i = 0; i < run_count; i++) {
+        const tl_ooorun_t* run = tl_memrun_ooo_run_at(mr, i);
+        if (run == NULL || run->len == 0) {
+            continue;
+        }
+        st = collect_from_sorted(result, run->records, NULL, run->len, ts,
+                                 run->applied_seq, tomb_seq);
+        if (st != TL_OK) {
+            return st;
+        }
     }
 
     return TL_OK;
 }
 
-/**
- * Collect matching records from memview active buffers.
- */
+/** Collect matching records from memview active buffers. */
 static tl_status_t collect_from_memview(tl_point_result_t* result,
                                          const tl_memview_t* mv,
-                                         tl_ts_t ts) {
+                                         tl_ts_t ts,
+                                         tl_seq_t tomb_seq) {
     tl_status_t st;
 
     /* Collect from active_run (sorted) */
     st = collect_from_sorted(result,
                              tl_memview_run_data(mv),
+                             tl_memview_run_seqs(mv),
                              tl_memview_run_len(mv),
-                             ts);
+                             ts,
+                             0,
+                             tomb_seq);
     if (st != TL_OK) {
         return st;
     }
 
-    /* Collect from active_ooo (sorted) */
+    /* Collect from active OOO head (sorted) */
     st = collect_from_sorted(result,
-                             tl_memview_ooo_data(mv),
-                             tl_memview_ooo_len(mv),
-                             ts);
+                             tl_memview_ooo_head_data(mv),
+                             tl_memview_ooo_head_seqs(mv),
+                             tl_memview_ooo_head_len(mv),
+                             ts,
+                             0,
+                             tomb_seq);
     if (st != TL_OK) {
         return st;
+    }
+
+    /* Collect from active OOO runs (sorted) */
+    const tl_ooorunset_t* runs = tl_memview_ooo_runs(mv);
+    if (runs != NULL) {
+        for (size_t i = 0; i < runs->count; i++) {
+            const tl_ooorun_t* run = runs->runs[i];
+            if (run == NULL || run->len == 0) {
+                continue;
+            }
+            st = collect_from_sorted(result, run->records, NULL, run->len, ts,
+                                     run->applied_seq, tomb_seq);
+            if (st != TL_OK) {
+                return st;
+            }
+        }
     }
 
     return TL_OK;
 }
 
 /**
- * Check if ts is covered by any tombstone in the snapshot.
+ * Compute max tombstone seq at a given timestamp across all sources.
+ * Uses bounds pruning to skip sources where ts is outside their range.
  */
-static bool is_deleted(const tl_snapshot_t* snap, tl_ts_t ts) {
+static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     const tl_manifest_t* manifest = snap->manifest;
     const tl_memview_t* mv = tl_snapshot_memview(snap);
 
-    /* Check memview tombstones */
+    tl_seq_t max_seq = 0;
+
+    /* Check memview tombstones (no bounds check - memview tombs cover full range) */
     tl_intervals_imm_t mv_tombs = tl_memview_tombs_imm(mv);
-    if (tl_intervals_imm_contains(mv_tombs, ts)) {
-        return true;
+    tl_seq_t seq = tl_intervals_imm_max_seq(mv_tombs, ts);
+    if (seq > max_seq) {
+        max_seq = seq;
     }
 
     /* Check sealed memrun tombstones */
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
+
+        /* Skip if ts outside memrun bounds */
+        if (ts < tl_memrun_min_ts(mr) || ts > tl_memrun_max_ts(mr)) {
+            continue;
+        }
+
         tl_intervals_imm_t mr_tombs = tl_memrun_tombs_imm(mr);
-        if (tl_intervals_imm_contains(mr_tombs, ts)) {
-            return true;
+        seq = tl_intervals_imm_max_seq(mr_tombs, ts);
+        if (seq > max_seq) {
+            max_seq = seq;
         }
     }
 
     /* Check L0 segment tombstones */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
+
+        /* Skip if ts outside segment bounds */
+        if (ts < seg->min_ts || ts > seg->max_ts) {
+            continue;
+        }
+
         tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        if (tl_intervals_imm_contains(seg_tombs, ts)) {
-            return true;
+        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        if (seq > max_seq) {
+            max_seq = seq;
         }
     }
 
-    /* Defensive: check L1 tombstones if present (should be empty in V1). */
+    /* Defensive: check any L1 tombstones if present. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
+
+        /* Skip if ts outside segment bounds */
+        if (ts < seg->min_ts || ts > seg->max_ts) {
+            continue;
+        }
+
         tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        if (tl_intervals_imm_contains(seg_tombs, ts)) {
-            return true;
+        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        if (seq > max_seq) {
+            max_seq = seq;
         }
     }
 
-    return false;
+    return max_seq;
 }
 
 /*===========================================================================
@@ -325,7 +366,6 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
     TL_ASSERT(snap != NULL);
     TL_ASSERT(alloc != NULL);
 
-    /* Initialize result */
     memset(result, 0, sizeof(*result));
     result->alloc = alloc;
 
@@ -334,10 +374,8 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
         return TL_OK;
     }
 
-    /* Step 1: Tombstone check first (LLD Section 8) */
-    if (is_deleted(snap, ts)) {
-        return TL_OK;  /* Deleted - return empty result */
-    }
+    /* Step 1: Compute tombstone max seq for ts (watermark filtering) */
+    tl_seq_t tomb_seq = max_tomb_seq_at(snap, ts);
 
     tl_status_t st;
     const tl_manifest_t* manifest = snap->manifest;
@@ -353,7 +391,7 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
             break;
         }
 
-        st = collect_from_segment(result, seg, ts);
+        st = collect_from_segment(result, seg, ts, tomb_seq);
         if (st != TL_OK) {
             goto fail;
         }
@@ -363,7 +401,7 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
-        st = collect_from_segment(result, seg, ts);
+        st = collect_from_segment(result, seg, ts, tomb_seq);
         if (st != TL_OK) {
             goto fail;
         }
@@ -375,14 +413,14 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
-        st = collect_from_memrun(result, mr, ts);
+        st = collect_from_memrun(result, mr, ts, tomb_seq);
         if (st != TL_OK) {
             goto fail;
         }
     }
 
     /* Active buffers */
-    st = collect_from_memview(result, mv, ts);
+    st = collect_from_memview(result, mv, ts, tomb_seq);
     if (st != TL_OK) {
         goto fail;
     }

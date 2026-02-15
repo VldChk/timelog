@@ -10,9 +10,7 @@
  * - Owner reference counting
  * - Release hooks
  *
- * Total: 19 tests organized in 8 phases per the implementation plan.
- *
- * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
+ * Total: 20 tests organized in 8 sections.
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -22,6 +20,10 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdint.h>
+
+#ifdef TL_TEST_HOOKS
+extern volatile int tl_test_pagespan_fail_iter_alloc;
+#endif
 
 /*===========================================================================
  * Test Helpers
@@ -81,8 +83,26 @@ static void test_release_hook(void* user) {
     }
 }
 
+typedef struct {
+    tl_timelog_t* tl;
+    int call_count;
+} hook_close_ctx_t;
+
+static void test_release_hook_close_timelog(void* user) {
+    hook_close_ctx_t* ctx = (hook_close_ctx_t*)user;
+    if (ctx == NULL) {
+        return;
+    }
+
+    ctx->call_count++;
+    if (ctx->tl != NULL) {
+        tl_close(ctx->tl);
+        ctx->tl = NULL;
+    }
+}
+
 /*===========================================================================
- * Phase 1: Validation Tests (5 tests)
+ * Validation Tests (5 tests)
  *===========================================================================*/
 
 /**
@@ -155,8 +175,32 @@ TEST_DECLARE(pagespan_iter_open_without_segments_only_returns_einval) {
     tl_close(tl);
 }
 
+/**
+ * Test: invalid args do not arm or invoke release hook.
+ */
+TEST_DECLARE(pagespan_iter_open_invalid_args_no_hook) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_tracker_t tracker = { .call_count = 0, .user_data = NULL };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &tracker,
+        .on_release = test_release_hook
+    };
+
+    tl_pagespan_iter_t* it = NULL;
+    uint32_t flags = TL_PAGESPAN_INCLUDE_L0 | TL_PAGESPAN_INCLUDE_L1;
+    tl_status_t st = tl_pagespan_iter_open(tl, 0, 100, flags, &hooks, &it);
+    TEST_ASSERT_STATUS(TL_EINVAL, st);
+    TEST_ASSERT_NULL(it);
+    TEST_ASSERT_EQ(0, tracker.call_count);
+
+    tl_close(tl);
+}
+
 /*===========================================================================
- * Phase 2: Empty Cases (2 tests)
+ * Empty Cases (2 tests)
  *===========================================================================*/
 
 /**
@@ -207,7 +251,7 @@ TEST_DECLARE(pagespan_empty_range_iter_next_returns_eof) {
 }
 
 /*===========================================================================
- * Phase 3: Single Page (2 tests)
+ * Single Page (2 tests)
  *===========================================================================*/
 
 /**
@@ -282,7 +326,7 @@ TEST_DECLARE(pagespan_single_page_partial_range) {
 }
 
 /*===========================================================================
- * Phase 4: Multi-Page/Segment (2 tests)
+ * Multi-Page/Segment (2 tests)
  *===========================================================================*/
 
 /**
@@ -392,7 +436,7 @@ TEST_DECLARE(pagespan_l1_and_l0_segments) {
 }
 
 /*===========================================================================
- * Phase 5: Range Filtering (2 tests)
+ * Range Filtering (2 tests)
  *===========================================================================*/
 
 /**
@@ -467,7 +511,7 @@ TEST_DECLARE(pagespan_range_no_overlap_returns_eof) {
 }
 
 /*===========================================================================
- * Phase 6: Owner Refcounting (2 tests)
+ * Owner Refcounting (2 tests)
  *===========================================================================*/
 
 /**
@@ -543,7 +587,7 @@ TEST_DECLARE(pagespan_views_valid_after_iter_close) {
 }
 
 /*===========================================================================
- * Phase 7: Release Hooks (2 tests)
+ * Release Hooks (3 tests)
  *===========================================================================*/
 
 /**
@@ -583,6 +627,45 @@ TEST_DECLARE(pagespan_release_hook_called_on_owner_destruction) {
     TEST_ASSERT_EQ(1, tracker.call_count);
 
     tl_close(tl);
+}
+
+/**
+ * Test: Release hook may close the timelog (allocator lifetime safety).
+ *
+ * This simulates a binding that decrefs the timelog in the release hook.
+ * The iterator must be freed before the hook runs to avoid allocator UAF.
+ */
+TEST_DECLARE(pagespan_release_hook_can_close_timelog) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, create_timelog_with_flushed_data(&tl, 100, 10));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_close_ctx_t ctx = { .tl = tl, .call_count = 0 };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &ctx,
+        .on_release = test_release_hook_close_timelog
+    };
+
+    tl_pagespan_iter_t* it = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_pagespan_iter_open(tl, 0, 1000, 0, &hooks, &it));
+    TEST_ASSERT_NOT_NULL(it);
+
+    /* Get and release a view to exercise owner refs */
+    tl_pagespan_view_t view;
+    memset(&view, 0, sizeof(view));
+    TEST_ASSERT_STATUS(TL_OK, tl_pagespan_iter_next(it, &view));
+    tl_pagespan_view_release(&view);
+
+    /* Close iterator - hook will close timelog */
+    tl_pagespan_iter_close(it);
+
+    TEST_ASSERT_EQ(1, ctx.call_count);
+
+    /* Cleanup if hook did not close (should not happen) */
+    if (ctx.tl != NULL) {
+        tl_close(ctx.tl);
+        ctx.tl = NULL;
+    }
 }
 
 /**
@@ -671,8 +754,35 @@ TEST_DECLARE(pagespan_release_hook_called_even_with_no_spans) {
     tl_close(tl);
 }
 
+#ifdef TL_TEST_HOOKS
+/**
+ * Test: iterator allocation failure does not invoke release hook.
+ */
+TEST_DECLARE(pagespan_iter_open_alloc_failure_no_hook) {
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, create_timelog_with_flushed_data(&tl, 100, 5));
+    TEST_ASSERT_NOT_NULL(tl);
+
+    hook_tracker_t tracker = { .call_count = 0, .user_data = NULL };
+    tl_pagespan_owner_hooks_t hooks = {
+        .user = &tracker,
+        .on_release = test_release_hook
+    };
+
+    tl_test_pagespan_fail_iter_alloc = 1;
+    tl_pagespan_iter_t* it = NULL;
+    tl_status_t st = tl_pagespan_iter_open(tl, 0, 1000, 0, &hooks, &it);
+    TEST_ASSERT_STATUS(TL_ENOMEM, st);
+    TEST_ASSERT_NULL(it);
+    TEST_ASSERT_EQ(0, tracker.call_count);
+
+    tl_test_pagespan_fail_iter_alloc = 0;
+    tl_close(tl);
+}
+#endif
+
 /*===========================================================================
- * Phase 8: Stress (1 test)
+ * Stress (1 test)
  *===========================================================================*/
 
 /**
@@ -729,38 +839,43 @@ TEST_DECLARE(pagespan_stress_many_segments) {
 void run_pagespan_iter_tests(void) {
     printf("\n=== PageSpan Iterator Tests ===\n");
 
-    /* Phase 1: Validation */
+    /* Validation */
     RUN_TEST(pagespan_flags_default_value);
     RUN_TEST(pagespan_iter_open_null_timelog_returns_einval);
     RUN_TEST(pagespan_iter_open_null_out_returns_einval);
     RUN_TEST(pagespan_iter_open_visible_only_returns_einval);
     RUN_TEST(pagespan_iter_open_without_segments_only_returns_einval);
+    RUN_TEST(pagespan_iter_open_invalid_args_no_hook);
 
-    /* Phase 2: Empty Cases */
+    /* Empty Cases */
     RUN_TEST(pagespan_empty_timelog_iter_next_returns_eof);
     RUN_TEST(pagespan_empty_range_iter_next_returns_eof);
 
-    /* Phase 3: Single Page */
+    /* Single Page */
     RUN_TEST(pagespan_single_page_full_range);
     RUN_TEST(pagespan_single_page_partial_range);
 
-    /* Phase 4: Multi-Page/Segment */
+    /* Multi-Page/Segment */
     RUN_TEST(pagespan_multiple_pages_single_segment);
     RUN_TEST(pagespan_l1_and_l0_segments);
 
-    /* Phase 5: Range Filtering */
+    /* Range Filtering */
     RUN_TEST(pagespan_range_excludes_earlier_segments);
     RUN_TEST(pagespan_range_no_overlap_returns_eof);
 
-    /* Phase 6: Owner Refcounting */
+    /* Owner Refcounting */
     RUN_TEST(pagespan_owner_refcount_incremented_per_view);
     RUN_TEST(pagespan_views_valid_after_iter_close);
 
-    /* Phase 7: Release Hooks */
+    /* Release Hooks */
     RUN_TEST(pagespan_release_hook_called_on_owner_destruction);
+    RUN_TEST(pagespan_release_hook_can_close_timelog);
     RUN_TEST(pagespan_release_hook_null_is_safe);
     RUN_TEST(pagespan_release_hook_called_even_with_no_spans);
+#ifdef TL_TEST_HOOKS
+    RUN_TEST(pagespan_iter_open_alloc_failure_no_hook);
+#endif
 
-    /* Phase 8: Stress */
+    /* Stress */
     RUN_TEST(pagespan_stress_many_segments);
 }

@@ -36,6 +36,12 @@ void tl__alloc_init(tl_alloc_ctx_t* ctx, const tl_allocator_t* user_alloc) {
 
     memset(ctx, 0, sizeof(*ctx));
 
+#ifdef TL_DEBUG
+    tl_atomic_init_u64(&ctx->total_allocated, 0);
+    tl_atomic_init_u64(&ctx->allocation_count, 0);
+    tl_atomic_init_u64(&ctx->peak_allocated, 0);
+#endif
+
     if (user_alloc == NULL ||
         user_alloc->malloc_fn == NULL ||
         user_alloc->free_fn == NULL) {
@@ -64,12 +70,14 @@ void tl__alloc_destroy(tl_alloc_ctx_t* ctx) {
     if (ctx == NULL) return;
 
 #ifdef TL_DEBUG
-    if (ctx->allocation_count != 0) {
+    uint64_t count = tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED);
+    if (count != 0) {
+        uint64_t total = tl_atomic_load_u64(&ctx->total_allocated, TL_MO_RELAXED);
         /* Note: Cannot use TL_LOG_WARN here since we don't have access to
          * the log context from the allocator. Use stderr directly for this
          * critical leak warning. */
         fprintf(stderr, "[WARN] Memory leak detected: %zu allocations, %zu bytes\n",
-                ctx->allocation_count, ctx->total_allocated);
+                (size_t)count, (size_t)total);
     }
 #endif
 
@@ -88,10 +96,17 @@ void* tl__malloc(tl_alloc_ctx_t* ctx, size_t size) {
 
 #ifdef TL_DEBUG
     if (ptr != NULL) {
-        ctx->total_allocated += size;
-        ctx->allocation_count++;
-        if (ctx->total_allocated > ctx->peak_allocated) {
-            ctx->peak_allocated = ctx->total_allocated;
+        uint64_t total = tl_atomic_fetch_add_u64(&ctx->total_allocated,
+                                                 (uint64_t)size,
+                                                 TL_MO_RELAXED) + (uint64_t)size;
+        tl_atomic_fetch_add_u64(&ctx->allocation_count, 1, TL_MO_RELAXED);
+
+        uint64_t peak = tl_atomic_load_u64(&ctx->peak_allocated, TL_MO_RELAXED);
+        while (total > peak) {
+            if (tl_atomic_cas_u64(&ctx->peak_allocated, &peak,
+                                  total, TL_MO_RELAXED, TL_MO_RELAXED)) {
+                break;
+            }
         }
     }
 #endif
@@ -126,15 +141,51 @@ void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
 
 #ifdef TL_DEBUG
     if (ptr != NULL) {
-        ctx->total_allocated += total;
-        ctx->allocation_count++;
-        if (ctx->total_allocated > ctx->peak_allocated) {
-            ctx->peak_allocated = ctx->total_allocated;
+        uint64_t total_bytes = tl_atomic_fetch_add_u64(&ctx->total_allocated,
+                                                       (uint64_t)total,
+                                                       TL_MO_RELAXED) + (uint64_t)total;
+        tl_atomic_fetch_add_u64(&ctx->allocation_count, 1, TL_MO_RELAXED);
+
+        uint64_t peak = tl_atomic_load_u64(&ctx->peak_allocated, TL_MO_RELAXED);
+        while (total_bytes > peak) {
+            if (tl_atomic_cas_u64(&ctx->peak_allocated, &peak,
+                                  total_bytes, TL_MO_RELAXED, TL_MO_RELAXED)) {
+                break;
+            }
         }
     }
 #endif
 
     return ptr;
+}
+
+void* tl__mallocarray(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
+    TL_ASSERT(ctx != NULL);
+
+    if (count == 0 || size == 0) {
+        return NULL;
+    }
+
+    if (tl__alloc_would_overflow(count, size)) {
+        return NULL;
+    }
+
+    return tl__malloc(ctx, count * size);
+}
+
+void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size) {
+    TL_ASSERT(ctx != NULL);
+
+    if (count == 0 || size == 0) {
+        (void)tl__realloc(ctx, ptr, 0);
+        return NULL;
+    }
+
+    if (tl__alloc_would_overflow(count, size)) {
+        return NULL;  /* ptr NOT freed; caller retains ownership */
+    }
+
+    return tl__realloc(ctx, ptr, count * size);
 }
 
 void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size) {
@@ -169,10 +220,16 @@ void tl__free(tl_alloc_ctx_t* ctx, void* ptr) {
     if (ctx == NULL || ptr == NULL) return;
 
 #ifdef TL_DEBUG
-    /* Note: We can't accurately decrement without tracking sizes.
-     * For debug, we just decrement count. */
-    if (ctx->allocation_count > 0) {
-        ctx->allocation_count--;
+    /* Keep debug accounting sane even under internal mismatches.
+     * Verify non-underflow before decrementing to avoid wraparound noise. */
+    uint64_t expected = tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED);
+    for (;;) {
+        TL_VERIFY(expected > 0);
+        uint64_t desired = expected - 1;
+        if (tl_atomic_cas_u64(&ctx->allocation_count, &expected, desired,
+                              TL_MO_RELAXED, TL_MO_RELAXED)) {
+            break;
+        }
     }
 #endif
 
@@ -185,14 +242,14 @@ void tl__free(tl_alloc_ctx_t* ctx, void* ptr) {
 
 #ifdef TL_DEBUG
 size_t tl__alloc_get_total(const tl_alloc_ctx_t* ctx) {
-    return ctx ? ctx->total_allocated : 0;
+    return ctx ? (size_t)tl_atomic_load_u64(&ctx->total_allocated, TL_MO_RELAXED) : 0;
 }
 
 size_t tl__alloc_get_count(const tl_alloc_ctx_t* ctx) {
-    return ctx ? ctx->allocation_count : 0;
+    return ctx ? (size_t)tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED) : 0;
 }
 
 size_t tl__alloc_get_peak(const tl_alloc_ctx_t* ctx) {
-    return ctx ? ctx->peak_allocated : 0;
+    return ctx ? (size_t)tl_atomic_load_u64(&ctx->peak_allocated, TL_MO_RELAXED) : 0;
 }
 #endif

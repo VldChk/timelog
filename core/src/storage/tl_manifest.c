@@ -1,4 +1,5 @@
 #include "tl_manifest.h"
+#include "../internal/tl_refcount.h"
 #include <stdlib.h>  /* qsort */
 
 /*===========================================================================
@@ -9,25 +10,19 @@ static void manifest_destroy(tl_manifest_t* m) {
     TL_ASSERT(m != NULL);
     tl_alloc_ctx_t* alloc = m->alloc;
 
-    /* Release all L0 segment references */
     for (uint32_t i = 0; i < m->n_l0; i++) {
         tl_segment_release(m->l0[i]);
     }
-
-    /* Release all L1 segment references */
     for (uint32_t i = 0; i < m->n_l1; i++) {
         tl_segment_release(m->l1[i]);
     }
 
-    /* Free arrays */
     if (m->l0 != NULL) {
         TL_FREE(alloc, m->l0);
     }
     if (m->l1 != NULL) {
         TL_FREE(alloc, m->l1);
     }
-
-    /* Free manifest */
     TL_FREE(alloc, m);
 }
 
@@ -78,13 +73,9 @@ void tl_manifest_release(tl_manifest_t* m) {
         return;
     }
 
-    uint32_t old = tl_atomic_fetch_sub_u32(&m->refcnt, 1, TL_MO_RELEASE);
-    TL_ASSERT(old >= 1);
-
-    if (old == 1) {
-        tl_atomic_fence(TL_MO_ACQUIRE);
-        manifest_destroy(m);
-    }
+    TL_REFCOUNT_RELEASE(&m->refcnt,
+                        manifest_destroy(m),
+                        "manifest double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================
@@ -136,7 +127,7 @@ size_t tl_manifest_l1_find_first_overlap(const tl_manifest_t* m, tl_ts_t t1) {
 
 void tl_manifest_builder_init(tl_manifest_builder_t* mb,
                                tl_alloc_ctx_t* alloc,
-                               tl_manifest_t* base) {
+                               const tl_manifest_t* base) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(alloc != NULL);
 
@@ -182,23 +173,44 @@ void tl_manifest_builder_destroy(tl_manifest_builder_t* mb) {
     mb->add_l1 = NULL;
     mb->remove_l0 = NULL;
     mb->remove_l1 = NULL;
+
+    mb->add_l0_len = 0;
+    mb->add_l0_cap = 0;
+    mb->add_l1_len = 0;
+    mb->add_l1_cap = 0;
+    mb->remove_l0_len = 0;
+    mb->remove_l0_cap = 0;
+    mb->remove_l1_len = 0;
+    mb->remove_l1_cap = 0;
+
+    mb->alloc = NULL;
+    mb->base = NULL;
 }
 
 /*===========================================================================
  * Builder: Internal Helpers
  *===========================================================================*/
 
+/** Minimum initial capacity for manifest builder arrays (small - few segments) */
+static const size_t MANIFEST_MIN_CAPACITY = 8;
+
 static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
                                     tl_segment_t*** arr,
-                                    size_t* len,
+                                    const size_t* len,
                                     size_t* cap) {
     if (*len < *cap) {
         return TL_OK;
     }
 
-    size_t new_cap = (*cap == 0) ? 8 : *cap * 2;
-    tl_segment_t** new_arr = tl__realloc(alloc, *arr,
-                                          new_cap * sizeof(tl_segment_t*));
+    /* Use shared growth helper with overflow check (fixes latent bug) */
+    size_t new_cap = tl__grow_capacity(*cap, *len + 1, MANIFEST_MIN_CAPACITY);
+    if (new_cap == 0 || tl__alloc_would_overflow(new_cap, sizeof(tl_segment_t*))) {
+        return TL_ENOMEM;
+    }
+
+    tl_segment_t** new_arr = (tl_segment_t**)tl__realloc(alloc,
+                                                          (void*)*arr,
+                                                          new_cap * sizeof(tl_segment_t*));
     if (new_arr == NULL) {
         return TL_ENOMEM;
     }
@@ -208,8 +220,8 @@ static tl_status_t ensure_capacity(tl_alloc_ctx_t* alloc,
     return TL_OK;
 }
 
-static bool is_in_removal_set(tl_segment_t* seg,
-                               tl_segment_t** remove_arr,
+static bool is_in_removal_set(const tl_segment_t* seg,
+                               tl_segment_t* const* remove_arr,
                                size_t remove_len) {
     for (size_t i = 0; i < remove_len; i++) {
         if (remove_arr[i] == seg) {
@@ -227,6 +239,9 @@ tl_status_t tl_manifest_builder_add_l0(tl_manifest_builder_t* mb,
                                         tl_segment_t* seg) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(seg != NULL);
+    if (seg->level != TL_SEG_L0) {
+        return TL_EINVAL;
+    }
 
     tl_status_t st = ensure_capacity(mb->alloc, &mb->add_l0,
                                       &mb->add_l0_len, &mb->add_l0_cap);
@@ -242,6 +257,9 @@ tl_status_t tl_manifest_builder_add_l1(tl_manifest_builder_t* mb,
                                         tl_segment_t* seg) {
     TL_ASSERT(mb != NULL);
     TL_ASSERT(seg != NULL);
+    if (seg->level != TL_SEG_L1) {
+        return TL_EINVAL;
+    }
 
     tl_status_t st = ensure_capacity(mb->alloc, &mb->add_l1,
                                       &mb->add_l1_len, &mb->add_l1_cap);
@@ -304,8 +322,8 @@ static int compare_l1_by_window_start(const void* a, const void* b) {
  * - Removal list contains duplicates
  *===========================================================================*/
 
-static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
-                                      tl_segment_t** remove_arr, size_t remove_len) {
+static tl_status_t validate_removals(tl_segment_t* const* base_arr, uint32_t base_len,
+                                      tl_segment_t* const* remove_arr, size_t remove_len) {
     /* Check each removal exists in base exactly once */
     for (size_t i = 0; i < remove_len; i++) {
         const tl_segment_t* target = remove_arr[i];
@@ -333,12 +351,76 @@ static tl_status_t validate_removals(tl_segment_t** base_arr, uint32_t base_len,
     return TL_OK;
 }
 
+/* Check if a segment pointer exists in an array. */
+static bool list_contains(tl_segment_t* const* arr, size_t len, const tl_segment_t* seg) {
+    for (size_t i = 0; i < len; i++) {
+        if (arr[i] == seg) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Validate add lists (levels, duplicates, and conflicts with base/removals). */
+static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
+    /* Validate add_l0 list */
+    for (size_t i = 0; i < mb->add_l0_len; i++) {
+        const tl_segment_t* seg = mb->add_l0[i];
+        if (seg == NULL || seg->level != TL_SEG_L0) {
+            return TL_EINVAL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (mb->add_l0[j] == seg) {
+                return TL_EINVAL; /* duplicate in add_l0 */
+            }
+        }
+        if (is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len) ||
+            is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
+            return TL_EINVAL; /* add + remove same seg */
+        }
+        if (list_contains(mb->add_l1, mb->add_l1_len, seg)) {
+            return TL_EINVAL; /* same seg in add_l1 */
+        }
+        if (mb->base != NULL) {
+            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
+                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+                return TL_EINVAL; /* already present in base */
+            }
+        }
+    }
+
+    /* Validate add_l1 list */
+    for (size_t i = 0; i < mb->add_l1_len; i++) {
+        const tl_segment_t* seg = mb->add_l1[i];
+        if (seg == NULL || seg->level != TL_SEG_L1) {
+            return TL_EINVAL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (mb->add_l1[j] == seg) {
+                return TL_EINVAL; /* duplicate in add_l1 */
+            }
+        }
+        if (is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len) ||
+            is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
+            return TL_EINVAL; /* add + remove same seg */
+        }
+        if (mb->base != NULL) {
+            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
+                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+                return TL_EINVAL; /* already present in base */
+            }
+        }
+    }
+
+    return TL_OK;
+}
+
 /*
  * Count how many segments from base survive removal.
  * Caller must have already validated that removals are a valid subset.
  */
-static size_t count_kept(tl_segment_t** base_arr, uint32_t base_len,
-                          tl_segment_t** remove_arr, size_t remove_len) {
+static size_t count_kept(tl_segment_t* const* base_arr, uint32_t base_len,
+                          tl_segment_t* const* remove_arr, size_t remove_len) {
     size_t kept = 0;
     for (uint32_t i = 0; i < base_len; i++) {
         if (!is_in_removal_set(base_arr[i], remove_arr, remove_len)) {
@@ -382,6 +464,14 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         }
     }
 
+    /* Validate add lists (levels, duplicates, base conflicts) */
+    {
+        tl_status_t st = validate_adds(mb);
+        if (st != TL_OK) {
+            return st;
+        }
+    }
+
     /*
      * Compute actual kept counts by scanning.
      * This is safe because we validated the removal lists above.
@@ -402,7 +492,6 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         return TL_EOVERFLOW;
     }
 
-    /* Allocate new manifest */
     tl_manifest_t* m = TL_NEW(alloc, tl_manifest_t);
     if (m == NULL) {
         return TL_ENOMEM;
@@ -412,7 +501,6 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     m->version = (mb->base != NULL) ? mb->base->version + 1 : 1;
     tl_atomic_init_u32(&m->refcnt, 1);
 
-    /* Allocate L0 array */
     if (new_l0_count > 0) {
         m->l0 = TL_NEW_ARRAY(alloc, tl_segment_t*, new_l0_count);
         if (m->l0 == NULL) {
@@ -426,7 +514,6 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     }
     m->n_l0 = 0;
 
-    /* Allocate L1 array */
     if (new_l1_count > 0) {
         m->l1 = TL_NEW_ARRAY(alloc, tl_segment_t*, new_l1_count);
         if (m->l1 == NULL) {
@@ -441,13 +528,13 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     }
     m->n_l1 = 0;
 
-    /* Copy L0 from base (excluding removals), then add new */
+    /* Populate L0: keep survivors from base, then append additions */
     if (new_l0_count > 0) {
         if (mb->base != NULL) {
             for (uint32_t i = 0; i < mb->base->n_l0; i++) {
-                tl_segment_t* seg = mb->base->l0[i];
+                const tl_segment_t* seg = mb->base->l0[i];
                 if (!is_in_removal_set(seg, mb->remove_l0, mb->remove_l0_len)) {
-                    m->l0[m->n_l0++] = tl_segment_acquire(seg);
+                    m->l0[m->n_l0++] = tl_segment_acquire((tl_segment_t*)seg);
                 }
             }
         }
@@ -458,13 +545,13 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         TL_ASSERT(mb->add_l0_len == 0);
     }
 
-    /* Copy L1 from base (excluding removals), then add new */
+    /* Populate L1: keep survivors from base, then append additions */
     if (new_l1_count > 0) {
         if (mb->base != NULL) {
             for (uint32_t i = 0; i < mb->base->n_l1; i++) {
-                tl_segment_t* seg = mb->base->l1[i];
+                const tl_segment_t* seg = mb->base->l1[i];
                 if (!is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
-                    m->l1[m->n_l1++] = tl_segment_acquire(seg);
+                    m->l1[m->n_l1++] = tl_segment_acquire((tl_segment_t*)seg);
                 }
             }
         }
@@ -475,12 +562,27 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         TL_ASSERT(mb->add_l1_len == 0);
     }
 
-    /* Sort L1 by window_start */
     if (m->n_l1 > 1) {
-        qsort(m->l1, m->n_l1, sizeof(tl_segment_t*), compare_l1_by_window_start);
+        qsort((void*)m->l1, m->n_l1, sizeof(tl_segment_t*), compare_l1_by_window_start);
     }
 
-    /* Compute cached bounds */
+    /* L1 non-overlap: checked in release mode to catch corruption early */
+    if (m->n_l1 > 1) {
+        for (uint32_t i = 1; i < m->n_l1; i++) {
+            const tl_segment_t* prev = m->l1[i - 1];
+            const tl_segment_t* curr = m->l1[i];
+
+            if (prev->window_end_unbounded) {
+                tl_manifest_release(m);
+                return TL_EINVAL;
+            }
+            if (curr->window_start < prev->window_end) {
+                tl_manifest_release(m);
+                return TL_EINVAL;
+            }
+        }
+    }
+
     m->has_bounds = false;
     if (m->n_l0 > 0 || m->n_l1 > 0) {
         tl_ts_t global_min = TL_TS_MAX;
@@ -512,20 +614,7 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
 
 #ifdef TL_DEBUG
 
-/**
- * Validate manifest invariants.
- *
- * Invariants:
- * 1. All L0 segment pointers non-NULL
- * 2. All L0 segments have level == TL_SEG_L0
- * 3. All L1 segment pointers non-NULL
- * 4. All L1 segments have level == TL_SEG_L1
- * 5. L1 segments sorted by window_start
- * 6. L1 windows non-overlapping (prev.window_end <= curr.window_start)
- * 7. Unbounded window (window_end == TL_TS_MAX) must be LAST
- * 8. Each segment validates via tl_segment_validate()
- * 9. Cached bounds match computed bounds (if has_bounds)
- */
+/** Validate manifest invariants (levels, sort order, non-overlap, bounds). */
 bool tl_manifest_validate(const tl_manifest_t* m) {
     if (m == NULL) {
         return false;
@@ -535,17 +624,17 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
      * L0 Segment Validation
      *=========================================================================*/
     for (uint32_t i = 0; i < m->n_l0; i++) {
-        /* Pointer non-NULL */
         if (m->l0[i] == NULL) {
             return false;
         }
-
-        /* Level check */
         if (m->l0[i]->level != TL_SEG_L0) {
             return false;
         }
 
-        /* Each segment validates */
+        if (i > 0 && m->l0[i]->generation < m->l0[i - 1]->generation) {
+            return false;
+        }
+
         if (!tl_segment_validate(m->l0[i])) {
             return false;
         }
@@ -558,40 +647,28 @@ bool tl_manifest_validate(const tl_manifest_t* m) {
     bool prev_window_unbounded = false;
 
     for (uint32_t i = 0; i < m->n_l1; i++) {
-        /* Pointer non-NULL */
         if (m->l1[i] == NULL) {
             return false;
         }
-
-        /* Level check */
         if (m->l1[i]->level != TL_SEG_L1) {
             return false;
         }
 
-        /*
-         * CRITICAL: Unbounded window guard
-         *
-         * If the previous window was unbounded, there MUST NOT be any more
-         * segments after it. An unbounded window covers all future timestamps,
-         * so any subsequent segment is invalid.
-         */
+        /* Unbounded window covers all future timestamps; must be last */
         if (prev_window_unbounded) {
-            return false;  /* Unbounded window must be last */
+            return false;
         }
 
-        /* Sorted by window_start */
         if (i > 0) {
             if (m->l1[i]->window_start < m->l1[i - 1]->window_start) {
                 return false;
             }
         }
 
-        /* Non-overlapping windows (prev.window_end <= curr.window_start) */
         if (m->l1[i]->window_start < prev_window_end) {
             return false;
         }
 
-        /* Each segment validates */
         if (!tl_segment_validate(m->l1[i])) {
             return false;
         }

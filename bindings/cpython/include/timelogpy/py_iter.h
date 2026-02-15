@@ -1,6 +1,6 @@
 /**
  * @file py_iter.h
- * @brief PyTimelogIter CPython extension type declaration (LLD-B3)
+ * @brief PyTimelogIter CPython extension type declaration
  *
  * This module provides the PyTimelogIter type which wraps a core
  * tl_iter_t* plus snapshot for snapshot-isolated iteration.
@@ -14,7 +14,8 @@
  *   ensuring the embedded handle_ctx remains valid. A pin is acquired
  *   on creation and released on close/exhaustion/dealloc.
  *
- * See: docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md
+ * See: docs/V2/timelog_v2_lld_read_path.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_ITER_H
@@ -38,11 +39,14 @@ extern "C" {
  *===========================================================================*/
 
 #if PY_VERSION_HEX < 0x030A0000
+#ifndef TL_Py_NewRef_DEFINED
+#define TL_Py_NewRef_DEFINED
 static inline PyObject* TL_Py_NewRef(PyObject* obj) {
     Py_INCREF(obj);
     return obj;
 }
 #define Py_NewRef TL_Py_NewRef
+#endif
 #endif
 
 /*===========================================================================
@@ -60,21 +64,16 @@ typedef struct {
 
     /**
      * Strong reference to owner PyTimelog.
-     *
-     * DESIGN NOTE (HLD Divergence):
-     * HLD specifies borrowed ref + open iterators counter on PyTimelog.
-     * We use strong ref + pin tracking instead because:
-     * 1. handle_ctx is EMBEDDED in PyTimelog (not pointer)
-     * 2. Strong ref prevents UAF if user drops PyTimelog ref while iterator exists
-     * 3. Pin tracking provides equivalent semantics for close() blocking
+     * Prevents UAF if user drops PyTimelog ref while iterator exists.
+     * Pin tracking replaces HLD's open-iterator counter.
      */
     PyObject* owner;
 
     /**
-     * Core snapshot (valid only when !closed).
+     * Pinned core snapshot (valid only when !closed).
      * Acquired via tl_snapshot_acquire, released on cleanup.
      */
-    tl_snapshot_t* snapshot;
+    tl_snapshot_t* pinned_snapshot;
 
     /**
      * Core iterator derived from snapshot (valid only when !closed).
@@ -88,6 +87,31 @@ typedef struct {
      * Safe because owner strong ref guarantees handle_ctx lifetime.
      */
     tl_py_handle_ctx_t* handle_ctx;
+
+    /**
+     * Query range bounds for view() support.
+     * Normalized at creation time so view() can create a PageSpanIter
+     * covering the same range regardless of original factory method.
+     */
+    tl_ts_t range_t1;
+    tl_ts_t range_t2;
+
+    /**
+     * Exact count of remaining rows visible in this iterator snapshot.
+     *
+     * Initialized once at iterator creation for the iterator's normalized
+     * query bounds, then decremented after each successful next().
+     */
+    uint64_t remaining_count;
+
+    /**
+     * Whether remaining_count is valid.
+     *
+     * Set to 1 on successful iterator construction after count precompute.
+     * Kept explicit so __len__ can fail deterministically if initialization
+     * logic changes in the future.
+     */
+    uint8_t remaining_valid;
 
     /**
      * State flag.

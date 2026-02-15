@@ -57,7 +57,10 @@ LLDs; those are referenced by name.
 
 1) L0 intake (memtable)
    - Writes and tombstones enter the memtable first.
-   - Memtable maintains an ordered view without snapshot-time sorting.
+   - In-order records (active_run) are always sorted by timestamp.
+   - Out-of-order records append into ooo_head (may be unsorted during append).
+   - OOO head is flushed into immutable sorted OOO runs at chunk threshold or seal.
+   - OOO head is sorted off-lock during memview capture if still unsorted.
 
 2) Flush to L0
    - Sealed memruns are flushed to immutable L0 segments.
@@ -153,9 +156,18 @@ typedef enum tl_time_unit {
 } tl_time_unit_t;
 
 typedef enum tl_maint_mode {
-    TL_MAINT_DISABLED = 0,
+    TL_MAINT_DISABLED   = 0,
     TL_MAINT_BACKGROUND = 1
 } tl_maint_mode_t;
+
+typedef enum tl_log_level {
+    TL_LOG_ERROR = 0,   /* Critical errors only */
+    TL_LOG_WARN  = 1,   /* Warnings and errors */
+    TL_LOG_INFO  = 2,   /* Informational messages */
+    TL_LOG_DEBUG = 3,   /* Debug output */
+    TL_LOG_TRACE = 4,   /* Verbose tracing */
+    TL_LOG_NONE  = -1   /* Disable all logging */
+} tl_log_level_t;
 ```
 
 ### 5.2 Configuration struct
@@ -172,34 +184,56 @@ typedef struct tl_allocator {
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 typedef void (*tl_on_drop_fn)(void* ctx, tl_ts_t ts, tl_handle_t h);
 
+/* Adaptive segmentation configuration (all zeros = disabled) */
+typedef struct tl_adaptive_config {
+    uint64_t    target_records;             /* 0 = disabled, >0 = target records per segment */
+    tl_ts_t     min_window;                 /* Minimum window size (guardrail) */
+    tl_ts_t     max_window;                 /* Maximum window size (guardrail) */
+    uint32_t    hysteresis_pct;             /* Min % change to apply (e.g., 10) */
+    tl_ts_t     window_quantum;             /* Snap to multiples (0 = no snapping) */
+    double      alpha;                      /* EWMA smoothing factor [0.0, 1.0] */
+    uint32_t    warmup_flushes;             /* Flushes before adapting */
+    uint32_t    stale_flushes;              /* Flushes without update = stale (0 = infinite) */
+    uint32_t    failure_backoff_threshold;  /* Failures before backoff */
+    uint32_t    failure_backoff_pct;        /* % to grow window on backoff */
+} tl_adaptive_config_t;
+
+/* Note: For adaptive segmentation, consider setting stale_flushes > 0
+ * to bound how long EWMA density can remain stale after long gaps. */
+
 typedef struct tl_config {
     tl_time_unit_t  time_unit;
 
     size_t          target_page_bytes;      /* default: 64 KiB */
-    size_t          memtable_max_bytes;     /* flush threshold */
+    size_t          memtable_max_bytes;     /* flush threshold, default: 1 MiB */
     size_t          ooo_budget_bytes;       /* 0 => memtable_max_bytes / 10 */
 
     size_t          sealed_max_runs;        /* default: 4 */
     uint32_t        sealed_wait_ms;         /* default: 100 */
 
-    size_t          max_delta_segments;     /* L0 bound */
+    uint32_t        maintenance_wakeup_ms;  /* default: 100 (periodic wake interval) */
+
+    size_t          max_delta_segments;     /* L0 bound, default: 8 */
 
     tl_ts_t         window_size;            /* 0 => default window (1 hour) */
     tl_ts_t         window_origin;          /* default: 0 */
 
     double          delete_debt_threshold;  /* 0.0 => disabled */
-    size_t          compaction_target_bytes;/* optional cap */
-    uint32_t        max_compaction_inputs;  /* optional cap */
-    uint32_t        max_compaction_windows; /* optional cap */
+    size_t          compaction_target_bytes;/* optional cap, 0 = unlimited */
+    uint32_t        max_compaction_inputs;  /* optional cap, 0 = unlimited */
+    uint32_t        max_compaction_windows; /* default: 0 (unlimited greedy selection) */
 
-    tl_maint_mode_t maintenance_mode;
+    tl_adaptive_config_t adaptive;          /* Adaptive segmentation (zeros = disabled) */
+
+    tl_maint_mode_t maintenance_mode;       /* default: TL_MAINT_BACKGROUND */
 
     tl_allocator_t  allocator;              /* optional; defaults to libc */
     tl_log_fn       log_fn;                 /* optional */
     void*           log_ctx;
+    tl_log_level_t  log_level;              /* max log level, default: TL_LOG_INFO */
 
-    tl_on_drop_fn   on_drop_handle;
-    void* on_drop_ctx;
+    tl_on_drop_fn   on_drop_handle;         /* physical delete callback */
+    void*           on_drop_ctx;
 } tl_config_t;
 
 tl_status_t tl_config_init_defaults(tl_config_t* cfg);
@@ -240,17 +274,24 @@ typedef struct tl_record {
 
 ```c
 typedef enum tl_status {
-    TL_OK        = 0,
-    TL_EOF       = 1,
-    TL_EINVAL    = 10,
-    TL_ESTATE    = 20,
-    TL_EBUSY     = 21,
-    TL_ENOMEM    = 30,
-    TL_EINTERNAL = 90
+    TL_OK        = 0,   /* Success */
+    TL_EOF       = 1,   /* End of iteration / no work */
+    TL_EINVAL    = 10,  /* Invalid argument */
+    TL_ESTATE    = 20,  /* Invalid state */
+    TL_EBUSY     = 21,  /* Resource busy (context-dependent) */
+    TL_ENOMEM    = 30,  /* Out of memory (often retryable) */
+    TL_EOVERFLOW = 31,  /* Arithmetic overflow */
+    TL_EINTERNAL = 90   /* Internal error (bug or system failure) */
 } tl_status_t;
 
 const char* tl_strerror(tl_status_t s);
 ```
+
+Error semantics (context-dependent):
+- TL_EBUSY: For write APIs, indicates data accepted; do not retry. For tl_maint_start, retryable after short delay.
+- TL_ENOMEM/TL_EOVERFLOW: Allocation/overflow failures; for writes, no data inserted, retryable after delay.
+- TL_EINVAL/TL_ESTATE: Not retryable without caller fix.
+- TL_EINTERNAL: Usually indicates a bug; may or may not be retryable.
 
 ### 6.3 Lifecycle
 
@@ -290,6 +331,8 @@ Semantics:
 - tl_delete_before is equivalent to delete [MIN_TS, cutoff).
 - Write calls may return TL_EBUSY if sealed_max_runs is reached and
   maintenance cannot make progress within sealed_wait_ms.
+- For writes, TL_EBUSY means data accepted; do not retry.
+- For writes, TL_ENOMEM/TL_EOVERFLOW mean no data inserted (all-or-nothing).
 - tl_flush performs a synchronous flush of active + sealed memruns and
   publishes the resulting L0 segments before returning.
 - tl_compact requests compaction; actual work is performed by maintenance
@@ -402,13 +445,32 @@ tl_status_t tl_maint_step(tl_timelog_t* tl);
 
 ```c
 typedef struct tl_stats {
-    uint64_t segments_l0;
-    uint64_t segments_l1;
-    uint64_t pages_total;
-    uint64_t records_estimate;
-    tl_ts_t  min_ts;
-    tl_ts_t  max_ts;
-    uint64_t tombstone_count;
+    /* Storage layer metrics */
+    uint64_t segments_l0;           /* L0 (delta) segments */
+    uint64_t segments_l1;           /* L1 (main) segments */
+    uint64_t pages_total;           /* Total pages across all segments */
+    uint64_t records_estimate;      /* Estimated total records (may include deleted) */
+    tl_ts_t  min_ts;                /* Minimum timestamp (TL_TS_MAX if empty) */
+    tl_ts_t  max_ts;                /* Maximum timestamp (TL_TS_MIN if empty) */
+    uint64_t tombstone_count;       /* Number of tombstone intervals */
+
+    /* Memtable/delta layer metrics (snapshot-time values) */
+    uint64_t memtable_active_records;  /* Records in active run buffer */
+    uint64_t memtable_ooo_records;     /* Records in OOO head + runs */
+    uint64_t memtable_sealed_runs;     /* Sealed memruns pending flush */
+
+    /* Operational counters (cumulative since open) */
+    uint64_t seals_total;              /* Total memtable seals performed */
+    uint64_t ooo_budget_hits;          /* Times OOO budget was exceeded */
+    uint64_t backpressure_waits;       /* Times writer blocked on sealed queue */
+    uint64_t flushes_total;            /* Total flush operations completed */
+    uint64_t compactions_total;        /* Total compaction operations completed */
+
+    /* Adaptive segmentation metrics (only populated if adaptive.target_records > 0) */
+    tl_ts_t  adaptive_window;          /* Current effective window size */
+    double   adaptive_ewma_density;    /* EWMA density (records per time unit) */
+    uint64_t adaptive_flush_count;     /* Flush count for density tracking */
+    uint32_t adaptive_failures;        /* Consecutive compaction failures */
 } tl_stats_t;
 
 tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);

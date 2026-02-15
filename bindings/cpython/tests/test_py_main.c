@@ -15,10 +15,10 @@
  * Without it, ctest reports "Not Run" because it can't find the executables.
  *
  * Individual test executables (in build/<Config>/):
- *   - test_py_handle.exe   (LLD-B1: Handle context and pin protocol)
- *   - test_py_timelog.exe  (LLD-B2: Timelog type and factory methods)
- *   - test_py_iter.exe     (LLD-B3: Iterator protocol)
- *   - test_py_span.exe     (LLD-B4: PageSpan zero-copy buffer protocol)
+ *   - test_py_handle.exe   (Handle context and pin protocol)
+ *   - test_py_timelog.exe  (Timelog type and factory methods)
+ *   - test_py_iter.exe     (Iterator protocol)
+ *   - test_py_span.exe     (PageSpan zero-copy buffer protocol)
  *
  * This file exists as documentation. The actual test runner is CTest.
  */

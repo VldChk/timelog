@@ -1,11 +1,9 @@
 /**
  * @file test_py_timelog.c
- * @brief Unit tests for PyTimelog CPython extension (LLD-B2)
+ * @brief Unit tests for PyTimelog CPython extension
  *
  * TDD-driven tests for the PyTimelog wrapper type.
  * Tests run with Python initialized and GIL held.
- *
- * See: docs/engineering_plan_B2_pytimelog.md Section 2.2
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -284,6 +282,82 @@ TEST(init_custom_config)
     close_and_dealloc(tl);
 }
 
+TEST(init_extended_config)
+{
+    PyObject* args = PyTuple_New(0);
+    PyObject* kwargs = PyDict_New();
+    ASSERT_NOT_NULL(args);
+    ASSERT_NOT_NULL(kwargs);
+
+    PyObject* val = NULL;
+
+    val = PyUnicode_FromString("background");
+    PyDict_SetItemString(kwargs, "maintenance", val);
+    Py_DECREF(val);
+
+    val = PyUnicode_FromString("raise");
+    PyDict_SetItemString(kwargs, "busy_policy", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(0);
+    PyDict_SetItemString(kwargs, "memtable_max_bytes", val);
+    PyDict_SetItemString(kwargs, "target_page_bytes", val);
+    PyDict_SetItemString(kwargs, "sealed_max_runs", val);
+    PyDict_SetItemString(kwargs, "ooo_budget_bytes", val);
+    PyDict_SetItemString(kwargs, "sealed_wait_ms", val);
+    PyDict_SetItemString(kwargs, "maintenance_wakeup_ms", val);
+    PyDict_SetItemString(kwargs, "max_delta_segments", val);
+    PyDict_SetItemString(kwargs, "compaction_target_bytes", val);
+    PyDict_SetItemString(kwargs, "max_compaction_inputs", val);
+    PyDict_SetItemString(kwargs, "max_compaction_windows", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(3600);
+    PyDict_SetItemString(kwargs, "window_size", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(0);
+    PyDict_SetItemString(kwargs, "window_origin", val);
+    Py_DECREF(val);
+
+    val = PyFloat_FromDouble(0.25);
+    PyDict_SetItemString(kwargs, "delete_debt_threshold", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(1000);
+    PyDict_SetItemString(kwargs, "adaptive_target_records", val);
+    PyDict_SetItemString(kwargs, "adaptive_min_window", val);
+    PyDict_SetItemString(kwargs, "adaptive_window_quantum", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(10000);
+    PyDict_SetItemString(kwargs, "adaptive_max_window", val);
+    Py_DECREF(val);
+
+    val = PyLong_FromLongLong(10);
+    PyDict_SetItemString(kwargs, "adaptive_hysteresis_pct", val);
+    PyDict_SetItemString(kwargs, "adaptive_warmup_flushes", val);
+    PyDict_SetItemString(kwargs, "adaptive_stale_flushes", val);
+    PyDict_SetItemString(kwargs, "adaptive_failure_backoff_threshold", val);
+    PyDict_SetItemString(kwargs, "adaptive_failure_backoff_pct", val);
+    Py_DECREF(val);
+
+    val = PyFloat_FromDouble(0.5);
+    PyDict_SetItemString(kwargs, "adaptive_alpha", val);
+    Py_DECREF(val);
+
+    PyTimelog* tl = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
+    ASSERT_NOT_NULL(tl);
+
+    int rc = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(tl->tl);
+
+    Py_DECREF(args);
+    Py_DECREF(kwargs);
+    close_and_dealloc(tl);
+}
+
 TEST(reinit_fails)
 {
     /* Re-init on open instance fails with TypeError */
@@ -388,6 +462,55 @@ TEST(dealloc_handles_unclosed)
     Py_DECREF(tl);
 
     /* If we get here without crash, test passes */
+}
+
+TEST(gc_collects_timelog_cycle)
+{
+    PyObject* gc_mod = PyImport_ImportModule("gc");
+    ASSERT_NOT_NULL(gc_mod);
+    PyObject* weakref_mod = PyImport_ImportModule("weakref");
+    ASSERT_NOT_NULL(weakref_mod);
+
+    PyTimelog* tl = create_timelog_custom("disabled", "raise");
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* weakref_fn = PyObject_GetAttrString(weakref_mod, "ref");
+    ASSERT_NOT_NULL(weakref_fn);
+    PyObject* wr = PyObject_CallFunctionObjArgs(weakref_fn, (PyObject*)tl, NULL);
+    ASSERT_NOT_NULL(wr);
+
+    /* Create cycle: timelog -> stored object(list) -> timelog */
+    PyObject* holder = PyList_New(1);
+    ASSERT_NOT_NULL(holder);
+    Py_INCREF((PyObject*)tl);
+    PyList_SET_ITEM(holder, 0, (PyObject*)tl);  /* Steals reference */
+
+    PyObject* append_method = PyObject_GetAttrString((PyObject*)tl, "append");
+    ASSERT_NOT_NULL(append_method);
+    PyObject* append_res = PyObject_CallFunction(append_method, "LO", 1LL, holder);
+    ASSERT_NOT_NULL(append_res);
+    Py_DECREF(append_res);
+    Py_DECREF(append_method);
+    Py_DECREF(holder);
+
+    /* Drop external strong reference; only the cycle remains. */
+    Py_DECREF((PyObject*)tl);
+
+    for (int i = 0; i < 3; i++) {
+        PyObject* collect_res = PyObject_CallMethod(gc_mod, "collect", NULL);
+        ASSERT_NOT_NULL(collect_res);
+        Py_DECREF(collect_res);
+    }
+
+    PyObject* target = PyObject_CallNoArgs(wr);
+    ASSERT_NOT_NULL(target);
+    ASSERT(target == Py_None);
+    Py_DECREF(target);
+
+    Py_DECREF(wr);
+    Py_DECREF(weakref_fn);
+    Py_DECREF(weakref_mod);
+    Py_DECREF(gc_mod);
 }
 
 /*===========================================================================
@@ -512,6 +635,28 @@ TEST(extend_empty)
     close_and_dealloc(tl);
 }
 
+TEST(extend_mostly_ordered_kw)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* extend_method = PyObject_GetAttrString((PyObject*)tl, "extend");
+    PyObject* empty_list = PyList_New(0);
+    PyObject* args = PyTuple_Pack(1, empty_list);
+    PyObject* kwargs = PyDict_New();
+    PyDict_SetItemString(kwargs, "mostly_ordered", Py_True);
+
+    PyObject* result = PyObject_Call(extend_method, args, kwargs);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+
+    Py_DECREF(kwargs);
+    Py_DECREF(args);
+    Py_DECREF(empty_list);
+    Py_DECREF(extend_method);
+    close_and_dealloc(tl);
+}
+
 TEST(extend_appends_all)
 {
     /* Extend appends all items */
@@ -575,6 +720,49 @@ TEST(extend_appends_all)
     Py_DECREF(obj1);
     Py_DECREF(obj2);
     Py_DECREF(obj3);
+    close_and_dealloc(tl);
+}
+
+TEST(extend_generator_streaming)
+{
+    /* Extend should accept non-sequence iterables (generator) without materializing */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* extend_method = PyObject_GetAttrString((PyObject*)tl, "extend");
+    ASSERT_NOT_NULL(extend_method);
+
+    PyObject* globals = PyDict_New();
+    ASSERT_NOT_NULL(globals);
+    if (PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) < 0) {
+        Py_DECREF(globals);
+        Py_DECREF(extend_method);
+        close_and_dealloc(tl);
+        ASSERT(0);
+    }
+
+    PyObject* gen = PyRun_String(
+        "((i, object()) for i in range(0, 1500))",
+        Py_eval_input,
+        globals,
+        globals);
+    ASSERT_NOT_NULL(gen);
+
+    PyObject* args = PyTuple_Pack(1, gen);
+    PyObject* result = PyObject_Call(extend_method, args, NULL);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+
+    Py_DECREF(args);
+
+    /* Generator should be exhausted */
+    PyObject* next_item = PyIter_Next(gen);
+    ASSERT_NULL(next_item);
+    ASSERT(PyErr_Occurred() == NULL);
+
+    Py_DECREF(gen);
+    Py_DECREF(globals);
+    Py_DECREF(extend_method);
     close_and_dealloc(tl);
 }
 
@@ -791,6 +979,240 @@ TEST(start_maintenance_background)
     close_and_dealloc(tl);
 }
 
+TEST(close_releases_tracked_objects)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* obj = PyDict_New();
+    ASSERT_NOT_NULL(obj);
+
+    Py_ssize_t rc_before = Py_REFCNT(obj);
+
+    PyObject* append_method = PyObject_GetAttrString((PyObject*)tl, "append");
+    ASSERT_NOT_NULL(append_method);
+    PyObject* result = PyObject_CallFunction(append_method, "LO", 1LL, obj);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+
+    ASSERT_EQ(Py_REFCNT(obj), rc_before + 1);
+
+    PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
+    ASSERT_NOT_NULL(close_method);
+    result = PyObject_CallNoArgs(close_method);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+    Py_DECREF(close_method);
+
+    ASSERT_EQ(Py_REFCNT(obj), rc_before);
+
+    Py_DECREF(obj);
+    Py_DECREF(append_method);
+    Py_DECREF(tl);
+}
+
+TEST(stats_empty)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "stats");
+    ASSERT_NOT_NULL(method);
+    PyObject* result = PyObject_CallNoArgs(method);
+    ASSERT_NOT_NULL(result);
+
+    ASSERT(PyDict_Check(result));
+    PyObject* storage = PyDict_GetItemString(result, "storage");
+    ASSERT(storage != NULL && PyDict_Check(storage));
+
+    Py_DECREF(result);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(delete_before_out_of_range)
+{
+    /* delete_before should reject out-of-range timestamps */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "delete_before");
+    PyObject* cutoff = PyLong_FromString("9223372036854775808", NULL, 10);
+    ASSERT_NOT_NULL(cutoff);
+    PyObject* args = PyTuple_Pack(1, cutoff);
+
+    PyObject* result = PyObject_Call(method, args, NULL);
+    ASSERT_NULL(result);
+    ASSERT_EXCEPTION(PyExc_OverflowError);
+
+    Py_DECREF(args);
+    Py_DECREF(cutoff);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(range_t1_gt_t2)
+{
+    /* range with t1 > t2 raises ValueError */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* t1 = PyLong_FromLongLong(200);
+    PyObject* t2 = PyLong_FromLongLong(100);
+    PyObject* args = PyTuple_Pack(2, t1, t2);
+
+    PyObject* result = PyObject_Call(method, args, NULL);
+    ASSERT_NULL(result);
+    ASSERT_EXCEPTION(PyExc_ValueError);
+
+    Py_DECREF(args);
+    Py_DECREF(t2);
+    Py_DECREF(t1);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(range_t1_equal_t2_empty)
+{
+    /* range with t1 == t2 returns an empty iterator */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "range");
+    PyObject* t1 = PyLong_FromLongLong(100);
+    PyObject* t2 = PyLong_FromLongLong(100);
+    PyObject* args = PyTuple_Pack(2, t1, t2);
+
+    PyObject* iter = PyObject_Call(method, args, NULL);
+    ASSERT_NOT_NULL(iter);
+
+    PyObject* item = PyIter_Next(iter);
+    ASSERT_NULL(item);
+    ASSERT(PyErr_Occurred() == NULL);
+
+    Py_DECREF(iter);
+    Py_DECREF(args);
+    Py_DECREF(t2);
+    Py_DECREF(t1);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(maint_step_disabled_empty)
+{
+    PyTimelog* tl = create_timelog_custom("disabled", "raise");
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "maint_step");
+    ASSERT_NOT_NULL(method);
+    PyObject* result = PyObject_CallNoArgs(method);
+    ASSERT_NOT_NULL(result);
+
+    ASSERT(PyBool_Check(result));
+    ASSERT(result == Py_False);
+
+    Py_DECREF(result);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(min_max_ts_empty)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* min_method = PyObject_GetAttrString((PyObject*)tl, "min_ts");
+    PyObject* max_method = PyObject_GetAttrString((PyObject*)tl, "max_ts");
+    ASSERT_NOT_NULL(min_method);
+    ASSERT_NOT_NULL(max_method);
+
+    PyObject* min_res = PyObject_CallNoArgs(min_method);
+    PyObject* max_res = PyObject_CallNoArgs(max_method);
+    ASSERT_NOT_NULL(min_res);
+    ASSERT_NOT_NULL(max_res);
+
+    ASSERT(min_res == Py_None);
+    ASSERT(max_res == Py_None);
+
+    Py_DECREF(min_res);
+    Py_DECREF(max_res);
+    Py_DECREF(min_method);
+    Py_DECREF(max_method);
+    close_and_dealloc(tl);
+}
+
+TEST(next_prev_ts_empty)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* next_method = PyObject_GetAttrString((PyObject*)tl, "next_ts");
+    PyObject* prev_method = PyObject_GetAttrString((PyObject*)tl, "prev_ts");
+    ASSERT_NOT_NULL(next_method);
+    ASSERT_NOT_NULL(prev_method);
+
+    PyObject* next_res = PyObject_CallFunction(next_method, "L", 0LL);
+    PyObject* prev_res = PyObject_CallFunction(prev_method, "L", 0LL);
+    ASSERT_NOT_NULL(next_res);
+    ASSERT_NOT_NULL(prev_res);
+
+    ASSERT(next_res == Py_None);
+    ASSERT(prev_res == Py_None);
+
+    Py_DECREF(next_res);
+    Py_DECREF(prev_res);
+    Py_DECREF(next_method);
+    Py_DECREF(prev_method);
+    close_and_dealloc(tl);
+}
+
+TEST(next_prev_ts_out_of_range)
+{
+    /* next_ts / prev_ts should reject out-of-range timestamps */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* next_method = PyObject_GetAttrString((PyObject*)tl, "next_ts");
+    PyObject* prev_method = PyObject_GetAttrString((PyObject*)tl, "prev_ts");
+    ASSERT_NOT_NULL(next_method);
+    ASSERT_NOT_NULL(prev_method);
+
+    PyObject* big = PyLong_FromString("9223372036854775808", NULL, 10);
+    ASSERT_NOT_NULL(big);
+
+    PyObject* args = PyTuple_Pack(1, big);
+    PyObject* next_res = PyObject_Call(next_method, args, NULL);
+    ASSERT_NULL(next_res);
+    ASSERT_EXCEPTION(PyExc_OverflowError);
+
+    PyObject* prev_res = PyObject_Call(prev_method, args, NULL);
+    ASSERT_NULL(prev_res);
+    ASSERT_EXCEPTION(PyExc_OverflowError);
+
+    Py_DECREF(args);
+    Py_DECREF(big);
+    Py_DECREF(next_method);
+    Py_DECREF(prev_method);
+    close_and_dealloc(tl);
+}
+
+TEST(validate_empty)
+{
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "validate");
+    ASSERT_NOT_NULL(method);
+    PyObject* result = PyObject_CallNoArgs(method);
+    ASSERT_NOT_NULL(result);
+    ASSERT(result == Py_None);
+
+    Py_DECREF(result);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
 TEST(start_maintenance_disabled_fails)
 {
     /* start_maintenance in disabled mode raises TimelogError */
@@ -855,6 +1277,149 @@ TEST(busy_policy_flush)
     ASSERT_EQ(tl->busy_policy, TL_PY_BUSY_FLUSH);
 
     close_and_dealloc(tl);
+}
+
+/*===========================================================================
+ * Test Suite: Overflow Validation (since/until)
+ *===========================================================================*/
+
+TEST(since_overflow_validation)
+{
+    /* since() should reject out-of-range timestamps */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "since");
+    ASSERT_NOT_NULL(method);
+
+    PyObject* big = PyLong_FromString("9223372036854775808", NULL, 10);
+    ASSERT_NOT_NULL(big);
+    PyObject* args = PyTuple_Pack(1, big);
+
+    PyObject* result = PyObject_Call(method, args, NULL);
+    ASSERT_NULL(result);
+    ASSERT_EXCEPTION(PyExc_OverflowError);
+
+    Py_DECREF(args);
+    Py_DECREF(big);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+TEST(until_overflow_validation)
+{
+    /* until() should reject out-of-range timestamps */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* method = PyObject_GetAttrString((PyObject*)tl, "until");
+    ASSERT_NOT_NULL(method);
+
+    PyObject* big = PyLong_FromString("9223372036854775808", NULL, 10);
+    ASSERT_NOT_NULL(big);
+    PyObject* args = PyTuple_Pack(1, big);
+
+    PyObject* result = PyObject_Call(method, args, NULL);
+    ASSERT_NULL(result);
+    ASSERT_EXCEPTION(PyExc_OverflowError);
+
+    Py_DECREF(args);
+    Py_DECREF(big);
+    Py_DECREF(method);
+    close_and_dealloc(tl);
+}
+
+/*===========================================================================
+ * Test Suite: Generator Error Propagation
+ *===========================================================================*/
+
+TEST(extend_generator_error_propagates)
+{
+    /*
+     * Spec: If a generator raises an exception during extend(),
+     * the exception should propagate and records yielded before
+     * the error should be committed (not rolled back).
+     */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* extend_method = PyObject_GetAttrString((PyObject*)tl, "extend");
+    ASSERT_NOT_NULL(extend_method);
+
+    /* Create a generator that yields 2 items then raises ValueError */
+    PyObject* globals = PyDict_New();
+    ASSERT_NOT_NULL(globals);
+    if (PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins()) < 0) {
+        Py_DECREF(globals);
+        Py_DECREF(extend_method);
+        close_and_dealloc(tl);
+        ASSERT(0);
+    }
+
+    /* Define a generator function that raises after 2 yields */
+    PyObject* code_result = PyRun_String(
+        "def _err_gen():\n"
+        "    yield (1, object())\n"
+        "    yield (2, object())\n"
+        "    raise ValueError('generator error')\n",
+        Py_file_input,
+        globals,
+        globals);
+    ASSERT_NOT_NULL(code_result);
+    Py_DECREF(code_result);
+
+    PyObject* gen = PyRun_String("_err_gen()", Py_eval_input, globals, globals);
+    ASSERT_NOT_NULL(gen);
+
+    PyObject* args = PyTuple_Pack(1, gen);
+    PyObject* result = PyObject_Call(extend_method, args, NULL);
+
+    /* extend() should propagate the ValueError */
+    ASSERT_NULL(result);
+    ASSERT_EXCEPTION(PyExc_ValueError);
+
+    Py_DECREF(args);
+    Py_DECREF(gen);
+    Py_DECREF(globals);
+    Py_DECREF(extend_method);
+    close_and_dealloc(tl);
+}
+
+/*===========================================================================
+ * Test Suite: Closed-State Exception Type
+ *===========================================================================*/
+
+TEST(closed_state_raises_timelog_error)
+{
+    /*
+     * Spec (P1-03): Closed-state checks should raise TimelogError,
+     * not RuntimeError, for consistent domain error handling.
+     */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    /* Close it */
+    PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
+    PyObject* close_result = PyObject_CallNoArgs(close_method);
+    ASSERT_NOT_NULL(close_result);
+    Py_DECREF(close_result);
+    Py_DECREF(close_method);
+
+    /* flush() on closed should raise TimelogError */
+    PyObject* flush_method = PyObject_GetAttrString((PyObject*)tl, "flush");
+    PyObject* flush_result = PyObject_CallNoArgs(flush_method);
+    ASSERT_NULL(flush_result);
+    ASSERT_EXCEPTION(TlPy_TimelogError);
+    Py_DECREF(flush_method);
+
+    /* stats() on closed should raise TimelogError */
+    PyObject* stats_method = PyObject_GetAttrString((PyObject*)tl, "stats");
+    PyObject* stats_result = PyObject_CallNoArgs(stats_method);
+    ASSERT_NULL(stats_result);
+    ASSERT_EXCEPTION(TlPy_TimelogError);
+    Py_DECREF(stats_method);
+
+    Py_DECREF(tl);
 }
 
 /*===========================================================================
@@ -965,11 +1530,14 @@ int main(int argc, char* argv[])
     printf("\n[Lifecycle]\n");
     run_init_defaults();
     run_init_custom_config();
+    run_init_extended_config();
     run_reinit_fails();
     run_close_idempotent();
+    run_close_releases_tracked_objects();
     run_close_sets_state();
     run_close_refuses_with_pins();
     run_dealloc_handles_unclosed();
+    run_gc_collects_timelog_cycle();
 
     /* Append tests */
     printf("\n[Append]\n");
@@ -980,7 +1548,9 @@ int main(int argc, char* argv[])
     /* Extend tests */
     printf("\n[Extend]\n");
     run_extend_empty();
+    run_extend_mostly_ordered_kw();
     run_extend_appends_all();
+    run_extend_generator_streaming();
 
     /* Delete tests */
     printf("\n[Delete]\n");
@@ -988,7 +1558,10 @@ int main(int argc, char* argv[])
     run_delete_range_t1_equal_t2();
     run_delete_range_t1_gt_t2();
     run_delete_before_valid();
+    run_delete_before_out_of_range();
     run_delete_after_close();
+    run_range_t1_gt_t2();
+    run_range_t1_equal_t2_empty();
 
     /* Flush/Compact tests */
     printf("\n[Flush/Compact]\n");
@@ -1001,11 +1574,33 @@ int main(int argc, char* argv[])
     run_start_maintenance_background();
     run_start_maintenance_disabled_fails();
     run_stop_maintenance_idempotent();
+    run_maint_step_disabled_empty();
 
     /* Backpressure tests */
     printf("\n[Backpressure]\n");
     run_busy_policy_silent();
     run_busy_policy_flush();
+
+    /* Diagnostics tests */
+    printf("\n[Diagnostics]\n");
+    run_stats_empty();
+    run_min_max_ts_empty();
+    run_next_prev_ts_empty();
+    run_next_prev_ts_out_of_range();
+    run_validate_empty();
+
+    /* Overflow validation tests */
+    printf("\n[Overflow Validation]\n");
+    run_since_overflow_validation();
+    run_until_overflow_validation();
+
+    /* Generator error propagation tests */
+    printf("\n[Generator Error]\n");
+    run_extend_generator_error_propagates();
+
+    /* Closed-state exception type tests */
+    printf("\n[Closed-State Exception]\n");
+    run_closed_state_raises_timelog_error();
 
     /* Context manager tests */
     printf("\n[Context Manager]\n");

@@ -10,8 +10,6 @@
  * - Each view owns a reference to the owner
  * - Owner refcount is plain uint32_t (caller serialization required)
  * - Free owner before calling release hook (allocator lifetime safety)
- *
- * Reference: docs/timelog_v2_lld_pagespan_core_api_unification.md
  *===========================================================================*/
 
 #include "tl_pagespan_iter.h"
@@ -19,12 +17,18 @@
 #include "../internal/tl_defs.h"
 #include "../internal/tl_alloc.h"
 #include "../internal/tl_range.h"
+#include "tl_segment_range.h"
 #include "../internal/tl_timelog_internal.h"
 #include "../storage/tl_page.h"
 #include "../storage/tl_segment.h"
 #include "../storage/tl_manifest.h"
 
 #include <string.h>
+
+/* Test hook: force iter allocation failure after owner creation */
+#ifdef TL_TEST_HOOKS
+volatile int tl_test_pagespan_fail_iter_alloc = 0;
+#endif
 
 /*===========================================================================
  * Internal Types
@@ -42,6 +46,7 @@ struct tl_pagespan_owner {
     tl_snapshot_t*              snapshot;   /* Owned reference */
     tl_alloc_ctx_t*             alloc;      /* Borrowed from timelog */
     tl_pagespan_owner_hooks_t   hooks;      /* Copied from iter_open */
+    bool                        hook_armed; /* Hook runs only after successful open */
 };
 
 /**
@@ -101,6 +106,7 @@ static tl_status_t owner_create(
     owner->refcnt = 1;
     owner->snapshot = snapshot;
     owner->alloc = alloc;
+    owner->hook_armed = false;
 
     /* Copy hooks (NULL-safe) */
     if (hooks != NULL) {
@@ -133,6 +139,7 @@ static void owner_destroy(tl_pagespan_owner_t* owner) {
     tl_snapshot_t* snap = owner->snapshot;
     tl_alloc_ctx_t* alloc = owner->alloc;
     tl_pagespan_owner_hooks_t hooks = owner->hooks;
+    bool hook_armed = owner->hook_armed;
 
     /* Step 2: Release snapshot (no binding code runs here) */
     if (snap != NULL) {
@@ -143,7 +150,7 @@ static void owner_destroy(tl_pagespan_owner_t* owner) {
     tl__free(alloc, owner);
 
     /* Step 4: Call release hook (may run binding code, e.g., Py_DECREF) */
-    if (hooks.on_release != NULL) {
+    if (hook_armed && hooks.on_release != NULL) {
         hooks.on_release(hooks.user);
     }
 }
@@ -168,7 +175,6 @@ void tl_pagespan_owner_decref(tl_pagespan_owner_t* owner) {
 /*===========================================================================
  * Segment Cursor Initialization
  *
- * Canonical algorithm from tl_segment_iter_init (Section 5.3 of plan).
  * Finds the page range [first, last) that overlaps with [t1, t2).
  *===========================================================================*/
 
@@ -190,23 +196,9 @@ static bool init_segment_cursor(tl_pagespan_iter_t* it, const tl_segment_t* seg)
         return false;
     }
 
-    const tl_page_catalog_t* cat = tl_segment_catalog(seg);
-
-    /*
-     * Find first page with max_ts >= t1.
-     * This is the first page that might contain records >= t1.
-     */
-    size_t first = tl_page_catalog_find_first_ge(cat, it->t1);
-
-    /*
-     * Find first page with min_ts >= t2.
-     * This is the first page that definitely starts after our range.
-     * All pages before this index might contain records < t2.
-     */
-    size_t last = tl_page_catalog_find_start_ge(cat, it->t2);
-
-    /* No overlapping pages */
-    if (first >= last) {
+    size_t first = 0;
+    size_t last = 0;
+    if (!tl_segment_page_range(seg, it->t1, it->t2, false, &first, &last)) {
         return false;
     }
 
@@ -248,8 +240,25 @@ static bool advance_to_next_segment(tl_pagespan_iter_t* it) {
             }
 
             /* Try next L1 segment */
-            while (it->seg_idx < tl_manifest_l1_count(m)) {
+            bool early_stop = false;
+            size_t l1_count = tl_manifest_l1_count(m);
+            while (it->seg_idx < l1_count) {
                 const tl_segment_t* seg = tl_manifest_l1_get(m, it->seg_idx);
+                /*
+                 * Early terminate L1 scan for bounded ranges.
+                 *
+                 * Correctness proof: L1 segments have strictly increasing min_ts.
+                 * Invariants: (1) L1 sorted by window_start
+                 *             (2) Non-overlapping: window_start[i] >= window_end[i-1]
+                 *             (3) Records in bounds: min_ts >= window_start
+                 * Chain: min_ts[i] >= window_start[i] >= window_end[i-1] > max_ts[i-1]
+                 *
+                 * Therefore if min_ts >= t2, all later segments also have min_ts >= t2.
+                 */
+                if (seg->min_ts >= it->t2) {
+                    early_stop = true;
+                    break;
+                }
                 it->seg_idx++;
 
                 if (init_segment_cursor(it, seg)) {
@@ -258,8 +267,10 @@ static bool advance_to_next_segment(tl_pagespan_iter_t* it) {
             }
 
             /* L1 exhausted, move to L0 */
-            it->phase = PHASE_L0;
-            it->seg_idx = 0;
+            if (early_stop || it->seg_idx >= l1_count) {
+                it->phase = PHASE_L0;
+                it->seg_idx = 0;
+            }
             break;
 
         case PHASE_L0:
@@ -359,6 +370,15 @@ tl_status_t tl_pagespan_iter_open(
         return st;
     }
 
+    /* Test hook: force iterator allocation failure after owner creation */
+#ifdef TL_TEST_HOOKS
+    if (tl_test_pagespan_fail_iter_alloc > 0) {
+        tl_test_pagespan_fail_iter_alloc--;
+        tl_pagespan_owner_decref(owner);
+        return TL_ENOMEM;
+    }
+#endif
+
     /* Step 7: Create iterator */
     tl_pagespan_iter_t* it = tl__malloc(alloc, sizeof(tl_pagespan_iter_t));
     if (it == NULL) {
@@ -392,6 +412,9 @@ tl_status_t tl_pagespan_iter_open(
     }
     it->seg_idx = 0;
     it->current_seg = NULL;
+
+    /* Arm release hook only after successful open */
+    owner->hook_armed = true;
 
     *out = it;
     return TL_OK;
@@ -433,14 +456,11 @@ tl_status_t tl_pagespan_iter_next(
             const tl_page_t* page = meta->page;
 
             /*
-             * Page flag validation (B4/V1 constraint):
+             * Page flag validation:
              *
-             * V1/B4 only supports TL_PAGE_FULLY_LIVE. Any other state indicates
-             * corruption or a bug. We error out loudly rather than silently
-             * skipping, which could hide data loss.
-             *
-             * If V2 introduces PARTIAL_DELETED pages with row bitmaps, this
-             * code must be updated to handle visibility splitting.
+             * Current page-span iteration supports TL_PAGE_FULLY_LIVE pages.
+             * Any other state indicates corruption or an unsupported format,
+             * so fail loudly instead of silently skipping rows.
              */
             if (page->flags != TL_PAGE_FULLY_LIVE) {
                 /* Corruption or unsupported page state - internal error */
@@ -493,15 +513,29 @@ void tl_pagespan_iter_close(tl_pagespan_iter_t* it) {
 
     it->closed = true;
 
-    /* Cache allocator before releasing owner (owner may be destroyed) */
+    /*
+     * Free iterator before releasing the owner reference.
+     *
+     * The owner's release hook may Py_DECREF the timelog, which owns the
+     * allocator. If owner decref triggers destroy -> hook -> allocator freed,
+     * then calling tl__free(alloc, it) would be use-after-free.
+     *
+     * Correct order:
+     * 1. Cache owner pointer
+     * 2. Free iterator using allocator (while allocator is still valid)
+     * 3. Release owner reference (may trigger destroy and hook)
+     *
+     * This mirrors the pattern in owner_destroy() which frees the owner
+     * struct before calling the release hook.
+     */
+    tl_pagespan_owner_t* owner = it->owner;
     tl_alloc_ctx_t* alloc = it->alloc;
 
-    /* Release our owner reference */
-    if (it->owner != NULL) {
-        tl_pagespan_owner_decref(it->owner);
-        it->owner = NULL;
-    }
-
-    /* Free iterator using cached allocator */
+    /* Step 1: Free iterator struct while allocator is valid */
     tl__free(alloc, it);
+
+    /* Step 2: Release owner reference (may trigger destroy and hook) */
+    if (owner != NULL) {
+        tl_pagespan_owner_decref(owner);
+    }
 }

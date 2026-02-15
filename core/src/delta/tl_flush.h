@@ -12,11 +12,10 @@
  * Builds L0 segments from sealed memruns. Serialized by flush_mu in tl_timelog.
  *
  * The flush builder:
- * 1. Merges run + ooo arrays into a single sorted stream (two-way merge)
+ * 1. Merges run + OOO runs into a single sorted stream (K-way merge)
  * 2. Passes merged records + tombstones to tl_segment_build_l0
  * 3. Returns the built L0 segment
  *
- * Reference: Write Path LLD Section 4.3
  *===========================================================================*/
 
 /*===========================================================================
@@ -29,13 +28,21 @@ typedef struct tl_flush_ctx {
     tl_alloc_ctx_t* alloc;              /* Allocator */
     size_t          target_page_bytes;  /* Page size target */
     uint32_t        generation;         /* Generation for L0 segment */
+    tl_seq_t        applied_seq;        /* Output segment watermark.
+                                         * Must satisfy: applied_seq >= max(ctx->tombs.max_seq). */
+    tl_intervals_imm_t tombs;           /* Snapshot-visible tombstones clipped to
+                                         * memrun bounds, used only for record
+                                         * filtering during merge. This is NOT
+                                         * the same set as mr->tombs persisted
+                                         * into the output L0 segment. */
+    bool            collect_drops;      /* Collect dropped records */
 } tl_flush_ctx_t;
 
 /*===========================================================================
  * Two-Way Merge Iterator
  *
  * Produces records in timestamp order from two sorted inputs.
- * Stable merge: if timestamps are equal, prefers first input (run over ooo).
+ * Stable merge: if timestamps are equal, prefers first input.
  *
  * Usage:
  *   tl_merge_iter_t it;
@@ -77,6 +84,16 @@ void tl_merge_iter_init(tl_merge_iter_t* it,
                          const tl_record_t* b, size_t b_len);
 
 /**
+ * Peek at the next record without advancing.
+ *
+ * Stable merge: If both inputs have equal timestamps, peeks from 'a' first.
+ *
+ * @param it  Iterator
+ * @return Pointer to next record, or NULL if exhausted
+ */
+const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it);
+
+/**
  * Get the next record from the merge.
  *
  * Stable merge: If both inputs have equal timestamps, returns from 'a' first.
@@ -94,7 +111,7 @@ TL_INLINE bool tl_merge_iter_done(const tl_merge_iter_t* it) {
 }
 
 /**
- * Get count of remaining records.
+ * Get count of remaining records (test/diagnostic helper).
  */
 TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
     return (it->a_len - it->a_pos) + (it->b_len - it->b_pos);
@@ -108,17 +125,22 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  * Build an L0 segment from a memrun.
  *
  * Algorithm:
- * 1. Check for addition overflow: run_len + ooo_len
- * 2. If both run and ooo empty but tombs non-empty: build tombstone-only segment
+ * 1. Check for addition overflow: run_len + ooo_total_len
+ * 2. If both run and OOO empty but tombs non-empty: build tombstone-only segment
  * 3. Check for multiplication overflow: total_records * sizeof(tl_record_t)
  * 4. Allocate merged[] buffer
- * 5. Merge run + ooo into merged[] using two-way merge iterator
+ * 5. Merge run + OOO runs into merged[] using K-way merge
  * 6. Call tl_segment_build_l0(merged, tombstones)
  * 7. Free merged[] buffer
  *
- * @param ctx      Flush context with configuration
- * @param mr       Pinned memrun (caller holds reference)
- * @param out_seg  Output: built L0 segment (caller takes ownership, refcnt = 1)
+ * @param ctx              Flush context with configuration
+ * @param mr               Pinned memrun (caller holds reference)
+ * @param out_seg          Output: built L0 segment (caller takes ownership,
+ *                         refcnt = 1). May be NULL if all records are dropped
+ *                         and no tombstones exist.
+ * @param out_dropped      Output: dropped records (ts, handle) for on_drop
+ *                         callback. Owned by caller; free with alloc.
+ * @param out_dropped_len  Output: length of out_dropped
  * @return TL_OK on success,
  *         TL_ENOMEM on allocation failure,
  *         TL_EOVERFLOW if total_records * sizeof overflows,
@@ -126,6 +148,8 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  */
 tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                             const tl_memrun_t* mr,
-                            tl_segment_t** out_seg);
+                            tl_segment_t** out_seg,
+                            tl_record_t** out_dropped,
+                            size_t* out_dropped_len);
 
 #endif /* TL_FLUSH_H */

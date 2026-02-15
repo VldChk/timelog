@@ -25,15 +25,14 @@
  * 3. Continue until heap is empty
  *
  * Tie-Breaking (implementation detail, not a public guarantee):
- * - On timestamp ties, sources are ordered by component_id (source index)
+ * - On timestamp ties, sources are ordered by tie_break_key (priority assigned
+ *   by the query plan, not necessarily the iterator array index)
  * - This provides deterministic results for testing, but clients must not
  *   depend on tie-break ordering - it may change in future versions
  *
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Plan must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 6
  *===========================================================================*/
 
 typedef struct tl_kmerge_iter {
@@ -45,6 +44,11 @@ typedef struct tl_kmerge_iter {
 
     /* State */
     bool            done;
+    tl_status_t     error;
+
+    /* Skip-ahead optimization state */
+    tl_seq_t        max_watermark;
+    bool            has_variable_watermark;
 
     /* Allocator (borrowed) */
     tl_alloc_ctx_t* alloc;
@@ -91,7 +95,8 @@ void tl_kmerge_iter_destroy(tl_kmerge_iter_t* it);
  * @param out  Output record
  * @return TL_OK if record available, TL_EOF if exhausted
  */
-tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
+tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
+                                 tl_seq_t* out_watermark);
 
 /**
  * Seek all sources to first record with ts >= target.
@@ -102,24 +107,38 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out);
  *
  * Semantics:
  * - Forward-only: if target <= current position, this is a no-op
- * - After seek, the heap is rebuilt with new positions from all sources
+ * - Entries in the heap with ts >= target are preserved (not re-fetched)
+ * - Only sources with buffered ts < target are re-sought
  * - If all sources are exhausted after seek, iterator becomes done
+ *
+ * Implementation note: The heap contains prefetched records. Source iterators
+ * use forward-only seek and cannot recover records they've already returned.
+ * Therefore, heap entries with ts >= target must be preserved in place.
  *
  * @param it     Iterator
  * @param target Target timestamp to seek to
  */
 void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target);
 
+/**
+ * Check if skip-ahead is safe for a tombstone seq.
+ *
+ * Safe when all sources have constant watermarks and tomb_seq is newer
+ * than every source watermark.
+ */
+TL_INLINE bool tl_kmerge_iter_can_skip(const tl_kmerge_iter_t* it,
+                                       tl_seq_t tomb_seq) {
+    return !it->has_variable_watermark && tomb_seq > it->max_watermark;
+}
+
 /*===========================================================================
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
     TL_ASSERT(it != NULL);
-    return it->done;
+    return it->done || (it->error != TL_OK);
 }
 
 /**
@@ -132,7 +151,7 @@ TL_INLINE bool tl_kmerge_iter_done(const tl_kmerge_iter_t* it) {
  */
 TL_INLINE const tl_ts_t* tl_kmerge_iter_peek_ts(const tl_kmerge_iter_t* it) {
     TL_ASSERT(it != NULL);
-    if (it->done) return NULL;
+    if (it->done || it->error != TL_OK) return NULL;
     const tl_heap_entry_t* entry = tl_heap_peek(&it->heap);
     return entry != NULL ? &entry->ts : NULL;
 }

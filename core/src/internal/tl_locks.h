@@ -4,7 +4,7 @@
 #include "tl_sync.h"
 
 /*===========================================================================
- * Lock Ordering (from timelog_v1_engineering_plan.md)
+ * Lock Ordering
  *
  * Strict order: maint_mu -> flush_mu -> writer_mu -> memtable_mu
  *
@@ -79,7 +79,7 @@ TL_INLINE void tl_lock_release_check(tl_lock_id_t id) {
  * Check if a specific lock is held.
  */
 TL_INLINE bool tl_lock_is_held(tl_lock_id_t id) {
-    tl_lock_tracker_t* t = &tl__lock_tracker;
+    const tl_lock_tracker_t* t = &tl__lock_tracker;
     for (int i = 0; i < t->depth; i++) {
         if (t->held[i] == id) return true;
     }

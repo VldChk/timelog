@@ -29,6 +29,8 @@ Options:
     --ingest-mode=MODE      Ingest measurement mode: end_to_end, parse_only, timelog_only
     --reuse-obj             Reuse a single Order object (isolates handle overhead)
     --no-tracemalloc        Disable tracemalloc (reduce measurement overhead)
+    --repeat-min-seconds=S  Repeat fast read-only features until >=S seconds (0 disables)
+    --repeat-max-runs=N     Max repeats for fast read-only features
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import sys
 import time
 import tracemalloc
@@ -55,11 +58,31 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
 
 from timelog import Timelog, TimelogBusyError, TimelogIter
 
+
+def _install_timelog_overrides(overrides: dict[str, object]) -> None:
+    """Force Timelog constructor overrides for all demo-created instances."""
+    global Timelog
+    if not overrides:
+        return
+
+    class _TimelogOverride(Timelog):
+        def __init__(self, *args, **kwargs):
+            kwargs.update(overrides)
+            super().__init__(*args, **kwargs)
+
+    Timelog = _TimelogOverride
+
 # Optional NumPy import for zero-copy demos (kept global to avoid per-test import cost)
 try:
     import numpy as np
 except ImportError:  # pragma: no cover - optional dependency
     np = None
+
+# Optional psutil import for RSS memory and system resources.
+try:
+    import psutil
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None
 
 # =============================================================================
 # Performance Profiling Infrastructure
@@ -76,6 +99,9 @@ class PerfMetrics:
     records: int = 0
     memory_peak_mb: float = 0.0
     memory_allocated_mb: float = 0.0
+    rss_start_mb: float = 0.0
+    rss_end_mb: float = 0.0
+    rss_delta_mb: float = 0.0
     gc_collections: tuple[int, int, int] = (0, 0, 0)  # gen0, gen1, gen2
 
     @property
@@ -117,6 +143,8 @@ class PerfProfiler:
         self._start_cpu: int = 0
         self._start_gc: tuple[int, int, int] = (0, 0, 0)
         self._mem_tracking: bool = False
+        self._rss_start_mb: float = 0.0
+        self._rss_end_mb: float = 0.0
         self.metrics: Optional[PerfMetrics] = None
         self.records: int = 0
 
@@ -140,6 +168,9 @@ class PerfProfiler:
             tracemalloc.start()
             self._mem_tracking = True
 
+        # Capture RSS after GC to reduce noise (if psutil available).
+        self._rss_start_mb = get_process_rss_mb()
+
         # Start timing (order matters - do timing last)
         self._start_cpu = time.process_time_ns()
         self._start_wall = time.perf_counter_ns()
@@ -158,6 +189,9 @@ class PerfProfiler:
             self._mem_tracking = False
         else:
             current = peak = 0
+
+        # Capture RSS at end (if psutil available).
+        self._rss_end_mb = get_process_rss_mb()
 
         # Get GC stats after
         if self.track_gc:
@@ -182,6 +216,9 @@ class PerfProfiler:
             records=self.records,
             memory_peak_mb=peak / (1024 * 1024),
             memory_allocated_mb=current / (1024 * 1024),
+            rss_start_mb=self._rss_start_mb,
+            rss_end_mb=self._rss_end_mb,
+            rss_delta_mb=self._rss_end_mb - self._rss_start_mb,
             gc_collections=gc_delta,
         )
 
@@ -207,6 +244,9 @@ class PerfProfiler:
             "ns_per_record": m.ns_per_record,
             "memory_peak_mb": m.memory_peak_mb,
             "memory_allocated_mb": m.memory_allocated_mb,
+            "rss_start_mb": m.rss_start_mb,
+            "rss_end_mb": m.rss_end_mb,
+            "rss_delta_mb": m.rss_delta_mb,
             "gc_gen0": m.gc_collections[0],
             "gc_gen1": m.gc_collections[1],
             "gc_gen2": m.gc_collections[2],
@@ -251,15 +291,59 @@ class PerfProfiler:
         return result
 
 
+def get_process_rss_mb() -> float:
+    """Get current process RSS memory in MB (0 if psutil unavailable)."""
+    if psutil is None:
+        return 0.0
+    try:
+        return psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _get_system_memory_info() -> dict:
+    """Best-effort system memory stats (requires psutil)."""
+    if psutil is None:
+        return {}
+    try:
+        vm = psutil.virtual_memory()
+        return {
+            "mem_total_gb": round(vm.total / (1024 ** 3), 2),
+            "mem_available_gb": round(vm.available / (1024 ** 3), 2),
+            "mem_percent": vm.percent,
+        }
+    except Exception:
+        return {}
+
+
+def _get_disk_usage_info(path: str) -> dict:
+    """Best-effort disk usage stats for the drive containing path."""
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "disk_total_gb": round(usage.total / (1024 ** 3), 2),
+            "disk_free_gb": round(usage.free / (1024 ** 3), 2),
+            "disk_used_gb": round(usage.used / (1024 ** 3), 2),
+        }
+    except Exception:
+        return {}
+
+
 def get_system_info() -> dict:
     """Capture system information for benchmark context."""
-    return {
+    info = {
         "python_version": sys.version,
         "platform": platform.platform(),
         "processor": platform.processor(),
         "cpu_count": os.cpu_count(),
         "machine": platform.machine(),
+        "psutil_available": psutil is not None,
     }
+    if psutil is not None:
+        info["psutil_version"] = getattr(psutil, "__version__", "unknown")
+    info.update(_get_system_memory_info())
+    info.update(_get_disk_usage_info(os.getcwd()))
+    return info
 
 
 class LatencyStats:
@@ -345,6 +429,8 @@ COMPLEXITY = {
     "B4": {"time": "O(N)", "space": "O(K)", "notes": "full k-way merge"},
     "B5": {"time": "O(K*log P + D)", "space": "O(K)", "notes": "D=duplicates"},
     "B6": {"time": "O(K*log P + M)", "space": "O(K)", "notes": "tiny result set"},
+    "B7": {"time": "O(S*T*log P + A)", "space": "O(S+T)", "notes": "snapshot full len(log) count path"},
+    "B8": {"time": "O(S*T*log P + A)", "space": "O(S+T)", "notes": "slice iterator remaining-count len(it) path"},
     "C1": {"time": "O(K*log P + W)", "space": "O(K)", "notes": "W=window records"},
     "C1B": {"time": "O(K*log P + M)", "space": "O(K)", "notes": "single pass over window"},
     "C2": {"time": "O(K*log P + W)", "space": "O(K)", "notes": "range + filter"},
@@ -414,6 +500,8 @@ EXPECTED_PERFORMANCE = {
     "B4": {"records_per_sec": 600_000},      # Full scan
     "B5": {"records_per_sec": 10_000},       # Point queries/sec (query-count metric)
     "B6": {"records_per_sec": 150_000},      # Micro-window queries/sec (query-count metric)
+    "B7": {"ops_per_sec": 2_000},            # len(log) calls/sec
+    "B8": {"ops_per_sec": 2_000},            # len(slice_iter) calls/sec
 
     # Category C: HFT Analytics (iteration + Python computation)
     "C1": {"records_per_sec": 8_000},        # Multi-window counting (10 windows)
@@ -609,35 +697,41 @@ def load_orders(
     """
     count = 0
     skipped = 0
-    with _open_csv_source(data_path) as f:
-        if CSV_MODE == "trusted":
-            reader = csv.reader(f)
-            header = next(reader, None)
-            if header is None:
-                return
-            index_map = {}
-            for name in CSV_COLUMNS:
-                if name not in header:
-                    raise ValueError(f"missing column in trusted CSV: {name}")
-                index_map[name] = header.index(name)
+    try:
+        with _open_csv_source(data_path) as f:
+            if CSV_MODE == "trusted":
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    return
+                index_map = {}
+                for name in CSV_COLUMNS:
+                    if name not in header:
+                        raise ValueError(f"missing column in trusted CSV: {name}")
+                    index_map[name] = header.index(name)
 
-            for row in reader:
-                result = parse_order_trusted(row, index_map)
-                yield result
-                count += 1
-                if limit > 0 and count >= limit:
-                    break
-        else:
-            reader = csv.DictReader(f)
-            for row in reader:
-                result = parse_order(row)
-                if result is None:
-                    skipped += 1
-                    continue
-                yield result
-                count += 1
-                if limit > 0 and count >= limit:
-                    break
+                for row in reader:
+                    result = parse_order_trusted(row, index_map)
+                    yield result
+                    count += 1
+                    if limit > 0 and count >= limit:
+                        break
+            else:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    result = parse_order(row)
+                    if result is None:
+                        skipped += 1
+                        continue
+                    yield result
+                    count += 1
+                    if limit > 0 and count >= limit:
+                        break
+    except MemoryError as exc:
+        rss_mb = get_process_rss_mb()
+        raise MemoryError(
+            f"MemoryError while reading {data_path} (rss_mb={rss_mb:.1f})"
+        ) from exc
     if skipped > 0:
         print(f"  (Skipped {skipped:,} malformed rows)")
 
@@ -661,6 +755,21 @@ def ingest_records(
         log.extend(records[i : i + batch_size])
     elapsed = time.perf_counter_ns() - start
     return elapsed / 1e9
+
+
+def _drain_manual_maintenance(log: Timelog, max_steps: int = 100_000) -> int:
+    """
+    Execute maint_step() until manual maintenance has no pending work.
+
+    Used by demos that run with maintenance="disabled" and want compact()
+    to execute immediately, not just queue a request.
+    """
+    steps = 0
+    while steps < max_steps:
+        if not log.maint_step():
+            return steps
+        steps += 1
+    raise RuntimeError(f"maintenance did not quiesce within {max_steps} steps")
 
 
 def _alternate_dataset_path(data_path: str) -> str | None:
@@ -704,6 +813,9 @@ def _alternate_dataset_path(data_path: str) -> str | None:
 FEATURES: dict[str, dict] = {}
 SHARED_LOG_CATEGORIES = "BCFGHI"  # Categories that reuse a shared Timelog instance
 SELF_CONTAINED_CATEGORIES = "ADEJK"  # Categories that create their own Timelog instances
+REPEATABLE_CATEGORIES = SHARED_LOG_CATEGORIES  # Read-only categories safe to repeat
+DEFAULT_REPEAT_MIN_SECONDS = 0.25
+DEFAULT_REPEAT_MAX_RUNS = 10
 
 
 def feature(code: str, name: str, category: str):
@@ -738,6 +850,9 @@ class DemoRunner:
         reuse_obj: bool = False,
         track_memory: bool = True,
         track_gc: bool = True,
+        repeat_min_seconds: float = DEFAULT_REPEAT_MIN_SECONDS,
+        repeat_max_runs: int = DEFAULT_REPEAT_MAX_RUNS,
+        log_overrides: Optional[dict[str, object]] = None,
     ):
         self.data_path = data_path
         self.limit = 100_000 if quick else 0
@@ -749,9 +864,12 @@ class DemoRunner:
         self.reuse_obj = reuse_obj
         self.track_memory = track_memory
         self.track_gc = track_gc
+        self.repeat_min_seconds = repeat_min_seconds
+        self.repeat_max_runs = repeat_max_runs
         self.results: dict[str, dict] = {}
         self.log: Optional[Timelog] = None
         self._data_loaded = False
+        self.log_overrides = log_overrides or {}
 
     def ensure_data_loaded(self) -> None:
         """Ensure test data is loaded into the log."""
@@ -783,6 +901,35 @@ class DemoRunner:
 
         print(f"  Loaded {total:,} records total")
         self._data_loaded = True
+
+    def _run_feature_with_repeats(
+        self,
+        func: Callable[["DemoRunner"], dict],
+        repeatable: bool,
+    ) -> tuple[dict, int, int]:
+        """Run a feature, repeating if it is fast and safe to retry."""
+        iterations = 0
+        total_records = 0
+        result: dict = {}
+        start = time.perf_counter()
+
+        while True:
+            result = func(self)
+            iterations += 1
+            records = result.get("records", 0)
+            if isinstance(records, (int, float)):
+                total_records += int(records)
+
+            if "error" in result:
+                break
+            if not repeatable:
+                break
+            if iterations >= self.repeat_max_runs:
+                break
+            if time.perf_counter() - start >= self.repeat_min_seconds:
+                break
+
+        return result, iterations, total_records
 
     def run_feature(self, code: str) -> dict:
         """Run a single feature and collect results."""
@@ -823,17 +970,34 @@ class DemoRunner:
                 result = f["func"](self)
                 result["expected"] = f["expected"]
             else:
+                repeatable = (
+                    self.repeat_min_seconds > 0
+                    and self.repeat_max_runs > 1
+                    and f["category"] in REPEATABLE_CATEGORIES
+                )
                 with PerfProfiler(
                     code,
                     f["expected"],
                     track_memory=self.track_memory,
                     track_gc=self.track_gc,
                 ) as profiler:
-                    result = f["func"](self)
-                    profiler.records = result.get("records", 0)
+                    result, iterations, total_records = self._run_feature_with_repeats(
+                        f["func"],
+                        repeatable,
+                    )
+                    profiler.records = total_records
                 perf_result = profiler.report()
                 result.update(perf_result)
+                if repeatable and iterations > 1 and "error" not in result:
+                    result["iterations"] = iterations
+                    result["records_per_run"] = (
+                        total_records / iterations if iterations else 0
+                    )
+                    result["repeat_min_seconds"] = self.repeat_min_seconds
+                    result["repeat_max_runs"] = self.repeat_max_runs
 
+            if self.log_overrides:
+                result["log_overrides"] = self.log_overrides
             self.results[code] = result
 
             # Print results
@@ -889,6 +1053,19 @@ class DemoRunner:
         print("  | MEMORY" + " " * 53 + "|")
         print(f"  |   Peak:           {result.get('memory_peak_mb', 0):>10.1f} MB" + " " * 27 + "|")
         print(f"  |   Allocated:      {result.get('memory_allocated_mb', 0):>10.1f} MB" + " " * 27 + "|")
+        rss_start = result.get("rss_start_mb", 0)
+        rss_end = result.get("rss_end_mb", 0)
+        rss_delta = result.get("rss_delta_mb", 0)
+        print(
+            f"  |   RSS start/end:  {rss_start:>10.1f}/{rss_end:>10.1f} MB"
+            + " " * 14
+            + "|"
+        )
+        print(
+            f"  |   RSS delta:      {rss_delta:>10.1f} MB"
+            + " " * 25
+            + "|"
+        )
         gc0 = result.get("gc_gen0", 0)
         gc1 = result.get("gc_gen1", 0)
         gc2 = result.get("gc_gen2", 0)
@@ -998,6 +1175,9 @@ def export_results_csv(results: dict, path: Path) -> None:
         "records_per_sec",
         "ns_per_record",
         "memory_peak_mb",
+        "rss_start_mb",
+        "rss_end_mb",
+        "rss_delta_mb",
         "gc_gen0",
         "expected_rps",
         "ratio",
@@ -1028,6 +1208,9 @@ def export_results_csv(results: dict, path: Path) -> None:
                 "records_per_sec": rps,
                 "ns_per_record": r.get("ns_per_record", 0),
                 "memory_peak_mb": r.get("memory_peak_mb", 0),
+                "rss_start_mb": r.get("rss_start_mb", 0),
+                "rss_end_mb": r.get("rss_end_mb", 0),
+                "rss_delta_mb": r.get("rss_delta_mb", 0),
                 "gc_gen0": r.get("gc_gen0", 0),
                 "expected_rps": exp_rps,
                 "ratio": rps / exp_rps if exp_rps > 0 else 0,
@@ -1046,6 +1229,18 @@ def print_system_info(info: dict, config: Optional[dict] = None) -> None:
     print(f"  Platform:  {info.get('platform', 'unknown')}")
     print(f"  Processor: {info.get('processor', 'unknown')}")
     print(f"  CPU Count: {info.get('cpu_count', 'unknown')}")
+    if info.get("psutil_available"):
+        print(f"  psutil:    {info.get('psutil_version', 'unknown')}")
+    if "mem_total_gb" in info:
+        print(
+            f"  Memory:    {info.get('mem_available_gb')} GB free / "
+            f"{info.get('mem_total_gb')} GB total ({info.get('mem_percent')}%)"
+        )
+    if "disk_free_gb" in info:
+        print(
+            f"  Disk:      {info.get('disk_free_gb')} GB free / "
+            f"{info.get('disk_total_gb')} GB total"
+        )
     if config:
         print("-" * 80)
         print("RUN CONFIG")
@@ -1110,8 +1305,11 @@ def demo_a0_ingest_breakdown(runner: DemoRunner) -> dict:
         if runner.reuse_obj and records:
             reuse_obj = records[0][1]
             records = [(ts, reuse_obj) for ts, _ in records]
-        with Timelog(time_unit="ns", maintenance="disabled") as log:
+        log = Timelog.for_bulk_ingest(time_unit="ns")
+        try:
             ingest_s = ingest_records(log, records)
+        finally:
+            log.close()
         results["timelog_only"] = {
             "records": len(records),
             "wall_time_s": ingest_s,
@@ -1123,7 +1321,8 @@ def demo_a0_ingest_breakdown(runner: DemoRunner) -> dict:
         BATCH_SIZE = 10_000
         total = 0
         start = time.perf_counter_ns()
-        with Timelog(time_unit="ns", maintenance="disabled") as log:
+        log = Timelog.for_bulk_ingest(time_unit="ns")
+        try:
             batch: list[tuple[int, Order]] = []
             reuse_obj = None
             for ts, order in load_orders(runner.data_path, limit=limit):
@@ -1139,6 +1338,8 @@ def demo_a0_ingest_breakdown(runner: DemoRunner) -> dict:
             if batch:
                 log.extend(batch)
                 total += len(batch)
+        finally:
+            log.close()
         elapsed = time.perf_counter_ns() - start
         end_to_end_s = elapsed / 1e9
         results["end_to_end"] = {
@@ -1163,10 +1364,13 @@ def demo_a1_single_append(runner: DemoRunner) -> dict:
     """Demonstrate single-record append with timing."""
     # Use a fresh Timelog for this test
     count = 0
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 10_000) or 10_000):
             log.append(ts, order)
             count += 1
+    finally:
+        log.close()
     return {"records": count}
 
 
@@ -1178,28 +1382,30 @@ def demo_a2_batch_ingestion(runner: DemoRunner) -> dict:
     total = 0
     busy_count = 0
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         for ts, order in load_orders(runner.data_path, runner.limit):
             batch.append((ts, order))
             if len(batch) >= BATCH_SIZE:
                 try:
                     log.extend(batch)
                 except TimelogBusyError:
-                    # Backpressure is expected with maintenance disabled.
-                    # Flush then retry the same batch to preserve correctness.
+                    # For write-path busy, the batch is already committed.
+                    # Do not retry, or duplicates can be created.
                     busy_count += 1
                     log.flush()
-                    log.extend(batch)
                 total += len(batch)
                 batch.clear()
         if batch:
             try:
                 log.extend(batch)
             except TimelogBusyError:
+                # Batch already committed; only relieve pressure.
                 busy_count += 1
                 log.flush()
-                log.extend(batch)
             total += len(batch)
+    finally:
+        log.close()
 
     return {"records": total, "busy_events": busy_count}
 
@@ -1215,7 +1421,8 @@ def demo_a2b_batch_ingestion_background(runner: DemoRunner) -> dict:
     batch = []
     total = 0
 
-    with Timelog(time_unit="ns", maintenance="background", busy_policy="flush") as log:
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
         for ts, order in load_orders(runner.data_path, runner.limit):
             batch.append((ts, order))
             if len(batch) >= BATCH_SIZE:
@@ -1225,6 +1432,8 @@ def demo_a2b_batch_ingestion_background(runner: DemoRunner) -> dict:
         if batch:
             log.extend(batch)
             total += len(batch)
+    finally:
+        log.close()
 
     return {"records": total}
 
@@ -1233,10 +1442,13 @@ def demo_a2b_batch_ingestion_background(runner: DemoRunner) -> dict:
 def demo_a3_streaming_ingestion(runner: DemoRunner) -> dict:
     """Simulate real-time order feed with rate tracking."""
     count = 0
-    with Timelog(time_unit="ns", maintenance="background") as log:
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
         for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000):
             log.append(ts, order)
             count += 1
+    finally:
+        log.close()
     return {"records": count}
 
 
@@ -1252,37 +1464,42 @@ def demo_a4_out_of_order(runner: DemoRunner) -> dict:
     random.shuffle(records)
 
     # Use background maintenance to handle backpressure
-    with Timelog(time_unit="ns", maintenance="background", busy_policy="flush") as log:
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
         # Batch insert, handling potential backpressure
         BATCH_SIZE = 5_000
         for i in range(0, len(records), BATCH_SIZE):
             batch = records[i : i + BATCH_SIZE]
             log.extend(batch)
+    finally:
+        log.close()
 
     return {"records": len(records)}
 
 
 @feature("A5", "Backpressure handling", "A")
 def demo_a5_backpressure(runner: DemoRunner) -> dict:
-    """Handle TimelogBusyError gracefully."""
+    """Handle TimelogBusyError without retrying already-committed writes."""
     busy_count = 0
     total = 0
 
-    with Timelog(
+    log = Timelog.for_low_latency(
         time_unit="ns",
         sealed_max_runs=1,
         memtable_max_bytes=64 * 1024,
-        busy_policy="raise",
-    ) as log:
+    )
+    try:
         for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 20_000) or 20_000):
             try:
                 log.append(ts, order)
                 total += 1
             except TimelogBusyError:
+                # append() committed; avoid retrying the same row.
                 busy_count += 1
                 log.flush()
-                log.append(ts, order)
                 total += 1
+    finally:
+        log.close()
 
     return {"records": total, "busy_events": busy_count}
 
@@ -1305,10 +1522,13 @@ def demo_a6_order_sensitivity(runner: DemoRunner) -> dict:
     for label, path in [("primary", runner.data_path), ("alternate", alt_path)]:
         records = list(load_orders(path, limit=limit))
         start = time.perf_counter_ns()
-        with Timelog(time_unit="ns", maintenance="background", busy_policy="flush") as log:
+        log = Timelog.for_streaming(time_unit="ns")
+        try:
             BATCH_SIZE = 10_000
             for i in range(0, len(records), BATCH_SIZE):
                 log.extend(records[i : i + BATCH_SIZE])
+        finally:
+            log.close()
         elapsed = time.perf_counter_ns() - start
 
         wall_s = elapsed / 1e9
@@ -1432,6 +1652,179 @@ def demo_b6_microsecond_window(runner: DemoRunner) -> dict:
 
     # Treat "records" as query count for throughput calculation.
     return {"records": queries, "queries": queries, "total_found": total_found, "window_ns": window_ns}
+
+
+@feature("B7", "len(log) full count benchmark", "B")
+def demo_b7_len_full_count(runner: DemoRunner) -> dict:
+    """Benchmark full timelog length calls under heavy loaded state."""
+    runner.ensure_data_loaded()
+
+    expected_full_count = None
+    b4_result = runner.results.get("B4")
+    if isinstance(b4_result, dict) and "error" not in b4_result:
+        b4_count = b4_result.get("records")
+        if isinstance(b4_count, int) and b4_count >= 0:
+            expected_full_count = b4_count
+    if expected_full_count is None:
+        expected_full_count = sum(1 for _ in runner.log)
+
+    # Warmup to reduce one-time effects.
+    for _ in range(3):
+        _ = len(runner.log)
+
+    target_seconds = 2.0 if runner.limit else 6.0
+    max_calls = 5_000 if runner.limit else 25_000
+    deadline = time.perf_counter() + target_seconds
+    lat = LatencyStats()
+    mismatch_calls = 0
+    calls = 0
+    len_value_last = 0
+
+    while calls < max_calls and time.perf_counter() < deadline:
+        t0 = time.perf_counter_ns()
+        got = len(runner.log)
+        dt = time.perf_counter_ns() - t0
+        lat.add(dt)
+        calls += 1
+        len_value_last = got
+        if got != expected_full_count:
+            mismatch_calls += 1
+
+    return {
+        "records": calls,  # operation count for throughput
+        "len_value_last": len_value_last,
+        "expected_full_count": expected_full_count,
+        "mismatch_calls": mismatch_calls,
+        "latency_ns": lat.summary(),
+    }
+
+
+@feature("B8", "len(slice) remaining-count benchmark", "B")
+def demo_b8_len_slice_count(runner: DemoRunner) -> dict:
+    """Benchmark len() on slice iterators and verify remaining-length contract."""
+    runner.ensure_data_loaded()
+
+    anchors: list[int] = []
+    for i, (ts, _) in enumerate(runner.log):
+        if i % 64 == 0:
+            anchors.append(ts)
+        if i >= 10_000:
+            break
+
+    if len(anchors) < 2:
+        return {"records": 0, "error": "insufficient anchors for slice len benchmark"}
+
+    def pick_range() -> tuple[int, int]:
+        i = random.randint(0, len(anchors) - 1)
+        j = min(len(anchors) - 1, i + random.randint(1, max(1, len(anchors) // 10)))
+        t1 = anchors[i]
+        t2 = anchors[j] + 1 if anchors[j] >= t1 else t1 + 1
+        return t1, t2
+
+    def make_iter(variant: str, t1: int, t2: int) -> TimelogIter:
+        if variant == "range":
+            return runner.log[t1:t2]
+        if variant == "since":
+            return runner.log[t1:]
+        if variant == "until":
+            return runner.log[:t2]
+        return runner.log[:]
+
+    def expected_count(variant: str, t1: int, t2: int) -> int:
+        if variant == "range":
+            return sum(1 for _ in runner.log[t1:t2])
+        if variant == "since":
+            return sum(1 for _ in runner.log[t1:])
+        if variant == "until":
+            return sum(1 for _ in runner.log[:t2])
+        return sum(1 for _ in runner.log[:])
+
+    # Contract probe before timing loop.
+    contract_failures: list[str] = []
+    probe_variants = ["range", "since", "until", "all"]
+    probe_count = min(8, len(anchors))
+    for i in range(probe_count):
+        variant = probe_variants[i % len(probe_variants)]
+        t1, t2 = pick_range()
+        it = None
+        try:
+            exp = expected_count(variant, t1, t2)
+            it = make_iter(variant, t1, t2)
+            before = len(it)
+            if before != exp:
+                contract_failures.append(
+                    f"{variant}:len_mismatch expected={exp} got={before} t1={t1} t2={t2}"
+                )
+                continue
+
+            consume_target = min(3, before)
+            consumed = 0
+            for _ in range(consume_target):
+                try:
+                    next(it)
+                    consumed += 1
+                except StopIteration:
+                    break
+            after = len(it)
+            if after != before - consumed:
+                contract_failures.append(
+                    f"{variant}:remaining_mismatch before={before} consumed={consumed} after={after}"
+                )
+                continue
+
+            it.close()
+            closed_len = len(it)
+            if closed_len != 0:
+                contract_failures.append(f"{variant}:closed_len_not_zero got={closed_len}")
+        except Exception as exc:
+            contract_failures.append(f"{variant}:exception {exc!r}")
+        finally:
+            if it is not None:
+                try:
+                    it.close()
+                except Exception:
+                    pass
+
+    # Timed len(slice) benchmark.
+    target_seconds = 2.0 if runner.limit else 6.0
+    max_calls = 8_000 if runner.limit else 30_000
+    deadline = time.perf_counter() + target_seconds
+    lat = LatencyStats()
+    variant_mix: Counter[str] = Counter()
+    total_returned = 0
+    calls = 0
+    variants = ["range", "since", "until", "all"]
+
+    while calls < max_calls and time.perf_counter() < deadline:
+        variant = random.choice(variants)
+        t1, t2 = pick_range()
+        it = None
+        t0 = time.perf_counter_ns()
+        n = 0
+        try:
+            it = make_iter(variant, t1, t2)
+            n = len(it)
+        finally:
+            if it is not None:
+                try:
+                    it.close()
+                except Exception:
+                    pass
+        dt = time.perf_counter_ns() - t0
+        lat.add(dt)
+        calls += 1
+        variant_mix[variant] += 1
+        total_returned += n
+
+    avg_returned_len = (total_returned / calls) if calls > 0 else 0.0
+    return {
+        "records": calls,  # operation count for throughput
+        "variant_mix": dict(sorted(variant_mix.items())),
+        "contract_failures": len(contract_failures),
+        "contract_failure_samples": contract_failures[:10],
+        "avg_returned_len": avg_returned_len,
+        "latency_ns": lat.summary(),
+    }
 
 
 # =============================================================================
@@ -1685,12 +2078,13 @@ def demo_c8_latency_histogram(runner: DemoRunner) -> dict:
 
 
 @feature("D1", "Delete time range", "D")
-def demo_d1_delete_range(runner: DemoRunner) -> dict:
+def demo_d1_delete(runner: DemoRunner) -> dict:
     """Delete orders in specific time window."""
     # Use a fresh log for deletion tests
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
 
         first = next(iter(log))[0]
@@ -1698,26 +2092,31 @@ def demo_d1_delete_range(runner: DemoRunner) -> dict:
         del_end = del_start + 5_000_000_000  # 5 second window
 
         before = sum(1 for _ in log[del_start:del_end])
-        log.delete_range(del_start, del_end)
+        log.delete(del_start, del_end)
         after = sum(1 for _ in log[del_start:del_end])
+    finally:
+        log.close()
 
     return {"records": len(records), "before": before, "after": after}
 
 
 @feature("D2", "Evict old data", "D")
 def demo_d2_evict_old_data(runner: DemoRunner) -> dict:
-    """TTL-style cleanup with delete_before()."""
+    """TTL-style cleanup with cutoff()."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
 
         first = next(iter(log))[0]
         cutoff = first + 30_000_000_000  # 30 seconds
 
         before = sum(1 for _ in log[:cutoff])
-        log.delete_before(cutoff)
+        log.cutoff(cutoff)
         after = sum(1 for _ in log[:cutoff])
+    finally:
+        log.close()
 
     return {"records": len(records), "before": before, "after": after}
 
@@ -1727,15 +2126,18 @@ def demo_d3_verify_deletion(runner: DemoRunner) -> dict:
     """Confirm tombstones work with point query."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 10_000) or 10_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
 
         # Get a timestamp we know exists
         target_ts = records[100][0]
 
         before = list(log.at(target_ts))
-        log.delete_range(target_ts, target_ts + 1)
+        log.delete(target_ts, target_ts + 1)
         after = list(log.at(target_ts))
+    finally:
+        log.close()
 
     return {
         "records": len(records),
@@ -1750,7 +2152,8 @@ def demo_d4_query_after_delete(runner: DemoRunner) -> dict:
     """Verify gap in results after deletion."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
 
         first = next(iter(log))[0]
@@ -1760,13 +2163,16 @@ def demo_d4_query_after_delete(runner: DemoRunner) -> dict:
         # Delete middle portion
         del_start = first + 20_000_000_000
         del_end = first + 40_000_000_000
-        log.delete_range(del_start, del_end)
+        log.delete(del_start, del_end)
 
         # Query the full range
         results = list(log[query_start:query_end])
 
         # Verify no results in deleted range
-        in_deleted = sum(1 for ts, _ in results if del_start <= ts < del_end)
+    finally:
+        log.close()
+
+    in_deleted = sum(1 for ts, _ in results if del_start <= ts < del_end)
 
     return {
         "records": len(results),
@@ -1784,37 +2190,48 @@ def demo_e1_manual_flush(runner: DemoRunner) -> dict:
     """Force memtable to L0 segment."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
         log.flush()
+    finally:
+        log.close()
 
     return {"records": len(records)}
 
 
 @feature("E2", "Request compaction", "E")
 def demo_e2_request_compaction(runner: DemoRunner) -> dict:
-    """Trigger compaction."""
+    """Trigger compaction and execute it in manual-maintenance mode."""
     records = list(load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000))
 
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    maint_steps = 0
+    try:
         # Load in batches to create multiple memruns
         batch_size = 10_000
         for i in range(0, len(records), batch_size):
             log.extend(records[i : i + batch_size])
             log.flush()
         log.compact()
+        maint_steps = _drain_manual_maintenance(log)
+    finally:
+        log.close()
 
-    return {"records": len(records)}
+    return {"records": len(records), "maint_steps": maint_steps}
 
 
 @feature("E3", "Background mode", "E")
 def demo_e3_background_mode(runner: DemoRunner) -> dict:
     """Auto flush/compact with maintenance='background'."""
     count = 0
-    with Timelog(time_unit="ns", maintenance="background") as log:
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
         for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 50_000) or 50_000):
             log.append(ts, order)
             count += 1
+    finally:
+        log.close()
 
     return {"records": count}
 
@@ -1824,8 +2241,11 @@ def demo_e4_maintenance_lifecycle(runner: DemoRunner) -> dict:
     """Control background worker with start/stop."""
     count = 0
     # Must initialize with maintenance="background" to allow start/stop.
-    with Timelog(time_unit="ns", maintenance="background") as log:
-        for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 20_000) or 20_000):
+    log = Timelog.for_streaming(time_unit="ns")
+    try:
+        for ts, order in load_orders(
+            runner.data_path, limit=min(runner.limit, 20_000) or 20_000
+        ):
             log.append(ts, order)
             count += 1
 
@@ -1834,12 +2254,16 @@ def demo_e4_maintenance_lifecycle(runner: DemoRunner) -> dict:
         log.start_maintenance()
 
         # Add more data
-        for ts, order in load_orders(runner.data_path, limit=min(runner.limit, 20_000) or 20_000):
+        for ts, order in load_orders(
+            runner.data_path, limit=min(runner.limit, 20_000) or 20_000
+        ):
             log.append(ts, order)
             count += 1
 
         # Stop maintenance
         log.stop_maintenance()
+    finally:
+        log.close()
 
     return {"records": count}
 
@@ -1861,11 +2285,11 @@ def demo_f1_pagespan_iteration(runner: DemoRunner) -> dict:
     span_count = 0
     total_timestamps = 0
 
-    with runner.log.page_spans(first, first + window) as spans:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            span_count += 1
-            total_timestamps += len(span)
-            span.close()
+            with span:
+                span_count += 1
+                total_timestamps += len(span)
 
     return {"records": total_timestamps, "spans": span_count}
 
@@ -1882,17 +2306,17 @@ def demo_f2_timestamp_memoryview(runner: DemoRunner) -> dict:
     total_timestamps = 0
     first_ts = last_ts = 0
 
-    with runner.log.page_spans(first, first + window) as spans:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            mv = span.timestamps
-            total_timestamps += len(mv)
-            if len(mv) > 0:
-                if first_ts == 0:
-                    first_ts = mv[0]
-                last_ts = mv[-1]
-            # Release the buffer view before closing the span to avoid UAF.
-            del mv
-            span.close()
+            with span as live_span:
+                mv = live_span.timestamps
+                total_timestamps += len(mv)
+                if len(mv) > 0:
+                    if first_ts == 0:
+                        first_ts = mv[0]
+                    last_ts = mv[-1]
+                # Release the buffer view before closing the span to avoid UAF.
+                del mv
 
     return {
         "records": total_timestamps,
@@ -1913,13 +2337,13 @@ def demo_f3_objects_view(runner: DemoRunner) -> dict:
     total_objects = 0
     tickers = set()
 
-    with runner.log.page_spans(first, first + window) as spans:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            objects = span.objects()
-            total_objects += len(objects)
-            for obj in objects:
-                tickers.add(obj.ticker)
-            span.close()
+            with span as live_span:
+                objects = live_span.objects()
+                total_objects += len(objects)
+                for obj in objects:
+                    tickers.add(obj.ticker)
 
     return {"records": total_objects, "unique_tickers": len(tickers)}
 
@@ -1939,16 +2363,16 @@ def demo_f4_numpy_integration(runner: DemoRunner) -> dict:
     total_timestamps = 0
     avg_gap = 0.0
 
-    with runner.log.page_spans(first, first + window) as spans:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            arr = np.asarray(span.timestamps)  # Zero-copy!
-            total_timestamps += len(arr)
-            if len(arr) > 1:
-                diffs = np.diff(arr)
-                avg_gap = float(np.mean(diffs))
-            # Release the NumPy view before closing the span to avoid UAF.
-            del arr
-            span.close()
+            with span as live_span:
+                arr = np.asarray(live_span.timestamps)  # Zero-copy!
+                total_timestamps += len(arr)
+                if len(arr) > 1:
+                    diffs = np.diff(arr)
+                    avg_gap = float(np.mean(diffs))
+                # Release the NumPy view before closing the span to avoid UAF.
+                del arr
             break  # Just first span for demo
 
     return {"records": total_timestamps, "dtype": "int64", "avg_gap_ns": avg_gap}
@@ -1969,13 +2393,13 @@ def demo_f5_bulk_statistics(runner: DemoRunner) -> dict:
     all_timestamps = []
     total = 0
 
-    with runner.log.page_spans(first, first + window) as spans:
+    with runner.log.views(first, first + window) as spans:
         for span in spans:
-            # Copy the array data since we need it after the span closes
-            arr = np.array(span.timestamps, copy=True)
-            all_timestamps.append(arr)
-            total += len(arr)
-            span.close()
+            with span as live_span:
+                # Copy the array data since we need it after the span closes
+                arr = np.array(live_span.timestamps, copy=True)
+                all_timestamps.append(arr)
+                total += len(arr)
 
     if all_timestamps:
         combined = np.concatenate(all_timestamps)
@@ -2024,15 +2448,18 @@ def demo_g1_batch_iteration(runner: DemoRunner) -> dict:
 
 @feature("G2", "Context manager", "G")
 def demo_g2_context_manager(runner: DemoRunner) -> dict:
-    """RAII-style cleanup with context manager."""
+    """Explicit iterator close (no context manager)."""
     runner.ensure_data_loaded()
     first = next(iter(runner.log))[0]
     window = 60_000_000_000  # 1 minute
 
     count = 0
-    with runner.log[first : first + window] as it:
+    it = runner.log[first : first + window]
+    try:
         for _ in it:
             count += 1
+    finally:
+        it.close()
 
     return {"records": count}
 
@@ -2232,11 +2659,11 @@ def demo_i1_memtable_read(runner: DemoRunner) -> dict:
     """
     # Create a fresh Timelog with NO background maintenance so data stays in memtable.
     # Use a larger memtable to avoid accidental flush on this synthetic workload.
-    with Timelog(
+    log = Timelog.for_bulk_ingest(
         time_unit="ns",
-        maintenance="disabled",
         memtable_max_bytes=32 * 1024 * 1024,
-    ) as log:
+    )
+    try:
         # Write fresh data (stays in memtable since no flush)
         base_ts = 2_000_000_000_000_000_000  # Far future to avoid conflicts
         batch = []
@@ -2261,6 +2688,8 @@ def demo_i1_memtable_read(runner: DemoRunner) -> dict:
             count += 1
 
         return {"records": count, "source": "memtable"}
+    finally:
+        log.close()
 
 
 @feature("I2", "Cold data read (segments)", "I")
@@ -2353,7 +2782,8 @@ def demo_j1_iteration_count(runner: DemoRunner) -> dict:
     If iterations << result_size, we have a different bug (missing results).
     """
     # Create our own log for this test
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         # Load some test data
         base_ts = 1_000_000_000_000_000_000
         batch = []
@@ -2404,6 +2834,8 @@ def demo_j1_iteration_count(runner: DemoRunner) -> dict:
             "all_correct": all_correct,
             "complexity_verified": "O(M)" if all_correct else "ANOMALY",
         }
+    finally:
+        log.close()
 
 
 @feature("J2", "Verify scaling behavior", "J")
@@ -2423,7 +2855,8 @@ def demo_j2_scaling_test(runner: DemoRunner) -> dict:
     times = []
 
     for size in sizes:
-        with Timelog(time_unit="ns", maintenance="disabled") as log:
+        log = Timelog.for_bulk_ingest(time_unit="ns")
+        try:
             # Generate test data
             base_ts = 1_000_000_000_000_000_000
             batch = []
@@ -2449,6 +2882,8 @@ def demo_j2_scaling_test(runner: DemoRunner) -> dict:
                 count += 1
             elapsed = time.perf_counter_ns() - start
             times.append(elapsed)
+        finally:
+            log.close()
 
     # Calculate scaling exponent using linear regression on log-log
     # log(time) = exponent * log(size) + c
@@ -2503,7 +2938,8 @@ def demo_j3_no_quadratic(runner: DemoRunner) -> dict:
     prev_time = None
 
     for size in [2000, 4000, 8000, 16000]:
-        with Timelog(time_unit="ns", maintenance="disabled") as log:
+        log = Timelog.for_bulk_ingest(time_unit="ns")
+        try:
             base_ts = 1_000_000_000_000_000_000
             batch = []
             for i in range(size):
@@ -2531,6 +2967,8 @@ def demo_j3_no_quadratic(runner: DemoRunner) -> dict:
                 ratios.append({"size": size, "time_ns": elapsed, "ratio": ratio})
 
             prev_time = elapsed
+        finally:
+            log.close()
 
     # Check if any ratio is >= 3.5 (would indicate O(N^2))
     avg_ratio = sum(r["ratio"] for r in ratios) / len(ratios) if ratios else 0
@@ -2566,13 +3004,12 @@ def demo_k1_append_latency_background(runner: DemoRunner) -> dict:
         "sealed_max_runs": 2,
     }
 
-    with Timelog(
+    log = Timelog.for_streaming(
         time_unit="ns",
-        maintenance="background",
-        busy_policy="flush",
         memtable_max_bytes=cfg["memtable_max_bytes"],
         sealed_max_runs=cfg["sealed_max_runs"],
-    ) as log:
+    )
+    try:
         base_ts = 3_000_000_000_000_000_000
         for ts, order in iter_synthetic_records(
             count, base_ts, reuse_obj=runner.reuse_obj
@@ -2583,6 +3020,8 @@ def demo_k1_append_latency_background(runner: DemoRunner) -> dict:
             lat.add(dt)
             if dt > spike_threshold_ns:
                 spikes += 1
+    finally:
+        log.close()
 
     return {
         "records": count,
@@ -2605,13 +3044,14 @@ def demo_k1b_append_latency_manual(runner: DemoRunner) -> dict:
     flush_every = 10_000
     compact_every = 5
     flush_count = 0
+    compact_steps: list[int] = []
 
-    with Timelog(
+    log = Timelog.for_bulk_ingest(
         time_unit="ns",
-        maintenance="disabled",
         memtable_max_bytes=128 * 1024,
         sealed_max_runs=2,
-    ) as log:
+    )
+    try:
         base_ts = 4_000_000_000_000_000_000
         for i, (ts, order) in enumerate(
             iter_synthetic_records(count, base_ts, reuse_obj=runner.reuse_obj)
@@ -2628,13 +3068,17 @@ def demo_k1b_append_latency_manual(runner: DemoRunner) -> dict:
                 if flush_count % compact_every == 0:
                     t1 = time.perf_counter_ns()
                     log.compact()
+                    compact_steps.append(_drain_manual_maintenance(log))
                     compact_times.append((time.perf_counter_ns() - t1) / 1e6)
+    finally:
+        log.close()
 
     return {
         "records": count,
         "latency_ns": lat.summary(),
         "flush_times_ms": flush_times,
         "compact_times_ms": compact_times,
+        "compact_maint_steps": compact_steps,
         "reuse_obj": runner.reuse_obj,
         "config": {
             "maintenance": "disabled",
@@ -2656,11 +3100,11 @@ def demo_k2_mixed_hot(runner: DemoRunner) -> dict:
     total_written = 0
     total_read = 0
 
-    with Timelog(
+    log = Timelog.for_bulk_ingest(
         time_unit="ns",
-        maintenance="disabled",
         memtable_max_bytes=32 * 1024 * 1024,
-    ) as log:
+    )
+    try:
         base_ts = 5_000_000_000_000_000_000
         ts = base_ts
 
@@ -2678,6 +3122,8 @@ def demo_k2_mixed_hot(runner: DemoRunner) -> dict:
             t1 = time.perf_counter_ns()
             total_read += sum(1 for _ in log[start:end])
             read_time_ns += time.perf_counter_ns() - t1
+    finally:
+        log.close()
 
     return {
         "records": total_written,
@@ -2702,11 +3148,11 @@ def demo_k3_mixed_cold(runner: DemoRunner) -> dict:
     total_written = 0
     total_read = 0
 
-    with Timelog(
+    log = Timelog.for_bulk_ingest(
         time_unit="ns",
-        maintenance="disabled",
         memtable_max_bytes=4 * 1024 * 1024,
-    ) as log:
+    )
+    try:
         base_ts = 6_000_000_000_000_000_000
         ts = base_ts
 
@@ -2730,6 +3176,8 @@ def demo_k3_mixed_cold(runner: DemoRunner) -> dict:
                 t1 = time.perf_counter_ns()
                 total_read += sum(1 for _ in log[start:end])
                 read_time_ns += time.perf_counter_ns() - t1
+    finally:
+        log.close()
 
     return {
         "records": total_written,
@@ -2752,12 +3200,13 @@ def demo_k4_delete_impact(runner: DemoRunner) -> dict:
     results: dict[str, dict] = {}
 
     # Hot delete: before flush
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
         t0 = time.perf_counter_ns()
         before = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t1 = time.perf_counter_ns()
-        log.delete_range(base_ts + 10_000, base_ts + 20_000)
+        log.delete(base_ts + 10_000, base_ts + 20_000)
         t2 = time.perf_counter_ns()
         after = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t3 = time.perf_counter_ns()
@@ -2767,20 +3216,24 @@ def demo_k4_delete_impact(runner: DemoRunner) -> dict:
             "delete_ms": (t2 - t1) / 1e6,
             "read_after_rps": after / ((t3 - t2) / 1e9) if t3 > t2 else 0,
         }
+    finally:
+        log.close()
 
     # Cold delete: after flush + compaction recovery
-    with Timelog(time_unit="ns", maintenance="disabled") as log:
+    log = Timelog.for_bulk_ingest(time_unit="ns")
+    try:
         log.extend(records)
         log.flush()
         t0 = time.perf_counter_ns()
         before = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t1 = time.perf_counter_ns()
-        log.delete_range(base_ts + 10_000, base_ts + 20_000)
+        log.delete(base_ts + 10_000, base_ts + 20_000)
         t2 = time.perf_counter_ns()
         after = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t3 = time.perf_counter_ns()
         t4 = time.perf_counter_ns()
         log.compact()
+        maint_steps = _drain_manual_maintenance(log)
         t5 = time.perf_counter_ns()
         after_compact = sum(1 for _ in log[base_ts : base_ts + total * 1000])
         t6 = time.perf_counter_ns()
@@ -2790,8 +3243,14 @@ def demo_k4_delete_impact(runner: DemoRunner) -> dict:
             "delete_ms": (t2 - t1) / 1e6,
             "read_after_rps": after / ((t3 - t2) / 1e9) if t3 > t2 else 0,
             "compact_ms": (t5 - t4) / 1e6,
-            "read_after_compact_rps": after_compact / ((t6 - t5) / 1e9) if t6 > t5 else 0,
+            "compact_maint_steps": maint_steps,
+            "read_after_compact_rps": after_compact
+            / ((t6 - t5) / 1e9)
+            if t6 > t5
+            else 0,
         }
+    finally:
+        log.close()
 
     return {"records": total, "results": results}
 
@@ -2828,36 +3287,34 @@ def demo_k5_a2b_stress_grid(runner: DemoRunner) -> dict:
             for mem_bytes in memtables:
                 for runs in sealed_runs:
                     busy_events = 0
-                    failed_batches = 0
+                    busy_action_failures = 0
                     inserted = 0
                     batch_size = 1000
                     start = time.perf_counter_ns()
-                    with Timelog(
+                    log = Timelog(
                         time_unit="ns",
                         maintenance=maintenance,
                         busy_policy=busy_policy,
                         memtable_max_bytes=mem_bytes,
                         sealed_max_runs=runs,
-                    ) as log:
+                    )
+                    try:
                         for i in range(0, len(records), batch_size):
                             batch = records[i : i + batch_size]
-                            attempts = 0
-                            while True:
+                            try:
+                                log.extend(batch)
+                                inserted += len(batch)
+                            except TimelogBusyError:
+                                # extend() committed; do not retry this batch.
+                                busy_events += 1
+                                inserted += len(batch)
+                                # Best-effort pressure relief for subsequent batches.
                                 try:
-                                    log.extend(batch)
-                                    inserted += len(batch)
-                                    break
-                                except TimelogBusyError:
-                                    busy_events += 1
-                                    attempts += 1
-                                    # Best-effort flush before retrying.
-                                    try:
-                                        log.flush()
-                                    except Exception:
-                                        pass
-                                    if attempts >= 2:
-                                        failed_batches += 1
-                                        break
+                                    log.flush()
+                                except Exception:
+                                    busy_action_failures += 1
+                    finally:
+                        log.close()
                     elapsed = time.perf_counter_ns() - start
                     rps = inserted / (elapsed / 1e9) if elapsed > 0 else 0
                     grid.append(
@@ -2870,7 +3327,7 @@ def demo_k5_a2b_stress_grid(runner: DemoRunner) -> dict:
                             "attempted_records": len(records),
                             "records_per_sec": rps,
                             "busy_events": busy_events,
-                            "failed_batches": failed_batches,
+                            "busy_action_failures": busy_action_failures,
                         }
                     )
 
@@ -2935,8 +3392,59 @@ def main():
         action="store_true",
         help="Disable tracemalloc to reduce measurement overhead",
     )
+    parser.add_argument(
+        "--repeat-min-seconds",
+        type=float,
+        default=DEFAULT_REPEAT_MIN_SECONDS,
+        help="Repeat fast read-only features until this duration (0 disables)",
+    )
+    parser.add_argument(
+        "--repeat-max-runs",
+        type=int,
+        default=DEFAULT_REPEAT_MAX_RUNS,
+        help="Max repeats for fast read-only features",
+    )
+    parser.add_argument(
+        "--force-maintenance",
+        choices=["disabled", "background"],
+        help="Override maintenance mode for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-busy-policy",
+        choices=["raise", "silent", "flush"],
+        help="Override busy_policy for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-memtable-max-bytes",
+        type=int,
+        help="Override memtable_max_bytes for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-target-page-bytes",
+        type=int,
+        help="Override target_page_bytes for all Timelog instances in this run",
+    )
+    parser.add_argument(
+        "--force-sealed-max-runs",
+        type=int,
+        help="Override sealed_max_runs for all Timelog instances in this run",
+    )
 
     args = parser.parse_args()
+
+    log_overrides: dict[str, object] = {}
+    if args.force_maintenance is not None:
+        log_overrides["maintenance"] = args.force_maintenance
+    if args.force_busy_policy is not None:
+        log_overrides["busy_policy"] = args.force_busy_policy
+    if args.force_memtable_max_bytes is not None:
+        log_overrides["memtable_max_bytes"] = args.force_memtable_max_bytes
+    if args.force_target_page_bytes is not None:
+        log_overrides["target_page_bytes"] = args.force_target_page_bytes
+    if args.force_sealed_max_runs is not None:
+        log_overrides["sealed_max_runs"] = args.force_sealed_max_runs
+    if log_overrides:
+        _install_timelog_overrides(log_overrides)
 
     # Handle --list
     if args.list:
@@ -2962,6 +3470,9 @@ def main():
         "ingest_mode": args.ingest_mode,
         "reuse_obj": args.reuse_obj,
         "tracemalloc": not args.no_tracemalloc,
+        "repeat_min_seconds": args.repeat_min_seconds,
+        "repeat_max_runs": args.repeat_max_runs,
+        "log_overrides": log_overrides,
     }
     print_system_info(system_info, run_config)
 
@@ -2983,6 +3494,9 @@ def main():
         reuse_obj=args.reuse_obj,
         track_memory=not args.no_tracemalloc,
         track_gc=not args.no_tracemalloc,
+        repeat_min_seconds=args.repeat_min_seconds,
+        repeat_max_runs=args.repeat_max_runs,
+        log_overrides=log_overrides,
     )
 
     print()
@@ -2999,18 +3513,24 @@ def main():
         # Single feature - need a log for shared-log categories
         category = args.feature[0].upper()
         if category in SHARED_LOG_CATEGORIES:
-            with Timelog(time_unit="ns", maintenance="background") as log:
+            log = Timelog.for_streaming(time_unit="ns")
+            try:
                 runner.log = log
                 runner.run_feature(args.feature.upper())
+            finally:
+                log.close()
         else:
             runner.run_feature(args.feature.upper())
     elif args.category:
         # Single category
         category = args.category.upper()
         if category in SHARED_LOG_CATEGORIES:
-            with Timelog(time_unit="ns", maintenance="background") as log:
+            log = Timelog.for_streaming(time_unit="ns")
+            try:
                 runner.log = log
                 runner.run_category(category)
+            finally:
+                log.close()
         else:
             runner.run_category(category)
     else:
@@ -3018,10 +3538,13 @@ def main():
         for cat in SELF_CONTAINED_CATEGORIES:
             runner.run_category(cat)
 
-        with Timelog(time_unit="ns", maintenance="background") as log:
+        log = Timelog.for_streaming(time_unit="ns")
+        try:
             runner.log = log
             for cat in SHARED_LOG_CATEGORIES:
                 runner.run_category(cat)
+        finally:
+            log.close()
 
     # Print summary
     print()

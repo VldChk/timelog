@@ -54,6 +54,10 @@ extern "C" {
  * - Maintenance (tl_maint_start, tl_maint_stop):
  *   Thread-safe. See function docs for mode constraints and idempotency.
  *   tl_maint_step is NOT thread-safe (manual mode only).
+ *
+ * - Lifecycle (tl_close):
+ *   NOT thread-safe. tl_close() must not race with any other API call on
+ *   the same instance. Caller must ensure exclusive access during close.
  *===========================================================================*/
 
 /*===========================================================================
@@ -78,8 +82,9 @@ typedef int64_t  tl_ts_t;
  * Records with ts == TL_TS_MAX are fully supported and can be:
  * - Appended via tl_append()
  * - Queried via tl_iter_equal(snap, TL_TS_MAX, &it)
- * - Deleted via tl_delete_range(): use a range ending before TL_TS_MAX,
- *   or use internal unbounded tombstone APIs for [TL_TS_MAX, +inf)
+ * - Deleted via tl_delete_range(): use a range ending before TL_TS_MAX.
+ *   The public API does NOT expose unbounded delete-to-infinity; that is
+ *   reserved for internal maintenance paths.
  *
  * NOTE: The half-open interval [TL_TS_MAX, TL_TS_MAX+1) cannot be expressed
  * in signed int64 arithmetic without overflow. For records at exactly TL_TS_MAX,
@@ -110,17 +115,33 @@ typedef struct tl_record {
  * - TL_EINVAL:    Invalid argument (NULL pointer, invalid range t1>=t2,
  *                 invalid config value, out-of-bounds index)
  * - TL_ESTATE:    Invalid state (e.g., instance not open, wrong maint mode)
- * - TL_EBUSY:     Resource temporarily busy (e.g., backpressure from sealed
- *                 memruns, compaction manifest conflict - retryable)
- * - TL_ENOMEM:    Memory allocation failed (often retryable after wait)
+ * - TL_EBUSY:     Resource temporarily busy. Context-dependent:
+ *                 - Write APIs (tl_append*, tl_delete*): Write WAS accepted,
+ *                   but a seal/maintenance issue occurred:
+ *                   (a) Sealed queue full (backpressure), OR
+ *                   (b) Seal allocation failed (rare TL_ENOMEM remapped), OR
+ *                   (c) OOO head flush failed after insert (runset allocation/backpressure).
+ *                   DO NOT RETRY - would cause duplicates. In manual mode
+ *                   call flush(); in background mode worker handles it.
+ *                 - Maintenance/flush APIs (tl_flush, tl_maint_step):
+ *                   Publish retry exhausted due to concurrent manifest change.
+ *                   NO data loss; safe to retry after a short delay.
+ *                 - tl_maint_start(): Stop in progress - retry later.
+ * - TL_ENOMEM:    Memory allocation failed. For write APIs (tl_append*),
+ *                 this means NO data was inserted - caller can rollback
+ *                 (e.g., DECREF handles) and retry later.
  * - TL_EOVERFLOW: Arithmetic overflow (extreme timestamp calculations,
- *                 array size overflow - usually non-retryable)
+ *                 array size overflow). For write APIs, this means NO
+ *                 data was inserted - caller can rollback and retry.
  * - TL_EINTERNAL: Internal error (thread creation failed, invariant violation
  *                 - should not occur in normal operation)
  *
- * Retryability:
- * - TL_EBUSY, TL_ENOMEM: Typically retryable after short delay
- * - TL_EINVAL, TL_ESTATE, TL_EOVERFLOW: Not retryable without caller fix
+ * Retryability guide:
+ * - TL_EBUSY for writes: NOT retryable (data is already in log)
+ * - TL_EBUSY for maintenance/flush: Retryable (publish conflict)
+ * - TL_EBUSY for tl_maint_start: Retryable after short delay
+ * - TL_ENOMEM/TL_EOVERFLOW for writes: Retryable (no data was inserted)
+ * - TL_EINVAL, TL_ESTATE: Not retryable without caller fix
  * - TL_EINTERNAL: Usually indicates a bug; may or may not be retryable
  *===========================================================================*/
 
@@ -129,7 +150,7 @@ typedef enum tl_status {
     TL_EOF       = 1,   /* End of iteration / no work */
     TL_EINVAL    = 10,  /* Invalid argument */
     TL_ESTATE    = 20,  /* Invalid state */
-    TL_EBUSY     = 21,  /* Resource busy (retryable) */
+    TL_EBUSY     = 21,  /* Resource busy - see status code docs for context */
     TL_ENOMEM    = 30,  /* Out of memory (often retryable) */
     TL_EOVERFLOW = 31,  /* Arithmetic overflow */
     TL_EINTERNAL = 90   /* Internal error (bug or system failure) */
@@ -153,20 +174,6 @@ typedef enum tl_maint_mode {
     TL_MAINT_DISABLED   = 0,
     TL_MAINT_BACKGROUND = 1
 } tl_maint_mode_t;
-
-/**
- * Compaction strategy (Phase 2 OOO Scaling).
- *
- * Controls how compaction chooses between L0→L1 merge and L0→L0 reshape.
- * - AUTO: System chooses based on L0 span and count (recommended)
- * - L0_L1: Force standard compaction only (merge L0 into L1)
- * - RESHAPE: Force reshape only (split wide L0s into window-contained L0s)
- */
-typedef enum tl_compaction_strategy {
-    TL_COMPACT_AUTO    = 0,  /* Default: system chooses based on overlap */
-    TL_COMPACT_L0_L1   = 1,  /* Force L0->L1 merge only */
-    TL_COMPACT_RESHAPE = 2   /* Force L0->L0 reshape only */
-} tl_compaction_strategy_t;
 
 /**
  * Log verbosity levels (passed to log_fn callback).
@@ -194,32 +201,21 @@ typedef struct tl_allocator {
 typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 
 /**
- * Handle drop callback (invoked after compaction when records are removed).
+ * Handle drop callback -- "retire" notification for physically deleted records.
  *
- * WHEN INVOKED:
- * - Only for records PHYSICALLY dropped during compaction (tombstone application)
- * - NOT called for logical tombstone insertion (tl_delete_range/tl_delete_before)
- * - Callbacks are DEFERRED until after successful manifest publish, ensuring
- *   that only truly committed drops trigger the callback
+ * Invoked after successful manifest publish when compaction or flush physically
+ * removes a record covered by a tombstone. NOT called during tl_close(),
+ * logical tombstone insertion, or segment release.
  *
- * SNAPSHOT SAFETY (read carefully):
- * This callback indicates a record is being RETIRED from the newest manifest,
- * NOT that it's safe to free immediately. Existing snapshots acquired before
- * compaction may still reference this handle until those snapshots are released.
- * Treat this as a "retire" notification, not a "free now" signal.
+ * WARNING: Existing snapshots may still reference the handle. Do NOT free
+ * the payload immediately. Use epoch-based reclamation or reference counting.
  *
- * SAFE usage patterns:
- * - Epoch-based reclamation: track callback timestamp, defer free until all
- *   snapshots older than that epoch are released
- * - Reference counting: callback decrements refcount, actual free when zero
- * - Grace period: callback adds to deferred-free queue with timestamp
+ * Threading: May be called from the maintenance worker or any thread that
+ * invokes tl_flush()/tl_maint_step(). Must not call back into timelog APIs.
  *
- * UNSAFE usage (can cause use-after-free):
- * - Immediately freeing user payload in this callback
- *
- * The callback is invoked after manifest publish completes, without holding
- * locks. It must not call back into timelog APIs. If compaction fails before
- * publish, no callbacks are invoked for that compaction attempt.
+ * Lifetime: Caller retains ownership of handles not covered by tombstones.
+ * At tl_close(), remaining records are NOT reported via this callback;
+ * track inserted handles independently if cleanup-at-close is needed.
  *
  * @param ctx    User-provided context (from tl_config_t.on_drop_ctx)
  * @param ts     Timestamp of the dropped record
@@ -228,15 +224,9 @@ typedef void (*tl_log_fn)(void* ctx, int level, const char* msg);
 typedef void (*tl_on_drop_fn)(void* ctx, tl_ts_t ts, tl_handle_t handle);
 
 /**
- * Adaptive segmentation configuration.
- * Embedded in tl_config_t as `tl_config_t.adaptive`.
- * All zeros = disabled (preserves existing behavior).
- *
- * Adaptive segmentation dynamically adjusts compaction window sizes based on
- * data density to maintain approximately constant segment sizes.
- *
- * Field naming: Uses short names inside nested struct.
- * LLD's `adaptive_target_records` == `config.adaptive.target_records`
+ * Adaptive segmentation configuration (embedded in tl_config_t).
+ * All zeros = disabled. When enabled, dynamically adjusts compaction window
+ * sizes based on data density to maintain approximately constant segment sizes.
  */
 typedef struct tl_adaptive_config {
     uint64_t    target_records;             /**< 0 = disabled, >0 = target records per segment */
@@ -255,62 +245,27 @@ typedef struct tl_adaptive_config {
 typedef struct tl_config {
     tl_time_unit_t  time_unit;
 
-    size_t          target_page_bytes;
-    size_t          memtable_max_bytes;
+    size_t          target_page_bytes;      /* 0 => default (64 KiB) */
+    size_t          memtable_max_bytes;     /* 0 => default (1 MiB) */
     size_t          ooo_budget_bytes;       /* 0 => memtable_max_bytes / 10 */
 
-    size_t          sealed_max_runs;        /* default: 4 */
-    uint32_t        sealed_wait_ms;         /* default: 100 */
-
-    /* Watermark-based scheduling (OOO Scaling Phase 1)
-     * ENABLED by default for better out-of-order handling.
-     * Default (0,0): auto-derive as 75%/25% of sealed_max_runs.
-     * User can set explicit values to override.
-     * When enabled: lo_wm < hi_wm <= sealed_max_runs
-     * - hi_wm: High watermark - enter flush-first mode when sealed >= hi_wm
-     * - lo_wm: Low watermark - allow compaction when sealed <= lo_wm */
-    size_t          sealed_hi_wm;           /* default: 0 (auto: 75% of sealed_max_runs) */
-    size_t          sealed_lo_wm;           /* default: 0 (auto: 25% of sealed_max_runs) */
+    size_t          sealed_max_runs;        /* 0 => default (4) */
+    uint32_t        sealed_wait_ms;         /* default: 100ms. Backpressure wait timeout.
+                                             * NOTE: 0 = no waiting (immediate TL_EBUSY).
+                                             * Unlike other fields, 0 is NOT "use default". */
 
     /* Maintenance timing */
-    uint32_t        maintenance_wakeup_ms;  /* default: 100 (periodic wake) */
+    uint32_t        maintenance_wakeup_ms;  /* 0 => default (100ms). Periodic wake interval. */
 
-    size_t          max_delta_segments;     /* L0 bound */
+    size_t          max_delta_segments;     /* 0 => default (8). L0 segment bound. */
 
     tl_ts_t         window_size;            /* 0 => default window (1 hour) */
     tl_ts_t         window_origin;          /* default: 0 */
 
     double          delete_debt_threshold;  /* 0.0 => disabled */
     size_t          compaction_target_bytes;/* optional cap */
-
-    /* Max L0 inputs per compaction (0 = unlimited, default).
-     *
-     * WARNING: Setting > 0 with tombstones may produce unexpected results.
-     * Partial overlap selection can remove tombstones from some inputs without
-     * applying them to all surviving segments in the window range. Recommended
-     * to keep at 0 unless tombstone semantics are not required. */
-    uint32_t        max_compaction_inputs;
-
-    uint32_t        max_compaction_windows; /* default: 4 (0 = unlimited) */
-
-    /* Phase 2 OOO Scaling: Reshape compaction tuning
-     *
-     * Reshape (L0→L0) splits wide L0 segments into window-contained pieces.
-     * This reduces merge fan-in for subsequent L0→L1 compaction.
-     *
-     * Trigger conditions (OR logic):
-     * - L0 count >= reshape_l0_threshold, OR
-     * - L0 span exceeds max_compaction_windows (if max_compaction_windows > 0)
-     *
-     * Cooldown prevents infinite reshape loops when workload is inherently wide.
-     *
-     * Note: All reshape parameters follow "0 = use default" pattern, allowing
-     * zero-initialized configs to work correctly without calling init_defaults.
-     */
-    tl_compaction_strategy_t compaction_strategy;  /* default: AUTO */
-    uint32_t        reshape_l0_threshold;   /* 0 or threshold (default: 12) */
-    uint32_t        reshape_max_inputs;     /* 0 or max inputs (default: 4) */
-    uint32_t        reshape_cooldown_max;   /* 0 or max reshapes (default: 3) */
+    uint32_t        max_compaction_inputs;  /* optional cap */
+    uint32_t        max_compaction_windows; /* default: 0 (unlimited) */
 
     tl_adaptive_config_t adaptive;          /* Adaptive segmentation (zeros = disabled) */
 
@@ -324,6 +279,7 @@ typedef struct tl_config {
     void*           on_drop_ctx;
 } tl_config_t;
 
+/** Initialize cfg to default values. cfg must not be NULL. */
 TL_API tl_status_t tl_config_init_defaults(tl_config_t* cfg);
 
 /*===========================================================================
@@ -337,7 +293,14 @@ TL_API tl_status_t tl_config_init_defaults(tl_config_t* cfg);
  *            The config is copied; it need not persist after this call.
  * @param out Output pointer for new instance (must not be NULL)
  * @return TL_OK on success; TL_EINVAL if out is NULL or config is invalid;
- *         TL_ENOMEM on allocation failure
+ *         TL_ENOMEM on allocation failure; TL_EINTERNAL if worker thread fails
+ *
+ * Maintenance:
+ * - When maintenance_mode == TL_MAINT_BACKGROUND (the default), the background
+ *   maintenance worker is automatically started during tl_open(). No separate
+ *   call to tl_maint_start() is needed for normal operation.
+ * - When maintenance_mode == TL_MAINT_DISABLED, no worker is started and the
+ *   caller must call tl_flush() and tl_maint_step() manually.
  *
  * If a log_fn callback is configured, informational messages may be logged
  * during open (and close) operations.
@@ -350,15 +313,26 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  * @param tl Instance to close (NULL is safe)
  *
  * DATA LOSS WARNING:
- * tl_close() does NOT flush unflushed records from the memtable.
+ * tl_close() does NOT flush/materialize unflushed records from the memtable.
  * Any records appended after the last tl_flush() call will be dropped.
- * To persist all data before close:
+ * To materialize all data before close:
  *   tl_flush(tl);   // Flush remaining memtable records
  *   tl_close(tl);   // Now safe to close
  *
  * Preconditions:
  * - All snapshots and iterators must be released before calling tl_close()
+ *   (tl_close reads snapshot counters without locking).
  * - Background maintenance (if enabled) will be stopped automatically
+ *
+ * Thread Safety:
+ * - tl_close() must NOT race with any other API call on the same instance.
+ *   The caller must ensure no other thread is calling tl_append, tl_flush,
+ *   tl_snapshot_acquire, tl_maint_start, tl_maint_stop, or any other API
+ *   while tl_close() is executing.
+ * - This is consistent with the single-writer model: external coordination
+ *   is required for lifecycle transitions.
+ * - If worker join fails (TL_EINTERNAL from internal tl_maint_stop), close
+ *   will abort in debug builds to prevent memory corruption.
  */
 TL_API void tl_close(tl_timelog_t* tl);
 
@@ -367,9 +341,23 @@ TL_API void tl_close(tl_timelog_t* tl);
  *===========================================================================*/
 
 /*
- * Backpressure:
- * - Write calls may return TL_EBUSY if sealed_max_runs is reached and
- *   maintenance cannot make progress within sealed_wait_ms.
+ * Backpressure and Error Semantics:
+ *
+ * TL_EBUSY (backpressure):
+ * - Write calls may return TL_EBUSY when:
+ *   (a) Sealed queue full (sealed_max_runs reached, maintenance can't keep up)
+ *   (b) Seal allocation failed (rare - memrun struct allocation failed)
+ *   (c) OOO head flush failed after insert (runset allocation/backpressure)
+ * - CRITICAL: TL_EBUSY means ALL data WAS accepted. DO NOT RETRY.
+ *   Retrying would create duplicate records. In manual mode, call tl_flush()
+ *   to relieve pressure. In background mode, wait for maintenance to catch up.
+ *
+ * TL_ENOMEM / TL_EOVERFLOW (true failures):
+ * - These mean NO data was inserted - operation has all-or-nothing semantics.
+ * - For tl_append_batch: either ALL records were inserted, or NONE were.
+ * - Caller can safely rollback (e.g., DECREF all handles) and retry later.
+ *
+ * Summary: TL_EBUSY = data accepted (don't retry), other errors = no data (can retry).
  */
 
 /** Append flags */
@@ -379,29 +367,49 @@ typedef enum tl_append_flags {
     TL_APPEND_HINT_MOSTLY_ORDER  = TL_APPEND_HINT_MOSTLY_IN_ORDER /* alias */
 } tl_append_flags_t;
 
+/** Append a single record. See backpressure/error semantics above. */
 TL_API tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle);
 
+/**
+ * Append a batch of records atomically (all-or-nothing on failure).
+ * A single internal sequence number is assigned to the whole batch.
+ * @param flags  Bitwise OR of tl_append_flags_t values
+ */
 TL_API tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                                    size_t n, uint32_t flags);
 
+/**
+ * Insert a tombstone covering [t1, t2). Returns TL_EINVAL if t1 >= t2.
+ * Cannot express a point-delete at TL_TS_MAX (half-open overflow).
+ */
 TL_API tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2);
 
-/* Delete [MIN_TS, cutoff) */
+/** Insert a tombstone covering [TL_TS_MIN, cutoff). No-op if cutoff == TL_TS_MIN. */
 TL_API tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff);
 
-/* Synchronous flush of active + sealed memruns; publishes L0 before return. */
+/**
+ * Synchronous flush of active + sealed memruns; publishes L0 before return.
+ *
+ * Returns:
+ * - TL_OK: All flushable data published
+ * - TL_EBUSY: Publish retries exhausted due to concurrent manifest change
+ *             (no data loss; safe to retry)
+ * - TL_ENOMEM/TL_EOVERFLOW: Build failed (inputs preserved; retry later)
+ * - TL_ESTATE/TL_EINVAL: Invalid state/args
+ */
 TL_API tl_status_t tl_flush(tl_timelog_t* tl);
 
-/* Request compaction; actual work performed by maintenance. */
+/** Request compaction. Sets compact_pending flag; actual merge runs in maintenance. */
 TL_API tl_status_t tl_compact(tl_timelog_t* tl);
 
 /*===========================================================================
  * Snapshot API (read isolation)
  *===========================================================================*/
 
+/** Acquire a consistent read snapshot. Thread-safe (multiple concurrent readers). */
 TL_API tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out);
 
-/* Release snapshot; all iterators derived from it must be destroyed first. */
+/** Release snapshot. All iterators derived from it must be destroyed first. */
 TL_API void tl_snapshot_release(tl_snapshot_t* s);
 
 /*===========================================================================
@@ -420,24 +428,19 @@ TL_API tl_status_t tl_iter_since(const tl_snapshot_t* snap, tl_ts_t t1,
 TL_API tl_status_t tl_iter_until(const tl_snapshot_t* snap, tl_ts_t t2,
                                  tl_iter_t** out);
 
-/*
- * Iterate all records with timestamp == ts (range form with overflow guard).
- * If any tombstone in the snapshot covers ts, the iterator is empty.
- */
+/** Iterate all records with timestamp == ts (range-based, handles TL_TS_MAX overflow). */
 TL_API tl_status_t tl_iter_equal(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);
 
-/**
- * Create an iterator over all records with timestamp == ts.
- *
- * Duplicates are returned; tie order is unspecified. If any tombstone in the
- * snapshot covers ts, the iterator is empty.
- */
+/** Point lookup: iterate all records with timestamp == ts via fast path.
+ *  Duplicates are returned; tie order is unspecified. */
 TL_API tl_status_t tl_iter_point(const tl_snapshot_t* snap, tl_ts_t ts,
                                  tl_iter_t** out);
 
+/** Advance iterator and write next record to out. Returns TL_EOF when exhausted. */
 TL_API tl_status_t tl_iter_next(tl_iter_t* it, tl_record_t* out);
 
+/** Destroy iterator. NULL is safe. */
 TL_API void tl_iter_destroy(tl_iter_t* it);
 
 /*===========================================================================
@@ -451,19 +454,122 @@ typedef enum tl_scan_decision {
 
 typedef tl_scan_decision_t (*tl_scan_fn)(void* ctx, const tl_record_t* rec);
 
+/** Scan records in [t1, t2), calling fn for each. Stops early if fn returns TL_SCAN_STOP. */
 TL_API tl_status_t tl_scan_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
                                  tl_scan_fn fn, void* ctx);
 
 /*===========================================================================
- * Timestamp navigation
+ * Count API
  *===========================================================================*/
 
+/* Count visible records in full snapshot range [MIN_TS, +inf). */
+TL_API tl_status_t tl_count(const tl_timelog_t* tl, uint64_t* out);
+
+/* Count visible records in [t1, t2). */
+TL_API tl_status_t tl_count_range(const tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2,
+                                  uint64_t* out);
+
+/**
+ * Count visible records in a snapshot range [t1, t2) or [t1, +inf).
+ *
+ * @param snap         Snapshot to query
+ * @param t1           Range start (inclusive)
+ * @param t2           Range end (exclusive) - ignored if t2_unbounded
+ * @param t2_unbounded If nonzero, treat range as [t1, +inf)
+ * @param out          Output count
+ * @return TL_OK on success
+ */
+TL_API tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
+                                            tl_ts_t t1, tl_ts_t t2,
+                                            int t2_unbounded,
+                                            uint64_t* out);
+
+/*===========================================================================
+ * Timestamp navigation
+ *
+ * Convenience functions for finding min/max timestamps and navigating between
+ * adjacent timestamps. These are intended for diagnostic/debugging use cases.
+ *
+ * **Performance note**: Forward navigation (tl_min_ts, tl_next_ts) is efficient
+ * at O(K log P), but backward navigation (tl_max_ts, tl_prev_ts) requires full
+ * dataset scan at O(N) due to LSM architecture. For performance-critical paths,
+ * use iterators directly or maintain your own bounds tracking.
+ *
+ * Where: K = component count, P = pages/component, N = total visible records.
+ *===========================================================================*/
+
+/**
+ * Get the minimum timestamp in the snapshot (first visible record).
+ *
+ * @param snap Snapshot to query
+ * @param out  Output parameter for minimum timestamp
+ * @return TL_OK   Success, *out contains minimum timestamp
+ *         TL_EOF  No visible records (empty or all deleted)
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * Complexity: O(K log P) typical - creates iterator and fetches first record.
+ * However, if tombstones delete early records, the function must scan past
+ * them to find the first VISIBLE record, degrading to O(N) in tombstone-heavy
+ * edge cases. For truly performance-critical paths with heavy deletes,
+ * consider maintaining your own min tracker.
+ */
 TL_API tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
+/**
+ * Get the maximum timestamp in the snapshot (last visible record).
+ *
+ * @param snap Snapshot to query
+ * @param out  Output parameter for maximum timestamp
+ * @return TL_OK   Success, *out contains maximum timestamp
+ *         TL_EOF  No visible records (empty or all deleted)
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * **WARNING: O(N) COMPLEXITY** - This function scans ALL visible records
+ * because LSM iterators only support forward traversal. For large datasets,
+ * consider maintaining your own max tracker during append operations.
+ */
 TL_API tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out);
 
+/**
+ * Find the next timestamp strictly greater than the given timestamp.
+ *
+ * @param snap Snapshot to query
+ * @param ts   Reference timestamp
+ * @param out  Output parameter for next timestamp
+ * @return TL_OK   Success, *out contains next timestamp after ts
+ *         TL_EOF  No visible records after ts
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * Complexity: O(K log P) typical - creates iterator at ts+1 and fetches first.
+ * However, if tombstones delete records after ts, the function must scan past
+ * them to find the first VISIBLE record, degrading to O(N) in tombstone-heavy
+ * edge cases.
+ *
+ * Note: If ts == TL_TS_MAX, returns TL_EOF (no overflow).
+ */
 TL_API tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
+/**
+ * Find the previous timestamp strictly less than the given timestamp.
+ *
+ * @param snap Snapshot to query
+ * @param ts   Reference timestamp
+ * @param out  Output parameter for previous timestamp
+ * @return TL_OK   Success, *out contains previous timestamp before ts
+ *         TL_EOF  No visible records before ts
+ *         TL_EINVAL  snap or out is NULL
+ *         TL_ENOMEM  Iterator allocation failed
+ *
+ * **WARNING: O(N) COMPLEXITY** - This function scans ALL visible records
+ * in [TL_TS_MIN, ts) to find the last one, because LSM iterators only
+ * support forward traversal. For large datasets, consider using iterators
+ * directly or implementing reverse navigation in your application layer.
+ *
+ * Note: If ts == TL_TS_MIN, returns TL_EOF (no underflow).
+ */
 TL_API tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out);
 
 /*===========================================================================
@@ -473,8 +579,9 @@ TL_API tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* ou
 /**
  * Start the background maintenance worker thread.
  *
- * Must be called after tl_open() to enable background flush and compaction.
- * tl_open() does NOT start the worker automatically.
+ * In TL_MAINT_BACKGROUND mode, the worker is automatically started by
+ * tl_open(), so this function is typically only needed to restart the
+ * worker after calling tl_maint_stop().
  *
  * @param tl Timelog instance
  * @return TL_OK       Worker started successfully (or already running)
@@ -519,6 +626,7 @@ TL_API tl_status_t tl_maint_stop(tl_timelog_t* tl);
  *         TL_EINVAL   tl is NULL
  *         TL_ESTATE   Not open, or mode is not TL_MAINT_DISABLED
  *         TL_ENOMEM   Build failed (inputs preserved, retry later)
+ *         TL_EBUSY    Publish retries exhausted (retry later)
  *
  * Thread Safety: NOT thread-safe. Caller must ensure single-threaded access.
  */
@@ -533,7 +641,7 @@ typedef struct tl_stats {
     uint64_t segments_l0;       /* L0 (delta) segments */
     uint64_t segments_l1;       /* L1 (main) segments */
     uint64_t pages_total;       /* Total pages across all segments */
-    uint64_t records_estimate;  /* Estimated total records (may include deleted) */
+    uint64_t records_estimate;  /* Snapshot-time tombstone-aware visible record count */
     tl_ts_t  min_ts;            /* Minimum timestamp (TL_TS_MAX if empty) */
     tl_ts_t  max_ts;            /* Maximum timestamp (TL_TS_MIN if empty) */
     uint64_t tombstone_count;   /* Number of tombstone intervals */
@@ -549,44 +657,26 @@ typedef struct tl_stats {
     uint64_t backpressure_waits;       /* Times writer blocked on sealed queue */
     uint64_t flushes_total;            /* Total flush operations completed */
     uint64_t compactions_total;        /* Total compaction operations completed */
+    uint64_t compaction_retries;       /* Compaction publish retries */
+    uint64_t compaction_publish_ebusy; /* Publish attempts returning TL_EBUSY */
+    /* Compaction selection observability */
+    uint64_t compaction_select_calls;      /* Selection attempts */
+    uint64_t compaction_select_l0_inputs;  /* Total L0 inputs selected */
+    uint64_t compaction_select_l1_inputs;  /* Total L1 inputs selected */
+    uint64_t compaction_select_no_work;    /* Selections with no L0s */
 
-    /* Adaptive segmentation metrics (V-Next)
+    /* Adaptive segmentation metrics.
      * Only populated when adaptive.target_records > 0 in config. */
     tl_ts_t  adaptive_window;          /* Current effective window size */
     double   adaptive_ewma_density;    /* EWMA density (records per time unit) */
     uint64_t adaptive_flush_count;     /* Flush count for density tracking */
     uint32_t adaptive_failures;        /* Consecutive compaction failures */
-
-    /* OOO Scaling metrics (Phase 1)
-     *
-     * Watermarks are ENABLED by default via auto-derive (when both sealed_hi_wm
-     * and sealed_lo_wm are 0 in config). These counters track scheduling decisions:
-     * - flush_first_cycles: High pressure triggered aggressive flush drain
-     * - compaction_deferred_cycles: Compaction postponed due to flush pressure
-     * - compaction_forced_cycles: Compaction forced despite pressure (L0 debt critical)
-     */
-    uint64_t flush_first_cycles;       /* Times watermark triggered flush-first mode */
-    uint64_t compaction_deferred_cycles; /* Times compaction deferred (sealed > lo_wm) */
-    uint64_t compaction_forced_cycles; /* Times compaction forced (L0 >= max_delta_segments) */
-
-    /* OOO Scaling metrics (Phase 2)
-     *
-     * Reshape and rebase publish metrics for OOO workload handling:
-     * - reshape_compactions_total: L0→L0 reshape operations completed
-     * - rebase_publish_success: Successful rebase publishes (manifest changed but inputs valid)
-     * - rebase_publish_fallback: Rebase fell back to full retry (inputs removed from manifest)
-     * - window_bound_exceeded: Single L0 span exceeded max_compaction_windows (observability)
-     * - rebase_l1_conflict: Rebase rejected due to new L1 overlap conflict
-     */
-    uint64_t reshape_compactions_total;  /* L0->L0 reshape operations completed */
-    uint64_t rebase_publish_success;     /* Successful rebase publishes */
-    uint64_t rebase_publish_fallback;    /* Rebase fell back to full retry */
-    uint64_t window_bound_exceeded;      /* Wide L0 exceeded window cap (observability) */
-    uint64_t rebase_l1_conflict;         /* Rebase rejected due to L1 conflict */
 } tl_stats_t;
 
+/** Gather aggregate statistics from a snapshot into out. */
 TL_API tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out);
 
+/** Validate snapshot invariants. Debug builds run full checks; release returns TL_OK. */
 TL_API tl_status_t tl_validate(const tl_snapshot_t* snap);
 
 #ifdef __cplusplus

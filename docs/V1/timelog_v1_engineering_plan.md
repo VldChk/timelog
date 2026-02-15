@@ -364,11 +364,13 @@ File: `src/delta/tl_memtable.[ch]`
 Deliverables:
 - tl_memtable_t with:
   - active_run (append-only, non-decreasing by ts)
-  - active_ooo (sorted vector for out-of-order records)
+  - ooo_head (append-only out-of-order head, may be unsorted)
+  - ooo_runs (immutable sorted OOO runs)
   - active_tombs (coalesced interval set)
   - sealed queue (FIFO of tl_memrun_t*)
   - last_inorder_ts tracking
   - active_bytes_est for threshold checks
+  - ooo_chunk_records and ooo_run_limit
   - epoch counter for snapshot caching
   - memtable.mu protecting sealed queue
 
@@ -389,13 +391,13 @@ if active_run empty OR ts >= last_inorder_ts:
     append to active_run
     last_inorder_ts = ts
 else:
-    binary search active_ooo for insertion point
-    memmove to create gap
-    insert record
-    increment ooo_len
+    append to ooo_head
+    track head sortedness
+    if head_len >= ooo_chunk_records: flush head -> new OOO run
 ```
 
-If active_ooo exceeds ooo_budget_bytes, seal early.
+If OOO usage (ooo_head + ooo_runs) exceeds ooo_budget_bytes or run limit,
+seal early.
 
 Batch insert:
 - If hint says mostly ordered and batch[0].ts >= last_inorder_ts:
@@ -416,9 +418,10 @@ File: `src/delta/tl_memtable.[ch]` (continued)
 Deliverables:
 - tl_memrun_t with:
   - run[] (sorted records from active_run)
-  - ooo[] (sorted records from active_ooo)
+  - ooo_runs (sorted OOO runs)
+  - ooo_total_len, ooo_run_count, ooo_min_ts, ooo_max_ts
   - tombs[] (coalesced intervals)
-  - min_ts, max_ts computed from run + ooo
+  - min_ts, max_ts computed from run + OOO runs
   - refcnt for pin/unpin
 
 Reference: Write Path LLD Section 3.5
@@ -429,14 +432,16 @@ File: `src/delta/tl_memtable.[ch]` (continued)
 
 Seal triggers:
 - active_bytes_est >= memtable_max_bytes
-- active_ooo bytes >= ooo_budget_bytes
+- ooo_total bytes >= ooo_budget_bytes
+- ooo_run_count >= ooo_run_limit
 - Explicit tl_flush() call
 
 Seal steps:
-1. Move active_run, active_ooo, active_tombs ownership to new memrun
-2. Compute memrun min_ts/max_ts
-3. Reset active buffers to empty
-4. Push memrun to sealed queue (under memtable.mu)
+1. Flush OOO head to a sorted run (required)
+2. Move active_run, ooo_runs, active_tombs ownership to new memrun
+3. Compute memrun min_ts/max_ts
+4. Reset active buffers to empty
+5. Push memrun to sealed queue (under memtable.mu)
 
 Reference: Write Path LLD Section 4.1
 
@@ -445,7 +450,7 @@ Reference: Write Path LLD Section 4.1
 File: `src/delta/tl_flush.[ch]`
 
 Deliverables:
-- Two-way merge of memrun.run + memrun.ooo into sorted stream
+- K-way merge of memrun.run + memrun.ooo_runs into sorted stream
 - Page building from merged stream
 - Segment creation with tombstone attachment
 - Tombstone-only segment creation if no records
@@ -531,7 +536,8 @@ File: `src/delta/tl_memview.[ch]`
 Deliverables:
 - tl_memview_t capturing:
   - Immutable copy of active_run (or cached immutable snapshot if epoch unchanged)
-  - Immutable copy of active_ooo
+  - Immutable copy of ooo_head (sorted off-lock)
+  - Pinned immutable ooo_runs
   - Immutable copy of active_tombs
   - Array of sealed memrun pointers (pinned)
   - min_ts/max_ts bounds
@@ -602,11 +608,11 @@ Segment iterator:
 4. Output: sorted stream from segment
 
 Memrun iterator:
-- Two-way merge of run[] and ooo[] (both sorted)
-- Seek uses binary search in both arrays
+- Internal K-way merge of run[] and ooo_runs (sorted)
+- Seek uses selective pop + per-source lower_bound
 
 Active memview iterator:
-- Same two-way merge of active_run and active_ooo
+- Internal K-way merge of active_run, ooo_head, and ooo_runs
 
 Memview iterator:
 - K-way merge over active iterator + sealed memrun iterators
@@ -659,7 +665,8 @@ Algorithm:
    - If any contains ts, return empty iterator
 3. For L1: binary search window containing ts, then page catalog, then ts[]
 4. For L0: scan overlapping segments with same binary search
-5. For memview: binary search active_run, active_ooo, sealed memruns
+5. For memview: binary search active_run, ooo_head, and each ooo_run
+   - sealed memruns (run + ooo_runs)
 6. Concatenate results (no k-way merge needed for single timestamp)
 
 Reference: Read Path LLD Section 9
@@ -724,6 +731,9 @@ Deliverables:
   - records_estimate
   - min_ts, max_ts (from manifest bounds)
   - tombstone_count
+  - seals_total, ooo_budget_hits, backpressure_waits
+  - flushes_total, compactions_total
+  - compaction_retries, compaction_publish_ebusy (strict publish retries/EBUSY)
 
 ### 6.2 Validation
 

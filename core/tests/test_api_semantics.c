@@ -12,8 +12,6 @@
  * These tests ensure the public API behaves predictably and safely
  * when given invalid inputs or called in invalid states.
  *
- * Part of Phase 10: Integration Testing and Hardening
- *
  * Migration Status: COMPLETE (migrated from test_phase0.c)
  * Note: Test names prefixed with "api_" to avoid conflicts during migration.
  *===========================================================================*/
@@ -62,24 +60,16 @@ TEST_DECLARE(api_config_defaults) {
     TEST_ASSERT_EQ(0, cfg.ooo_budget_bytes);  /* 0 means use default */
     TEST_ASSERT_EQ(4, cfg.sealed_max_runs);
     TEST_ASSERT_EQ(100, cfg.sealed_wait_ms);
-    TEST_ASSERT_EQ(0, cfg.sealed_hi_wm);          /* 0 = auto-derive (becomes 75% in normalize) */
-    TEST_ASSERT_EQ(0, cfg.sealed_lo_wm);          /* 0 = auto-derive (becomes 25% in normalize) */
     TEST_ASSERT_EQ(0, cfg.maintenance_wakeup_ms); /* 0 means use default (100ms) */
     TEST_ASSERT_EQ(8, cfg.max_delta_segments);
     TEST_ASSERT_EQ(0, cfg.window_size);  /* 0 means use default */
     TEST_ASSERT_EQ(0, cfg.window_origin);
 
-    /* Compaction policy fields (Phase 10 addition) */
+    /* Compaction policy fields */
     TEST_ASSERT(cfg.delete_debt_threshold == 0.0);  /* Disabled */
     TEST_ASSERT_EQ(0, cfg.compaction_target_bytes); /* Unlimited */
     TEST_ASSERT_EQ(0, cfg.max_compaction_inputs);   /* Unlimited */
-    TEST_ASSERT_EQ(4, cfg.max_compaction_windows);  /* Phase 2: default 4 (was 0/unlimited) */
-
-    /* Compaction strategy fields (Phase 2 OOO Scaling) */
-    TEST_ASSERT_EQ(TL_COMPACT_AUTO, cfg.compaction_strategy);
-    TEST_ASSERT_EQ(12, cfg.reshape_l0_threshold);
-    TEST_ASSERT_EQ(4, cfg.reshape_max_inputs);
-    TEST_ASSERT_EQ(3, cfg.reshape_cooldown_max);
+    TEST_ASSERT_EQ(0, cfg.max_compaction_windows);  /* 0 = unlimited (greedy selection) */
 
     TEST_ASSERT_EQ(TL_MAINT_BACKGROUND, cfg.maintenance_mode);
 
@@ -186,149 +176,6 @@ TEST_DECLARE(api_open_negative_time_unit) {
 
     TEST_ASSERT_STATUS(TL_EINVAL, s);
     TEST_ASSERT_NULL(tl);
-}
-
-/*===========================================================================
- * Watermark Configuration Tests (OOO Scaling Phase 1)
- *===========================================================================*/
-
-TEST_DECLARE(api_config_watermarks_auto_derive) {
-    /* Both zero = auto-derive from sealed_max_runs (valid, default behavior).
-     * With sealed_max_runs=4: hi_wm=3 (75%), lo_wm=1 (25%). */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;  /* Avoid starting thread */
-
-    /* Defaults should be 0,0 (auto-derive marker) */
-    TEST_ASSERT_EQ(0, cfg.sealed_hi_wm);
-    TEST_ASSERT_EQ(0, cfg.sealed_lo_wm);
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_NOT_NULL(tl);
-    tl_close(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_lo_zero_valid) {
-    /* hi_wm > 0, lo_wm = 0 (valid: drain to empty before compaction) */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_max_runs = 8;
-    cfg.sealed_hi_wm = 6;
-    cfg.sealed_lo_wm = 0;
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_NOT_NULL(tl);
-    tl_close(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_hi_zero_invalid) {
-    /* hi_wm = 0, lo_wm > 0 (invalid: hi_wm must be set if lo_wm is set) */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_hi_wm = 0;
-    cfg.sealed_lo_wm = 2;
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_EINVAL, s);
-    TEST_ASSERT_NULL(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_invalid_pair) {
-    /* lo_wm >= hi_wm (invalid) */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_hi_wm = 4;
-    cfg.sealed_lo_wm = 4;  /* Equal, should fail */
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_EINVAL, s);
-    TEST_ASSERT_NULL(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_invalid_pair_greater) {
-    /* lo_wm > hi_wm (invalid) */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_hi_wm = 3;
-    cfg.sealed_lo_wm = 5;  /* Greater, should fail */
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_EINVAL, s);
-    TEST_ASSERT_NULL(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_hi_clamped) {
-    /* hi_wm > sealed_max_runs (clamped, should succeed) */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_max_runs = 4;
-    cfg.sealed_hi_wm = 10;  /* Exceeds max_runs, will be clamped to 4 */
-    cfg.sealed_lo_wm = 1;
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_NOT_NULL(tl);
-    tl_close(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_valid_pair) {
-    /* Valid watermark pair: lo_wm < hi_wm <= sealed_max_runs */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_max_runs = 8;
-    cfg.sealed_hi_wm = 6;
-    cfg.sealed_lo_wm = 2;
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_NOT_NULL(tl);
-    tl_close(tl);
-}
-
-TEST_DECLARE(api_config_watermarks_auto_scale_with_max_runs) {
-    /* Verify watermarks auto-scale when user changes sealed_max_runs.
-     * With sealed_max_runs=16: hi_wm should be ~12 (75%), lo_wm ~4 (25%). */
-    tl_config_t cfg;
-    tl_config_init_defaults(&cfg);
-    cfg.maintenance_mode = TL_MAINT_DISABLED;
-    cfg.sealed_max_runs = 16;
-    /* Leave hi_wm and lo_wm at 0,0 (auto-derive) */
-
-    tl_timelog_t* tl = NULL;
-    tl_status_t s = tl_open(&cfg, &tl);
-
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_NOT_NULL(tl);
-
-    /* Watermarks should have been auto-derived from sealed_max_runs=16:
-     * hi_wm = ceil(16 * 0.75) = ceil(12) = 12
-     * lo_wm = floor(16 * 0.25) = 4
-     * We can't directly inspect tl->effective_sealed_hi_wm from tests,
-     * but we verified the logic works by the instance opening successfully. */
-
-    tl_close(tl);
 }
 
 /*===========================================================================
@@ -533,7 +380,7 @@ TEST_DECLARE(api_write_null_checks) {
 }
 
 /*===========================================================================
- * Maintenance API Mode Validation Tests (Phase 10)
+ * Maintenance API Mode Validation Tests
  *
  * These tests verify the maintenance API behaves correctly w.r.t. mode.
  *===========================================================================*/
@@ -706,6 +553,56 @@ TEST_DECLARE(api_compact_sets_pending) {
 }
 
 /*===========================================================================
+ * on_drop_handle Contract Verification
+ *===========================================================================*/
+
+static int g_h05_drop_count = 0;
+
+static void h05_track_drop(void* ctx, tl_ts_t ts, tl_handle_t h) {
+    (void)ctx;
+    (void)ts;
+    (void)h;
+    g_h05_drop_count++;
+}
+
+/**
+ * Test: on_drop_handle NOT invoked at close.
+ *
+ * This test documents and verifies the intended behavior:
+ * on_drop_handle fires ONLY when tombstones physically delete records
+ * (compaction or flush). It is NOT invoked during tl_close().
+ */
+TEST_DECLARE(api_on_drop_handle_not_called_at_close) {
+    g_h05_drop_count = 0;
+
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.on_drop_handle = h05_track_drop;
+    cfg.maintenance_mode = TL_MAINT_DISABLED;
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    /* Insert some records */
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 100, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 200, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 300, 3));
+
+    /* Seal and flush to create a segment.
+     * No tombstones: flush should not invoke on_drop_handle. */
+    TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
+    TEST_ASSERT_EQ(0, g_h05_drop_count);  /* Flush doesn't drop */
+
+    /* Close WITHOUT any tombstones - callback should NOT fire.
+     * on_drop_handle only fires during compaction when tombstones
+     * actually delete records. */
+    tl_close(tl);
+
+    /* Verify: callback was never called (handles NOT dropped at close) */
+    TEST_ASSERT_EQ(0, g_h05_drop_count);
+}
+
+/*===========================================================================
  * Test Runner
  *===========================================================================*/
 
@@ -728,16 +625,6 @@ void run_api_semantics_tests(void) {
     RUN_TEST(api_open_invalid_maint_mode);
     RUN_TEST(api_open_negative_time_unit);
 
-    /* Watermark configuration (8 tests - OOO Scaling Phase 1) */
-    RUN_TEST(api_config_watermarks_auto_derive);
-    RUN_TEST(api_config_watermarks_lo_zero_valid);
-    RUN_TEST(api_config_watermarks_hi_zero_invalid);
-    RUN_TEST(api_config_watermarks_invalid_pair);
-    RUN_TEST(api_config_watermarks_invalid_pair_greater);
-    RUN_TEST(api_config_watermarks_hi_clamped);
-    RUN_TEST(api_config_watermarks_valid_pair);
-    RUN_TEST(api_config_watermarks_auto_scale_with_max_runs);
-
     /* Custom allocator (1 test) */
     RUN_TEST(api_custom_allocator);
 
@@ -755,12 +642,15 @@ void run_api_semantics_tests(void) {
     RUN_TEST(api_write_flush);
     RUN_TEST(api_write_null_checks);
 
-    /* Maintenance API mode validation (5 tests - Phase 10) */
+    /* Maintenance API mode validation (5 tests) */
     RUN_TEST(api_maint_start_wrong_mode_estate);
     RUN_TEST(api_maint_step_wrong_mode_estate);
     RUN_TEST(api_maint_start_idempotent);
     RUN_TEST(api_maint_stop_idempotent);
     RUN_TEST(api_compact_sets_pending);
+
+    /* on_drop_handle contract verification (1 test) */
+    RUN_TEST(api_on_drop_handle_not_called_at_close);
 
     /* Total: 27 tests */
 }

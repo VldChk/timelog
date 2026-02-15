@@ -82,6 +82,7 @@ set(TIMELOG_SOURCES
     core/src/internal/tl_test_hooks.c
     # Phase 2
     core/src/internal/tl_recvec.c
+    core/src/internal/tl_seqvec.c
     core/src/internal/tl_intervals.c
     core/src/internal/tl_heap.c
     # Phase 3
@@ -91,6 +92,7 @@ set(TIMELOG_SOURCES
     core/src/storage/tl_manifest.c
     # Phase 4
     core/src/delta/tl_memrun.c
+    core/src/delta/tl_ooorun.c
     core/src/delta/tl_memtable.c
     core/src/delta/tl_flush.c
     # Phase 5
@@ -99,6 +101,8 @@ set(TIMELOG_SOURCES
     core/src/query/tl_segment_iter.c
     core/src/query/tl_memrun_iter.c
     core/src/query/tl_active_iter.c
+    core/src/query/tl_iter_build.c
+    core/src/query/tl_submerge.c
     core/src/query/tl_plan.c
     core/src/query/tl_merge_iter.c
     core/src/query/tl_filter.c
@@ -204,6 +208,13 @@ if(NOT WIN32)
 endif()
 
 add_test(NAME timelog_tests COMMAND test_timelog)
+
+# =============================================================================
+# Demo Targets
+# =============================================================================
+
+add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
+target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
 
 # Ensure ASan runtime DLL is discoverable when using Clang on Windows.
 if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)

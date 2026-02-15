@@ -1,12 +1,15 @@
 #include "test_harness.h"
 #include "timelog/timelog.h"
 #include <inttypes.h>
+#include <stdbool.h>
 
 /*===========================================================================
  * Global Test Context
  *===========================================================================*/
 
 test_context_t g_test_ctx;
+static const char* g_test_filter;
+static bool test_name_enabled(const char* filter, const char* name);
 
 /*===========================================================================
  * Test Framework Implementation
@@ -17,6 +20,10 @@ void test_init(void) {
 }
 
 void test_run(const char* name, test_fn fn) {
+    if (!test_name_enabled(g_test_filter, name)) {
+        return;
+    }
+
     g_test_ctx.current_test = name;
     printf("  Running: %s ... ", name);
     fflush(stdout);
@@ -121,6 +128,74 @@ int test_report(void) {
 }
 
 /*===========================================================================
+ * Optional Group Filter (Targeted Runs)
+ *===========================================================================*/
+
+static bool test_group_enabled(const char* groups, const char* name) {
+    if (groups == NULL || *groups == '\0') {
+        return true;
+    }
+
+    size_t name_len = strlen(name);
+    const char* p = groups;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        const char* end = p;
+        while (*end != '\0' && *end != ',') {
+            end++;
+        }
+
+        size_t len = (size_t)(end - p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            return true;
+        }
+
+        p = end;
+    }
+
+    return false;
+}
+
+static bool test_name_enabled(const char* filter, const char* name) {
+    if (filter == NULL || *filter == '\0') {
+        return true;
+    }
+
+    size_t name_len = strlen(name);
+    const char* p = filter;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        const char* end = p;
+        while (*end != '\0' && *end != ',') {
+            end++;
+        }
+
+        size_t len = (size_t)(end - p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            return true;
+        }
+
+        p = end;
+    }
+
+    return false;
+}
+
+/*===========================================================================
  * External Test Declarations
  *
  * Tests organized by category:
@@ -155,16 +230,16 @@ extern void run_stress_tests(void);
 /* Snapshot lifetime tests */
 extern void run_snapshot_lifetime_tests(void);
 
-/* Storage layer internal tests (LLD-driven) */
+/* Storage layer internal tests */
 extern void run_storage_internal_tests(void);
 
-/* Delta layer internal tests (LLD-driven) */
+/* Delta layer internal tests */
 extern void run_delta_internal_tests(void);
 
-/* Compaction internal tests (LLD-driven) */
+/* Compaction internal tests */
 extern void run_compaction_internal_tests(void);
 
-/* PageSpan core API tests (V2 binding support) */
+/* PageSpan core API tests */
 extern void run_pagespan_iter_tests(void);
 
 /* Adaptive Segmentation internal tests (V-Next) */
@@ -178,74 +253,103 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
-    printf("Timelog V1 Test Suite\n");
+    const char* groups = getenv("TL_TEST_GROUPS");
+    g_test_filter = getenv("TL_TEST_FILTER");
+
+    printf("Timelog Test Suite\n");
     printf("========================================\n\n");
 
     test_init();
 
     /*-----------------------------------------------------------------------
-     * Internal Tests (LLD-driven implementation verification)
+     * Internal Tests
      *-----------------------------------------------------------------------*/
 
-    printf("[Internal] Sync Primitives\n");
-    printf("----------------------------------------\n");
-    run_internal_sync_tests();
+    if (test_group_enabled(groups, "internal_sync")) {
+        printf("[Internal] Sync Primitives\n");
+        printf("----------------------------------------\n");
+        run_internal_sync_tests();
+    }
 
-    printf("\n[Internal] Data Structures\n");
-    printf("----------------------------------------\n");
-    run_internal_data_structures_tests();
+    if (test_group_enabled(groups, "internal_data")) {
+        printf("\n[Internal] Data Structures\n");
+        printf("----------------------------------------\n");
+        run_internal_data_structures_tests();
+    }
 
-    printf("\n[Internal] Storage Layer\n");
-    printf("----------------------------------------\n");
-    run_storage_internal_tests();
+    if (test_group_enabled(groups, "storage")) {
+        printf("\n[Internal] Storage Layer\n");
+        printf("----------------------------------------\n");
+        run_storage_internal_tests();
+    }
 
-    printf("\n[Internal] Delta Layer\n");
-    printf("----------------------------------------\n");
-    run_delta_internal_tests();
+    if (test_group_enabled(groups, "delta")) {
+        printf("\n[Internal] Delta Layer\n");
+        printf("----------------------------------------\n");
+        run_delta_internal_tests();
+    }
 
-    printf("\n[Internal] Compaction\n");
-    printf("----------------------------------------\n");
-    run_compaction_internal_tests();
+    if (test_group_enabled(groups, "compaction")) {
+        printf("\n[Internal] Compaction\n");
+        printf("----------------------------------------\n");
+        run_compaction_internal_tests();
+    }
 
-    printf("\n[Internal] PageSpan Iterator\n");
-    printf("----------------------------------------\n");
-    run_pagespan_iter_tests();
+    if (test_group_enabled(groups, "pagespan")) {
+        printf("\n[Internal] PageSpan Iterator\n");
+        printf("----------------------------------------\n");
+        run_pagespan_iter_tests();
+    }
 
-    printf("\n[Internal] Adaptive Segmentation\n");
-    printf("----------------------------------------\n");
-    run_adaptive_internal_tests();
+    if (test_group_enabled(groups, "adaptive")) {
+        printf("\n[Internal] Adaptive Segmentation\n");
+        printf("----------------------------------------\n");
+        run_adaptive_internal_tests();
+    }
 
     /*-----------------------------------------------------------------------
      * Functional Tests (Public API behavior)
      *-----------------------------------------------------------------------*/
 
-    printf("\n[Functional] Core Operations\n");
-    printf("----------------------------------------\n");
-    run_functional_tests();
+    if (test_group_enabled(groups, "functional")) {
+        printf("\n[Functional] Core Operations\n");
+        printf("----------------------------------------\n");
+        run_functional_tests();
+    }
 
-    printf("\n[Functional] API Semantics\n");
-    printf("----------------------------------------\n");
-    run_api_semantics_tests();
+    if (test_group_enabled(groups, "api_semantics")) {
+        printf("\n[Functional] API Semantics\n");
+        printf("----------------------------------------\n");
+        run_api_semantics_tests();
+    }
 
-    printf("\n[Functional] Snapshot Lifetime\n");
-    printf("----------------------------------------\n");
-    run_snapshot_lifetime_tests();
+    if (test_group_enabled(groups, "snapshot_lifetime")) {
+        printf("\n[Functional] Snapshot Lifetime\n");
+        printf("----------------------------------------\n");
+        run_snapshot_lifetime_tests();
+    }
 
-    printf("\n[Functional] Invariants\n");
-    printf("----------------------------------------\n");
-    run_invariants_tests();
+    if (test_group_enabled(groups, "invariants")) {
+        printf("\n[Functional] Invariants\n");
+        printf("----------------------------------------\n");
+        run_invariants_tests();
+    }
 
     /*-----------------------------------------------------------------------
      * Concurrency and Stress Tests
      *-----------------------------------------------------------------------*/
 
-    printf("\n[Concurrency] Thread Safety\n");
-    printf("----------------------------------------\n");
-    run_concurrency_tests();
+    if (test_group_enabled(groups, "concurrency")) {
+        printf("\n[Concurrency] Thread Safety\n");
+        printf("----------------------------------------\n");
+        run_concurrency_tests();
+    }
 
-    printf("\n[Stress] Load Testing\n");
-    printf("----------------------------------------\n");
-    run_stress_tests();
+    if (test_group_enabled(groups, "stress")) {
+        printf("\n[Stress] Load Testing\n");
+        printf("----------------------------------------\n");
+        run_stress_tests();
+    }
 
     return test_report();
 }

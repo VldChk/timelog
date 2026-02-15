@@ -1,32 +1,33 @@
 /**
  * @file py_timelog.h
- * @brief PyTimelog CPython extension type declaration (LLD-B2)
+ * @brief PyTimelog CPython extension type declaration
  *
  * This module provides the PyTimelog type which wraps tl_timelog_t*
  * and exposes a stable, low-overhead Python API for writes, deletes,
  * and maintenance.
  *
  * Thread Safety:
- *   A Timelog instance is NOT thread-safe. Do not access the same instance
- *   from multiple threads without external synchronization. This is consistent
- *   with Python's sqlite3.Connection and file objects.
+ *   Single-writer model: the same instance must not be used concurrently
+ *   for writes or lifecycle operations without external synchronization.
+ *   The binding serializes core calls to prevent concurrent use while the
+ *   GIL is released, but this is not a guarantee of full thread safety.
+ *   Snapshot-based iterators are safe for concurrent reads.
  *
  *   The GIL is released during flush(), compact(), stop_maintenance(), and
- *   close() to allow other Python threads to run. The user must ensure no
- *   other thread accesses this Timelog instance during these operations.
+ *   close(). The user must ensure no other thread touches this Timelog
+ *   instance while these operations are in progress.
+ *
+ *   This binding requires the CPython GIL and is NOT supported on
+ *   free-threaded/no-GIL Python builds.
  *
  * Known Limitations:
- *   - Unflushed records leak on close(): The core engine's tl_close() does
- *     not invoke the on_drop callback for memtable records. To avoid leaking
- *     Python objects, ALWAYS call flush() before close(). Records that reach
- *     compaction will have their references properly released.
+ *   - Unflushed records are dropped on close(). The binding tracks all
+ *     inserted handles and releases Python objects during close(), but
+ *     data is not persisted. Call flush() before close() if you need to
+ *     preserve all records.
  *
- *   - Close-time reclamation: Even with flush(), compaction must run to
- *     physically drop records and trigger DECREF. If maintenance is disabled,
- *     call compact() and run_maintenance() before close().
- *
- * See: docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md
- *      docs/engineering_plan_B2_pytimelog.md
+ * See: docs/V2/timelog_v2_engineering_plan.md
+ *      docs/V2/timelog_v2_c_software_design_spec.md
  */
 
 #ifndef TL_PY_TIMELOG_H
@@ -49,8 +50,11 @@ extern "C" {
  * Controls behavior when TL_EBUSY is returned from write operations.
  *
  * CRITICAL: TL_EBUSY from tl_append/tl_delete_* means the record/tombstone
- * WAS successfully inserted, but backpressure occurred (sealed queue full).
- * This is NOT a failure - the data is in the engine.
+ * WAS successfully inserted, but backpressure occurred. This is NOT a
+ * failure - the data is in the engine.
+ *
+ * Note: TL_EBUSY can also be returned by flush/maintenance publish retries
+ * (safe to retry). Busy policy only applies to write operations.
  *
  * Policy options:
  * - RAISE:  Raise TimelogBusyError (record IS inserted)
@@ -94,6 +98,12 @@ typedef struct {
     tl_py_handle_ctx_t handle_ctx;
 
     /**
+     * Per-instance lock to serialize all core calls.
+     * Protects against concurrent use while GIL is released.
+     */
+    PyThread_type_lock core_lock;
+
+    /**
      * Config introspection (stored for Python access).
      * Set during init, immutable after.
      */
@@ -105,6 +115,11 @@ typedef struct {
      * Controls behavior when TL_EBUSY is returned.
      */
     tl_py_busy_policy_t busy_policy;
+
+    /**
+     * Weak reference list head for Python weakref support.
+     */
+    PyObject* weakreflist;
 
 } PyTimelog;
 
@@ -122,6 +137,12 @@ extern PyTypeObject PyTimelog_Type;
  * Type check macro.
  */
 #define PyTimelog_Check(op) PyObject_TypeCheck(op, &PyTimelog_Type)
+
+/**
+ * Internal helper: acquire core lock and re-check closed state.
+ * Returns 0 on success, -1 with exception set on closed.
+ */
+int tl_py_lock_checked(PyTimelog* self);
 
 /*===========================================================================
  * Macros for Method Implementation
@@ -147,6 +168,23 @@ extern PyTypeObject PyTimelog_Type;
         if ((self)->closed || (self)->tl == NULL) { \
             TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
             return -1; \
+        } \
+    } while (0)
+
+/**
+ * Serialize core calls. No-op if lock is NULL.
+ */
+#define TL_PY_LOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_acquire_lock((self)->core_lock, 1); \
+        } \
+    } while (0)
+
+#define TL_PY_UNLOCK(self) \
+    do { \
+        if ((self)->core_lock) { \
+            PyThread_release_lock((self)->core_lock); \
         } \
     } while (0)
 

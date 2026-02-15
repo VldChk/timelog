@@ -70,7 +70,8 @@ triggers it; it does not define selection or output rules.
 
 Active state (single-writer only):
 - active_run: append-only vector of records, always non-decreasing by ts.
-- active_ooo: small sorted vector of out-of-order records (ts < last_inorder_ts).
+- ooo_head: append-only buffer of out-of-order records (may be unsorted).
+- ooo_runs: immutable sorted OOO runs created from head flush.
 - active_tombs: coalesced interval set [t1, t2).
 
 Sealed state:
@@ -79,7 +80,9 @@ Sealed state:
 Metadata:
 - last_inorder_ts
 - active_bytes_est
-- ooo_len and ooo_budget thresholds
+- ooo_budget_bytes (budget applied to ooo_head + ooo_runs)
+- ooo_chunk_records (head flush threshold)
+- ooo_run_limit (hard cap for run count)
 - memtable_epoch (monotonic counter of writes) for snapshot caching
 
 Config (tl_config_t):
@@ -88,15 +91,16 @@ Config (tl_config_t):
 
 ### 3.3 Chosen OOO structure (rationale)
 
-- Sorted OOO vector is chosen for V1.
-- It keeps snapshots cheap (no sort at snapshot time).
-- Insert cost is O(log n + n) for OOO inserts, but OOO is bounded by budget.
-- Better for high hit-rate reads than sorting at snapshot time.
+- OOO head + immutable runs (mini-LSM) for V1.
+- OOO inserts are O(1) appends into the head.
+- Sorting cost is bounded to head flushes (O(H log H) per chunk).
+- Snapshots pin immutable runs and sort only the head copy off-lock.
+- Read path merges run + head + runs with a small, bounded fan-in.
 
 ### 3.4 High hit-rate read considerations
 
-- active_ooo is always sorted; memview iterators use lower_bound on both arrays.
-- memtable snapshots reuse a cached memview if epoch unchanged, avoiding copies.
+- Memview iterators merge active_run, sorted head copy, and OOO runs.
+- Memview cache pins immutable runs (no copy) and reuses snapshots by epoch.
 - Optional future: a small recent-index for point lookups on newest data.
 
 ### 3.5 Memtable structs (LLD shape)
@@ -106,7 +110,8 @@ typedef struct tl_memtable {
     tl_alloc_ctx_t* alloc;          /* allocator context (not owned) */
 
     tl_recvec_t    active_run;      /* append-only, sorted */
-    tl_recvec_t    active_ooo;      /* sorted vector */
+    tl_recvec_t    ooo_head;        /* append-only head (may be unsorted) */
+    tl_ooorunset_t* ooo_runs;       /* immutable sorted runs */
     tl_intervals_t active_tombs;    /* coalesced intervals */
 
     tl_memrun_t**  sealed;          /* FIFO queue (preallocated) */
@@ -116,7 +121,14 @@ typedef struct tl_memtable {
     tl_ts_t        last_inorder_ts;
     size_t         active_bytes_est;
     size_t         memtable_max_bytes;
-    size_t         ooo_budget_bytes; /* 0 = unlimited OOO budget */
+    size_t         ooo_budget_bytes; /* 0 => memtable_max_bytes / 10 */
+    size_t         ooo_chunk_records;
+    size_t         ooo_run_limit;
+
+    bool           ooo_head_sorted;
+    tl_ts_t        ooo_head_last_ts;
+    tl_handle_t    ooo_head_last_handle;
+    uint64_t       ooo_next_gen;
 
     uint64_t       epoch;           /* increments on any write */
 
@@ -134,8 +146,11 @@ typedef struct tl_memrun {
     tl_record_t*   run;
     size_t         run_len;
 
-    tl_record_t*   ooo;
-    size_t         ooo_len;
+    tl_ooorunset_t* ooo_runs;
+    size_t          ooo_total_len;
+    size_t          ooo_run_count;
+    tl_ts_t         ooo_min_ts;
+    tl_ts_t         ooo_max_ts;
 
     tl_interval_t* tombs;
     size_t         tombs_len;
@@ -157,14 +172,14 @@ else if ts >= last_inorder_ts:
     append to active_run
     last_inorder_ts = ts
 else:
-    insert into active_ooo:
-      - binary search insertion point
-      - memmove to create a gap (O(n))
-      - store record
-      - increment ooo_len
+    append to ooo_head
+    update head sortedness tracking
+    if ooo_head_len >= ooo_chunk_records:
+        flush head -> new OOO run (sorted)
 ```
 
-If active_ooo exceeds ooo_budget_bytes, seal early.
+If OOO usage (ooo_head + ooo_runs) exceeds ooo_budget_bytes or run limit,
+seal early (or return TL_EBUSY on backpressure).
 
 ### 3.7 Batch insert algorithm
 
@@ -188,14 +203,16 @@ Insert [t1, t2) into active_tombs (coalesced interval set).
 
 Seal if any of:
 - active_bytes_est >= memtable_max_bytes
-- active_ooo_bytes >= ooo_budget_bytes
+- ooo_total_bytes >= ooo_budget_bytes
+- ooo_run_count >= ooo_run_limit
 - explicit tl_flush
 
 Sealing steps:
-1) Move ownership of active_run, active_ooo, active_tombs into a memrun.
-2) Compute memrun min_ts/max_ts from run and ooo.
-3) Reset active buffers to empty.
-4) Push memrun into sealed queue (FIFO).
+1) Flush OOO head into a sorted run (required).
+2) Move ownership of active_run, ooo_runs, active_tombs into a memrun.
+3) Compute memrun min_ts/max_ts from run and OOO runs.
+4) Reset active buffers to empty.
+5) Push memrun into sealed queue (FIFO).
 
 ### 4.2 Flush policy
 
@@ -208,11 +225,11 @@ Flush targets the oldest sealed memrun. Selection uses peek + pin:
 
 Inputs:
 - memrun.run (sorted)
-- memrun.ooo (sorted)
+- memrun.ooo_runs (sorted runs)
 - memrun.tombs (interval list)
 
 Algorithm:
-1) Two-way merge run + ooo to produce a sorted stream.
+1) K-way merge run + OOO runs to produce a sorted stream.
 2) Build pages from the stream using storage LLD page builder.
 3) Build page catalog.
 4) Attach tombstones (if any).

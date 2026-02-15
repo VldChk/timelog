@@ -20,7 +20,6 @@
  * For CI/quick validation, set TIMELOG_SHORT_STRESS=1 to run abbreviated
  * versions with reduced iteration counts.
  *
- * Part of Phase 10: Integration Testing and Hardening
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -140,7 +139,7 @@ static void stress_srand(uint32_t seed) {
 }
 
 /*===========================================================================
- * Stress Tests (Phase 10)
+ * Stress Tests
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -196,10 +195,11 @@ static void* stress_single_writer_thread(void* arg) {
         if (st == TL_OK) {
             appended++;
         } else if (st == TL_EBUSY) {
-            /* Backpressure - retry with backoff */
+            /* TL_EBUSY: Record WAS inserted, but backpressure occurred.
+             * DO NOT retry (i--) - would create duplicate. Count as success. */
+            appended++;
             tl_atomic_fetch_add_u64(&ctx->backpressure_count, 1, TL_MO_RELAXED);
-            tl_sleep_ms(1);
-            i--;  /* Retry this record */
+            tl_sleep_ms(1);  /* Brief backoff before next insert */
         } else {
             /* Unexpected error */
             tl_atomic_fetch_add_u32(&ctx->error_count, 1, TL_MO_RELAXED);
@@ -404,23 +404,23 @@ TEST_DECLARE(stress_heavy_ooo_ingestion) {
         timestamps[j] = tmp;
     }
 
-    /* Insert in shuffled order with retry on backpressure */
+    /* Insert in shuffled order */
     size_t inserted = 0;
     size_t backpressure_count = 0;
 
-    for (size_t i = 0; i < record_count; ) {
+    for (size_t i = 0; i < record_count; i++) {
         tl_status_t st = tl_append(tl, timestamps[i], (tl_handle_t)(i + 1));
         if (st == TL_OK) {
             inserted++;
-            i++;
         } else if (st == TL_EBUSY) {
-            /* Backpressure - wait and retry */
+            /* TL_EBUSY: Record WAS inserted, but backpressure occurred.
+             * DO NOT retry - would create duplicate. Count as success. */
+            inserted++;
             backpressure_count++;
-            tl_sleep_ms(1);
-            /* Don't increment i - retry same record */
+            tl_sleep_ms(1);  /* Brief backoff before next insert */
         } else {
-            /* Unexpected failure - skip and continue */
-            i++;
+            /* Unexpected failure - record NOT inserted, skip */
+            printf("    [WARN] Append failed with %d at i=%zu\n", st, i);
         }
     }
 
@@ -792,7 +792,7 @@ void run_stress_tests(void) {
         printf("  [INFO] Running stress tests in FULL mode\n");
     }
 
-    /* Phase 10 stress tests - all respect single-writer contract */
+    /* Stress tests - all respect single-writer contract */
     RUN_TEST(stress_high_volume_append_query);
     RUN_TEST(stress_heavy_ooo_ingestion);
     RUN_TEST(stress_delete_churn);

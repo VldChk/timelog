@@ -8,7 +8,7 @@
  * data density. The feature dynamically adjusts compaction window sizes to
  * maintain approximately constant segment sizes (target_records per segment).
  *
- * Design Principles (LLD Section 4):
+ * Design principles:
  * 1. Backward compatible: Disabled by default (target_records == 0)
  * 2. Non-invasive: Pure policy module with clean integration points
  * 3. Safe: No allocation in policy loop, overflow-safe arithmetic
@@ -24,7 +24,6 @@
  * - Density updates occur ONLY when maintenance thread performs flush
  * - Manual tl_flush() does NOT update density (acceptable constraint)
  *
- * Reference: docs/timelog_adaptive_segmentation_lld_c17.md (draft-5)
  *===========================================================================*/
 
 #include "timelog/timelog.h"  /* For tl_adaptive_config_t, tl_ts_t, tl_status_t */
@@ -72,7 +71,7 @@ typedef struct tl_adaptive_state {
     /* Failure tracking */
     uint32_t        consecutive_failures;
     /* NOTE: last_compact_windows removed - not used in current implementation.
-     * The LLD defines it for desired_segments_per_compact feature which is
+     * Defined for the desired_segments_per_compact feature which is
      * not yet implemented. Add back if/when that feature is added. */
 } tl_adaptive_state_t;
 
@@ -207,6 +206,26 @@ void tl_adaptive_record_success(tl_adaptive_state_t* state);
 void tl_adaptive_record_failure(tl_adaptive_state_t* state);
 
 /*===========================================================================
+ * Advisory Resize Query
+ *
+ * Returns true if adaptive segmentation has sufficient samples to potentially
+ * resize the window. Used by scheduler to decide if compaction should run.
+ *
+ * This is an advisory function only - actual resize decision happens in
+ * tl_adaptive_compute_candidate() which includes warmup checks, staleness,
+ * hysteresis, etc.
+ *
+ * Thread Safety: This function reads fields without locking (intentionally).
+ * Reads may be racy but are benign for advisory use. See implementation for
+ * detailed rationale. Callers must NOT use this for correctness decisions.
+ *
+ * @param tl  Timelog instance (must not be NULL)
+ * @return true if resize might be beneficial, false otherwise
+ *===========================================================================*/
+
+bool tl_adaptive_wants_resize(const tl_timelog_t* tl);
+
+/*===========================================================================
  * Internal Computation Helpers (Exposed for Testing)
  *
  * These are implementation details but exposed in the header for unit testing.
@@ -241,7 +260,7 @@ bool tl__adaptive_hysteresis_skip(double candidate,
  * Apply nearest-quantum snapping.
  * Returns snapped value, or current_window if snapping fails.
  *
- * Algorithm (per LLD):
+ * Algorithm:
  * 1. wi = llround(candidate)
  * 2. qid = floor_div(wi, quantum)
  * 3. snapped = qid * quantum

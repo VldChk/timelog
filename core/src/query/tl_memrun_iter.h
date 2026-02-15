@@ -3,12 +3,12 @@
 
 #include "../internal/tl_defs.h"
 #include "../delta/tl_memrun.h"
+#include "tl_submerge.h"
 
 /*===========================================================================
  * Memrun Iterator
  *
- * Two-way merge over run[] and ooo[] arrays within a memrun.
- * Produces records in timestamp order (run preferred on ties for stability).
+ * Internal K-way merge over run[] and OOO runs within a memrun.
  *
  * UNBOUNDED QUERY DESIGN:
  * - If t2_unbounded == true, the query is [t1, +inf)
@@ -17,8 +17,6 @@
  * Thread Safety:
  * - Not thread-safe (each thread needs its own iterator)
  * - Memrun must remain valid for the lifetime of the iterator
- *
- * Reference: Read Path LLD Section 5.2
  *===========================================================================*/
 
 typedef struct tl_memrun_iter {
@@ -29,16 +27,11 @@ typedef struct tl_memrun_iter {
     tl_ts_t         t2;              /* ONLY valid if !t2_unbounded */
     bool            t2_unbounded;
 
-    /* Positions in run and ooo */
-    size_t          run_pos;
-    size_t          run_end;
-    size_t          ooo_pos;
-    size_t          ooo_end;
+    /* Internal merge state */
+    tl_submerge_t   merge;
 
-    /* State */
+    /* Output state */
     bool            done;
-    bool            has_current;
-    tl_record_t     current;
 } tl_memrun_iter_t;
 
 /*===========================================================================
@@ -48,6 +41,12 @@ typedef struct tl_memrun_iter {
 /**
  * Initialize memrun iterator for range [t1, t2) or [t1, +inf).
  *
+ * Lifecycle contract:
+ * - This API may allocate internal merge state.
+ * - After each init attempt (success or failure), calling
+ *   tl_memrun_iter_destroy() is always safe.
+ * - Re-initializing the same iterator without destroy is invalid.
+ *
  * After init, call tl_memrun_iter_next() to get the first record.
  *
  * @param it           Iterator to initialize
@@ -55,11 +54,21 @@ typedef struct tl_memrun_iter {
  * @param t1           Range start (inclusive)
  * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
  * @param t2_unbounded True => [t1, +inf), t2 is ignored
+ * @param alloc        Allocator for internal merge state
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on allocation failure
  */
-void tl_memrun_iter_init(tl_memrun_iter_t* it,
-                          const tl_memrun_t* mr,
-                          tl_ts_t t1, tl_ts_t t2,
-                          bool t2_unbounded);
+tl_status_t tl_memrun_iter_init(tl_memrun_iter_t* it,
+                                 const tl_memrun_t* mr,
+                                 tl_ts_t t1, tl_ts_t t2,
+                                 bool t2_unbounded,
+                                 tl_alloc_ctx_t* alloc);
+
+/**
+ * Destroy memrun iterator and free internal resources.
+ *
+ * Safe to call on a zeroed or partially initialized iterator.
+ */
+void tl_memrun_iter_destroy(tl_memrun_iter_t* it);
 
 /*===========================================================================
  * Iteration
@@ -70,9 +79,12 @@ void tl_memrun_iter_init(tl_memrun_iter_t* it,
  *
  * @param it   Iterator
  * @param out  Output record (may be NULL)
- * @return TL_OK if record available, TL_EOF if exhausted
+ * @param out_watermark Source watermark for the emitted record (optional)
+ * @return TL_OK if record available, TL_EOF if exhausted, or error status
  */
-tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it, tl_record_t* out);
+tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it,
+                                 tl_record_t* out,
+                                 tl_seq_t* out_watermark);
 
 /**
  * Seek to first record with ts >= target.
@@ -82,37 +94,20 @@ tl_status_t tl_memrun_iter_next(tl_memrun_iter_t* it, tl_record_t* out);
  *
  * @param it     Iterator
  * @param target Target timestamp
+ * @return TL_OK on success, TL_ENOMEM/TL_EOVERFLOW on internal growth failure
+ *
+ * On error, iterator transitions to done=true.
  */
-void tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target);
+tl_status_t tl_memrun_iter_seek(tl_memrun_iter_t* it, tl_ts_t target);
 
 /*===========================================================================
  * State Queries
  *===========================================================================*/
 
-/**
- * Check if iterator is exhausted.
- */
+/** Check if iterator is exhausted. */
 TL_INLINE bool tl_memrun_iter_done(const tl_memrun_iter_t* it) {
     TL_ASSERT(it != NULL);
     return it->done;
-}
-
-/**
- * Peek at current record without advancing.
- * Precondition: !done && has_current
- */
-TL_INLINE const tl_record_t* tl_memrun_iter_peek(const tl_memrun_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    TL_ASSERT(!it->done && it->has_current);
-    return &it->current;
-}
-
-/**
- * Check if iterator has a current record.
- */
-TL_INLINE bool tl_memrun_iter_has_current(const tl_memrun_iter_t* it) {
-    TL_ASSERT(it != NULL);
-    return !it->done && it->has_current;
 }
 
 #endif /* TL_MEMRUN_ITER_H */

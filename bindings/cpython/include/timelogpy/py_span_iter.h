@@ -24,7 +24,7 @@
  *   Individual PageSpan instances each hold their own owner ref, remaining
  *   valid after the iterator is closed.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_ITER_H
@@ -112,7 +112,7 @@ extern PyTypeObject PyPageSpanIter_Type;
  * @param timelog PyTimelog instance
  * @param t1      Range start (inclusive)
  * @param t2      Range end (exclusive)
- * @param kind    "segment" (only supported value)
+ * @param kind    "segment" (currently supported value)
  * @return New PageSpanIter object, or NULL on error with exception set
  */
 PyObject* PyPageSpanIter_Create(PyObject* timelog,

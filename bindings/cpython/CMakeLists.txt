@@ -125,11 +125,11 @@ endif()
 set(TIMELOG_PY_SOURCES
     src/py_handle.c
     src/py_errors.c
-    src/py_timelog.c    # LLD-B2: PyTimelog type implementation
-    src/py_iter.c       # LLD-B3: PyTimelogIter type implementation
-    src/py_span.c       # LLD-B4: PyPageSpan type implementation
-    src/py_span_iter.c  # LLD-B4: PyPageSpanIter type implementation
-    src/py_span_objects.c # LLD-B4: PyPageSpanObjectsView type implementation
+    src/py_timelog.c    # PyTimelog type implementation
+    src/py_iter.c       # PyTimelogIter type implementation
+    src/py_span.c       # PyPageSpan type implementation
+    src/py_span_iter.c  # PyPageSpanIter type implementation
+    src/py_span_objects.c # PyPageSpanObjectsView type implementation
     src/module.c        # Module initialization
 )
 
@@ -178,11 +178,11 @@ option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
 
 if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
-    # Test: test_py_handle (LLD-B1 unit tests)
+    # Test: test_py_handle (Handle unit tests)
     # =========================================================================
     add_executable(test_py_handle
         tests/test_py_handle.c
-        src/py_handle.c         # LLD-B1 implementation under test
+        src/py_handle.c         # Handle implementation under test
     )
 
     target_include_directories(test_py_handle PRIVATE
@@ -224,17 +224,17 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_timelog (LLD-B2 unit tests)
+    # Test: test_py_timelog (PyTimelog unit tests)
     # =========================================================================
     add_executable(test_py_timelog
         tests/test_py_timelog.c
-        src/py_handle.c         # LLD-B1 dependency
+        src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
-        src/py_timelog.c        # LLD-B2 implementation under test
-        src/py_iter.c           # LLD-B3 dependency (used by py_timelog.c)
-        src/py_span.c           # LLD-B4 dependency (used by py_timelog.c)
-        src/py_span_iter.c      # LLD-B4 dependency
-        src/py_span_objects.c   # LLD-B4 dependency
+        src/py_timelog.c        # PyTimelog implementation under test
+        src/py_iter.c           # Iterator dependency (used by py_timelog.c)
+        src/py_span.c           # PageSpan dependency (used by py_timelog.c)
+        src/py_span_iter.c      # PageSpan dependency
+        src/py_span_objects.c   # PageSpan dependency
     )
 
     target_include_directories(test_py_timelog PRIVATE
@@ -277,17 +277,17 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_iter (LLD-B3 unit tests)
+    # Test: test_py_iter (Iterator unit tests)
     # =========================================================================
     add_executable(test_py_iter
         tests/test_py_iter.c
-        src/py_handle.c         # LLD-B1 dependency
+        src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
-        src/py_timelog.c        # LLD-B2 dependency (factory methods)
-        src/py_iter.c           # LLD-B3 implementation under test
-        src/py_span.c           # LLD-B4 dependency (used by py_timelog.c)
-        src/py_span_iter.c      # LLD-B4 dependency
-        src/py_span_objects.c   # LLD-B4 dependency
+        src/py_timelog.c        # PyTimelog dependency (factory methods)
+        src/py_iter.c           # Iterator implementation under test
+        src/py_span.c           # PageSpan dependency (used by py_timelog.c)
+        src/py_span_iter.c      # PageSpan dependency
+        src/py_span_objects.c   # PageSpan dependency
     )
 
     target_include_directories(test_py_iter PRIVATE
@@ -301,6 +301,9 @@ if(TIMELOG_BUILD_PY_TESTS)
             TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
         )
     endif()
+    target_compile_definitions(test_py_iter PRIVATE
+        TL_PY_ITER_TEST_HOOKS
+    )
 
     target_link_libraries(test_py_iter PRIVATE
         timelog
@@ -330,17 +333,17 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_span (LLD-B4 unit tests)
+    # Test: test_py_span (PageSpan unit tests)
     # =========================================================================
     add_executable(test_py_span
         tests/test_py_span.c
-        src/py_handle.c         # LLD-B1 dependency
+        src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
-        src/py_timelog.c        # LLD-B2 dependency (factory methods)
-        src/py_iter.c           # LLD-B3 dependency
-        src/py_span.c           # LLD-B4 implementation under test
-        src/py_span_iter.c      # LLD-B4 iterator
-        src/py_span_objects.c   # LLD-B4 objects view
+        src/py_timelog.c        # PyTimelog dependency (factory methods)
+        src/py_iter.c           # Iterator dependency
+        src/py_span.c           # PageSpan implementation under test
+        src/py_span_iter.c      # PageSpan iterator
+        src/py_span_objects.c   # PageSpan objects view
     )
 
     target_include_directories(test_py_span PRIVATE
@@ -383,17 +386,17 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_maint_b5 (LLD-B5 unit tests - Maintenance + Threading)
+    # Test: test_py_maint_b5 (Maintenance unit tests - Maintenance + Threading)
     # =========================================================================
     add_executable(test_py_maint_b5
         tests/test_py_maint_b5.c
-        src/py_handle.c         # LLD-B1 dependency
+        src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
-        src/py_timelog.c        # LLD-B2 dependency (factory methods)
-        src/py_iter.c           # LLD-B3 dependency
-        src/py_span.c           # LLD-B4 dependency
-        src/py_span_iter.c      # LLD-B4 dependency
-        src/py_span_objects.c   # LLD-B4 dependency
+        src/py_timelog.c        # PyTimelog dependency (factory methods)
+        src/py_iter.c           # Iterator dependency
+        src/py_span.c           # PageSpan dependency
+        src/py_span_iter.c      # PageSpan dependency
+        src/py_span_objects.c   # PageSpan dependency
     )
 
     target_include_directories(test_py_maint_b5 PRIVATE
@@ -436,17 +439,17 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_errors (LLD-B6 unit tests - Error Model Subsystem)
+    # Test: test_py_errors (Error Model unit tests - Error Model Subsystem)
     # =========================================================================
     add_executable(test_py_errors
         tests/test_py_errors.c
-        src/py_handle.c         # LLD-B1 dependency
+        src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation (primary target)
-        src/py_timelog.c        # LLD-B2 dependency (integration tests)
-        src/py_iter.c           # LLD-B3 dependency (integration tests)
-        src/py_span.c           # LLD-B4 dependency
-        src/py_span_iter.c      # LLD-B4 dependency
-        src/py_span_objects.c   # LLD-B4 dependency
+        src/py_timelog.c        # PyTimelog dependency (integration tests)
+        src/py_iter.c           # Iterator dependency (integration tests)
+        src/py_span.c           # PageSpan dependency
+        src/py_span_iter.c      # PageSpan dependency
+        src/py_span_objects.c   # PageSpan dependency
     )
 
     target_include_directories(test_py_errors PRIVATE

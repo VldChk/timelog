@@ -13,8 +13,6 @@
  * Segments are classified by their level:
  * - L0 (delta layer): Flush outputs, may overlap, may carry tombstones
  * - L1 (main layer): Compaction outputs, non-overlapping, no tombstones
- *
- * Reference: Storage LLD Section 3.6
  *===========================================================================*/
 
 typedef enum tl_segment_level {
@@ -25,13 +23,12 @@ typedef enum tl_segment_level {
 /*===========================================================================
  * Tombstones (Immutable Interval Set)
  *
- * Matches Storage LLD Section 3.5 exactly.
  * Segment holds a POINTER to this struct (NULL if no tombstones).
  *
  * Invariants:
  * - Intervals are sorted by start
  * - Non-overlapping
- * - Coalesced (no adjacent intervals)
+ * - Coalesced (no adjacent intervals with equal max_seq)
  *===========================================================================*/
 
 typedef struct tl_tombstones {
@@ -59,8 +56,6 @@ typedef struct tl_tombstones {
  * - page_count = 0, record_count = 0
  * - tombstones != NULL && tombstones->n > 0
  * - min_ts/max_ts derived from tombstones
- *
- * Reference: Storage LLD Section 3.6, Section 5
  *===========================================================================*/
 
 typedef struct tl_segment {
@@ -68,13 +63,40 @@ typedef struct tl_segment {
     tl_ts_t   min_ts;           /* Minimum timestamp (inclusive) */
     tl_ts_t   max_ts;           /* Maximum timestamp (inclusive) */
 
+    /* Record-only bounds (valid when page_count > 0) */
+    tl_ts_t   record_min_ts;    /* First record ts (inclusive) */
+    tl_ts_t   record_max_ts;    /* Last record ts (inclusive) */
+
+    /* Tombstone-only bounds (valid when tombstones exist) */
+    tl_ts_t   tomb_min_ts;      /* Min tombstone start */
+    tl_ts_t   tomb_max_ts;      /* Max tombstone end-1 (or TL_TS_MAX if unbounded) */
+
     /* Counts */
-    uint64_t  record_count;     /* Total records (sum of page counts) */
+    uint64_t  record_count;     /* Cached total; validated vs page catalog */
     uint32_t  page_count;       /* Number of pages (0 for tombstone-only) */
 
     /* Level and generation */
     uint32_t  level;            /* tl_segment_level_t */
     uint32_t  generation;       /* Monotonic generation counter (diagnostics) */
+    /*
+     * Tombstone watermark applied to this segment.
+     *
+     * CONTRACT: For immutable source S with S.applied_seq = X, all
+     * tombstones with seq <= X were physically applied to S's records
+     * at build time. Surviving records have either:
+     *   - tomb_seq <= X: tombstone already applied, record survived
+     *   - tomb_seq > X:  tombstone newer, must be checked at query time
+     *
+     * INVARIANT: applied_seq >= max(tombstones[i].max_seq) for all
+     * tombstones stored in this segment.
+     *
+     * INVARIANT: For L0 segments produced in order, applied_seq is
+     * non-decreasing with generation (flush assigns op_seq at seal time).
+     *
+     * CRITICAL: During flush, applied_seq and the tombstone set MUST come
+     * from the same snapshot to preserve the watermark guarantee.
+     */
+    tl_seq_t  applied_seq;
 
     /* Window bounds (L1 only, 0 for L0) */
     tl_ts_t   window_start;     /* Inclusive start (L1 only) */
@@ -83,6 +105,11 @@ typedef struct tl_segment {
 
     /* Page catalog */
     tl_page_catalog_t catalog;
+
+    /* Optional prefix sums over page counts, length = page_count + 1.
+     * page_prefix_counts[i] = total records in pages [0, i).
+     * NULL when page_count == 0. */
+    uint64_t* page_prefix_counts;
 
     /* Tombstones (L0 only, NULL for L1) */
     tl_tombstones_t* tombstones;
@@ -101,7 +128,7 @@ typedef struct tl_segment {
 /**
  * Build an L0 segment from sorted records and optional tombstones.
  *
- * Used by flush builder (Write Path LLD Section 4.3).
+ * Used by flush builder.
  *
  * @param alloc             Allocator context
  * @param records           Sorted record array (may be NULL if tombstone-only)
@@ -114,7 +141,9 @@ typedef struct tl_segment {
  * @return TL_OK on success,
  *         TL_ENOMEM on allocation failure,
  *         TL_EINVAL if both record_count == 0 and tombstones_len == 0,
- *         TL_EINVAL if tombstones_len > UINT32_MAX
+ *         TL_EINVAL if tombstones_len > UINT32_MAX,
+ *         TL_EINVAL if tombstones_len > 0 but tombstones == NULL,
+ *         TL_EINVAL if record_count > 0 but records == NULL
  *
  * Segment bounds for tombstone-only segments:
  * - min_ts = min(tombstones[i].start)
@@ -127,12 +156,13 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
                                  const tl_interval_t* tombstones, size_t tombstones_len,
                                  size_t target_page_bytes,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out);
 
 /**
  * Build an L1 segment from sorted records within a window.
  *
- * Used by compaction builder (Compaction Policy LLD Section 7).
+ * Used by compaction builder.
  *
  * @param alloc               Allocator context
  * @param records             Sorted record array (must not be NULL, count > 0)
@@ -142,12 +172,16 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
  * @param window_end          Window end (exclusive); TL_TS_MAX when unbounded
  * @param window_end_unbounded True if window extends to +infinity
  * @param generation          Generation counter
- * @param out                 Output segment pointer
- * @return TL_OK on success, TL_ENOMEM on failure, TL_EINVAL if records empty
+ * @param out                 Output segment pointer (set to NULL on error)
+ * @return TL_OK on success,
+ *         TL_ENOMEM on allocation failure,
+ *         TL_EINVAL if records empty or NULL,
+ *         TL_EINVAL if window_end_unbounded is true but window_end != TL_TS_MAX
  *
  * Precondition: All records satisfy window_start <= ts < window_end
  *               (or ts >= window_start if window_end_unbounded).
  * Invariant: window_end_unbounded implies window_end == TL_TS_MAX.
+ *            This is enforced at runtime (returns TL_EINVAL on violation).
  *
  * Returned segment has refcnt = 1 (caller owns reference).
  */
@@ -157,6 +191,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
                                  tl_ts_t window_start, tl_ts_t window_end,
                                  bool window_end_unbounded,
                                  uint32_t generation,
+                                 tl_seq_t applied_seq,
                                  tl_segment_t** out);
 
 /*===========================================================================
@@ -175,7 +210,6 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
  *       destroy(obj);
  *   }
  *
- * Reference: Implementation Notes Section 7.2, 7.3
  *===========================================================================*/
 
 /**
@@ -212,8 +246,62 @@ TL_INLINE bool tl_segment_is_tombstone_only(const tl_segment_t* seg) {
     return seg->page_count == 0 && seg->tombstones != NULL && seg->tombstones->n > 0;
 }
 
+TL_INLINE bool tl_segment_has_records(const tl_segment_t* seg) {
+    return seg->page_count > 0;
+}
+
 TL_INLINE bool tl_segment_has_tombstones(const tl_segment_t* seg) {
     return seg->tombstones != NULL && seg->tombstones->n > 0;
+}
+
+TL_INLINE tl_ts_t tl_segment_record_min_ts(const tl_segment_t* seg) {
+    return seg->record_min_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_record_max_ts(const tl_segment_t* seg) {
+    return seg->record_max_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_tomb_min_ts(const tl_segment_t* seg) {
+    return seg->tomb_min_ts;
+}
+
+TL_INLINE tl_ts_t tl_segment_tomb_max_ts(const tl_segment_t* seg) {
+    return seg->tomb_max_ts;
+}
+
+TL_INLINE tl_seq_t tl_segment_applied_seq(const tl_segment_t* seg) {
+    return seg->applied_seq;
+}
+
+TL_INLINE const tl_page_catalog_t* tl_segment_catalog(const tl_segment_t* seg) {
+    return &seg->catalog;
+}
+
+TL_INLINE const uint64_t* tl_segment_page_prefix_counts(const tl_segment_t* seg) {
+    return seg->page_prefix_counts;
+}
+
+TL_INLINE uint64_t tl_segment_page_prefix_sum(const tl_segment_t* seg,
+                                              size_t first,
+                                              size_t last) {
+    TL_ASSERT(seg != NULL);
+    TL_ASSERT(first <= last);
+    TL_ASSERT(last <= seg->page_count);
+
+    if (first == last) {
+        return 0;
+    }
+
+    if (seg->page_prefix_counts != NULL) {
+        return seg->page_prefix_counts[last] - seg->page_prefix_counts[first];
+    }
+
+    uint64_t total = 0;
+    for (size_t i = first; i < last; i++) {
+        total += seg->catalog.pages[i].count;
+    }
+    return total;
 }
 
 /**
@@ -230,13 +318,6 @@ TL_INLINE tl_intervals_imm_t tl_segment_tombstones_imm(const tl_segment_t* seg) 
         imm.len = 0;
     }
     return imm;
-}
-
-/**
- * Get page catalog (for iteration).
- */
-TL_INLINE const tl_page_catalog_t* tl_segment_catalog(const tl_segment_t* seg) {
-    return &seg->catalog;
 }
 
 /*===========================================================================

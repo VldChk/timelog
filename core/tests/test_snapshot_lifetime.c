@@ -13,7 +13,6 @@
  * Tests use the tl__test_assert_hook mechanism to intercept assertions
  * without terminating the process.
  *
- * Part of Phase 10: Integration Testing and Hardening
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -76,7 +75,7 @@ static void lifetime_test_assert_hook(const char* file, int line, const char* ex
 #endif /* TL_DEBUG && TL_TEST_HOOKS */
 
 /*===========================================================================
- * Snapshot Lifetime Tests (Phase 10 - P0 CRITICAL)
+ * Snapshot Lifetime Tests
  *
  * These tests verify proper snapshot and iterator lifetime management.
  *===========================================================================*/

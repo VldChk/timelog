@@ -13,7 +13,7 @@
  * Zero-Copy Promise:
  *   The .timestamps property returns a memoryview directly backed by
  *   span->ts memory. No copying occurs unless explicitly requested
- *   via copy_timestamps() or copy().
+ *   via copy_timestamps().
  *
  * Thread Safety:
  *   A PageSpan instance is NOT thread-safe. Do not access the same
@@ -26,7 +26,7 @@
  *   iterator creation) handles pins_exit and Py_DECREF of the timelog.
  *   Page memory remains valid as long as any span holds an owner ref.
  *
- * See: docs/timelog_v2_lld_pagespan_cpython_bindings_update.md
+ * See: docs/V2/timelog_v2_lld_storage_pages.md
  */
 
 #ifndef TL_PY_SPAN_H
@@ -74,7 +74,7 @@ static inline PyObject* TL_Py_NewRef(PyObject* obj) {
  *   - len: row count
  *   - first_ts, last_ts: cached boundary timestamps
  *
- * Cannot be instantiated directly; use Timelog.page_spans() factory.
+ * Cannot be instantiated directly; use Timelog.views() (alias: page_spans()).
  *===========================================================================*/
 
 typedef struct {

@@ -22,8 +22,6 @@
  * - Manifest holds strong references to all its segments (acquired on build)
  * - When manifest is released and refcnt hits 0, all segment references are
  *   released
- *
- * Reference: Storage LLD Section 3.7, Section 8
  *===========================================================================*/
 
 typedef struct tl_manifest {
@@ -33,12 +31,12 @@ typedef struct tl_manifest {
     /* L1 segments: non-overlapping, sorted by window_start */
     tl_segment_t** l1;
     uint32_t       n_l1;
-    uint32_t       cap_l1;
+    uint32_t       cap_l1; /* Capacity cache (diagnostic; == n_l1 when published) */
 
     /* L0 segments: may overlap, in flush order */
     tl_segment_t** l0;
     uint32_t       n_l0;
-    uint32_t       cap_l0;
+    uint32_t       cap_l0; /* Capacity cache (diagnostic; == n_l0 when published) */
 
     /* Cached global bounds (optional optimization) */
     bool      has_bounds;
@@ -99,13 +97,11 @@ TL_INLINE uint32_t tl_manifest_refcnt(const tl_manifest_t* m) {
  * 2. Queue additions/removals
  * 3. Build new manifest
  * 4. Destroy builder (cleans up temporary buffers)
- *
- * Reference: Storage LLD Section 8
  *===========================================================================*/
 
 typedef struct tl_manifest_builder {
     tl_alloc_ctx_t* alloc;
-    tl_manifest_t*  base;           /* Old manifest (NULL for initial) */
+    const tl_manifest_t* base;      /* Old manifest (NULL for initial) */
 
     /* Pending additions */
     tl_segment_t**  add_l0;
@@ -132,7 +128,7 @@ typedef struct tl_manifest_builder {
  */
 void tl_manifest_builder_init(tl_manifest_builder_t* mb,
                                tl_alloc_ctx_t* alloc,
-                               tl_manifest_t* base);
+                               const tl_manifest_t* base);
 
 /**
  * Destroy builder and free temporary buffers.
@@ -225,7 +221,7 @@ TL_INLINE uint64_t tl_manifest_version(const tl_manifest_t* m) {
  * Returns index of first potentially overlapping segment.
  * Returns m->n_l1 if no such segment exists.
  *
- * Used by read path for L1 pruning (Read Path LLD Section 4.1).
+ * Used by read path for L1 pruning.
  *
  * Note: Uses max_ts (not window_end) for precise pruning.
  * Since L1 segments are non-overlapping by window and sorted by window_start,
