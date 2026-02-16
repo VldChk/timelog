@@ -107,12 +107,9 @@ def _a6_setup(ctx: BenchmarkCaseContext) -> ScenarioState:
     runner = _runner_from_ctx(ctx)
     alt_path = td._alternate_dataset_path(ctx.data_path)
     if alt_path is None:
-        # Try generated 20% OOO file first, then legacy CSV
-        for name in ("generated_20pct.csv", "order_book_50MB_20pct_ooo_clean.csv"):
-            candidate = Path(ctx.data_path).with_name(name)
-            if candidate.exists():
-                alt_path = str(candidate)
-                break
+        paired = td.paired_dataset_path(ctx.data_path)
+        if paired is not None and Path(paired).exists():
+            alt_path = paired
     if alt_path is None:
         alt_path = ctx.data_path
     return ScenarioState(

@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+concurrency:
+  group: docs-check-pr-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   docs-check:
     runs-on: ubuntu-latest

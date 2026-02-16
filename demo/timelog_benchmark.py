@@ -84,12 +84,13 @@ def _ensure_data_generated(args: argparse.Namespace) -> None:
     # Primary benchmark dataset.
     _ensure_one(data_path, _rate_from_name(data_path, ooo_rate))
 
-    # Scenario A6 compares against an alternate ordering profile; when using
-    # generated datasets, ensure the paired file exists as well.
-    alt = td._alternate_dataset_path(str(data_path))
+    # Scenario A6 compares against an alternate ordering profile; ensure the
+    # paired dataset file exists even when it has not been generated yet.
+    alt = td.paired_dataset_path(str(data_path))
     if alt is not None:
         alt_path = Path(alt)
-        _ensure_one(alt_path, _rate_from_name(alt_path, ooo_rate))
+        if alt_path.resolve() != data_path.resolve():
+            _ensure_one(alt_path, _rate_from_name(alt_path, ooo_rate))
 
 
 def run_methodology(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:

@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
     paths:
+      - 'core/**'
+      - 'bindings/**'
+      - 'python/**'
       - 'demo/**'
       - 'docs/PERFORMANCE_METHODOLOGY.md'
       - 'benchmarks/**'
@@ -51,7 +54,7 @@ jobs:
             --output demo/generated_20pct.csv \
             --rows 581400 \
             --ooo-rate 0.20 \
-            --seed 12345
+            --seed 67890
 
       - name: Run methodology full profile and refresh baseline
         shell: bash
@@ -77,6 +80,33 @@ jobs:
             demo/benchmark_runs/methodology_full_${{ runner.os }}.md
             demo/benchmark_runs/methodology_full_${{ runner.os }}.log
             benchmarks/baselines/**/methodology_v1.json
+
+      - name: Append summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path("demo/benchmark_runs/methodology_full_${{ runner.os }}.json")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write("## Benchmark Methodology (Main)\n")
+              if not p.exists():
+                  out.write("- summary JSON missing\n")
+              else:
+                  try:
+                      d = json.loads(p.read_text(encoding="utf-8"))
+                  except Exception as exc:
+                      out.write(f"- summary JSON parse error: {exc}\n")
+                  else:
+                      counts = d.get("summary", {}).get("gate_counts", {})
+                      out.write(f"- platform: {d.get('platform')}\n")
+                      out.write(f"- correctness fail: {counts.get('correctness', {}).get('fail', 0)}\n")
+                      out.write(f"- complexity fail: {counts.get('complexity', {}).get('fail', 0)}\n")
+                      out.write(f"- throughput warn: {counts.get('throughput', {}).get('warn', 0)}\n")
+          PY
 
       - name: Create baseline update PR
         uses: peter-evans/create-pull-request@v6

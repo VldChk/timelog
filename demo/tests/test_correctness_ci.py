@@ -10,9 +10,19 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "demo"))
+
+import correctness_ci as cci  # noqa: E402
 
 
 class CorrectnessCIOrchestratorTests(unittest.TestCase):
+    def test_nightly_profile_includes_mixed_leg_config(self) -> None:
+        legs = cci._profile_legs("nightly", duration_override_seconds=1)
+        mixed = [leg for leg in legs if leg.source_mode == "mixed"]
+        self.assertEqual(len(mixed), 1)
+        self.assertAlmostEqual(mixed[0].ooo_rate, 0.05)
+        self.assertAlmostEqual(mixed[0].mixed_alt_ooo_rate or 0.0, 0.20)
+
     def test_pr_profile_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -67,6 +77,7 @@ class CorrectnessCIOrchestratorTests(unittest.TestCase):
             payload = json.loads(export_json.read_text(encoding="utf-8"))
             self.assertEqual(payload.get("profile"), "nightly")
             self.assertEqual(len(payload.get("legs", [])), 3)
+            self.assertEqual(sum(1 for leg in payload.get("legs", []) if leg.get("source_mode") == "mixed"), 1)
             self.assertEqual(proc.returncode, int(payload.get("exit_code")))
 
 

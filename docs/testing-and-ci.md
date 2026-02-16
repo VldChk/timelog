@@ -15,3 +15,14 @@
 - Docs consistency workflow: `.github/workflows/docs-check.yml`
 
 Detailed test commands and branch-protection checks are in `docs/CI_TESTS.md`.
+
+## Demo/Verifier Runtime Behavior
+
+1. `demo/timelog_demo.py` bootstrap:
+   - Uses `demo/generated_5pct.csv` by default.
+   - Auto-generates missing `generated_*.csv` inputs via `demo/hft_synthetic.py`.
+2. Correctness checker source modes:
+   - `synthetic`: single synthetic stream.
+   - `csv`: strict CSV-only mode; requires valid `--csv` inputs.
+   - `mixed`: explicit dual-source mode (`mixed_csv_syn` or `mixed_syn_syn`).
+3. Correctness summaries include `source_contract` and `source_counters` for CI triage.

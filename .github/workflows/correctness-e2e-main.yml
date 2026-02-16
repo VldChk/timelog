@@ -96,4 +96,13 @@ jobs:
                       out.write(f"- exit_code: {d.get('exit_code')}\n")
                       out.write(f"- legs: {len(d.get('legs', []))}\n")
                       out.write(f"- failed_legs: {', '.join(d.get('failed_legs', [])) or 'none'}\n")
+                      for leg in d.get("legs", []):
+                          counters = leg.get("source_counters", {})
+                          rendered = ", ".join(
+                              f"{k}={v}" for k, v in sorted(counters.items())
+                          ) if counters else "none"
+                          out.write(
+                              f"- leg `{leg.get('leg_id')}`: mode={leg.get('source_mode')} "
+                              f"contract={leg.get('source_contract')} counters={rendered}\n"
+                          )
           PY

@@ -83,9 +83,15 @@ dist/
 # =============================================================================
 # Temp script files
 *.bat
-!run_clang_tidy.bat
 *.sh
-!run_tidy.sh
+
+# Static analysis output
+*.plist
+
+# Structured logs
+*.jsonl
+
+demo/benchmark_runs/*
 
 # Working notes (keep in separate branch or local)
 notes*.md

@@ -215,7 +215,7 @@ class HFTOrderBookEngine:
     def _fill_order_event(self) -> HFTEvent | None:
         if not self.orders:
             return None
-        order_id = self.rng.choice(tuple(self.orders.keys()))
+        order_id = self.rng.choice(list(self.orders))
         state = self.orders[order_id]
         market_ask, market_bid = self._next_prices(state.symbol)
 

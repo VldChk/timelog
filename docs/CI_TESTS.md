@@ -9,6 +9,23 @@ This repository includes a dedicated PR workflow at `.github/workflows/tests-pr.
 3. Python facade tests in `python/tests` via `pytest`.
 4. Demo/methodology/correctness tests in `demo/tests` via `unittest`.
 
+## Synthetic Data Contracts
+
+1. `demo/timelog_demo.py` defaults to `demo/generated_5pct.csv` and auto-generates missing `generated_*.csv` files with `demo/hft_synthetic.py`.
+2. `demo/timelog_benchmark.py --generate-data` guarantees both the primary generated dataset and its A6 comparison pair (`generated_5pct.csv` <-> `generated_20pct.csv`).
+3. Large committed CSV fixtures are not required for CI benchmark/correctness flows.
+
+## Correctness Source Contracts
+
+1. `demo/correctness_checker.py --source-mode csv` is strict and fails when no valid `--csv` files are provided.
+2. `--source-mode mixed` never silently degrades to single-source synthetic behavior:
+   - With CSV paths: `mixed_csv_syn`.
+   - Without CSV paths: `mixed_syn_syn` (primary + alternate synthetic OOO streams).
+3. Nightly correctness CI includes:
+   - synthetic 5% OOO leg
+   - synthetic 20% OOO leg
+   - mixed synthetic leg (5% primary + 20% alternate)
+
 ## Core Group List
 
 The grouped core run uses these 13 groups from `core/tests/test_main.c`:

@@ -10,6 +10,10 @@ on:
       - "demo/**"
       - ".github/workflows/benchmark-methodology-pr.yml"
 
+concurrency:
+  group: methodology-pr-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   methodology-pr:
     runs-on: ${{ matrix.os }}

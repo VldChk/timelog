@@ -12,6 +12,10 @@ on:
       - "demo/hft_synthetic.py"
       - ".github/workflows/correctness-e2e-pr.yml"
 
+concurrency:
+  group: correctness-e2e-pr-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   correctness-e2e-pr:
     runs-on: ubuntu-latest
