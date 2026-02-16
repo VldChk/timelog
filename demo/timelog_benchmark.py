@@ -54,20 +54,42 @@ def _ensure_data_generated(args: argparse.Namespace) -> None:
     """Generate benchmark CSV data on-the-fly if --generate-data is set."""
     if not getattr(args, "generate_data", False):
         return
+
+    def _rate_from_name(path: Path, default: float) -> float:
+        name = path.name
+        if "20pct" in name:
+            return 0.20
+        if "5pct" in name:
+            return 0.05
+        return default
+
     data_path = Path(args.data)
-    if data_path.exists():
-        return
     from hft_synthetic import generate_csv
+
     ooo_rate = getattr(args, "ooo_rate", 0.05)
     generate_rows = getattr(args, "generate_rows", 581_400)
-    print(f"[benchmark] Generating test data: {data_path} "
-          f"(rows={generate_rows}, ooo_rate={ooo_rate})")
-    generate_csv(
-        data_path,
-        rows=generate_rows,
-        ooo_rate=ooo_rate,
-        seed=args.seed,
-    )
+
+    def _ensure_one(path: Path, rate: float) -> None:
+        if path.exists():
+            return
+        print(f"[benchmark] Generating test data: {path} "
+              f"(rows={generate_rows}, ooo_rate={rate})")
+        generate_csv(
+            path,
+            rows=generate_rows,
+            ooo_rate=rate,
+            seed=args.seed,
+        )
+
+    # Primary benchmark dataset.
+    _ensure_one(data_path, _rate_from_name(data_path, ooo_rate))
+
+    # Scenario A6 compares against an alternate ordering profile; when using
+    # generated datasets, ensure the paired file exists as well.
+    alt = td._alternate_dataset_path(str(data_path))
+    if alt is not None:
+        alt_path = Path(alt)
+        _ensure_one(alt_path, _rate_from_name(alt_path, ooo_rate))
 
 
 def run_methodology(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
