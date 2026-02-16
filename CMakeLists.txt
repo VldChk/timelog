@@ -35,6 +35,7 @@ if(MSVC)
         /W4                     # Warning level 4
         /WX                     # Warnings as errors
         /wd4100                 # Unreferenced formal parameter (allow)
+        /wd4127                 # Conditional expression is constant (assert macros, while(1))
         /wd4189                 # Local variable initialized but not referenced
         /wd4200                 # Zero-sized array (flexible array member)
         /D_CRT_SECURE_NO_WARNINGS

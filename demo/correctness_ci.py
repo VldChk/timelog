@@ -16,9 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SEED = 12345
 FAIL_STATUSES = "CONFIRMED_ENGINE_BUG,CHECKER_BUG"
 
-CSV_7PCT = "demo/order_book_50MB_5pct_ooo_clean.csv"
-CSV_21PCT = "demo/order_book_50MB_20pct_ooo_clean.csv"
-
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -31,6 +28,7 @@ class LegSpec:
     duration_seconds: int
     csv_paths: list[str]
     ci_profile: str
+    ooo_rate: float = 0.05
 
 
 def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[LegSpec]:
@@ -38,11 +36,12 @@ def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[L
         duration = duration_override_seconds if duration_override_seconds is not None else 90
         return [
             LegSpec(
-                leg_id="pr_csv_7pct",
-                source_mode="csv",
+                leg_id="pr_syn_5pct",
+                source_mode="synthetic",
                 duration_seconds=duration,
-                csv_paths=[CSV_7PCT],
+                csv_paths=[],
                 ci_profile="pr",
+                ooo_rate=0.05,
             )
         ]
 
@@ -50,25 +49,28 @@ def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[L
     duration = duration_override_seconds if duration_override_seconds is not None else 200
     return [
         LegSpec(
-            leg_id="nightly_csv_7pct",
-            source_mode="csv",
+            leg_id="nightly_syn_5pct",
+            source_mode="synthetic",
             duration_seconds=duration,
-            csv_paths=[CSV_7PCT],
+            csv_paths=[],
             ci_profile="nightly",
+            ooo_rate=0.05,
         ),
         LegSpec(
-            leg_id="nightly_csv_21pct",
-            source_mode="csv",
+            leg_id="nightly_syn_20pct",
+            source_mode="synthetic",
             duration_seconds=duration,
-            csv_paths=[CSV_21PCT],
+            csv_paths=[],
             ci_profile="nightly",
+            ooo_rate=0.20,
         ),
         LegSpec(
-            leg_id="nightly_mixed",
-            source_mode="mixed",
+            leg_id="nightly_syn_mixed",
+            source_mode="synthetic",
             duration_seconds=duration,
-            csv_paths=[CSV_7PCT, CSV_21PCT],
+            csv_paths=[],
             ci_profile="nightly",
+            ooo_rate=0.12,
         ),
     ]
 
@@ -132,6 +134,8 @@ def _run_leg(
         str(bundle_out),
         "--run-id",
         run_id,
+        "--ooo-rate",
+        str(leg.ooo_rate),
     ]
     for csv in leg.csv_paths:
         cmd.extend(["--csv", csv])

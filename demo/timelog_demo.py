@@ -790,6 +790,8 @@ def _alternate_dataset_path(data_path: str) -> str | None:
         "tiny_order_book_less_order.csv": "tiny_order_book_mostly_ordered.csv",
         "tiny_order_book_mostly_ordered_clean.csv": "tiny_order_book_less_ordered_clean.csv",
         "tiny_order_book_less_ordered_clean.csv": "tiny_order_book_mostly_ordered_clean.csv",
+        "generated_5pct.csv": "generated_20pct.csv",
+        "generated_20pct.csv": "generated_5pct.csv",
     }
 
     alt_name = mapping.get(name)
