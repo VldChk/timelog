@@ -36,7 +36,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build e2e targets
-        run: cmake --build build --target timelog_e2e_build -j 2
+        run: cmake --build build --target timelog_e2e_build --config Release -j 2
 
       - name: Run correctness CI profile (nightly)
         shell: bash
