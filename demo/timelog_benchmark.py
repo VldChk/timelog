@@ -50,7 +50,28 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _ensure_data_generated(args: argparse.Namespace) -> None:
+    """Generate benchmark CSV data on-the-fly if --generate-data is set."""
+    if not getattr(args, "generate_data", False):
+        return
+    data_path = Path(args.data)
+    if data_path.exists():
+        return
+    from hft_synthetic import generate_csv
+    ooo_rate = getattr(args, "ooo_rate", 0.05)
+    generate_rows = getattr(args, "generate_rows", 581_400)
+    print(f"[benchmark] Generating test data: {data_path} "
+          f"(rows={generate_rows}, ooo_rate={ooo_rate})")
+    generate_csv(
+        data_path,
+        rows=generate_rows,
+        ooo_rate=ooo_rate,
+        seed=args.seed,
+    )
+
+
 def run_methodology(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    _ensure_data_generated(args)
     profile = _resolve_profile(args)
 
     registry = build_scenario_registry()
@@ -155,12 +176,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=["pr", "full", "custom"], default="pr")
     parser.add_argument("--config", type=str, help="Path to custom profile JSON config")
     parser.add_argument("--scenarios", type=str, help="Comma-separated scenario ids override")
-    parser.add_argument("--data", type=str, default="demo/order_book_50MB_5pct_ooo_clean.csv")
+    parser.add_argument("--data", type=str, default="demo/generated_5pct.csv")
     parser.add_argument("--baseline", type=str, default=None)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--export-json", type=str, default="demo/benchmark_runs/methodology_v1.json")
     parser.add_argument("--export-md", type=str, default="demo/benchmark_runs/methodology_v1.md")
     parser.add_argument("--update-baseline", action="store_true")
+    parser.add_argument("--generate-data", action="store_true",
+                        help="Generate CSV test data before benchmark if file missing")
+    parser.add_argument("--ooo-rate", type=float, default=0.05,
+                        help="OOO rate for generated data (default: 0.05)")
+    parser.add_argument("--generate-rows", type=int, default=581_400,
+                        help="Row count when generating data (default: 581400)")
 
     parser.add_argument("--trust-csv", action="store_true")
     parser.add_argument("--preload-csv", action="store_true")

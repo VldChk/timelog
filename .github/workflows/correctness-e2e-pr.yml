@@ -9,6 +9,7 @@ on:
       - "python/**"
       - "demo/correctness_checker.py"
       - "demo/correctness_ci.py"
+      - "demo/hft_synthetic.py"
       - ".github/workflows/correctness-e2e-pr.yml"
 
 jobs:

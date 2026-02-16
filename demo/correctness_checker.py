@@ -53,12 +53,10 @@ for _candidate in [
 
 from timelog import Timelog, TimelogBusyError, TimelogError  # noqa: E402
 from timelog._api import TL_TS_MAX, TL_TS_MIN, _coerce_ts  # noqa: E402
+from hft_synthetic import HFTSyntheticSource  # noqa: E402
 
 
-DEFAULT_CSVS = [
-    str(Path("demo") / "order_book_less_ordered_clean.csv"),
-    str(Path("demo") / "order_book_more_ordered_clean.csv"),
-]
+DEFAULT_CSVS: list[str] = []
 
 ISSUE_STATUS_CONFIRMED = "CONFIRMED_ENGINE_BUG"
 ISSUE_STATUS_CHECKER = "CHECKER_BUG"
@@ -177,6 +175,7 @@ class RunConfig:
     summary_md_out: str | None = None
     failure_bundle_out: str | None = None
     run_id_override: str | None = None
+    ooo_rate: float = 0.20
 
 
 @dataclass
@@ -981,7 +980,7 @@ class CorrectnessRunner:
         csv_paths = [Path(p) if Path(p).is_absolute() else (_REPO / p) for p in cfg.csv_paths]
         csv_paths = [p for p in csv_paths if p.exists()]
         self.csv_source = CsvRollingSource(csv_paths) if csv_paths else None
-        self.synthetic_source = SyntheticSource(self.rng)
+        self.synthetic_source = HFTSyntheticSource(self.rng, base_ts=1_000_000, ooo_rate=cfg.ooo_rate)
         self.mixed_source = MixedSource(self.rng, self.synthetic_source, self.csv_source)
 
         self.shadow_fast = ShadowFast()
@@ -2670,7 +2669,9 @@ def _parse_args() -> RunConfig:
     parser.add_argument("--duration-seconds", type=int, default=3600)
     parser.add_argument("--duration", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--source-mode", choices=["synthetic", "csv", "mixed"], default="mixed")
+    parser.add_argument("--source-mode", choices=["synthetic", "csv", "mixed"], default="synthetic")
+    parser.add_argument("--ooo-rate", type=float, default=0.20,
+                        help="OOO rate for synthetic source (0.0 to 1.0)")
     parser.add_argument("--csv", action="append", default=None,
                         help="CSV file path (repeatable). Default: two demo files.")
     parser.add_argument("--out-dir", type=str, default="demo/correctness_runs")
@@ -2738,6 +2739,7 @@ def _parse_args() -> RunConfig:
         summary_md_out=args.summary_md_out,
         failure_bundle_out=args.failure_bundle_out,
         run_id_override=args.run_id,
+        ooo_rate=args.ooo_rate,
     )
 
 
