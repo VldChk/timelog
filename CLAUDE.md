@@ -617,20 +617,21 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 
 | Document | Purpose |
 |----------|---------|
-| `docs/V1/timelog_one_pager.md` | Vision and goals |
-| `docs/V1/timelog_v1_c_software_design_spec.md` | Public API contracts |
-| `docs/V1/timelog_v1_lld_storage_pages.md` | Page/segment/manifest |
-| `docs/V1/timelog_v1_lld_write_path.md` | Memtable, flush |
-| `docs/V1/timelog_v1_lld_read_path.md` | Snapshot, iterators, merge |
-| `docs/V1/timelog_v1_lld_compaction_policy.md` | Compaction logic |
-| `docs/V1/timelog_v1_lld_background_maintenance.md` | Worker scheduling |
-| `docs/timelog_v1_lld_B1_python_handle_lifetime.md` | Pin/unpin, retired queue, GIL |
-| `docs/timelog_v1_lld_B2_pytimelog_engine_wrapper.md` | PyTimelog |
-| `docs/timelog_v1_lld_B3_pytimelogiter_snapshot_iterator.md` | Iterators |
-| `docs/timelog_v1_lld_B4_pagespan_zero_copy.md` | Buffer protocol |
-| `docs/timelog_v2_lld_B5_maintenance_threading_integration.md` | Background worker |
-| `docs/timelog_v2_lld_B6_error_model_subsystem.md` | Exception handling |
-| `docs/timelog_adaptive_segmentation_lld_c17.md` | Adaptive window segmentation |
+| `docs/index.md` | Canonical docs entry point |
+| `docs/what-is-timelog.md` | Product definition and scope |
+| `docs/python-api.md` | Python-facing API reference |
+| `docs/configuration.md` | Runtime configuration and presets |
+| `docs/errors-and-retry-semantics.md` | Error contracts and retry rules |
+| `docs/operations.md` | Lifecycle and troubleshooting |
+| `docs/internals/hld.md` | Architecture overview |
+| `docs/internals/components/write-path.md` | Memtable/flush write mechanics |
+| `docs/internals/components/read-path.md` | Snapshot and query mechanics |
+| `docs/internals/components/storage-and-manifest.md` | Storage layout and publication |
+| `docs/internals/components/compaction-and-maintenance.md` | Maintenance and compaction |
+| `docs/internals/components/adaptive-segmentation.md` | Adaptive window behavior |
+| `docs/internals/components/python-binding-architecture.md` | CPython binding design |
+| `docs/internals/components/tombstone-watermark-model.md` | Tombstone sequencing model |
+| `docs/archive/v1/` and `docs/archive/v2/` | Historical iteration docs |
 
 ---
 

@@ -585,16 +585,18 @@ if(TIMELOG_BUILD_PY_TESTS)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
+    set(_timelog_py_test_env "")
+    if(TIMELOG_TEST_PYTHONHOME)
+        list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
+    endif()
     if(NOT WIN32)
-        set(_timelog_py_test_env "")
-        if(TIMELOG_TEST_PYTHONHOME)
-            list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
-        endif()
         # Embedded CPython may keep tiny process-lifetime allocations that are
         # not actionable for extension correctness; keep ASan/UBSan enabled but
         # disable LSan in these CTest runs to avoid false-red failures.
         list(APPEND _timelog_py_test_env "ASAN_OPTIONS=detect_leaks=0")
+    endif()
 
+    if(_timelog_py_test_env)
         set_tests_properties(
             py_handle_tests
             py_timelog_tests

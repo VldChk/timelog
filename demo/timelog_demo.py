@@ -774,13 +774,18 @@ def _drain_manual_maintenance(log: Timelog, max_steps: int = 100_000) -> int:
 
 def _alternate_dataset_path(data_path: str) -> str | None:
     """
-    Locate a related dataset with different ordering characteristics.
-
-    This lets us compare "mostly ordered" vs "less ordered" ingestion
-    without requiring a separate CLI run.
+    Locate an existing related dataset with different ordering characteristics.
     """
-    p = Path(data_path)
-    name = p.name
+    alt_path = paired_dataset_path(data_path)
+    if alt_path is None:
+        return None
+    return alt_path if Path(alt_path).exists() else None
+
+
+def _alternate_dataset_name(name: str) -> str | None:
+    """
+    Return paired dataset name for ordering comparisons without checking file existence.
+    """
     mapping = {
         "order_book_1GB.csv": "order_book_1GB_less_order.csv",
         "order_book_1GB_less_order.csv": "order_book_1GB.csv",
@@ -790,6 +795,8 @@ def _alternate_dataset_path(data_path: str) -> str | None:
         "tiny_order_book_less_order.csv": "tiny_order_book_mostly_ordered.csv",
         "tiny_order_book_mostly_ordered_clean.csv": "tiny_order_book_less_ordered_clean.csv",
         "tiny_order_book_less_ordered_clean.csv": "tiny_order_book_mostly_ordered_clean.csv",
+        "generated_5pct.csv": "generated_20pct.csv",
+        "generated_20pct.csv": "generated_5pct.csv",
     }
 
     alt_name = mapping.get(name)
@@ -798,12 +805,51 @@ def _alternate_dataset_path(data_path: str) -> str | None:
             alt_name = name.replace("less_order", "mostly_ordered")
         elif "mostly_ordered" in name:
             alt_name = name.replace("mostly_ordered", "less_order")
+    return alt_name
 
+
+def paired_dataset_path(data_path: str) -> str | None:
+    """
+    Return the paired dataset path for ordering comparisons (existence not required).
+    """
+    p = Path(data_path)
+    alt_name = _alternate_dataset_name(p.name)
     if alt_name is None:
         return None
+    return str(p.with_name(alt_name))
 
-    alt_path = p.with_name(alt_name)
-    return str(alt_path) if alt_path.exists() else None
+
+def _infer_generated_ooo_rate(path: str) -> float:
+    name = Path(path).name
+    if "20pct" in name:
+        return 0.20
+    if "5pct" in name:
+        return 0.05
+    return 0.05
+
+
+def _is_autogen_dataset_name(path: str) -> bool:
+    name = Path(path).name
+    return name.startswith("generated_") and name.endswith(".csv")
+
+
+def _maybe_generate_default_dataset(data_path: str, rows: int = 581_400, seed: int = 12345) -> bool:
+    """
+    Auto-generate default synthetic data files when using generated_* dataset names.
+    """
+    path = Path(data_path)
+    if path.exists() or not _is_autogen_dataset_name(data_path):
+        return False
+
+    from hft_synthetic import generate_csv
+
+    rate = _infer_generated_ooo_rate(data_path)
+    print(
+        f"Auto-generating synthetic dataset: {path} "
+        f"(rows={rows}, ooo_rate={rate}, seed={seed})"
+    )
+    generate_csv(path, rows=rows, ooo_rate=rate, seed=seed)
+    return True
 
 
 # =============================================================================
@@ -3359,7 +3405,7 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="demo/order_book_1GB.csv",
+        default="demo/generated_5pct.csv",
         help="Path to CSV data file",
     )
     parser.add_argument(
@@ -3528,8 +3574,15 @@ def main():
 
     # Check data file exists
     if not os.path.exists(args.data):
+        _maybe_generate_default_dataset(args.data)
+    if not os.path.exists(args.data):
+        inferred_rate = _infer_generated_ooo_rate(args.data)
         print(f"ERROR: Data file not found: {args.data}")
-        print("Generate it with: python demo/generate_data.py")
+        print(
+            "Generate it with: "
+            f"python demo/hft_synthetic.py --output {args.data} "
+            f"--rows 581400 --ooo-rate {inferred_rate:.2f} --seed 12345"
+        )
         sys.exit(1)
 
     # Create runner

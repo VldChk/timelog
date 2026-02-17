@@ -114,9 +114,9 @@ class CorrectnessCheckerCITests(unittest.TestCase):
                 "--duration-seconds",
                 "2",
                 "--source-mode",
-                "csv",
-                "--csv",
-                "demo/order_book_50MB_5pct_ooo_clean.csv",
+                "synthetic",
+                "--ooo-rate",
+                "0.05",
                 "--out-dir",
                 str(run_dir),
                 "--ci-profile",
@@ -139,11 +139,102 @@ class CorrectnessCheckerCITests(unittest.TestCase):
             self.assertIn("gate", payload)
             self.assertIn("exit_code", payload)
             self.assertIn("artifact_manifest", payload)
+            self.assertIn("source_contract", payload)
+            self.assertIn("source_counters", payload)
             run_path = Path(payload["artifact_paths"]["run_dir"])
             self.assertFalse((run_path / "ops.jsonl").exists())
             self.assertFalse((run_path / "checks.jsonl").exists())
             self.assertFalse((run_path / "issues.jsonl").exists())
             self.assertFalse((run_path / "issues").exists())
+
+    def test_csv_mode_without_csv_paths_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "runs"
+            cmd = [
+                sys.executable,
+                "demo/correctness_checker.py",
+                "--duration-seconds",
+                "1",
+                "--source-mode",
+                "csv",
+                "--out-dir",
+                str(run_dir),
+                "--run-id",
+                "cc_test_csv_missing",
+            ]
+            proc = subprocess.run(
+                cmd,
+                cwd=str(REPO_ROOT),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("requires at least one existing --csv path", proc.stderr + proc.stdout)
+
+    def test_invalid_ooo_rates_are_rejected(self) -> None:
+        base = [
+            sys.executable,
+            "demo/correctness_checker.py",
+            "--duration-seconds",
+            "1",
+            "--out-dir",
+            "/tmp/cc_invalid_rates",
+            "--run-id",
+            "cc_invalid_rates",
+        ]
+        proc1 = subprocess.run(
+            base + ["--ooo-rate", "1.5"],
+            cwd=str(REPO_ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(proc1.returncode, 0)
+        self.assertIn("--ooo-rate must be between 0.0 and 1.0", proc1.stderr + proc1.stdout)
+
+        proc2 = subprocess.run(
+            base + ["--mixed-alt-ooo-rate", "-0.1"],
+            cwd=str(REPO_ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertIn("--mixed-alt-ooo-rate must be between 0.0 and 1.0", proc2.stderr + proc2.stdout)
+
+    def test_mixed_synthetic_mode_reports_both_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            summary_json = root / "summary.json"
+            run_dir = root / "runs"
+            cmd = [
+                sys.executable,
+                "demo/correctness_checker.py",
+                "--duration-seconds",
+                "2",
+                "--source-mode",
+                "mixed",
+                "--ooo-rate",
+                "0.05",
+                "--mixed-alt-ooo-rate",
+                "0.20",
+                "--out-dir",
+                str(run_dir),
+                "--artifact-mode",
+                "minimal",
+                "--summary-json-out",
+                str(summary_json),
+                "--run-id",
+                "cc_test_mixed_syn",
+            ]
+            proc = subprocess.run(cmd, cwd=str(REPO_ROOT), check=False)
+            self.assertIn(proc.returncode, (0, 2))
+            payload = json.loads(summary_json.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("source_contract"), "mixed_syn_syn")
+            counters = payload.get("source_counters", {})
+            self.assertGreater(counters.get("hft_syn_primary", 0), 0)
+            self.assertGreater(counters.get("hft_syn_alt", 0), 0)
 
 
 if __name__ == "__main__":

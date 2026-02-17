@@ -10,6 +10,10 @@ on:
       - "demo/**"
       - ".github/workflows/benchmark-methodology-pr.yml"
 
+concurrency:
+  group: methodology-pr-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   methodology-pr:
     runs-on: ${{ matrix.os }}
@@ -31,7 +35,16 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build e2e targets
-        run: cmake --build build --target timelog_e2e_build -j 2
+        run: cmake --build build --target timelog_e2e_build --config Release -j 2
+
+      - name: Generate benchmark test data
+        shell: bash
+        run: |
+          python demo/hft_synthetic.py \
+            --output demo/generated_5pct.csv \
+            --rows 581400 \
+            --ooo-rate 0.05 \
+            --seed 12345
 
       - name: Run methodology PR profile
         shell: bash
@@ -39,7 +52,7 @@ jobs:
           set +e
           python demo/timelog_benchmark.py \
             --profile pr \
-            --data demo/order_book_50MB_5pct_ooo_clean.csv \
+            --data demo/generated_5pct.csv \
             --export-json demo/benchmark_runs/methodology_pr_${{ runner.os }}.json \
             --export-md demo/benchmark_runs/methodology_pr_${{ runner.os }}.md \
             2>&1 | tee demo/benchmark_runs/methodology_pr_${{ runner.os }}.log

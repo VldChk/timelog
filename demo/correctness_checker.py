@@ -53,12 +53,10 @@ for _candidate in [
 
 from timelog import Timelog, TimelogBusyError, TimelogError  # noqa: E402
 from timelog._api import TL_TS_MAX, TL_TS_MIN, _coerce_ts  # noqa: E402
+from hft_synthetic import HFTSyntheticSource, SourceRecord  # noqa: E402
 
 
-DEFAULT_CSVS = [
-    str(Path("demo") / "order_book_less_ordered_clean.csv"),
-    str(Path("demo") / "order_book_more_ordered_clean.csv"),
-]
+DEFAULT_CSVS: list[str] = []
 
 ISSUE_STATUS_CONFIRMED = "CONFIRMED_ENGINE_BUG"
 ISSUE_STATUS_CHECKER = "CHECKER_BUG"
@@ -177,6 +175,8 @@ class RunConfig:
     summary_md_out: str | None = None
     failure_bundle_out: str | None = None
     run_id_override: str | None = None
+    ooo_rate: float = 0.20
+    mixed_alt_ooo_rate: float = 0.20
 
 
 @dataclass
@@ -185,6 +185,28 @@ class RunOutcome:
     result: str
     fail_status_counts: dict[str, int]
     artifact_manifest: dict[str, Any] = field(default_factory=dict)
+
+
+class _TaggedSyntheticSource:
+    """Attach stable source tags to synthetic records."""
+
+    def __init__(self, inner: HFTSyntheticSource, tag: str):
+        self.inner = inner
+        self.tag = tag
+
+    def next_records(self, count: int) -> list[SourceRecord]:
+        out: list[SourceRecord] = []
+        for rec in self.inner.next_records(count):
+            out.append(
+                SourceRecord(
+                    ts=rec.ts,
+                    payload=rec.payload,
+                    src=self.tag,
+                    cycle=rec.cycle,
+                    source_file=rec.source_file,
+                )
+            )
+        return out
 
 
 def _parse_fail_statuses(raw: str | None) -> set[str]:
@@ -273,15 +295,6 @@ def _apply_artifact_policy(
         "removed_paths": sorted(removed_paths),
         "retained_files": sorted(retained),
     }
-
-
-@dataclass
-class SourceRecord:
-    ts: int
-    payload: Any
-    src: str
-    cycle: int
-    source_file: str
 
 
 @dataclass
@@ -422,71 +435,6 @@ class IssueRegistry:
         return issue_id
 
 
-class SyntheticSource:
-    def __init__(self, rng: random.Random, base_ts: int = 1_000_000):
-        self.rng = rng
-        self.cursor = base_ts
-        self.floor = base_ts
-        self.ooo_rate = 0.20
-        self.max_lookback = 50_000
-        self.total = 0
-        self.cycle = 0
-
-    def _tick_total(self) -> None:
-        self.total += 1
-        if self.total % 1_000_000 == 0:
-            self.cycle += 1
-
-    def _next_ts(self) -> int:
-        if self.rng.random() < self.ooo_rate and self.cursor > self.floor + 10:
-            max_lb = min(self.max_lookback, self.cursor - self.floor - 1)
-            if max_lb > 0:
-                ts = self.cursor - self.rng.randint(1, max_lb)
-                if TL_TS_MIN <= ts <= TL_TS_MAX:
-                    self._tick_total()
-                    return ts
-        nxt = self.cursor + self.rng.randint(1, 1000)
-        if nxt > TL_TS_MAX:
-            nxt = TL_TS_MAX - self.rng.randint(0, 100)
-        self.cursor = nxt
-        self._tick_total()
-        return self.cursor
-
-    def _next_payload(self) -> Any:
-        kind = self.rng.randint(0, 8)
-        if kind == 0:
-            return {"kind": "quote", "px": self.rng.random(), "sz": self.rng.randint(1, 10000)}
-        if kind == 1:
-            return {"kind": "trade", "side": self.rng.choice(["B", "S"]), "qty": self.rng.randint(1, 5000)}
-        if kind == 2:
-            return ["evt", self.rng.randint(-10_000, 10_000), self.rng.random()]
-        if kind == 3:
-            return ("tuple", self.rng.randint(0, 1_000_000))
-        if kind == 4:
-            return self.rng.randint(-2**31, 2**31 - 1)
-        if kind == 5:
-            return self.rng.random()
-        if kind == 6:
-            return None
-        if kind == 7:
-            return {"nested": {"a": self.rng.randint(0, 99), "b": [1, 2, 3]}, "ok": True}
-        return f"synthetic_{self.total}_{self.rng.randint(0, 1_000_000)}"
-
-    def next_records(self, count: int) -> list[SourceRecord]:
-        out: list[SourceRecord] = []
-        for _ in range(count):
-            out.append(
-                SourceRecord(
-                    ts=self._next_ts(),
-                    payload=self._next_payload(),
-                    src="syn",
-                    cycle=self.cycle,
-                    source_file="<synthetic>",
-                )
-            )
-        return out
-
-
 class CsvRollingSource:
     def __init__(self, paths: list[Path]):
         if not paths:
@@ -587,21 +535,19 @@ class MixedSource:
     def __init__(
         self,
         rng: random.Random,
-        synthetic: SyntheticSource,
-        csv_source: CsvRollingSource | None,
-        csv_weight: float = 0.7,
+        primary_source: Any,
+        secondary_source: Any,
+        primary_weight: float,
     ):
         self.rng = rng
-        self.synthetic = synthetic
-        self.csv_source = csv_source
-        self.csv_weight = csv_weight
+        self.primary_source = primary_source
+        self.secondary_source = secondary_source
+        self.primary_weight = primary_weight
 
     def next_records(self, count: int) -> list[SourceRecord]:
-        if self.csv_source is None:
-            return self.synthetic.next_records(count)
-        if self.rng.random() < self.csv_weight:
-            return self.csv_source.next_records(count)
-        return self.synthetic.next_records(count)
+        if self.rng.random() < self.primary_weight:
+            return self.primary_source.next_records(count)
+        return self.secondary_source.next_records(count)
 
 
 class ShadowFast:
@@ -978,11 +924,46 @@ class CorrectnessRunner:
             time_unit="ns",
         )
 
-        csv_paths = [Path(p) if Path(p).is_absolute() else (_REPO / p) for p in cfg.csv_paths]
-        csv_paths = [p for p in csv_paths if p.exists()]
+        requested_csv_paths = [Path(p) if Path(p).is_absolute() else (_REPO / p) for p in cfg.csv_paths]
+        csv_paths = [p for p in requested_csv_paths if p.exists()]
         self.csv_source = CsvRollingSource(csv_paths) if csv_paths else None
-        self.synthetic_source = SyntheticSource(self.rng)
-        self.mixed_source = MixedSource(self.rng, self.synthetic_source, self.csv_source)
+        if cfg.source_mode == "csv" and self.csv_source is None:
+            requested = ", ".join(str(p) for p in requested_csv_paths) if requested_csv_paths else "(none)"
+            raise SystemExit(
+                "CSV source mode requires at least one existing --csv path; "
+                f"requested={requested}"
+            )
+
+        self.synthetic_primary = _TaggedSyntheticSource(
+            HFTSyntheticSource(self.rng, base_ts=1_000_000, ooo_rate=cfg.ooo_rate),
+            "hft_syn_primary",
+        )
+        self.synthetic_alt = _TaggedSyntheticSource(
+            HFTSyntheticSource(self.rng, base_ts=2_000_000, ooo_rate=cfg.mixed_alt_ooo_rate),
+            "hft_syn_alt",
+        )
+        self.source_contract = "synthetic"
+        self.mixed_source: MixedSource | None = None
+        if cfg.source_mode == "csv":
+            self.source_contract = "csv_strict"
+        elif cfg.source_mode == "mixed":
+            if self.csv_source is not None:
+                self.source_contract = "mixed_csv_syn"
+                self.mixed_source = MixedSource(
+                    self.rng,
+                    primary_source=self.csv_source,
+                    secondary_source=self.synthetic_primary,
+                    primary_weight=0.70,
+                )
+            else:
+                self.source_contract = "mixed_syn_syn"
+                self.mixed_source = MixedSource(
+                    self.rng,
+                    primary_source=self.synthetic_primary,
+                    secondary_source=self.synthetic_alt,
+                    primary_weight=0.50,
+                )
+        self.source_counters: Counter[str] = Counter()
 
         self.shadow_fast = ShadowFast()
         self.shadow_truth = ShadowTruth()
@@ -1026,6 +1007,7 @@ class CorrectnessRunner:
                 "git_commit": self.git_commit,
                 "config": cfg_dict,
                 "csv_source": None if self.csv_source is None else [str(p) for p in self.csv_source.paths],
+                "source_contract": self.source_contract,
             },
             flush=True,
         )
@@ -1168,13 +1150,35 @@ class CorrectnessRunner:
         )
 
     def _source_next_records(self, count: int) -> list[SourceRecord]:
+        records: list[SourceRecord]
         if self.cfg.source_mode == "synthetic":
-            return self.synthetic_source.next_records(count)
-        if self.cfg.source_mode == "csv":
+            records = self.synthetic_primary.next_records(count)
+        elif self.cfg.source_mode == "csv":
             if self.csv_source is None:
-                return self.synthetic_source.next_records(count)
-            return self.csv_source.next_records(count)
-        return self.mixed_source.next_records(count)
+                raise RuntimeError("csv mode requires a CSV source")
+            records = self.csv_source.next_records(count)
+        else:
+            if self.mixed_source is None:
+                raise RuntimeError("mixed mode requires a configured mixed source")
+            records = self.mixed_source.next_records(count)
+
+        for rec in records:
+            self.source_counters[rec.src] += 1
+        return records
+
+    def _diversify_payload(self, payload: Any, src_tag: str) -> Any:
+        if not src_tag.startswith("hft_syn"):
+            return payload
+        variant = self.rng.randint(0, 3)
+        if variant == 0:
+            return payload
+        if variant == 1:
+            return ("syn_tuple", src_tag, payload)
+        if variant == 2:
+            return ["syn_list", src_tag, payload]
+        order_id = payload.get("order_id", "na") if isinstance(payload, dict) else "na"
+        status = payload.get("status", "na") if isinstance(payload, dict) else "na"
+        return f"syn_scalar|src={src_tag}|order_id={order_id}|status={status}"
 
     def _choose_reinsert_ts(self) -> int | None:
         p = self.rng.random()
@@ -1202,14 +1206,15 @@ class CorrectnessRunner:
                 ts = _coerce_ts(self._bounded_ts(forced_ts))
             rid = self.next_rid
             self.next_rid += 1
-            digest = _payload_digest(src.payload)
+            payload = self._diversify_payload(src.payload, src.src)
+            digest = _payload_digest(payload)
             obj = {
                 "__cc_schema": 1,
                 "rid": rid,
                 "src": src.src,
                 "cycle": src.cycle,
                 "payload_digest": digest,
-                "payload": src.payload,
+                "payload": payload,
             }
             row = StoredRow(
                 rid=rid,
@@ -2519,6 +2524,8 @@ class CorrectnessRunner:
             },
             "artifact_manifest": [],
             "csv_source": None if self.csv_source is None else self.csv_source.stats(),
+            "source_contract": self.source_contract,
+            "source_counters": dict(self.source_counters),
         }
 
     def _render_summary_md(self, summary: dict[str, Any]) -> str:
@@ -2533,6 +2540,7 @@ class CorrectnessRunner:
             f"- Result: `{summary.get('result')}`",
             f"- Exit code: `{summary.get('exit_code')}`",
             f"- Artifact mode: `{summary.get('artifact_mode')}`",
+            f"- Source contract: `{summary.get('source_contract')}`",
             "",
             "## Totals",
             "",
@@ -2561,6 +2569,13 @@ class CorrectnessRunner:
         md += ["", "## Issues by Kind", ""]
         for k, v in sorted(summary["stats"]["issues_by_kind"].items()):
             md.append(f"- `{k}`: `{v}`")
+        md += ["", "## Source Counters", ""]
+        source_counters = summary.get("source_counters", {})
+        if source_counters:
+            for k, v in sorted(source_counters.items()):
+                md.append(f"- `{k}`: `{v}`")
+        else:
+            md.append("- none")
         md += ["", "## Len Mismatches by Kind", ""]
         if summary["stats"]["len_mismatches_by_kind"]:
             for k, v in sorted(summary["stats"]["len_mismatches_by_kind"].items()):
@@ -2670,9 +2685,13 @@ def _parse_args() -> RunConfig:
     parser.add_argument("--duration-seconds", type=int, default=3600)
     parser.add_argument("--duration", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--source-mode", choices=["synthetic", "csv", "mixed"], default="mixed")
+    parser.add_argument("--source-mode", choices=["synthetic", "csv", "mixed"], default="synthetic")
+    parser.add_argument("--ooo-rate", type=float, default=0.20,
+                        help="OOO rate for synthetic source (0.0 to 1.0)")
+    parser.add_argument("--mixed-alt-ooo-rate", type=float, default=0.20,
+                        help="Alternate OOO rate used for synthetic mixed mode (0.0 to 1.0)")
     parser.add_argument("--csv", action="append", default=None,
-                        help="CSV file path (repeatable). Default: two demo files.")
+                        help="CSV file path (repeatable). Required for --source-mode=csv.")
     parser.add_argument("--out-dir", type=str, default="demo/correctness_runs")
     parser.add_argument("--min-batch", type=int, default=1)
     parser.add_argument("--max-batch", type=int, default=10_000)
@@ -2705,6 +2724,10 @@ def _parse_args() -> RunConfig:
     duration = args.duration if args.duration is not None else args.duration_seconds
     if duration <= 0:
         raise SystemExit("--duration-seconds must be positive")
+    if not (0.0 <= args.ooo_rate <= 1.0):
+        raise SystemExit("--ooo-rate must be between 0.0 and 1.0")
+    if not (0.0 <= args.mixed_alt_ooo_rate <= 1.0):
+        raise SystemExit("--mixed-alt-ooo-rate must be between 0.0 and 1.0")
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     min_batch = max(1, args.min_batch)
     max_batch = max(min_batch, args.max_batch)
@@ -2738,6 +2761,8 @@ def _parse_args() -> RunConfig:
         summary_md_out=args.summary_md_out,
         failure_bundle_out=args.failure_bundle_out,
         run_id_override=args.run_id,
+        ooo_rate=args.ooo_rate,
+        mixed_alt_ooo_rate=args.mixed_alt_ooo_rate,
     )
 
 
