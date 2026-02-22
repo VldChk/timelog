@@ -10,11 +10,15 @@
 ## CI Workflows
 
 - PR cross-platform test workflow: `.github/workflows/tests-pr.yml`
+- PR packaging workflow: `.github/workflows/packaging-pr.yml`
 - Correctness E2E workflows: `.github/workflows/correctness-e2e-*.yml`
 - Methodology benchmark workflows: `.github/workflows/benchmark-methodology-*.yml`
 - Docs consistency workflow: `.github/workflows/docs-check.yml`
+- TestPyPI release workflow: `.github/workflows/release-testpypi.yml`
+- PyPI release workflow: `.github/workflows/release-pypi.yml`
 
 Detailed test commands and branch-protection checks are in `docs/CI_TESTS.md`.
+Packaging and publishing runbook is in `docs/pypi-release.md`.
 
 ## Demo/Verifier Runtime Behavior
 

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.15)
 project(timelog VERSION 1.0.0 LANGUAGES C)
 
 # =============================================================================
@@ -19,6 +19,9 @@ option(TIMELOG_STAGE_PYTHON_MODULE
     "Copy built _timelog extension into python/timelog for in-repo imports" ON)
 option(TIMELOG_BUILD_PY_FACADE_TESTS
     "Add target to run python/tests via pytest (requires pytest installed)" OFF)
+option(TIMELOG_BUILD_CORE_TESTS
+    "Build core C test executable and register core CTest entry" ON)
+option(TIMELOG_BUILD_DEMOS "Build demo executables" ON)
 
 # Build type defaults to Release
 if(NOT CMAKE_BUILD_TYPE)
@@ -164,66 +167,70 @@ endif()
 
 enable_testing()
 
-# Test files organized by category
-set(TEST_SOURCES
-    core/tests/test_main.c
-    # Internal implementation tests (LLD-driven)
-    core/tests/test_internal_sync.c
-    core/tests/test_internal_data_structures.c
-    core/tests/test_storage_internal.c
-    core/tests/test_delta_internal.c
-    core/tests/test_compaction_internal.c
-    # Functional tests (public API behavior)
-    core/tests/test_functional.c
-    core/tests/test_api_semantics.c
-    core/tests/test_snapshot_lifetime.c
-    core/tests/test_invariants.c
-    # Concurrency and stress tests
-    core/tests/test_concurrency.c
-    core/tests/test_stress.c
-    # PageSpan core API tests
-    core/tests/test_pagespan_iter.c
-    # Adaptive Segmentation tests
-    core/tests/test_adaptive_internal.c
-)
-
-add_executable(test_timelog ${TEST_SOURCES})
-target_link_libraries(test_timelog PRIVATE timelog)
-target_include_directories(test_timelog
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/storage
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/delta
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/query
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
-)
-
-# Clang on Windows (non-MSVC driver) does not pull CRT libs by default.
-if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
-    target_link_libraries(test_timelog PRIVATE
-        $<$<CONFIG:Debug>:msvcrtd.lib vcruntimed.lib ucrtd.lib legacy_stdio_definitions.lib oldnames.lib>
-        $<$<NOT:$<CONFIG:Debug>>:msvcrt.lib vcruntime.lib ucrt.lib legacy_stdio_definitions.lib oldnames.lib>
+if(TIMELOG_BUILD_CORE_TESTS)
+    # Test files organized by category
+    set(TEST_SOURCES
+        core/tests/test_main.c
+        # Internal implementation tests (LLD-driven)
+        core/tests/test_internal_sync.c
+        core/tests/test_internal_data_structures.c
+        core/tests/test_storage_internal.c
+        core/tests/test_delta_internal.c
+        core/tests/test_compaction_internal.c
+        # Functional tests (public API behavior)
+        core/tests/test_functional.c
+        core/tests/test_api_semantics.c
+        core/tests/test_snapshot_lifetime.c
+        core/tests/test_invariants.c
+        # Concurrency and stress tests
+        core/tests/test_concurrency.c
+        core/tests/test_stress.c
+        # PageSpan core API tests
+        core/tests/test_pagespan_iter.c
+        # Adaptive Segmentation tests
+        core/tests/test_adaptive_internal.c
     )
+
+    add_executable(test_timelog ${TEST_SOURCES})
+    target_link_libraries(test_timelog PRIVATE timelog)
+    target_include_directories(test_timelog
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/storage
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/delta
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/query
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
+    )
+
+    # Clang on Windows (non-MSVC driver) does not pull CRT libs by default.
+    if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+        target_link_libraries(test_timelog PRIVATE
+            $<$<CONFIG:Debug>:msvcrtd.lib vcruntimed.lib ucrtd.lib legacy_stdio_definitions.lib oldnames.lib>
+            $<$<NOT:$<CONFIG:Debug>>:msvcrt.lib vcruntime.lib ucrt.lib legacy_stdio_definitions.lib oldnames.lib>
+        )
+    endif()
+
+    # Enable test hooks for deterministic failpoint testing (Phase 9)
+    target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
+
+    # Enable adaptive module internal test helpers
+    target_compile_definitions(test_timelog PRIVATE TL_ADAPTIVE_INTERNAL_TEST)
+
+    # Link pthread on POSIX systems
+    if(NOT WIN32)
+        target_link_libraries(test_timelog PRIVATE Threads::Threads)
+    endif()
+
+    add_test(NAME timelog_tests COMMAND test_timelog)
 endif()
-
-# Enable test hooks for deterministic failpoint testing (Phase 9)
-target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
-
-# Enable adaptive module internal test helpers
-target_compile_definitions(test_timelog PRIVATE TL_ADAPTIVE_INTERNAL_TEST)
-
-# Link pthread on POSIX systems
-if(NOT WIN32)
-    target_link_libraries(test_timelog PRIVATE Threads::Threads)
-endif()
-
-add_test(NAME timelog_tests COMMAND test_timelog)
 
 # =============================================================================
 # Demo Targets
 # =============================================================================
 
-add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
-target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
+if(TIMELOG_BUILD_DEMOS)
+    add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
+    target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
+endif()
 
 # =============================================================================
 # Python Bindings (Integrated Build)
@@ -241,13 +248,13 @@ if(TIMELOG_BUILD_PYTHON)
 
     add_subdirectory(bindings/cpython)
 
-    add_custom_target(timelog_e2e_build
-        DEPENDS timelog test_timelog _timelog
-        COMMENT "Build core library/tests plus CPython extension"
-    )
+    set(_timelog_e2e_build_deps timelog _timelog)
+    if(TIMELOG_BUILD_CORE_TESTS)
+        list(APPEND _timelog_e2e_build_deps test_timelog)
+    endif()
 
     if(TIMELOG_BUILD_PY_TESTS)
-        add_dependencies(timelog_e2e_build
+        list(APPEND _timelog_e2e_build_deps
             test_py_handle
             test_py_timelog
             test_py_iter
@@ -256,6 +263,11 @@ if(TIMELOG_BUILD_PYTHON)
             test_py_errors
         )
     endif()
+
+    add_custom_target(timelog_e2e_build
+        DEPENDS ${_timelog_e2e_build_deps}
+        COMMENT "Build core library/tests plus CPython extension"
+    )
 
     add_custom_target(timelog_e2e_test
         COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG> --output-on-failure
@@ -278,7 +290,7 @@ if(TIMELOG_BUILD_PYTHON)
 endif()
 
 # Ensure ASan runtime DLL is discoverable when using Clang on Windows.
-if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
+if (TIMELOG_BUILD_CORE_TESTS AND WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
     execute_process(
         COMMAND ${CMAKE_C_COMPILER} --print-resource-dir
         OUTPUT_VARIABLE _clang_res_dir
@@ -313,6 +325,7 @@ endif()
 install(TARGETS timelog
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
+    COMPONENT core
 )
 
-install(DIRECTORY core/include/timelog DESTINATION include)
+install(DIRECTORY core/include/timelog DESTINATION include COMPONENT core)

@@ -15,7 +15,7 @@
 #   cmake --build build
 #
 
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.15)
 if(POLICY CMP0177)
     cmake_policy(SET CMP0177 NEW)
 endif()
@@ -144,8 +144,9 @@ set(TIMELOG_PY_SOURCES
     src/module.c        # Module initialization
 )
 
-# Create Python extension module
-Python3_add_library(_timelog MODULE ${TIMELOG_PY_SOURCES})
+# Create Python extension module.
+# WITH_SOABI ensures wheel-compatible extension naming.
+Python3_add_library(_timelog MODULE WITH_SOABI ${TIMELOG_PY_SOURCES})
 
 # Determine TIMELOG_ROOT for internal headers
 if(NOT DEFINED TIMELOG_ROOT)
@@ -623,10 +624,10 @@ endif()
 # Installation
 # =============================================================================
 
-# Install the extension module to Python site-packages
-# This is typically done via pip/setuptools, not CMake directly
-# But we provide the target for manual installation
+# Install extension into the wheel/package-relative ``timelog`` package dir.
+# scikit-build-core selects components during wheel assembly.
 
 install(TARGETS _timelog
-    LIBRARY DESTINATION "${Python3_SITEARCH}/timelog"
+    LIBRARY DESTINATION timelog COMPONENT python
+    RUNTIME DESTINATION timelog COMPONENT python
 )

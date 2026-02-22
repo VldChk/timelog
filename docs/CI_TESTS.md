@@ -50,6 +50,15 @@ Set these GitHub checks as required:
 
 1. `Tests (PR) / test (ubuntu-latest, 3.13)`
 2. `Tests (PR) / test (windows-latest, 3.13)`
+3. `Packaging (PR) / packaging-pr`
+
+## Packaging and Release Workflows
+
+1. PR packaging validation: `.github/workflows/packaging-pr.yml`
+2. Manual TestPyPI release: `.github/workflows/release-testpypi.yml`
+3. Tag-triggered PyPI release: `.github/workflows/release-pypi.yml`
+
+See `docs/pypi-release.md` for publish runbooks and OIDC setup.
 
 ## Local Dry-Run Commands
 
@@ -60,4 +69,18 @@ python demo/ci/run_core_test_groups.py --build-dir build --config Release --summ
 ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$'
 cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests -q
 python -m unittest discover -s demo/tests -p "test_*.py" -v
+```
+
+## Local Packaging Dry-Run Commands
+
+```bash
+python -m pip install --upgrade pip build twine
+python -m build
+python -m twine check dist/*
+
+python -m venv .venv-wheel-smoke
+source .venv-wheel-smoke/bin/activate
+python -m pip install --upgrade pip
+python -m pip install dist/timelog_lib-*.whl
+python -m pytest python/tests -q
 ```

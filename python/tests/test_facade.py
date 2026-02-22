@@ -1,5 +1,6 @@
 """Tests for the Python facade layer."""
 
+from importlib import metadata as importlib_metadata
 import gc
 import weakref
 import pytest
@@ -69,6 +70,40 @@ class TestVersion:
         import timelog
 
         assert "__version__" in timelog.__all__
+
+    def test_resolve_version_prefers_timelog_lib(self, monkeypatch):
+        """Version resolver should prefer timelog-lib distribution metadata."""
+        import timelog
+
+        calls = []
+
+        def _fake_version(dist_name):
+            calls.append(dist_name)
+            if dist_name == "timelog-lib":
+                return "1.0.0"
+            raise importlib_metadata.PackageNotFoundError(dist_name)
+
+        monkeypatch.setattr(importlib_metadata, "version", _fake_version)
+        assert timelog._resolve_version() == "1.0.0"
+        assert calls == ["timelog-lib"]
+
+    def test_resolve_version_falls_back_to_timelog(self, monkeypatch):
+        """Version resolver should fall back to legacy timelog metadata."""
+        import timelog
+
+        calls = []
+
+        def _fake_version(dist_name):
+            calls.append(dist_name)
+            if dist_name == "timelog-lib":
+                raise importlib_metadata.PackageNotFoundError(dist_name)
+            if dist_name == "timelog":
+                return "0.9.9"
+            raise AssertionError(f"unexpected distribution lookup: {dist_name}")
+
+        monkeypatch.setattr(importlib_metadata, "version", _fake_version)
+        assert timelog._resolve_version() == "0.9.9"
+        assert calls == ["timelog-lib", "timelog"]
 
 
 # =============================================================================

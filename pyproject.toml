@@ -1,0 +1,65 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "timelog-lib"
+version = "1.0.0"
+description = "In-memory LSM-style time-indexed storage engine with CPython bindings."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Timelog Contributors" }]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/VldChk/timelog"
+Repository = "https://github.com/VldChk/timelog"
+Issues = "https://github.com/VldChk/timelog/issues"
+
+[tool.scikit-build]
+cmake.source-dir = "."
+cmake.build-type = "Release"
+wheel.packages = ["python/timelog"]
+install.components = ["python"]
+
+[tool.scikit-build.cmake.define]
+TIMELOG_BUILD_PYTHON = true
+TIMELOG_BUILD_PY_TESTS = false
+TIMELOG_BUILD_PY_FACADE_TESTS = false
+TIMELOG_STAGE_PYTHON_MODULE = false
+TIMELOG_BUILD_CORE_TESTS = false
+TIMELOG_BUILD_DEMOS = false
+TIMELOG_BUILD_SHARED = false
+
+[tool.cibuildwheel]
+build = "cp312-* cp313-* cp314-*"
+skip = "cp313t-* cp314t-* pp* *-musllinux_*"
+test-command = "pytest {project}/python/tests -q"
+test-extras = ["test"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

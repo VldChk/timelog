@@ -17,11 +17,25 @@ Example::
 from __future__ import annotations
 
 try:
-    from importlib.metadata import version as _pkg_version
-
-    __version__ = _pkg_version("timelog")
+    from importlib import metadata as _importlib_metadata
 except Exception:
-    __version__ = "0+unknown"
+    _importlib_metadata = None
+
+
+def _resolve_version() -> str:
+    """Resolve package version across distribution name variants."""
+    if _importlib_metadata is None:
+        return "0+unknown"
+
+    for dist_name in ("timelog-lib", "timelog"):
+        try:
+            return _importlib_metadata.version(dist_name)
+        except Exception:
+            continue
+    return "0+unknown"
+
+
+__version__ = _resolve_version()
 
 from typing import Iterator
 

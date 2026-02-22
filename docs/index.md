@@ -31,6 +31,7 @@ Historical iteration docs are archived under `docs/archive/`.
 1. `docs/testing-and-ci.md`
 2. `docs/PERFORMANCE_METHODOLOGY.md`
 3. `docs/CI_TESTS.md`
+4. `docs/pypi-release.md`
 
 ## Glossary
 

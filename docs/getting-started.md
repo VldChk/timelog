@@ -2,7 +2,27 @@
 
 ## Install
 
-Timelog packaging instructions are evolving with CI/wheel integration. For source builds, use CMake and the CPython binding target.
+Install from PyPI:
+
+```bash
+pip install timelog-lib
+```
+
+or with `uv`:
+
+```bash
+uv add timelog-lib
+```
+
+The distribution name is `timelog-lib`, but import paths stay unchanged:
+
+```python
+from timelog import Timelog
+```
+
+## Source Build (Development)
+
+For local source builds, use CMake and the CPython binding target:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
