@@ -15,7 +15,7 @@
 #   cmake --build build
 #
 
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.15)
 if(POLICY CMP0177)
     cmake_policy(SET CMP0177 NEW)
 endif()
@@ -78,7 +78,13 @@ endif()
 # Find Python
 # =============================================================================
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+# Wheel builds only need extension-module headers/tooling. Embedded-Python C
+# tests need embed libraries as well. Request components accordingly.
+if(TIMELOG_BUILD_PY_TESTS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module Development.Embed)
+else()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+endif()
 
 message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
 message(STATUS "Python3 include: ${Python3_INCLUDE_DIRS}")
@@ -144,8 +150,9 @@ set(TIMELOG_PY_SOURCES
     src/module.c        # Module initialization
 )
 
-# Create Python extension module
-Python3_add_library(_timelog MODULE ${TIMELOG_PY_SOURCES})
+# Create Python extension module.
+# WITH_SOABI ensures wheel-compatible extension naming.
+Python3_add_library(_timelog MODULE WITH_SOABI ${TIMELOG_PY_SOURCES})
 
 # Determine TIMELOG_ROOT for internal headers
 if(NOT DEFINED TIMELOG_ROOT)
@@ -585,16 +592,18 @@ if(TIMELOG_BUILD_PY_TESTS)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
+    set(_timelog_py_test_env "")
+    if(TIMELOG_TEST_PYTHONHOME)
+        list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
+    endif()
     if(NOT WIN32)
-        set(_timelog_py_test_env "")
-        if(TIMELOG_TEST_PYTHONHOME)
-            list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
-        endif()
         # Embedded CPython may keep tiny process-lifetime allocations that are
         # not actionable for extension correctness; keep ASan/UBSan enabled but
         # disable LSan in these CTest runs to avoid false-red failures.
         list(APPEND _timelog_py_test_env "ASAN_OPTIONS=detect_leaks=0")
+    endif()
 
+    if(_timelog_py_test_env)
         set_tests_properties(
             py_handle_tests
             py_timelog_tests
@@ -621,10 +630,10 @@ endif()
 # Installation
 # =============================================================================
 
-# Install the extension module to Python site-packages
-# This is typically done via pip/setuptools, not CMake directly
-# But we provide the target for manual installation
+# Install extension into the wheel/package-relative ``timelog`` package dir.
+# scikit-build-core selects components during wheel assembly.
 
 install(TARGETS _timelog
-    LIBRARY DESTINATION "${Python3_SITEARCH}/timelog"
+    LIBRARY DESTINATION timelog COMPONENT python
+    RUNTIME DESTINATION timelog COMPONENT python
 )

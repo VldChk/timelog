@@ -16,9 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SEED = 12345
 FAIL_STATUSES = "CONFIRMED_ENGINE_BUG,CHECKER_BUG"
 
-CSV_7PCT = "demo/order_book_50MB_5pct_ooo_clean.csv"
-CSV_21PCT = "demo/order_book_50MB_20pct_ooo_clean.csv"
-
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -29,8 +26,9 @@ class LegSpec:
     leg_id: str
     source_mode: str
     duration_seconds: int
-    csv_paths: list[str]
     ci_profile: str
+    ooo_rate: float = 0.05
+    mixed_alt_ooo_rate: float | None = None
 
 
 def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[LegSpec]:
@@ -38,11 +36,11 @@ def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[L
         duration = duration_override_seconds if duration_override_seconds is not None else 90
         return [
             LegSpec(
-                leg_id="pr_csv_7pct",
-                source_mode="csv",
+                leg_id="pr_syn_5pct",
+                source_mode="synthetic",
                 duration_seconds=duration,
-                csv_paths=[CSV_7PCT],
                 ci_profile="pr",
+                ooo_rate=0.05,
             )
         ]
 
@@ -50,38 +48,28 @@ def _profile_legs(profile: str, duration_override_seconds: int | None) -> list[L
     duration = duration_override_seconds if duration_override_seconds is not None else 200
     return [
         LegSpec(
-            leg_id="nightly_csv_7pct",
-            source_mode="csv",
+            leg_id="nightly_syn_5pct",
+            source_mode="synthetic",
             duration_seconds=duration,
-            csv_paths=[CSV_7PCT],
             ci_profile="nightly",
+            ooo_rate=0.05,
         ),
         LegSpec(
-            leg_id="nightly_csv_21pct",
-            source_mode="csv",
+            leg_id="nightly_syn_20pct",
+            source_mode="synthetic",
             duration_seconds=duration,
-            csv_paths=[CSV_21PCT],
             ci_profile="nightly",
+            ooo_rate=0.20,
         ),
         LegSpec(
-            leg_id="nightly_mixed",
+            leg_id="nightly_syn_mixed",
             source_mode="mixed",
             duration_seconds=duration,
-            csv_paths=[CSV_7PCT, CSV_21PCT],
             ci_profile="nightly",
+            ooo_rate=0.05,
+            mixed_alt_ooo_rate=0.20,
         ),
     ]
-
-
-def _validate_legs(legs: list[LegSpec]) -> None:
-    missing: list[str] = []
-    for leg in legs:
-        for csv in leg.csv_paths:
-            if not (REPO_ROOT / csv).exists():
-                missing.append(csv)
-    if missing:
-        uniq = sorted(set(missing))
-        raise SystemExit(f"Missing CSV inputs for correctness CI: {', '.join(uniq)}")
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -132,10 +120,11 @@ def _run_leg(
         str(bundle_out),
         "--run-id",
         run_id,
+        "--ooo-rate",
+        str(leg.ooo_rate),
     ]
-    for csv in leg.csv_paths:
-        cmd.extend(["--csv", csv])
-
+    if leg.mixed_alt_ooo_rate is not None:
+        cmd.extend(["--mixed-alt-ooo-rate", str(leg.mixed_alt_ooo_rate)])
     try:
         proc = subprocess.run(
             cmd,
@@ -155,7 +144,8 @@ def _run_leg(
             "seed": seed,
             "source_mode": leg.source_mode,
             "duration_seconds": leg.duration_seconds,
-            "csv_paths": leg.csv_paths,
+            "ooo_rate": leg.ooo_rate,
+            "mixed_alt_ooo_rate": leg.mixed_alt_ooo_rate,
             "return_code": -1,
             "result": "fail",
             "fail_status_counts": {"TIMEOUT": 1},
@@ -191,13 +181,18 @@ def _run_leg(
     fail_counts: dict[str, int] = {}
     if summary is not None:
         fail_counts = dict(summary.get("gate", {}).get("fail_status_counts", {}))
+    source_contract = summary.get("source_contract") if summary is not None else None
+    source_counters = dict(summary.get("source_counters", {})) if summary is not None else {}
 
     return {
         "leg_id": leg.leg_id,
         "seed": seed,
         "source_mode": leg.source_mode,
         "duration_seconds": leg.duration_seconds,
-        "csv_paths": leg.csv_paths,
+        "ooo_rate": leg.ooo_rate,
+        "mixed_alt_ooo_rate": leg.mixed_alt_ooo_rate,
+        "source_contract": source_contract,
+        "source_counters": source_counters,
         "return_code": proc.returncode,
         "result": result,
         "fail_status_counts": fail_counts,
@@ -217,13 +212,21 @@ def _build_markdown(payload: dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Legs")
     lines.append("")
-    lines.append("| Leg | Source | Duration(s) | Result | Exit |")
-    lines.append("|---|---|---:|---|---:|")
+    lines.append("| Leg | Source | Contract | Duration(s) | Result | Exit |")
+    lines.append("|---|---|---|---:|---|---:|")
     for leg in payload.get("legs", []):
         lines.append(
-            f"| {leg.get('leg_id')} | {leg.get('source_mode')} | {leg.get('duration_seconds')} | "
+            f"| {leg.get('leg_id')} | {leg.get('source_mode')} | {leg.get('source_contract', 'na')} "
+            f"| {leg.get('duration_seconds')} | "
             f"{leg.get('result')} | {leg.get('return_code')} |"
         )
+    lines.append("")
+    lines.append("## Source Counters")
+    lines.append("")
+    for leg in payload.get("legs", []):
+        counters = leg.get("source_counters", {})
+        rendered = ", ".join(f"{k}={v}" for k, v in sorted(counters.items())) if counters else "none"
+        lines.append(f"- `{leg.get('leg_id')}`: {rendered}")
     lines.append("")
     lines.append("## Gate Counts")
     lines.append("")
@@ -258,7 +261,6 @@ def main() -> int:
     export_md.parent.mkdir(parents=True, exist_ok=True)
 
     legs = _profile_legs(args.profile, args.duration_override_seconds)
-    _validate_legs(legs)
     leg_results: list[dict[str, Any]] = []
     gate_totals: dict[str, int] = {}
 

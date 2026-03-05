@@ -90,8 +90,6 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     TL_ASSERT(out_seg != NULL);
     TL_ASSERT(out_dropped != NULL);
     TL_ASSERT(out_dropped_len != NULL);
-    TL_ASSERT(ctx->applied_seq > 0);
-
     if (ctx->applied_seq == 0) {
         return TL_EINVAL;
     }

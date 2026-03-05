@@ -53,17 +53,8 @@ void tl_compact_ctx_init(tl_compact_ctx_t* ctx,
     ctx->on_drop_handle = tl->config.on_drop_handle;
     ctx->on_drop_ctx = tl->config.on_drop_ctx;
 
-    /* Initialize empty interval sets */
     tl_intervals_init(&ctx->tombs, alloc);
     tl_intervals_init(&ctx->tombs_clipped, alloc);
-
-    ctx->snapshot = NULL;
-    ctx->applied_seq = 0;
-
-    /* Initialize deferred drop records (empty) */
-    ctx->dropped_records = NULL;
-    ctx->dropped_len = 0;
-    ctx->dropped_cap = 0;
 }
 
 void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {

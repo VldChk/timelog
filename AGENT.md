@@ -136,14 +136,15 @@
 - `CLAUDE.md` documents lock order `maint_mu -> flush_mu -> writer_mu -> memtable.mu`, matching internal headers. (`CLAUDE.md:184`, `core/src/internal/tl_timelog_internal.h:85`, `core/src/delta/tl_memtable.h:24`)
 - `CLAUDE.md` describes snapshot seqlock retry protocol, but current snapshot acquisition code states writer-mutex capture without seqlock retry. (`CLAUDE.md:131`, `CLAUDE.md:135`, `core/src/query/tl_snapshot.c:89`, `core/src/query/tl_snapshot.c:92`)
 
-## Latest LLD: `TOMBSTONE_WATERMARK_LLD.md` Alignment
-- The LLD goal is two-tier sequencing: mutable per-record seq + immutable per-source applied watermark. (`TOMBSTONE_WATERMARK_LLD.md:5`, `TOMBSTONE_WATERMARK_LLD.md:6`)
+## Tombstone Watermark Model Alignment
+- Canonical model doc: `docs/internals/components/tombstone-watermark-model.md`.
+- The design goal is two-tier sequencing: mutable per-record seq + immutable per-source applied watermark.
 - Current implementation has global `op_seq` in timelog and increments it for inserts/deletes. (`core/src/internal/tl_timelog_internal.h:166`, `core/src/tl_timelog.c:736`, `core/src/tl_timelog.c:838`)
 - Current mutable layers store per-record seqs in active run and OOO head sequence vectors. (`core/src/delta/tl_memtable.h:37`, `core/src/delta/tl_memtable.h:39`)
 - Current immutable sources carry applied watermark in memrun and segment. (`core/src/delta/tl_memrun.h:74`, `core/src/storage/tl_segment.h:86`)
-- Read/filter rule in code is `drop if tomb_seq > watermark`, matching LLD predicate. (`TOMBSTONE_WATERMARK_LLD.md:13`, `TOMBSTONE_WATERMARK_LLD.md:111`, `core/src/query/tl_filter.c:51`, `core/src/query/tl_filter.c:54`)
-- Point lookup also uses max tomb seq at timestamp and compares against per-source watermarks/seqs. (`TOMBSTONE_WATERMARK_LLD.md:137`, `core/src/query/tl_point.c:311`, `core/src/query/tl_point.c:154`, `core/src/query/tl_point.c:228`, `core/src/query/tl_point.c:90`)
-- LLD proposes a dedicated `tl_tombmap` module, but current implementation realizes piecewise-max tomb fragments through `tl_intervals` (`max_seq` intervals + cursor). (`TOMBSTONE_WATERMARK_LLD.md:29`, `core/src/internal/tl_intervals.h:30`, `core/src/internal/tl_intervals.h:40`, `core/src/internal/tl_intervals.c:250`, `core/src/internal/tl_intervals.c:671`)
+- Read/filter rule in code is `drop if tomb_seq > watermark`, matching the documented model. (`core/src/query/tl_filter.c:51`, `core/src/query/tl_filter.c:54`)
+- Point lookup also uses max tomb seq at timestamp and compares against per-source watermarks/seqs. (`core/src/query/tl_point.c:311`, `core/src/query/tl_point.c:154`, `core/src/query/tl_point.c:228`, `core/src/query/tl_point.c:90`)
+- The current implementation realizes piecewise-max tomb fragments through `tl_intervals` (`max_seq` intervals + cursor). (`core/src/internal/tl_intervals.h:30`, `core/src/internal/tl_intervals.h:40`, `core/src/internal/tl_intervals.c:250`, `core/src/internal/tl_intervals.c:671`)
 
 ## Practical Mental Model (Code-Verified)
 - Writes mutate memtable state (`active_run`/`ooo_head`/`active_tombs`) under writer serialization with monotonic `op_seq`. (`core/src/delta/tl_memtable.h:36`, `core/src/delta/tl_memtable.h:38`, `core/src/delta/tl_memtable.h:40`, `core/src/tl_timelog.c:733`, `core/src/tl_timelog.c:736`)

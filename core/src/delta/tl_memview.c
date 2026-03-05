@@ -426,38 +426,15 @@ void tl_memview_destroy(tl_memview_t* mv) {
         return;
     }
 
-    if (mv->active_run != NULL) {
-        tl__free(mv->alloc, mv->active_run);
-        mv->active_run = NULL;
-    }
-    mv->active_run_len = 0;
-    if (mv->active_run_seqs != NULL) {
-        tl__free(mv->alloc, mv->active_run_seqs);
-        mv->active_run_seqs = NULL;
-    }
-
-    if (mv->active_ooo_head != NULL) {
-        tl__free(mv->alloc, mv->active_ooo_head);
-        mv->active_ooo_head = NULL;
-    }
-    mv->active_ooo_head_len = 0;
-    mv->active_ooo_head_sorted = false;
-    if (mv->active_ooo_head_seqs != NULL) {
-        tl__free(mv->alloc, mv->active_ooo_head_seqs);
-        mv->active_ooo_head_seqs = NULL;
-    }
+    tl__free(mv->alloc, mv->active_run);
+    tl__free(mv->alloc, mv->active_run_seqs);
+    tl__free(mv->alloc, mv->active_ooo_head);
+    tl__free(mv->alloc, mv->active_ooo_head_seqs);
+    tl__free(mv->alloc, mv->active_tombs);
 
     if (mv->active_ooo_runs != NULL) {
         tl_ooorunset_release(mv->active_ooo_runs);
-        mv->active_ooo_runs = NULL;
     }
-    mv->active_ooo_total_len = 0;
-
-    if (mv->active_tombs != NULL) {
-        tl__free(mv->alloc, mv->active_tombs);
-        mv->active_tombs = NULL;
-    }
-    mv->active_tombs_len = 0;
 
     if (mv->sealed != NULL) {
         for (size_t i = 0; i < mv->sealed_len; i++) {
@@ -466,13 +443,9 @@ void tl_memview_destroy(tl_memview_t* mv) {
             }
         }
         tl__free(mv->alloc, (void*)mv->sealed);
-        mv->sealed = NULL;
     }
-    mv->sealed_len = 0;
 
-    mv->min_ts = 0;
-    mv->max_ts = 0;
-    mv->has_data = false;
+    memset(mv, 0, sizeof(*mv));
 }
 
 /*===========================================================================

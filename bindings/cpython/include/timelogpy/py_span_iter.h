@@ -24,7 +24,7 @@
  *   Individual PageSpan instances each hold their own owner ref, remaining
  *   valid after the iterator is closed.
  *
- * See: docs/V2/timelog_v2_lld_storage_pages.md
+ * See: docs/internals/components/storage-and-manifest.md
  */
 
 #ifndef TL_PY_SPAN_ITER_H

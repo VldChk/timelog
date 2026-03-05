@@ -50,7 +50,70 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.load(f)
 
 
+def _ensure_data_generated(args: argparse.Namespace) -> None:
+    """Generate benchmark CSV datasets when requested or needed by defaults."""
+
+    def _is_generated_dataset(path: Path) -> bool:
+        return path.suffix.lower() == ".csv" and path.name.startswith("generated_")
+
+    def _rate_from_name(path: Path, default: float) -> float:
+        name = path.name
+        if "20pct" in name:
+            return 0.20
+        if "5pct" in name:
+            return 0.05
+        return default
+
+    data_path = Path(args.data)
+    generate_data = bool(getattr(args, "generate_data", False))
+
+    # Keep default flow robust: if the benchmark points at generated_* and the
+    # file is missing, generate it automatically instead of crashing.
+    if not generate_data and not data_path.exists():
+        if _is_generated_dataset(data_path):
+            generate_data = True
+            print(f"[benchmark] Missing generated dataset, auto-generating: {data_path}")
+        else:
+            raise FileNotFoundError(
+                f"Benchmark data file not found: {data_path}. "
+                "Provide an existing CSV or pass --generate-data."
+            )
+
+    if not generate_data:
+        return
+
+    from hft_synthetic import generate_csv
+
+    ooo_rate = getattr(args, "ooo_rate", 0.05)
+    generate_rows = getattr(args, "generate_rows", 581_400)
+
+    def _ensure_one(path: Path, rate: float) -> None:
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[benchmark] Generating test data: {path} "
+              f"(rows={generate_rows}, ooo_rate={rate})")
+        generate_csv(
+            path,
+            rows=generate_rows,
+            ooo_rate=rate,
+            seed=args.seed,
+        )
+
+    # Primary benchmark dataset.
+    _ensure_one(data_path, _rate_from_name(data_path, ooo_rate))
+
+    # Scenario A6 compares against an alternate ordering profile; ensure the
+    # paired dataset file exists even when it has not been generated yet.
+    alt = td.paired_dataset_path(str(data_path))
+    if alt is not None:
+        alt_path = Path(alt)
+        if alt_path.resolve() != data_path.resolve():
+            _ensure_one(alt_path, _rate_from_name(alt_path, ooo_rate))
+
+
 def run_methodology(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    _ensure_data_generated(args)
     profile = _resolve_profile(args)
 
     registry = build_scenario_registry()
@@ -155,12 +218,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=["pr", "full", "custom"], default="pr")
     parser.add_argument("--config", type=str, help="Path to custom profile JSON config")
     parser.add_argument("--scenarios", type=str, help="Comma-separated scenario ids override")
-    parser.add_argument("--data", type=str, default="demo/order_book_50MB_5pct_ooo_clean.csv")
+    parser.add_argument("--data", type=str, default="demo/generated_5pct.csv")
     parser.add_argument("--baseline", type=str, default=None)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--export-json", type=str, default="demo/benchmark_runs/methodology_v1.json")
     parser.add_argument("--export-md", type=str, default="demo/benchmark_runs/methodology_v1.md")
     parser.add_argument("--update-baseline", action="store_true")
+    parser.add_argument("--generate-data", action="store_true",
+                        help="Generate CSV test data before benchmark if file missing")
+    parser.add_argument("--ooo-rate", type=float, default=0.05,
+                        help="OOO rate for generated data (default: 0.05)")
+    parser.add_argument("--generate-rows", type=int, default=581_400,
+                        help="Row count when generating data (default: 581400)")
 
     parser.add_argument("--trust-csv", action="store_true")
     parser.add_argument("--preload-csv", action="store_true")

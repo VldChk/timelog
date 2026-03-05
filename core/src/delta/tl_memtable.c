@@ -60,18 +60,13 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
      * Use head-record footprint (record + seq watermark) to avoid
      * optimistic chunk sizing that can overshoot OOO budget pressure. */
     size_t ooo_head_record_bytes = TL_RECORD_SIZE + sizeof(tl_seq_t);
-    size_t budget_records = (ooo_head_record_bytes == 0)
-        ? 0
-        : (ooo_budget_bytes / ooo_head_record_bytes);
+    size_t budget_records = ooo_budget_bytes / ooo_head_record_bytes;
     size_t chunk = budget_records / TL_OOO_TARGET_RUNS;
     if (chunk < TL_OOO_CHUNK_MIN_RECORDS) {
         chunk = TL_OOO_CHUNK_MIN_RECORDS;
     }
     if (chunk > TL_OOO_CHUNK_MAX_RECORDS) {
         chunk = TL_OOO_CHUNK_MAX_RECORDS;
-    }
-    if (chunk == 0) {
-        chunk = TL_OOO_CHUNK_MIN_RECORDS;
     }
     mt->ooo_chunk_records = chunk;
 
@@ -134,6 +129,22 @@ static void memtable_add_record_bytes(tl_memtable_t* mt, size_t count) {
         return;
     }
     memtable_add_bytes(mt, count * rec_bytes);
+}
+
+static void memtable_sub_bytes(tl_memtable_t* mt, size_t dec, bool dec_valid) {
+    if (!dec_valid || mt->active_bytes_est < dec) {
+        mt->active_bytes_est = SIZE_MAX;
+    } else {
+        mt->active_bytes_est -= dec;
+    }
+}
+
+static void memtable_reset_ooo_head(tl_memtable_t* mt) {
+    tl_recvec_clear(&mt->ooo_head);
+    tl_seqvec_clear(&mt->ooo_head_seqs);
+    mt->ooo_head_sorted = true;
+    mt->ooo_head_last_ts = TL_TS_MIN;
+    mt->ooo_head_last_handle = 0;
 }
 
 static void memtable_adjust_tomb_bytes(tl_memtable_t* mt,
@@ -347,18 +358,8 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
 
     if (out_len == 0) {
         tl__free(mt->alloc, copy);
-        tl_recvec_clear(&mt->ooo_head);
-        tl_seqvec_clear(&mt->ooo_head_seqs);
-        mt->ooo_head_sorted = true;
-        mt->ooo_head_last_ts = TL_TS_MIN;
-        mt->ooo_head_last_handle = 0;
-        if (!dec_valid) {
-            mt->active_bytes_est = SIZE_MAX;
-        } else if (mt->active_bytes_est < dec) {
-            mt->active_bytes_est = SIZE_MAX;
-        } else {
-            mt->active_bytes_est -= dec;
-        }
+        memtable_reset_ooo_head(mt);
+        memtable_sub_bytes(mt, dec, dec_valid);
         mt->epoch++;
         return TL_OK;
     }
@@ -386,20 +387,10 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
     }
     tl_ooorun_release(run); /* Runset now owns a reference */
 
-    tl_recvec_clear(&mt->ooo_head);
-    tl_seqvec_clear(&mt->ooo_head_seqs);
-    mt->ooo_head_sorted = true;
-    mt->ooo_head_last_ts = TL_TS_MIN;
-    mt->ooo_head_last_handle = 0;
+    memtable_reset_ooo_head(mt);
 
     mt->epoch++;
-    if (!dec_valid) {
-        mt->active_bytes_est = SIZE_MAX;
-    } else if (mt->active_bytes_est < dec) {
-        mt->active_bytes_est = SIZE_MAX;
-    } else {
-        mt->active_bytes_est -= dec;
-    }
+    memtable_sub_bytes(mt, dec, dec_valid);
 
     return TL_OK;
 }
@@ -826,12 +817,8 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     /* Step 8: Reset active state */
     mt->last_inorder_ts = TL_TS_MIN;
     mt->active_bytes_est = 0;
-    mt->epoch++;  /* Memtable state changed (active -> sealed) */
-    tl_recvec_clear(&mt->ooo_head);
-    tl_seqvec_clear(&mt->ooo_head_seqs);
-    mt->ooo_head_sorted = true;
-    mt->ooo_head_last_ts = TL_TS_MIN;
-    mt->ooo_head_last_handle = 0;
+    mt->epoch++;
+    memtable_reset_ooo_head(mt);
     mt->ooo_next_gen = 0;
 
     /* Signal waiters if provided */

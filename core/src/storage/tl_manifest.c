@@ -351,16 +351,6 @@ static tl_status_t validate_removals(tl_segment_t* const* base_arr, uint32_t bas
     return TL_OK;
 }
 
-/* Check if a segment pointer exists in an array. */
-static bool list_contains(tl_segment_t* const* arr, size_t len, const tl_segment_t* seg) {
-    for (size_t i = 0; i < len; i++) {
-        if (arr[i] == seg) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* Validate add lists (levels, duplicates, and conflicts with base/removals). */
 static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
     /* Validate add_l0 list */
@@ -378,12 +368,12 @@ static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
             is_in_removal_set(seg, mb->remove_l1, mb->remove_l1_len)) {
             return TL_EINVAL; /* add + remove same seg */
         }
-        if (list_contains(mb->add_l1, mb->add_l1_len, seg)) {
+        if (is_in_removal_set(seg, mb->add_l1, mb->add_l1_len)) {
             return TL_EINVAL; /* same seg in add_l1 */
         }
         if (mb->base != NULL) {
-            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
-                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+            if (is_in_removal_set(seg, mb->base->l0, mb->base->n_l0) ||
+                is_in_removal_set(seg, mb->base->l1, mb->base->n_l1)) {
                 return TL_EINVAL; /* already present in base */
             }
         }
@@ -405,8 +395,8 @@ static tl_status_t validate_adds(const tl_manifest_builder_t* mb) {
             return TL_EINVAL; /* add + remove same seg */
         }
         if (mb->base != NULL) {
-            if (list_contains(mb->base->l0, mb->base->n_l0, seg) ||
-                list_contains(mb->base->l1, mb->base->n_l1, seg)) {
+            if (is_in_removal_set(seg, mb->base->l0, mb->base->n_l0) ||
+                is_in_removal_set(seg, mb->base->l1, mb->base->n_l1)) {
                 return TL_EINVAL; /* already present in base */
             }
         }

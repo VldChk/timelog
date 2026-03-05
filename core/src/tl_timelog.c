@@ -24,6 +24,13 @@
 
 #include <string.h>
 
+/* Common precondition check for public API functions. */
+#define TL_CHECK_OPEN(tl) \
+    do { \
+        if ((tl) == NULL) return TL_EINVAL; \
+        if (!(tl)->is_open) return TL_ESTATE; \
+    } while (0)
+
 /*===========================================================================
  * Iterator Structure
  *
@@ -610,12 +617,7 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
 }
 
 tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
 
     bool need_signal = false;
     tl_record_t* dropped = NULL;
@@ -656,12 +658,7 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
 
 tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                             size_t n, uint32_t flags) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
     if (n == 0) {
         return TL_OK; /* No-op for empty batch */
     }
@@ -707,12 +704,7 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
 }
 
 tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
 
     if (t1 == t2) {
         return TL_OK;  /* empty range */
@@ -753,12 +745,7 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
 }
 
 tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
 
     tl_status_t st;
     bool need_signal = false;
@@ -801,13 +788,8 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
  * Compaction Delegation
  *===========================================================================*/
 
-static bool tl__compaction_needed(const tl_timelog_t* tl) {
-    return tl_compact_needed(tl);
-}
-
-static tl_status_t tl__compact_one_step(tl_timelog_t* tl) {
-    return tl_compact_one(tl, 3);  /* 3 bounded publish retries */
-}
+/* Compaction publish retries (bounded, see H-17 in CLAUDE.md). */
+#define TL_COMPACT_MAX_RETRIES 3
 
 /*===========================================================================
  * Flush Implementation
@@ -1086,12 +1068,7 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
 }
 
 tl_status_t tl_flush(tl_timelog_t* tl) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
 
     tl_status_t st;
 
@@ -1190,12 +1167,7 @@ static void tl__maint_request_compact(tl_timelog_t* tl) {
  *===========================================================================*/
 
 tl_status_t tl_compact(tl_timelog_t* tl) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
 
     tl__maint_request_compact(tl);
 
@@ -1727,7 +1699,7 @@ static void* tl__maint_worker_entry(void* arg) {
         /* Only check compaction heuristic when flush work exists (compaction
          * triggers only change after flush creates new L0 segments). */
         if (!(work & TL_WORK_COMPACT_EXPLICIT) && (work & TL_WORK_FLUSH)) {
-            if (tl__compaction_needed(tl)) {
+            if (tl_compact_needed(tl)) {
                 work |= TL_WORK_COMPACT_HEURISTIC;
             }
         }
@@ -1736,7 +1708,7 @@ static void* tl__maint_worker_entry(void* arg) {
         if (work & TL_WORK_FLUSH) {
             tl_status_t st;
             while ((st = tl__flush_one(tl)) == TL_OK) {
-                if (tl__compaction_needed(tl)) {
+                if (tl_compact_needed(tl)) {
                     work |= TL_WORK_COMPACT_HEURISTIC;
                     break;
                 }
@@ -1774,7 +1746,7 @@ static void* tl__maint_worker_entry(void* arg) {
 
         /* Execute compaction work */
         if (work & (TL_WORK_COMPACT_EXPLICIT | TL_WORK_COMPACT_HEURISTIC)) {
-            tl_status_t st = tl__compact_one_step(tl);
+            tl_status_t st = tl_compact_one(tl, TL_COMPACT_MAX_RETRIES);
 
             if (st == TL_ENOMEM || st == TL_EBUSY || st == TL_EINTERNAL) {
                 tl_sleep_ms(backoff_ms);
@@ -1812,13 +1784,7 @@ static void* tl__maint_worker_entry(void* arg) {
  *===========================================================================*/
 
 tl_status_t tl_maint_start(tl_timelog_t* tl) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
     if (tl->config.maintenance_mode != TL_MAINT_BACKGROUND) {
         return TL_ESTATE;
     }
@@ -1903,13 +1869,7 @@ tl_status_t tl_maint_stop(tl_timelog_t* tl) {
  *===========================================================================*/
 
 tl_status_t tl_maint_step(tl_timelog_t* tl) {
-    if (tl == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (!tl->is_open) {
-        return TL_ESTATE;
-    }
+    TL_CHECK_OPEN(tl);
     if (tl->config.maintenance_mode != TL_MAINT_DISABLED) {
         return TL_ESTATE;
     }
@@ -1933,10 +1893,10 @@ tl_status_t tl_maint_step(tl_timelog_t* tl) {
     }
     TL_UNLOCK_MAINT(tl);
 
-    bool do_compact = was_explicit || tl__compaction_needed(tl);
+    bool do_compact = was_explicit || tl_compact_needed(tl);
 
     if (do_compact) {
-        tl_status_t st = tl__compact_one_step(tl);
+        tl_status_t st = tl_compact_one(tl, TL_COMPACT_MAX_RETRIES);
 
         /* Clear on success/no-work/fatal; preserve on transient errors */
         if (was_explicit && (st == TL_OK || st == TL_EOF || st == TL_EOVERFLOW)) {

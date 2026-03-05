@@ -83,9 +83,15 @@ dist/
 # =============================================================================
 # Temp script files
 *.bat
-!run_clang_tidy.bat
 *.sh
-!run_tidy.sh
+
+# Static analysis output
+*.plist
+
+# Structured logs
+*.jsonl
+
+demo/benchmark_runs/*
 
 # Working notes (keep in separate branch or local)
 notes*.md
@@ -94,7 +100,6 @@ proposal_unified.md
 everything_you_want_to_know_about_timelog.md
 *.json
 *.csv
-!demo/order_book_50MB_*_ooo_clean.csv
 
 # LLVM binary cache
 llvm_bin/

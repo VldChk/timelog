@@ -1,0 +1,78 @@
+name: Packaging (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "core/**"
+      - "bindings/**"
+      - "python/**"
+      - "pyproject.toml"
+      - "CMakeLists.txt"
+      - ".github/workflows/packaging-pr.yml"
+
+concurrency:
+  group: packaging-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packaging-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install packaging tools
+        run: python -m pip install --upgrade pip build twine cibuildwheel
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Build representative wheel (cp313-manylinux_x86_64)
+        env:
+          CIBW_BUILD: cp313-manylinux_x86_64
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_CONFIG_SETTINGS: >-
+            cmake.define.TIMELOG_BUILD_PYTHON=true
+            cmake.define.TIMELOG_BUILD_PY_TESTS=false
+            cmake.define.TIMELOG_BUILD_PY_FACADE_TESTS=false
+            cmake.define.TIMELOG_STAGE_PYTHON_MODULE=false
+            cmake.define.TIMELOG_STRICT_WARNINGS=false
+            cmake.define.TIMELOG_BUILD_CORE_TESTS=false
+            cmake.define.TIMELOG_BUILD_DEMOS=false
+            cmake.define.TIMELOG_BUILD_SHARED=false
+        run: python -m cibuildwheel --output-dir dist
+
+      - name: Verify package metadata
+        run: python -m twine check dist/*
+
+      - name: Wheel install + smoke tests
+        shell: bash
+        run: |
+          python -m venv .venv-wheel
+          source .venv-wheel/bin/activate
+          python -m pip install --upgrade pip
+          wheel_path="$(ls dist/timelog_lib-*.whl)"
+          python -m pip install "${wheel_path}[test]"
+          python -m pytest python/tests -q
+          python - <<'PY'
+          from timelog import Timelog, __version__
+          with Timelog() as log:
+              log.append(1, "ok")
+              rows = list(log[1:2])
+              assert rows == [(1, "ok")]
+          print(__version__)
+          PY
+
+      - name: Upload packaging artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-pr-dist
+          path: dist/*
