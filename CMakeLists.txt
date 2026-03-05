@@ -19,6 +19,8 @@ option(TIMELOG_STAGE_PYTHON_MODULE
     "Copy built _timelog extension into python/timelog for in-repo imports" ON)
 option(TIMELOG_BUILD_PY_FACADE_TESTS
     "Add target to run python/tests via pytest (requires pytest installed)" OFF)
+option(TIMELOG_STRICT_WARNINGS
+    "Treat compiler warnings as errors for core targets" ON)
 option(TIMELOG_BUILD_CORE_TESTS
     "Build core C test executable and register core CTest entry" ON)
 option(TIMELOG_BUILD_DEMOS "Build demo executables" ON)
@@ -34,9 +36,13 @@ endif()
 
 if(MSVC)
     # MSVC flags
+    set(_timelog_msvc_warn_flags /W4)
+    if(TIMELOG_STRICT_WARNINGS)
+        list(APPEND _timelog_msvc_warn_flags /WX)
+    endif()
+
     add_compile_options(
-        /W4                     # Warning level 4
-        /WX                     # Warnings as errors
+        ${_timelog_msvc_warn_flags}
         /wd4100                 # Unreferenced formal parameter (allow)
         /wd4127                 # Conditional expression is constant (assert macros, while(1))
         /wd4189                 # Local variable initialized but not referenced
@@ -54,11 +60,17 @@ if(MSVC)
 
 else()
     # GCC/Clang flags
-    add_compile_options(
+    set(_timelog_gcc_warn_flags
         -Wall -Wextra -Wpedantic
-        -Werror
         -Wno-unused-parameter
         -fvisibility=hidden
+    )
+    if(TIMELOG_STRICT_WARNINGS)
+        list(APPEND _timelog_gcc_warn_flags -Werror)
+    endif()
+
+    add_compile_options(
+        ${_timelog_gcc_warn_flags}
     )
 
     # Enable POSIX APIs (clock_gettime, pthread_condattr_setclock, nanosleep, etc.)

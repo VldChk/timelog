@@ -78,7 +78,13 @@ endif()
 # Find Python
 # =============================================================================
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+# Wheel builds only need extension-module headers/tooling. Embedded-Python C
+# tests need embed libraries as well. Request components accordingly.
+if(TIMELOG_BUILD_PY_TESTS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module Development.Embed)
+else()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+endif()
 
 message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
 message(STATUS "Python3 include: ${Python3_INCLUDE_DIRS}")
