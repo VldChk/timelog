@@ -88,12 +88,8 @@ static tl_status_t intervals_split_at(tl_intervals_t* iv, tl_ts_t ts) {
     tl_interval_t right = *cur;
     right.start = ts;
 
-    if (cur->end_unbounded) {
-        cur->end_unbounded = false;
-        cur->end = ts;
-    } else {
-        cur->end = ts;
-    }
+    cur->end_unbounded = false;
+    cur->end = ts;
 
     return intervals_insert_at(iv, i + 1, &right);
 }
@@ -193,8 +189,6 @@ tl_status_t tl_intervals_insert(tl_intervals_t* iv, tl_ts_t t1, tl_ts_t t2, tl_s
         return TL_EINVAL;
     }
 
-    TL_ASSERT(seq > 0);
-
     if (iv->len == 0) {
         tl_interval_t interval = {
             .start = t1,
@@ -279,8 +273,6 @@ tl_status_t tl_intervals_insert_unbounded(tl_intervals_t* iv, tl_ts_t t1, tl_seq
     if (seq == 0) {
         return TL_EINVAL;
     }
-
-    TL_ASSERT(seq > 0);
 
     if (iv->len == 0) {
         tl_interval_t interval = {
