@@ -51,9 +51,10 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _ensure_data_generated(args: argparse.Namespace) -> None:
-    """Generate benchmark CSV data on-the-fly if --generate-data is set."""
-    if not getattr(args, "generate_data", False):
-        return
+    """Generate benchmark CSV datasets when requested or needed by defaults."""
+
+    def _is_generated_dataset(path: Path) -> bool:
+        return path.suffix.lower() == ".csv" and path.name.startswith("generated_")
 
     def _rate_from_name(path: Path, default: float) -> float:
         name = path.name
@@ -64,6 +65,23 @@ def _ensure_data_generated(args: argparse.Namespace) -> None:
         return default
 
     data_path = Path(args.data)
+    generate_data = bool(getattr(args, "generate_data", False))
+
+    # Keep default flow robust: if the benchmark points at generated_* and the
+    # file is missing, generate it automatically instead of crashing.
+    if not generate_data and not data_path.exists():
+        if _is_generated_dataset(data_path):
+            generate_data = True
+            print(f"[benchmark] Missing generated dataset, auto-generating: {data_path}")
+        else:
+            raise FileNotFoundError(
+                f"Benchmark data file not found: {data_path}. "
+                "Provide an existing CSV or pass --generate-data."
+            )
+
+    if not generate_data:
+        return
+
     from hft_synthetic import generate_csv
 
     ooo_rate = getattr(args, "ooo_rate", 0.05)
@@ -72,6 +90,7 @@ def _ensure_data_generated(args: argparse.Namespace) -> None:
     def _ensure_one(path: Path, rate: float) -> None:
         if path.exists():
             return
+        path.parent.mkdir(parents=True, exist_ok=True)
         print(f"[benchmark] Generating test data: {path} "
               f"(rows={generate_rows}, ooo_rate={rate})")
         generate_csv(

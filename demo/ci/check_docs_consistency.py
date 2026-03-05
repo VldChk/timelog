@@ -55,9 +55,8 @@ def _iter_md_files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*.md") if p.is_file())
 
 
-def _check_links(repo_root: Path, docs_root: Path) -> list[str]:
+def _check_links(docs_root: Path) -> list[str]:
     errors: list[str] = []
-    all_files = {p.resolve() for p in repo_root.rglob("*") if p.is_file()}
 
     for md in _iter_md_files(docs_root):
         text = md.read_text(encoding="utf-8", errors="replace")
@@ -73,7 +72,7 @@ def _check_links(repo_root: Path, docs_root: Path) -> list[str]:
             resolved = (md.parent / target).resolve()
             if resolved.is_dir():
                 continue
-            if resolved not in all_files:
+            if not resolved.is_file():
                 errors.append(f"Broken link: {md.as_posix()} -> {target}")
 
     return errors
@@ -82,7 +81,12 @@ def _check_links(repo_root: Path, docs_root: Path) -> list[str]:
 def _check_c_symbols(repo_root: Path) -> list[str]:
     errors: list[str] = []
     header = repo_root / "core/include/timelog/timelog.h"
-    text = header.read_text(encoding="utf-8", errors="replace")
+    try:
+        text = header.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [f"Missing required file: {header.as_posix()}"]
+    except OSError as exc:
+        return [f"Failed reading {header.as_posix()}: {exc}"]
     for sym in REQUIRED_C_SYMBOLS:
         if re.search(rf"\b{re.escape(sym)}\b", text) is None:
             errors.append(f"Missing C symbol in header: {sym}")
@@ -92,7 +96,12 @@ def _check_c_symbols(repo_root: Path) -> list[str]:
 def _check_python_symbols(repo_root: Path) -> list[str]:
     errors: list[str] = []
     py_api = repo_root / "python/timelog/__init__.py"
-    text = py_api.read_text(encoding="utf-8", errors="replace")
+    try:
+        text = py_api.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [f"Missing required file: {py_api.as_posix()}"]
+    except OSError as exc:
+        return [f"Failed reading {py_api.as_posix()}: {exc}"]
     for sym in REQUIRED_PY_SYMBOLS:
         if sym not in text:
             errors.append(f"Missing Python API symbol: {sym}")
@@ -113,7 +122,7 @@ def main() -> int:
     docs_root = repo_root / "docs"
 
     issues: list[str] = []
-    issues.extend(_check_links(repo_root, docs_root))
+    issues.extend(_check_links(docs_root))
     issues.extend(_check_c_symbols(repo_root))
     issues.extend(_check_python_symbols(repo_root))
 

@@ -46,6 +46,34 @@ class BenchmarkDataGenerationTests(unittest.TestCase):
             self.assertTrue(primary.exists())
             self.assertTrue(alt.exists())
 
+    def test_missing_generated_default_is_auto_created_without_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as td_tmp:
+            primary = Path(td_tmp) / "generated_5pct.csv"
+            alt = Path(td_tmp) / "generated_20pct.csv"
+            args = argparse.Namespace(
+                generate_data=False,
+                data=str(primary),
+                ooo_rate=0.05,
+                generate_rows=40,
+                seed=123,
+            )
+            tb._ensure_data_generated(args)
+            self.assertTrue(primary.exists())
+            self.assertTrue(alt.exists())
+
+    def test_missing_custom_csv_raises_without_generate_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as td_tmp:
+            custom = Path(td_tmp) / "custom.csv"
+            args = argparse.Namespace(
+                generate_data=False,
+                data=str(custom),
+                ooo_rate=0.05,
+                generate_rows=40,
+                seed=123,
+            )
+            with self.assertRaises(FileNotFoundError):
+                tb._ensure_data_generated(args)
+
 
 if __name__ == "__main__":
     unittest.main()

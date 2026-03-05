@@ -51,7 +51,7 @@ Timelog is a good fit when you want timestamp slicing as a primitive inside Pyth
 - **In‑memory only**: no durable storage layer and no SQL/query language.  
 - Not positioned as a distributed TSDB; it is an embedded engine.  
 - Write concurrency is intentionally constrained (single writer) to keep the core simple and fast.
-– No Numpy integration
+- No NumPy integration
 
 ## Quality and Delivery Confidence
 - Large C test surface (hundreds of assertions across core suites), plus binding and Python façade tests.  
