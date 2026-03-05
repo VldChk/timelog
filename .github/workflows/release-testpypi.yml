@@ -48,6 +48,16 @@ jobs:
         run: python -m pip install --upgrade pip cibuildwheel
 
       - name: Build wheels
+        env:
+          CIBW_CONFIG_SETTINGS: >-
+            cmake.define.TIMELOG_BUILD_PYTHON=true
+            cmake.define.TIMELOG_BUILD_PY_TESTS=false
+            cmake.define.TIMELOG_BUILD_PY_FACADE_TESTS=false
+            cmake.define.TIMELOG_STAGE_PYTHON_MODULE=false
+            cmake.define.TIMELOG_STRICT_WARNINGS=false
+            cmake.define.TIMELOG_BUILD_CORE_TESTS=false
+            cmake.define.TIMELOG_BUILD_DEMOS=false
+            cmake.define.TIMELOG_BUILD_SHARED=false
         run: python -m cibuildwheel --output-dir wheelhouse
 
       - name: Upload wheel artifacts
