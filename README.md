@@ -3,6 +3,8 @@
 In-memory, LSM-inspired, time-indexed multimap for Python (C17 core + CPython extension).
 
 [![License](https://img.shields.io/github/license/VldChk/timelog)](LICENSE)
+[![PyPI version](https://img.shields.io/pypi/v/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
+[![Python versions](https://img.shields.io/pypi/pyversions/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
 [![Tests (PR)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml)
 [![Packaging (PR)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/VldChk/timelog)
@@ -187,8 +189,6 @@ Complexity claims should be interpreted with stated assumptions. In practice:
 - [ ] Sanitizer CI visibility (ASan/UBSan)
 - [ ] Docs site publishing badge
 - [ ] Benchmark dashboard link
-
-PyPI badges (`timelog-lib` version / supported Python) will be added after first successful public release.
 
 ## License
 
