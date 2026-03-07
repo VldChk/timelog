@@ -44,6 +44,12 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Setup QEMU (Linux cross-arch wheels)
+        if: runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Install wheel build tools
         run: python -m pip install --upgrade pip cibuildwheel
 
