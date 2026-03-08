@@ -7,6 +7,9 @@ In-memory, LSM-inspired, time-indexed multimap for Python (C17 core + CPython ex
 [![Python versions](https://img.shields.io/pypi/pyversions/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
 [![Tests (PR)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml)
 [![Packaging (PR)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml)
+[![Coverage](https://codecov.io/gh/VldChk/timelog/branch/main/graph/badge.svg)](https://codecov.io/gh/VldChk/timelog)
+[![CodeQL](https://github.com/VldChk/timelog/actions/workflows/codeql.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/codeql.yml)
+[![Sanitizers](https://github.com/VldChk/timelog/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/sanitizers.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/VldChk/timelog)
 
 ## Why Timelog
@@ -42,16 +45,19 @@ from timelog import Timelog
 ```python
 from timelog import Timelog
 
-with Timelog.for_streaming(time_unit="ms") as log:
-    # Auto-timestamp append
-    log.append({"event": "boot"})
+log = Timelog.for_streaming(time_unit="ms")
 
-    # Explicit timestamp append
-    log.append(1_700_000_000_000, {"event": "tick"})
+# Auto-timestamp append
+log.append({"event": "boot"})
 
-    # Half-open range query [t1, t2)
-    rows = list(log[1_700_000_000_000:1_700_000_000_001])
-    print(rows)
+# Operator-style explicit timestamp append
+log[1_700_000_000_000] = {"event": "tick"}
+
+# Half-open range query [t1, t2)
+rows = list(log[1_700_000_000_000:1_700_000_000_001])
+print(rows)
+
+log.close()  # optional explicit cleanup
 ```
 
 ## Quickstart: Correctness Semantics
@@ -59,13 +65,15 @@ with Timelog.for_streaming(time_unit="ms") as log:
 ```python
 from timelog import Timelog
 
-with Timelog(time_unit="ms") as log:
-    log.append(10, "A")
-    log.delete(5, 15)      # delete [5, 15)
-    log.append(10, "B")    # later insert at same ts
+log = Timelog(time_unit="ms")
+log[10] = "A"
+del log[5:15]              # delete [5, 15)
+log[10] = "B"              # later insert at same ts
 
-    print(log[10])         # ['B']
-    print(list(log[0:20])) # [(10, 'B')]
+print(log[10])             # ['B']
+print(list(log[0:20]))     # [(10, 'B')]
+
+log.close()  # optional explicit cleanup
 ```
 
 Timelog uses sequenced tombstones, so later inserts are not hidden by earlier deletes.
@@ -181,14 +189,6 @@ Complexity claims should be interpreted with stated assumptions. In practice:
 - Error and retry semantics: `docs/errors-and-retry-semantics.md`
 - Performance methodology: `docs/PERFORMANCE_METHODOLOGY.md`
 - PyPI/release operations: `docs/pypi-release.md`
-
-## Planned Trust Signals
-
-- [ ] Coverage badge integration
-- [ ] CodeQL/security scan badge
-- [ ] Sanitizer CI visibility (ASan/UBSan)
-- [ ] Docs site publishing badge
-- [ ] Benchmark dashboard link
 
 ## License
 

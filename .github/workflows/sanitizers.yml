@@ -1,0 +1,101 @@
+name: Sanitizers
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+  UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python test dependencies
+        run: python -m pip install --upgrade pip -r requirements-test.txt
+
+      - name: Configure (Debug + sanitizers)
+        run: >
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
+          -DTIMELOG_BUILD_PYTHON=ON
+          -DTIMELOG_BUILD_PY_TESTS=ON
+          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
+
+      - name: Build e2e targets
+        run: cmake --build build-asan --target timelog_e2e_build --config Debug -j 2
+
+      - name: Run pure C tests by group (sanitizers)
+        shell: bash
+        run: |
+          set +e
+          python demo/ci/run_core_test_groups.py \
+            --build-dir build-asan \
+            --config Debug \
+            --ctest-regex '^timelog_tests$' \
+            --summary-json "${RUNNER_TEMP}/sanitizers-core-summary.json" \
+            --summary-md "${RUNNER_TEMP}/sanitizers-core-summary.md" \
+            2>&1 | tee "${RUNNER_TEMP}/sanitizers-core.log"
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Run C-level CPython binding tests (sanitizers)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          ctest --test-dir build-asan -C Debug --output-on-failure -R '^py_.*_tests$' \
+            2>&1 | tee "${RUNNER_TEMP}/sanitizers-bindings.log"
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Run Python facade tests (sanitizers)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+            python -m pytest python/tests -q \
+            2>&1 | tee "${RUNNER_TEMP}/sanitizers-pyfacade.log"
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Run demo tests (sanitizers)
+        if: success() || failure()
+        shell: bash
+        run: |
+          set +e
+          cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+            python -m pytest demo/tests -q \
+            2>&1 | tee "${RUNNER_TEMP}/sanitizers-demo.log"
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Upload sanitizer artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizers-failure-logs
+          path: |
+            ${{ runner.temp }}/sanitizers-core-summary.json
+            ${{ runner.temp }}/sanitizers-core-summary.md
+            ${{ runner.temp }}/sanitizers-core.log
+            ${{ runner.temp }}/sanitizers-bindings.log
+            ${{ runner.temp }}/sanitizers-pyfacade.log
+            ${{ runner.temp }}/sanitizers-demo.log
