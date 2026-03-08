@@ -34,7 +34,7 @@ cmake -S . -B build-native \
   -DTIMELOG_BUILD_CORE_TESTS=OFF \
   -DTIMELOG_BUILD_DEMOS=ON
 cmake --build build-native --target timelog_native_benchmark -j2
-./build-native/timelog_native_benchmark --records 5000000 --batch-size 4096 --ooo-rate 0.05
+./build-native/timelog_native_benchmark --records 5000000 --batch-size 4096 --ooo-rate 0.05 --scan-loops 1
 ```
 
 Interpretation guardrails:
@@ -42,6 +42,23 @@ Interpretation guardrails:
 - This benchmark measures native Timelog APIs directly in C.
 - It excludes Python object creation, Python/C boundary overhead, and Python iterator costs.
 - It is valid for "engine ceiling" framing, not end-to-end application throughput claims.
+
+## Python Methodology Benchmark (CSV auto-generation)
+
+For end-to-end Python facade benchmarking, use:
+
+```bash
+python demo/timelog_benchmark.py \
+  --profile pr \
+  --data demo/generated_5pct.csv \
+  --generate-data \
+  --ooo-rate 0.05
+```
+
+Notes:
+
+- The harness can auto-generate `generated_*.csv` inputs when missing.
+- Scenario `A6` comparison data (`generated_5pct.csv` and `generated_20pct.csv`) is bootstrapped automatically.
 
 ## Historical Reports
 

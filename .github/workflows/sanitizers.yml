@@ -41,6 +41,17 @@ jobs:
       - name: Build e2e targets
         run: cmake --build build-asan --target timelog_e2e_build --config Debug -j 2
 
+      - name: Resolve sanitizer runtime preload
+        shell: bash
+        run: |
+          libasan="$(gcc -print-file-name=libasan.so)"
+          libubsan="$(gcc -print-file-name=libubsan.so)"
+          preload="${libasan}"
+          if [ -n "${libubsan}" ] && [ "${libubsan}" != "libubsan.so" ]; then
+            preload="${preload}:${libubsan}"
+          fi
+          echo "LD_PRELOAD=${preload}" >> "${GITHUB_ENV}"
+
       - name: Run pure C tests by group (sanitizers)
         shell: bash
         run: |
@@ -56,7 +67,7 @@ jobs:
           exit $exit_code
 
       - name: Run C-level CPython binding tests (sanitizers)
-        if: success() || failure()
+        if: success()
         shell: bash
         run: |
           set +e
@@ -66,7 +77,7 @@ jobs:
           exit $exit_code
 
       - name: Run Python facade tests (sanitizers)
-        if: success() || failure()
+        if: success()
         shell: bash
         run: |
           set +e
@@ -77,7 +88,7 @@ jobs:
           exit $exit_code
 
       - name: Run demo tests (sanitizers)
-        if: success() || failure()
+        if: success()
         shell: bash
         run: |
           set +e

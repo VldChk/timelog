@@ -13,7 +13,8 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - `Timelog(**kwargs)`
 - `reopen(...)`
 - `configure(...)` (alias for `reopen`)
-- Context manager is supported.
+- `close()` for deterministic explicit cleanup
+- Context manager is supported, but optional.
 
 `Contract`
 - `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
