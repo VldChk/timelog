@@ -23,6 +23,26 @@ Use conditional wording tied to measured conditions:
 - Include statistical summaries (median/p95/p99/MAD).
 - Keep complexity claims tied to explicit sweep dimensions (`N`, `K`, `T`, `M`).
 
+## Native C Engine Benchmark
+
+For engine-only measurements (without Python wrapper/runtime overhead), use:
+
+```bash
+cmake -S . -B build-native \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTIMELOG_BUILD_PYTHON=OFF \
+  -DTIMELOG_BUILD_CORE_TESTS=OFF \
+  -DTIMELOG_BUILD_DEMOS=ON
+cmake --build build-native --target timelog_native_benchmark -j2
+./build-native/timelog_native_benchmark --records 5000000 --batch-size 4096 --ooo-rate 0.05
+```
+
+Interpretation guardrails:
+
+- This benchmark measures native Timelog APIs directly in C.
+- It excludes Python object creation, Python/C boundary overhead, and Python iterator costs.
+- It is valid for "engine ceiling" framing, not end-to-end application throughput claims.
+
 ## Historical Reports
 
 - `docs/BENCHMARK_REPORT.md`
