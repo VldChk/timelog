@@ -7,11 +7,12 @@ for full API documentation.
 Example::
 
     >>> from timelog import Timelog
-    >>> with Timelog() as log:
-    ...     log.append("hello")           # auto-timestamp
-    ...     log[1000] = "explicit ts"     # dict-style insert
-    ...     for ts, obj in log[1000:]:
-    ...         print(ts, obj)
+    >>> log = Timelog()
+    >>> log.append("hello")           # auto-timestamp
+    >>> log[1000] = "explicit ts"     # dict-style insert
+    >>> for ts, obj in log[1000:]:
+    ...     print(ts, obj)
+    >>> log.close()
 """
 
 from __future__ import annotations
@@ -80,16 +81,17 @@ class Timelog(_CTimelog):
 
     Warning:
         ``close()`` drops unflushed records. Call ``flush()`` first to
-        materialize pending writes. Use the context manager for
-        deterministic cleanup.
+        materialize pending writes. Call ``close()`` for deterministic
+        cleanup.
 
     Example::
 
-        >>> with Timelog(time_unit="ms") as log:
-        ...     log.append({"event": "start"})
-        ...     log[2000] = {"event": "end"}
-        ...     for ts, obj in log[1000:]:
-        ...         print(ts, obj)
+        >>> log = Timelog(time_unit="ms")
+        >>> log.append({"event": "start"})
+        >>> log[2000] = {"event": "end"}
+        >>> for ts, obj in log[1000:]:
+        ...     print(ts, obj)
+        >>> log.close()
 
     Args (Essential):
         time_unit: Timestamp resolution. One of "s", "ms", "us", "ns".

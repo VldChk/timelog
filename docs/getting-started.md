@@ -40,19 +40,20 @@ cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests -q
 ```python
 from timelog import Timelog
 
-with Timelog.for_streaming(time_unit="ms") as log:
-    log.append({"event": "start"})     # auto timestamp
-    log[1700000000000] = {"event": "a"}
-    log.extend([
-        (1700000000100, {"event": "b"}),
-        (1700000000200, {"event": "c"}),
-    ])
+log = Timelog.for_streaming(time_unit="ms")
+log.append({"event": "start"})     # auto timestamp
+log[1700000000000] = {"event": "a"}
+log.extend([
+    (1700000000100, {"event": "b"}),
+    (1700000000200, {"event": "c"}),
+])
 
-    rows = list(log[1700000000000:1700000000300])
-    at_t = log.at(1700000000100)
+rows = list(log[1700000000000:1700000000300])
+at_t = log.at(1700000000100)
 
-    log.cutoff(1700000000050)            # delete before timestamp
-    log.flush()                           # materialize pending writes
+log.cutoff(1700000000050)            # delete before timestamp
+log.flush()                           # materialize pending writes
+log.close()                           # deterministic cleanup
 ```
 
 ## Recommended Constructor Presets

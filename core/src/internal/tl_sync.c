@@ -2,6 +2,15 @@
 #include "tl_locks.h"
 #include "tl_log.h"
 
+/*
+ * On some Linux toolchains, pthread_setname_np declaration is hidden behind
+ * feature macros that may not be active under strict C17 builds. Provide the
+ * expected prototype here so debug thread naming compiles with -Werror.
+ */
+#if defined(TL_DEBUG) && defined(__linux__)
+extern int pthread_setname_np(pthread_t thread, const char* name);
+#endif
+
 /*===========================================================================
  * Thread-Local Lock Tracker (Debug Mode Only)
  *===========================================================================*/

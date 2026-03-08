@@ -52,9 +52,10 @@ Quick runtime check:
 ```bash
 python - <<'PY'
 from timelog import Timelog
-with Timelog() as log:
-    log.append(1, "ok")
-    assert list(log[1:2]) == [(1, "ok")]
+log = Timelog()
+log.append(1, "ok")
+assert list(log[1:2]) == [(1, "ok")]
+log.close()
 print("smoke-pass")
 PY
 ```
