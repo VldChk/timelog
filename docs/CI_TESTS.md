@@ -51,12 +51,14 @@ Set these GitHub checks as required:
 1. `Tests (PR) / test (ubuntu-latest, 3.13)`
 2. `Tests (PR) / test (windows-latest, 3.13)`
 3. `Packaging (PR) / packaging-pr`
+4. `Dependency Review / dependency-review`
 
 ## Packaging and Release Workflows
 
 1. PR packaging validation: `.github/workflows/packaging-pr.yml`
-2. Manual TestPyPI release: `.github/workflows/release-testpypi.yml`
-3. Tag-triggered PyPI release: `.github/workflows/release-pypi.yml`
+2. Dependency policy gate: `.github/workflows/dependency-review.yml`
+3. Manual TestPyPI release: `.github/workflows/release-testpypi.yml`
+4. Tag-triggered PyPI release: `.github/workflows/release-pypi.yml`
 
 See `docs/pypi-release.md` for publish runbooks and OIDC setup.
 

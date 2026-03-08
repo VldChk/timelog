@@ -7,9 +7,12 @@ In-memory, LSM-inspired, time-indexed multimap for Python (C17 core + CPython ex
 [![Python versions](https://img.shields.io/pypi/pyversions/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
 [![Tests (PR)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/tests-pr.yml)
 [![Packaging (PR)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/packaging-pr.yml)
+[![Dependency Review](https://github.com/VldChk/timelog/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/dependency-review.yml)
+[![Release (PyPI)](https://github.com/VldChk/timelog/actions/workflows/release-pypi.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/release-pypi.yml)
 [![Coverage](https://codecov.io/gh/VldChk/timelog/branch/main/graph/badge.svg)](https://codecov.io/gh/VldChk/timelog)
 [![CodeQL](https://github.com/VldChk/timelog/actions/workflows/codeql.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/codeql.yml)
 [![Sanitizers](https://github.com/VldChk/timelog/actions/workflows/sanitizers.yml/badge.svg)](https://github.com/VldChk/timelog/actions/workflows/sanitizers.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/VldChk/timelog/badge)](https://securityscorecards.dev/viewer/?uri=github.com/VldChk/timelog)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/VldChk/timelog)
 
 ## Why Timelog
