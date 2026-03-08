@@ -243,7 +243,6 @@ if(TIMELOG_BUILD_DEMOS)
     add_executable(adaptive_segmentation_demo demo/adaptive_segmentation_demo.c)
     target_link_libraries(adaptive_segmentation_demo PRIVATE timelog)
 
-    target_link_libraries(timelog_native_benchmark PRIVATE timelog)
 endif()
 
 # =============================================================================
