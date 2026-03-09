@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "timelog-lib"
-version = "1.0.2"
+version = "1.0.3"
 description = "In-memory LSM-style time-indexed storage engine with CPython bindings."
 readme = "README.md"
 requires-python = ">=3.12"
