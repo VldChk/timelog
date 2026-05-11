@@ -19,6 +19,7 @@
  *   - test_py_timelog.exe  (Timelog type and factory methods)
  *   - test_py_iter.exe     (Iterator protocol)
  *   - test_py_span.exe     (PageSpan zero-copy buffer protocol)
+ *   - test_py_module.exe   (Black-box module/package import smoke)
  *
  * This file exists as documentation. The actual test runner is CTest.
  */

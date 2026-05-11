@@ -12,6 +12,7 @@
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
 
 #include <stdio.h>
@@ -72,6 +73,53 @@ static void tlpy_init_python(void)
 static int tlpy_finalize_python(void)
 {
     return Py_FinalizeEx();
+}
+
+static PyObject* test_module = NULL;
+static PyObject* test_timelog_error = NULL;
+static PyObject* test_timelog_busy_error = NULL;
+
+static int tlpy_init_test_module(void)
+{
+    PyObject* modules = NULL;
+
+    test_module = TlPy_Test_CreateModule();
+    if (test_module == NULL) {
+        return -1;
+    }
+
+    if (TlPy_Test_ExecModule(test_module) < 0) {
+        return -1;
+    }
+
+    modules = PyImport_GetModuleDict();
+    if (modules == NULL ||
+        PyDict_SetItemString(modules, "timelog._timelog", test_module) < 0) {
+        return -1;
+    }
+
+    test_timelog_error = PyObject_GetAttrString(test_module, "TimelogError");
+    test_timelog_busy_error = PyObject_GetAttrString(test_module, "TimelogBusyError");
+    if (test_timelog_error == NULL || test_timelog_busy_error == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void tlpy_clear_test_module(void)
+{
+    PyObject* modules = PyImport_GetModuleDict();
+
+    if (modules != NULL) {
+        if (PyDict_DelItemString(modules, "timelog._timelog") < 0) {
+            PyErr_Clear();
+        }
+    }
+
+    Py_CLEAR(test_timelog_busy_error);
+    Py_CLEAR(test_timelog_error);
+    Py_CLEAR(test_module);
 }
 
 #define TEST(name) \
@@ -376,6 +424,35 @@ TEST(reinit_fails)
     close_and_dealloc(tl);
 }
 
+TEST(init_rejects_shadowed_sys_modules_entry)
+{
+    PyObject* modules = PyImport_GetModuleDict();
+    PyObject* fake_module = PyModule_New("timelog._timelog");
+    PyObject* args = PyTuple_New(0);
+    PyObject* kwargs = PyDict_New();
+    PyTimelog* tl = NULL;
+    int result;
+
+    ASSERT_NOT_NULL(modules);
+    ASSERT_NOT_NULL(fake_module);
+    ASSERT_NOT_NULL(args);
+    ASSERT_NOT_NULL(kwargs);
+    ASSERT(PyDict_SetItemString(modules, "timelog._timelog", fake_module) == 0);
+
+    tl = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
+    ASSERT_NOT_NULL(tl);
+
+    result = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
+    ASSERT(PyDict_SetItemString(modules, "timelog._timelog", test_module) == 0);
+    ASSERT_EQ(result, -1);
+    ASSERT_EXCEPTION(PyExc_RuntimeError);
+
+    Py_DECREF(tl);
+    Py_DECREF(kwargs);
+    Py_DECREF(args);
+    Py_DECREF(fake_module);
+}
+
 TEST(close_idempotent)
 {
     /* Close is idempotent - can be called multiple times */
@@ -436,7 +513,7 @@ TEST(close_refuses_with_pins)
 
     /* Should fail */
     ASSERT_NULL(result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     /* Engine should still be open */
     ASSERT(tl->tl != NULL);
@@ -602,7 +679,7 @@ TEST(append_after_close)
 
     PyObject* result = PyObject_Call(append_method, args, NULL);
     ASSERT_NULL(result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     Py_DECREF(args);
     Py_DECREF(obj);
@@ -876,7 +953,7 @@ TEST(delete_after_close)
 
     PyObject* result = PyObject_Call(method, args, NULL);
     ASSERT_NULL(result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     Py_DECREF(args);
     Py_DECREF(t2);
@@ -948,7 +1025,7 @@ TEST(flush_after_close)
     PyObject* flush_method = PyObject_GetAttrString((PyObject*)tl, "flush");
     PyObject* result = PyObject_CallNoArgs(flush_method);
     ASSERT_NULL(result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     Py_DECREF(flush_method);
     Py_DECREF(tl);
@@ -1222,7 +1299,7 @@ TEST(start_maintenance_disabled_fails)
     PyObject* method = PyObject_GetAttrString((PyObject*)tl, "start_maintenance");
     PyObject* result = PyObject_CallNoArgs(method);
     ASSERT_NULL(result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     Py_DECREF(method);
     close_and_dealloc(tl);
@@ -1409,14 +1486,14 @@ TEST(closed_state_raises_timelog_error)
     PyObject* flush_method = PyObject_GetAttrString((PyObject*)tl, "flush");
     PyObject* flush_result = PyObject_CallNoArgs(flush_method);
     ASSERT_NULL(flush_result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
     Py_DECREF(flush_method);
 
     /* stats() on closed should raise TimelogError */
     PyObject* stats_method = PyObject_GetAttrString((PyObject*)tl, "stats");
     PyObject* stats_result = PyObject_CallNoArgs(stats_method);
     ASSERT_NULL(stats_result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
     Py_DECREF(stats_method);
 
     Py_DECREF(tl);
@@ -1493,15 +1570,6 @@ TEST(context_manager_exit_with_exception)
  * Test Runner
  *===========================================================================*/
 
-/* Module definition for test harness */
-static struct PyModuleDef test_module_def = {
-    PyModuleDef_HEAD_INIT,
-    "_timelog_test",
-    NULL,
-    -1,
-    NULL
-};
-
 int main(int argc, char* argv[])
 {
     (void)argc;
@@ -1510,10 +1578,7 @@ int main(int argc, char* argv[])
     /* Initialize Python */
     tlpy_init_python();
 
-    /* Initialize error types first */
-    PyObject* module = PyModule_Create(&test_module_def);
-
-    if (TlPy_InitErrors(module) < 0) {
+    if (tlpy_init_test_module() < 0) {
         fprintf(stderr, "Failed to initialize error types\n");
         return 1;
     }
@@ -1532,6 +1597,7 @@ int main(int argc, char* argv[])
     run_init_custom_config();
     run_init_extended_config();
     run_reinit_fails();
+    run_init_rejects_shadowed_sys_modules_entry();
     run_close_idempotent();
     run_close_releases_tracked_objects();
     run_close_sets_state();
@@ -1610,7 +1676,7 @@ int main(int argc, char* argv[])
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
 
-    Py_DECREF(module);
+    tlpy_clear_test_module();
 
     /* Finalize Python */
     if (tlpy_finalize_python() < 0) {

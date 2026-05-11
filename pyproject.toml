@@ -64,3 +64,10 @@ archs = ["x86_64", "arm64"]
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
+
+[tool.pytest.ini_options]
+markers = [
+    "subinterpreters: compatibility baseline tests for isolated interpreter support",
+    "freethreading: compatibility baseline tests for free-threaded/no-GIL support",
+    "stress: opt-in compatibility stress harnesses for lifetime and concurrency",
+]

@@ -1,0 +1,108 @@
+name: Compatibility Baseline (PR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "core/**"
+      - "bindings/**"
+      - "python/**"
+      - "demo/ci/run_compat_baseline.py"
+      - "pyproject.toml"
+      - "docs/CI_TESTS.md"
+      - ".github/workflows/compatibility-baseline-pr.yml"
+
+concurrency:
+  group: compatibility-baseline-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility-baseline:
+    name: compatibility-baseline (${{ matrix.leg-label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg-label: subinterpreters-3.14
+            python-version: "3.14"
+            compat-legs: "subinterpreters,stress"
+            stress-tests: "1"
+            short-stress: "1"
+          # If hosted 3.14t resolution proves flaky, fall back to 3.13t for
+          # this advisory job only. Keep the regular subinterpreter leg on 3.14.
+          - leg-label: freethreading-3.14t
+            python-version: "3.14t"
+            compat-legs: "freethreading"
+            stress-tests: "0"
+            short-stress: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install Python test dependencies
+        run: python -m pip install --upgrade pip -r requirements-test.txt
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DTIMELOG_BUILD_PYTHON=ON
+          -DTIMELOG_BUILD_PY_TESTS=ON
+          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
+
+      - name: Build e2e targets
+        run: cmake --build build --target timelog_e2e_build --config Release -j 2
+
+      - name: Run compatibility baseline
+        shell: bash
+        run: |
+          set +e
+          cmake -E env \
+            "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+            "TIMELOG_STRESS_TESTS=${{ matrix.stress-tests }}" \
+            "TIMELOG_SHORT_STRESS=${{ matrix.short-stress }}" \
+            python demo/ci/run_compat_baseline.py \
+              --legs "${{ matrix.compat-legs }}" \
+              --summary-json "${RUNNER_TEMP}/compatibility-${{ matrix.leg-label }}.json" \
+              --summary-md "${RUNNER_TEMP}/compatibility-${{ matrix.leg-label }}.md" \
+            2>&1 | tee "${RUNNER_TEMP}/compatibility-${{ matrix.leg-label }}.log"
+          exit_code=${PIPESTATUS[0]}
+          exit $exit_code
+
+      - name: Upload compatibility baseline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-baseline-${{ matrix.leg-label }}
+          path: |
+            ${{ runner.temp }}/compatibility-${{ matrix.leg-label }}.json
+            ${{ runner.temp }}/compatibility-${{ matrix.leg-label }}.md
+            ${{ runner.temp }}/compatibility-${{ matrix.leg-label }}.log
+
+      - name: Append summary
+        if: always()
+        env:
+          COMPAT_LEG_LABEL: ${{ matrix.leg-label }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          leg_label = os.environ["COMPAT_LEG_LABEL"]
+          summary_path = Path(os.environ["RUNNER_TEMP"]) / f"compatibility-{leg_label}.md"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
+              out.write(f"## Compatibility Baseline (`{leg_label}`)\n")
+              if not summary_path.exists():
+                  out.write("- summary markdown missing\n")
+              else:
+                  out.write(summary_path.read_text(encoding="utf-8"))
+                  out.write("\n")
+          PY

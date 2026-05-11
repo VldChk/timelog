@@ -25,6 +25,7 @@
 #include <Python.h>
 
 #include "timelog/timelog.h"
+#include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
 
 #ifdef __cplusplus
@@ -95,6 +96,11 @@ typedef struct {
      */
     tl_ts_t range_t1;
     tl_ts_t range_t2;
+
+    /**
+     * Object-local exception translation context copied from the owner.
+     */
+    tl_py_exc_ctx_t exc_ctx;
 
     /**
      * Exact count of remaining rows visible in this iterator snapshot.

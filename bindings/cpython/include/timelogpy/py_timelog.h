@@ -117,6 +117,17 @@ typedef struct {
     tl_py_busy_policy_t busy_policy;
 
     /**
+     * Strong reference to the owning timelog._timelog module used to seed
+     * object-local exception context in the current interpreter.
+     */
+    PyObject* owning_module;
+
+    /**
+     * Object-local exception translation context copied from module state.
+     */
+    tl_py_exc_ctx_t exc_ctx;
+
+    /**
      * Weak reference list head for Python weakref support.
      */
     PyObject* weakreflist;
@@ -155,7 +166,8 @@ int tl_py_lock_checked(PyTimelog* self);
 #define CHECK_CLOSED(self) \
     do { \
         if ((self)->closed || (self)->tl == NULL) { \
-            return TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
+            return TlPy_RaiseFromExcContextFmt(&(self)->exc_ctx, TL_ESTATE, \
+                                               "Timelog is closed"); \
         } \
     } while (0)
 
@@ -166,7 +178,8 @@ int tl_py_lock_checked(PyTimelog* self);
 #define CHECK_CLOSED_INT(self) \
     do { \
         if ((self)->closed || (self)->tl == NULL) { \
-            TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
+            TlPy_RaiseFromExcContextFmt(&(self)->exc_ctx, TL_ESTATE, \
+                                        "Timelog is closed"); \
             return -1; \
         } \
     } while (0)

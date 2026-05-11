@@ -278,6 +278,8 @@ if(TIMELOG_BUILD_PYTHON)
             test_py_span
             test_py_maint_b5
             test_py_errors
+            test_py_module
+            test_py_module_exec
         )
     endif()
 

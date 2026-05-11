@@ -33,6 +33,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include "timelogpy/py_errors.h"
 #include "timelogpy/py_span.h"
 
 #ifdef __cplusplus
@@ -66,6 +67,11 @@ typedef struct {
      * NULL if closed.
      */
     PyObject* timelog;
+
+    /**
+     * Object-local exception translation context copied from the creator.
+     */
+    tl_py_exc_ctx_t exc_ctx;
 
     /**
      * State flag.

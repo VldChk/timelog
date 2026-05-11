@@ -126,7 +126,8 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
 
     /* Check closed state. */
     if (tl_obj->closed || tl_obj->tl == NULL) {
-        TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
+        TlPy_RaiseFromExcContextFmt(&tl_obj->exc_ctx, TL_ESTATE,
+                                    "Timelog is closed");
         return NULL;
     }
 
@@ -168,7 +169,7 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
         Py_DECREF(hook_ctx->timelog);
         PyMem_Free(hook_ctx);
         tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        TlPy_RaiseFromStatus(st);
+        TlPy_RaiseFromExcContext(&tl_obj->exc_ctx, st);
         return NULL;
     }
 
@@ -187,6 +188,14 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     self->iter = core_iter;
     self->timelog = Py_NewRef((PyObject*)tl_obj);
     self->closed = 0;
+    self->exc_ctx.timelog_error = NULL;
+    self->exc_ctx.timelog_busy_error = NULL;
+    if (TlPy_ExcContext_Copy(&self->exc_ctx, &tl_obj->exc_ctx) < 0) {
+        tl_pagespan_iter_close(core_iter);
+        Py_CLEAR(self->timelog);
+        PyObject_GC_Del((PyObject*)self);
+        return NULL;
+    }
 
     /* GC track after full initialization. */
     PyObject_GC_Track((PyObject*)self);
@@ -221,6 +230,7 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
         PyObject *exc_type, *exc_value, *exc_tb;
         PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
         Py_CLEAR(self->timelog);
+        TlPy_ExcContext_Clear(&self->exc_ctx);
         PyErr_Restore(exc_type, exc_value, exc_tb);
     }
 }
@@ -232,6 +242,8 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
 static int PyPageSpanIter_traverse(PyPageSpanIter* self, visitproc visit, void* arg)
 {
     Py_VISIT(self->timelog);
+    Py_VISIT(self->exc_ctx.timelog_error);
+    Py_VISIT(self->exc_ctx.timelog_busy_error);
     return 0;
 }
 
@@ -284,7 +296,7 @@ static PyObject* PyPageSpanIter_iternext(PyPageSpanIter* self)
 
     /* Error. */
     pagespaniter_cleanup(self);
-    TlPy_RaiseFromStatus(st);
+    TlPy_RaiseFromExcContext(&self->exc_ctx, st);
     return NULL;
 }
 

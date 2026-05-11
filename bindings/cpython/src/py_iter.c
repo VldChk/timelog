@@ -154,6 +154,7 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     }
 
     Py_XDECREF(owner);
+    TlPy_ExcContext_Clear(&self->exc_ctx);
 
     PyErr_Restore(exc_type, exc_value, exc_tb);
 }
@@ -165,6 +166,8 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
 static int PyTimelogIter_traverse(PyTimelogIter* self, visitproc visit, void* arg)
 {
     Py_VISIT(self->owner);
+    Py_VISIT(self->exc_ctx.timelog_error);
+    Py_VISIT(self->exc_ctx.timelog_busy_error);
     return 0;
 }
 
@@ -236,7 +239,7 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 
     /* Error path - cleanup and raise */
     pytimelogiter_cleanup(self);
-    return TlPy_RaiseFromStatus(st);
+    return TlPy_RaiseFromExcContext(&self->exc_ctx, st);
 }
 
 /*===========================================================================
@@ -331,7 +334,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
 
         /* Error path */
         pytimelogiter_cleanup(self);
-        TlPy_RaiseFromStatus(st);
+        TlPy_RaiseFromExcContext(&self->exc_ctx, st);
         goto fail;
     }
 

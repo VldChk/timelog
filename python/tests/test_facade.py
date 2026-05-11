@@ -451,6 +451,16 @@ class TestIntegration:
             with log.views(0, 100) as spans_iter:
                 assert isinstance(spans_iter, PageSpanIter)
 
+    def test_runtime_error_matches_reexported_exception(self):
+        """Runtime TL_ESTATE translation still uses the facade TimelogError."""
+        from timelog import Timelog, TimelogError
+
+        log = Timelog()
+        log.close()
+
+        with pytest.raises(TimelogError):
+            log.flush()
+
     def test_type_aliases_defined(self):
         """Type aliases are defined and have correct types."""
         from timelog import Record, RecordIter, RecordBatch

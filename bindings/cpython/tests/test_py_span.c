@@ -16,6 +16,7 @@
 #include "timelogpy/py_span_objects.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
 
 #include <stdio.h>
@@ -76,6 +77,34 @@ static void tlpy_init_python(void)
 static int tlpy_finalize_python(void)
 {
     return Py_FinalizeEx();
+}
+
+static PyObject* test_module = NULL;
+
+static int tlpy_init_test_module(void)
+{
+    test_module = TlPy_Test_CreateModule();
+    if (test_module == NULL) {
+        return -1;
+    }
+
+    if (TlPy_Test_ExecModule(test_module) < 0) {
+        return -1;
+    }
+
+    if (PyDict_SetItemString(PyImport_GetModuleDict(), "timelog._timelog", test_module) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void tlpy_clear_test_module(void)
+{
+    if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+    Py_CLEAR(test_module);
 }
 
 #define TEST(name) \
@@ -1828,13 +1857,10 @@ int main(void)
         return 1;
     }
 
-    /* Initialize errors module */
-    PyObject* mod = PyModule_New("_timelog");
-    if (!mod || TlPy_InitErrors(mod) < 0) {
+    if (tlpy_init_test_module() < 0) {
         fprintf(stderr, "Failed to initialize error types\n");
         return 1;
     }
-    Py_DECREF(mod);
 
     printf("\nRunning PageSpan tests:\n\n");
 
@@ -1907,6 +1933,7 @@ int main(void)
     printf("Tests failed: %d\n", tests_failed);
     printf("=================================\n");
 
+    tlpy_clear_test_module();
     tlpy_finalize_python();
 
     return tests_failed > 0 ? 1 : 0;

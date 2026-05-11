@@ -18,6 +18,7 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
+- Holding live `Timelog` objects across a manual reload/reimport of `timelog._timelog` is unsupported.
 
 ## Write API
 
