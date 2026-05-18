@@ -1,8 +1,8 @@
-name: Compatibility Baseline (PR)
+name: Compatibility Baseline (Main)
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
     paths:
       - "core/**"
       - "bindings/**"
@@ -10,11 +10,11 @@ on:
       - "demo/ci/run_compat_baseline.py"
       - "pyproject.toml"
       - "docs/CI_TESTS.md"
-      - ".github/workflows/compatibility-baseline-pr.yml"
       - ".github/workflows/compatibility-baseline-main.yml"
+  workflow_dispatch:
 
 concurrency:
-  group: compatibility-baseline-pr-${{ github.ref }}
+  group: compatibility-baseline-main-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -89,7 +89,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compatibility-baseline-${{ matrix.leg-label }}
+          name: compatibility-baseline-main-${{ matrix.leg-label }}
           path: |
             ${{ runner.temp }}/compatibility-${{ matrix.leg-label }}.json
             ${{ runner.temp }}/compatibility-${{ matrix.leg-label }}.md

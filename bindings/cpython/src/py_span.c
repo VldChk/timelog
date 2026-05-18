@@ -22,26 +22,6 @@
 static void pagespan_cleanup(PyPageSpan* self);
 
 /*===========================================================================
- * Block Direct Construction
- *
- * PageSpans are only created via factory (page_spans iterator).
- *===========================================================================*/
-
-static PyObject* PyPageSpan_new_error(PyTypeObject* type,
-                                       PyObject* args,
-                                       PyObject* kwds)
-{
-    (void)type;
-    (void)args;
-    (void)kwds;
-
-    PyErr_SetString(PyExc_TypeError,
-        "PageSpan cannot be instantiated directly; "
-        "use Timelog.page_spans()");
-    return NULL;
-}
-
-/*===========================================================================
  * PageSpan Creation from Core View
  *
  * Consume a core view's owner reference to create a PageSpan.
@@ -62,13 +42,18 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
         PyErr_SetString(PyExc_RuntimeError, "timelog is NULL");
         return NULL;
     }
-    if (!PyTimelog_Check(timelog)) {
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject(timelog);
+    if (mod_st == NULL) {
+        return NULL;
+    }
+    if (!TlPyTimelog_Check(timelog, mod_st)) {
         PyErr_SetString(PyExc_TypeError, "expected PyTimelog");
         return NULL;
     }
 
     /* Allocate GC-tracked Python object. */
-    PyPageSpan* self = PyObject_GC_New(PyPageSpan, &PyPageSpan_Type);
+    PyTypeObject* span_type = (PyTypeObject*)mod_st->type_pagespan;
+    PyPageSpan* self = (PyPageSpan*)span_type->tp_alloc(span_type, 0);
     if (self == NULL) {
         /* Allocation failed - caller must release view */
         return NULL;
@@ -94,8 +79,6 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
     self->exports = 0;
     self->closed = 0;
 
-    /* Track with GC only after all fields are initialized. */
-    PyObject_GC_Track((PyObject*)self);
     return (PyObject*)self;
 }
 
@@ -141,6 +124,7 @@ static void pagespan_cleanup(PyPageSpan* self)
 
 static int PyPageSpan_traverse(PyPageSpan* self, visitproc visit, void* arg)
 {
+    Py_VISIT(Py_TYPE(self));
     Py_VISIT(self->timelog);
     return 0;
 }
@@ -157,10 +141,12 @@ static int PyPageSpan_clear(PyPageSpan* self)
 
 static void PyPageSpan_dealloc(PyPageSpan* self)
 {
+    PyTypeObject* tp = Py_TYPE(self);
     PyObject_GC_UnTrack(self);
     /* exports > 0 here means a bug; cleanup anyway to avoid leaks. */
     pagespan_cleanup(self);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
 /*===========================================================================
@@ -244,11 +230,6 @@ static void pagespan_releasebuffer(PyObject* exporter, Py_buffer* view)
         self->exports--;
     }
 }
-
-static PyBufferProcs pagespan_as_buffer = {
-    .bf_getbuffer = pagespan_getbuffer,
-    .bf_releasebuffer = pagespan_releasebuffer,
-};
 
 /*===========================================================================
  * Methods
@@ -345,10 +326,6 @@ static Py_ssize_t PyPageSpan_length(PyPageSpan* self)
     return (Py_ssize_t)self->len;
 }
 
-static PySequenceMethods pagespan_as_sequence = {
-    .sq_length = (lenfunc)PyPageSpan_length,
-};
-
 /*===========================================================================
  * Properties
  *===========================================================================*/
@@ -438,28 +415,45 @@ static PyGetSetDef PyPageSpan_getset[] = {
 };
 
 /*===========================================================================
- * Type Object
+ * Type Specification
  *===========================================================================*/
 
-PyTypeObject PyPageSpan_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpan",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyPageSpan_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Zero-copy view of timestamps from a single page slice.\n\n"
         "The .timestamps property returns a memoryview directly backed by\n"
         "page memory. Cannot be instantiated directly; use Timelog.views()\n"
         "(alias: page_spans())."
-    ),
-    .tp_basicsize = sizeof(PyPageSpan),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .tp_new = PyPageSpan_new_error,
-    .tp_dealloc = (destructor)PyPageSpan_dealloc,
-    .tp_traverse = (traverseproc)PyPageSpan_traverse,
-    .tp_clear = (inquiry)PyPageSpan_clear,
-    .tp_free = PyObject_GC_Del,
-    .tp_as_buffer = &pagespan_as_buffer,
-    .tp_as_sequence = &pagespan_as_sequence,
-    .tp_methods = PyPageSpan_methods,
-    .tp_getset = PyPageSpan_getset,
+    )},
+    {Py_tp_dealloc, (void*)PyPageSpan_dealloc},
+    {Py_tp_traverse, (void*)PyPageSpan_traverse},
+    {Py_tp_clear, (void*)PyPageSpan_clear},
+    {Py_tp_methods, PyPageSpan_methods},
+    {Py_tp_getset, PyPageSpan_getset},
+    {Py_bf_getbuffer, (void*)pagespan_getbuffer},
+    {Py_bf_releasebuffer, (void*)pagespan_releasebuffer},
+    {Py_sq_length, (void*)PyPageSpan_length},
+    {0, NULL}
 };
+
+static PyType_Spec PyPageSpan_spec = {
+    .name = "timelog._timelog.PageSpan",
+    .basicsize = sizeof(PyPageSpan),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpan_slots,
+};
+
+PyObject* TlPy_CreatePageSpanType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpan_spec, NULL);
+}
+
+int TlPyPageSpan_Check(PyObject* op, const tl_py_module_state_t* st)
+{
+    return op != NULL && st != NULL && st->type_pagespan != NULL &&
+           PyObject_TypeCheck(op, (PyTypeObject*)st->type_pagespan);
+}

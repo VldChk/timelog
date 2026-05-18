@@ -7,11 +7,13 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdio.h>
 
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_span_iter.h"
+#include "timelogpy/py_timelog.h"
 #include "timelog/timelog.h"
 
 /*===========================================================================
@@ -80,26 +82,6 @@ static int tl_py_iter_test_should_fail_next_batch(void)
 #endif
 
 /*===========================================================================
- * Block Direct Construction
- *
- * Iterators are only created via factory methods (range, since, etc.).
- *===========================================================================*/
-
-static PyObject* PyTimelogIter_new_error(PyTypeObject* type,
-                                          PyObject* args,
-                                          PyObject* kwds)
-{
-    (void)type;
-    (void)args;
-    (void)kwds;
-
-    PyErr_SetString(PyExc_TypeError,
-        "TimelogIter cannot be instantiated directly; "
-        "use Timelog.range(), .since(), .until(), .all(), etc.");
-    return NULL;
-}
-
-/*===========================================================================
  * Cleanup Routine (Single Source of Truth)
  *
  * All resource release goes through this routine:
@@ -113,6 +95,8 @@ static PyObject* PyTimelogIter_new_error(PyTypeObject* type,
 
 static void pytimelogiter_cleanup(PyTimelogIter* self)
 {
+    fprintf(stderr, "pytimelogiter_cleanup: self=%p closed=%d engine_ctx=%p\n",
+            (void*)self, (int)self->closed, (void*)self->engine_ctx);
     if (self->closed) {
         return;  /* Already cleaned up */
     }
@@ -129,6 +113,9 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
 
     tl_py_handle_ctx_t* ctx = self->handle_ctx;
     /* handle_ctx is borrowed; keep for pin exit below */
+
+    tl_py_engine_ctx_t* engine_ctx = self->engine_ctx;
+    self->engine_ctx = NULL;
 
     PyObject* owner = self->owner;
     self->owner = NULL;
@@ -153,8 +140,15 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
         tl_py_pins_exit_and_maybe_drain(ctx);
     }
 
+    if (engine_ctx) {
+        tl_py_engine_ctx_decref(engine_ctx);
+    }
+
+    if (ctx) {
+        tl_py_handle_ctx_decref(ctx);
+    }
+
     Py_XDECREF(owner);
-    TlPy_ExcContext_Clear(&self->exc_ctx);
 
     PyErr_Restore(exc_type, exc_value, exc_tb);
 }
@@ -165,23 +159,26 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
 
 static int PyTimelogIter_traverse(PyTimelogIter* self, visitproc visit, void* arg)
 {
+    Py_VISIT(Py_TYPE(self));
     Py_VISIT(self->owner);
-    Py_VISIT(self->exc_ctx.timelog_error);
-    Py_VISIT(self->exc_ctx.timelog_busy_error);
     return 0;
 }
 
 static int PyTimelogIter_clear(PyTimelogIter* self)
 {
+    fprintf(stderr, "PyTimelogIter_clear: self=%p\n", (void*)self);
     pytimelogiter_cleanup(self);
     return 0;
 }
 
 static void PyTimelogIter_dealloc(PyTimelogIter* self)
 {
+    fprintf(stderr, "PyTimelogIter_dealloc: self=%p\n", (void*)self);
+    PyTypeObject* tp = Py_TYPE(self);
     PyObject_GC_UnTrack(self);
     pytimelogiter_cleanup(self);  /* Idempotent */
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
 /*===========================================================================
@@ -239,7 +236,7 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 
     /* Error path - cleanup and raise */
     pytimelogiter_cleanup(self);
-    return TlPy_RaiseFromExcContext(&self->exc_ctx, st);
+    return TlPy_RaiseFromObject((PyObject*)self, st);
 }
 
 /*===========================================================================
@@ -334,7 +331,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
 
         /* Error path */
         pytimelogiter_cleanup(self);
-        TlPy_RaiseFromExcContext(&self->exc_ctx, st);
+        TlPy_RaiseFromObject((PyObject*)self, st);
         goto fail;
     }
 
@@ -417,35 +414,47 @@ static PyGetSetDef PyTimelogIter_getset[] = {
     {NULL, NULL, NULL, NULL, NULL}
 };
 
-static PySequenceMethods timelogiter_as_sequence = {
-    .sq_length = (lenfunc)PyTimelogIter_len,
-};
-
 /*===========================================================================
- * Type Object
+ * Type Specification
  *===========================================================================*/
 
-PyTypeObject PyTimelogIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.TimelogIter",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyTimelogIter_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Snapshot-based iterator over timelog records.\n\n"
         "Yields (timestamp, object) tuples. Cannot be instantiated directly;\n"
         "use Timelog.range(), .since(), .until(), .all() factory methods.\n\n"
         "len(iter) reports remaining visible rows in the iterator snapshot,\n"
         "not a live global timelog count."
-    ),
-    .tp_basicsize = sizeof(PyTimelogIter),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .tp_new = PyTimelogIter_new_error,  /* Block direct construction */
-    .tp_dealloc = (destructor)PyTimelogIter_dealloc,
-    .tp_traverse = (traverseproc)PyTimelogIter_traverse,
-    .tp_clear = (inquiry)PyTimelogIter_clear,
-    .tp_free = PyObject_GC_Del,         /* Explicit for GC-allocated types */
-    .tp_iter = PyObject_SelfIter,
-    .tp_iternext = (iternextfunc)PyTimelogIter_iternext,
-    .tp_as_sequence = &timelogiter_as_sequence,
-    .tp_methods = PyTimelogIter_methods,
-    .tp_getset = PyTimelogIter_getset,
+    )},
+    {Py_tp_dealloc, (void*)PyTimelogIter_dealloc},
+    {Py_tp_traverse, (void*)PyTimelogIter_traverse},
+    {Py_tp_clear, (void*)PyTimelogIter_clear},
+    {Py_tp_iter, PyObject_SelfIter},
+    {Py_tp_iternext, (void*)PyTimelogIter_iternext},
+    {Py_tp_methods, PyTimelogIter_methods},
+    {Py_tp_getset, PyTimelogIter_getset},
+    {Py_sq_length, (void*)PyTimelogIter_len},
+    {0, NULL}
 };
+
+static PyType_Spec PyTimelogIter_spec = {
+    .name = "timelog._timelog.TimelogIter",
+    .basicsize = sizeof(PyTimelogIter),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyTimelogIter_slots,
+};
+
+PyObject* TlPy_CreateTimelogIterType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyTimelogIter_spec, NULL);
+}
+
+int TlPyTimelogIter_Check(PyObject* op, const tl_py_module_state_t* st)
+{
+    return op != NULL && st != NULL && st->type_timelog_iter != NULL &&
+           PyObject_TypeCheck(op, (PyTypeObject*)st->type_timelog_iter);
+}

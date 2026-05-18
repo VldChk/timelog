@@ -80,6 +80,10 @@ static int tlpy_finalize_python(void)
 }
 
 static PyObject* test_module = NULL;
+static PyObject* test_timelog_type = NULL;
+static PyObject* test_pagespan_type = NULL;
+static PyObject* test_pagespan_iter_type = NULL;
+static PyObject* test_pagespan_objects_view_type = NULL;
 
 static int tlpy_init_test_module(void)
 {
@@ -92,7 +96,19 @@ static int tlpy_init_test_module(void)
         return -1;
     }
 
-    if (PyDict_SetItemString(PyImport_GetModuleDict(), "timelog._timelog", test_module) < 0) {
+    if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+
+    test_timelog_type = PyObject_GetAttrString(test_module, "Timelog");
+    test_pagespan_type = PyObject_GetAttrString(test_module, "PageSpan");
+    test_pagespan_iter_type = PyObject_GetAttrString(test_module, "PageSpanIter");
+    test_pagespan_objects_view_type =
+        PyObject_GetAttrString(test_module, "PageSpanObjectsView");
+    if (test_timelog_type == NULL ||
+        test_pagespan_type == NULL ||
+        test_pagespan_iter_type == NULL ||
+        test_pagespan_objects_view_type == NULL) {
         return -1;
     }
 
@@ -104,6 +120,10 @@ static void tlpy_clear_test_module(void)
     if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
         PyErr_Clear();
     }
+    Py_CLEAR(test_pagespan_objects_view_type);
+    Py_CLEAR(test_pagespan_iter_type);
+    Py_CLEAR(test_pagespan_type);
+    Py_CLEAR(test_timelog_type);
     Py_CLEAR(test_module);
 }
 
@@ -198,21 +218,7 @@ static PyTimelog* create_timelog_default(void)
         return NULL;
     }
 
-    /* Allocate object */
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    /* Initialize */
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -227,26 +233,13 @@ static void close_and_dealloc(PyTimelog* tl)
 {
     if (tl == NULL) return;
 
-    /* First flush to ensure records are in segments */
-    if (!tl->closed && tl->tl) {
-        tl_flush(tl->tl);
+    PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
+    if (close_method != NULL) {
+        PyObject* result = PyObject_CallNoArgs(close_method);
+        Py_XDECREF(result);
+        Py_DECREF(close_method);
     }
-
-    /* Drain any retired objects before close */
-    if (!tl->closed) {
-        tl_py_drain_retired(&tl->handle_ctx, 1);
-    }
-
-    /* Now close */
-    if (!tl->closed && tl->tl) {
-        tl_close(tl->tl);
-        tl->tl = NULL;
-        tl->closed = 1;
-    }
-
-    /* Final drain */
-    tl_py_drain_retired(&tl->handle_ctx, 1);
-    tl_py_handle_ctx_destroy(&tl->handle_ctx);
+    PyErr_Clear();
 
     Py_DECREF((PyObject*)tl);
 }
@@ -285,15 +278,17 @@ static int append_and_flush(PyTimelog* tl, tl_ts_t* timestamps, PyObject** objec
  */
 TEST(types_ready)
 {
-    /* Check types are ready */
-    ASSERT(PyType_Ready(&PyPageSpan_Type) == 0 || PyPageSpan_Type.tp_dict != NULL);
-    ASSERT(PyType_Ready(&PyPageSpanIter_Type) == 0 || PyPageSpanIter_Type.tp_dict != NULL);
-    ASSERT(PyType_Ready(&PyPageSpanObjectsView_Type) == 0 || PyPageSpanObjectsView_Type.tp_dict != NULL);
+    ASSERT(PyType_Check(test_pagespan_type));
+    ASSERT(PyType_Check(test_pagespan_iter_type));
+    ASSERT(PyType_Check(test_pagespan_objects_view_type));
 
     /* Check type names */
-    ASSERT(strcmp(PyPageSpan_Type.tp_name, "timelog._timelog.PageSpan") == 0);
-    ASSERT(strcmp(PyPageSpanIter_Type.tp_name, "timelog._timelog.PageSpanIter") == 0);
-    ASSERT(strcmp(PyPageSpanObjectsView_Type.tp_name, "timelog._timelog.PageSpanObjectsView") == 0);
+    ASSERT(strcmp(((PyTypeObject*)test_pagespan_type)->tp_name,
+                  "timelog._timelog.PageSpan") == 0);
+    ASSERT(strcmp(((PyTypeObject*)test_pagespan_iter_type)->tp_name,
+                  "timelog._timelog.PageSpanIter") == 0);
+    ASSERT(strcmp(((PyTypeObject*)test_pagespan_objects_view_type)->tp_name,
+                  "timelog._timelog.PageSpanObjectsView") == 0);
 }
 
 /**
@@ -305,17 +300,17 @@ TEST(direct_instantiation_blocked)
     ASSERT_NOT_NULL(args);
 
     /* PageSpan */
-    PyObject* span = PyPageSpan_Type.tp_new(&PyPageSpan_Type, args, NULL);
+    PyObject* span = PyObject_Call(test_pagespan_type, args, NULL);
     ASSERT_NULL(span);
     ASSERT_EXCEPTION(PyExc_TypeError);
 
     /* PageSpanIter */
-    PyObject* iter = PyPageSpanIter_Type.tp_new(&PyPageSpanIter_Type, args, NULL);
+    PyObject* iter = PyObject_Call(test_pagespan_iter_type, args, NULL);
     ASSERT_NULL(iter);
     ASSERT_EXCEPTION(PyExc_TypeError);
 
     /* PageSpanObjectsView */
-    PyObject* view = PyPageSpanObjectsView_Type.tp_new(&PyPageSpanObjectsView_Type, args, NULL);
+    PyObject* view = PyObject_Call(test_pagespan_objects_view_type, args, NULL);
     ASSERT_NULL(view);
     ASSERT_EXCEPTION(PyExc_TypeError);
 
@@ -392,7 +387,7 @@ TEST(page_spans_with_data)
     /* Should get at least one span */
     PyObject* span = PyIter_Next(iter);
     ASSERT_NOT_NULL(span);
-    ASSERT(PyPageSpan_Check(span));
+    ASSERT(PyObject_TypeCheck(span, (PyTypeObject*)test_pagespan_type));
 
     /* Check span properties via public protocol */
     Py_ssize_t len = PyObject_Length(span);
@@ -1000,7 +995,7 @@ TEST(span_holds_pins)
     ASSERT_EQ(rc, 0);
 
     /* Initially pins should be 0 */
-    uint64_t initial_pins = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t initial_pins = tl_py_pins_count(tl->handle_ctx);
     ASSERT_EQ(initial_pins, 0);
 
     /* Create span iterator and get a span */
@@ -1011,7 +1006,7 @@ TEST(span_holds_pins)
     ASSERT_NOT_NULL(span);
 
     /* While span exists, pins should be > 0 */
-    uint64_t pins_with_span = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t pins_with_span = tl_py_pins_count(tl->handle_ctx);
     ASSERT(pins_with_span > 0);
 
     /* Clean up span and iterator */
@@ -1019,10 +1014,10 @@ TEST(span_holds_pins)
     Py_DECREF(iter);
 
     /* Drain to let owner destroy complete */
-    tl_py_drain_retired(&tl->handle_ctx, 1);
+    tl_py_drain_retired(tl->handle_ctx, 1);
 
     /* After cleanup, pins should be back to 0 */
-    uint64_t final_pins = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t final_pins = tl_py_pins_count(tl->handle_ctx);
     ASSERT_EQ(final_pins, 0);
 
     Py_DECREF(obj);
@@ -1049,7 +1044,7 @@ TEST(closed_spans_release_pins)
     ASSERT_EQ(rc, 0);
 
     /* Initially pins should be 0 */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 0);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 0);
 
     /* Create span */
     PyObject* iter = PyPageSpanIter_Create((PyObject*)tl, 0, 1000, "segment");
@@ -1059,7 +1054,7 @@ TEST(closed_spans_release_pins)
     ASSERT_NOT_NULL(span);
 
     /* Pins should be > 0 with active span */
-    ASSERT(tl_py_pins_count(&tl->handle_ctx) > 0);
+    ASSERT(tl_py_pins_count(tl->handle_ctx) > 0);
 
     /* Close span explicitly */
     PyObject* close_result = PyObject_CallMethod(span, "close", NULL);
@@ -1075,10 +1070,10 @@ TEST(closed_spans_release_pins)
     Py_DECREF(iter);
 
     /* Drain retired objects */
-    tl_py_drain_retired(&tl->handle_ctx, 1);
+    tl_py_drain_retired(tl->handle_ctx, 1);
 
     /* After explicit close and drain, pins should be 0 */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 0);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 0);
 
     Py_DECREF(obj);
     close_and_dealloc(tl);
@@ -1830,32 +1825,6 @@ int main(void)
 {
     printf("Initializing Python...\n");
     tlpy_init_python();
-
-    /* Ready types */
-    if (PyType_Ready(&PyTimelog_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyTimelog_Type\n");
-        return 1;
-    }
-    if (PyType_Ready(&PyTimelogIter_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyTimelogIter_Type\n");
-        return 1;
-    }
-    if (PyType_Ready(&PyPageSpan_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyPageSpan_Type\n");
-        return 1;
-    }
-    if (PyType_Ready(&PyPageSpanIter_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyPageSpanIter_Type\n");
-        return 1;
-    }
-    if (PyType_Ready(&PyPageSpanObjectsView_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyPageSpanObjectsView_Type\n");
-        return 1;
-    }
-    if (PyType_Ready(&PyPageSpanObjectsViewIter_Type) < 0) {
-        fprintf(stderr, "Failed to ready PyPageSpanObjectsViewIter_Type\n");
-        return 1;
-    }
 
     if (tlpy_init_test_module() < 0) {
         fprintf(stderr, "Failed to initialize error types\n");

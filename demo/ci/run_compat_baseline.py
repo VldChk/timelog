@@ -189,6 +189,8 @@ def _classify_leg(summary: dict[str, Any]) -> str:
         return "fail"
     if summary["failed"] > 0 or summary["errors"] > 0 or summary["xpassed"] > 0:
         return "fail"
+    if summary["passed"] == 0 and summary["xfailed"] == 0:
+        return "fail"
     if summary["xfailed"] > 0:
         return "xfail"
     if summary["passed"] > 0:

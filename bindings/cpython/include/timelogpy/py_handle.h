@@ -98,6 +98,24 @@ typedef struct tl_py_drop_node {
 
 typedef struct tl_py_handle_ctx {
     /**
+     * Lifetime reference count for heap-allocated contexts.
+     * PyTimelog, iterators, and PageSpan release hooks each hold refs.
+     */
+    _Atomic(uint64_t) refcnt;
+
+    /**
+     * True when this context was allocated by tl_py_handle_ctx_new().
+     */
+    uint8_t heap_allocated;
+
+    /**
+     * Interpreter that owns all PyObject references tracked by this context.
+     * Drain/live-release paths must only DECREF while running on this
+     * interpreter's attached Python thread state.
+     */
+    PyInterpreterState* interp;
+
+    /**
      * Lock-free MPSC stack of retired objects awaiting DECREF.
      * Producers: flush or maintenance thread (on_drop callback)
      * Consumer: Python thread (drain function)
@@ -167,6 +185,20 @@ typedef struct tl_py_handle_ctx {
  */
 tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
                                    uint32_t drain_batch_limit);
+
+/**
+ * Allocate and initialize a refcounted handle context.
+ *
+ * @param drain_batch_limit Max objects per drain (0 = unlimited)
+ * @return New context with refcount 1, or NULL with MemoryError set
+ */
+tl_py_handle_ctx_t* tl_py_handle_ctx_new(uint32_t drain_batch_limit);
+
+/**
+ * Increment/decrement a refcounted handle context.
+ */
+void tl_py_handle_ctx_incref(tl_py_handle_ctx_t* ctx);
+void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx);
 
 /**
  * Destroy a handle context.
@@ -285,12 +317,6 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
  * Must be called with GIL held.
  */
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg);
-
-/**
- * GC clear helper: release Python references held by ctx (force-drain + live table).
- * Must be called with GIL held.
- */
-void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx);
 
 /*===========================================================================
  * Metrics API

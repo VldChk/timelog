@@ -42,6 +42,39 @@ struct tl_py_live_entry {
     uint8_t   state;
 };
 
+static int tl_py_handle_ctx_current_interp_owns(const tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL || !Py_IsInitialized() || !PyGILState_Check()) {
+        return 0;
+    }
+
+    PyInterpreterState* current = PyInterpreterState_Get();
+    return current != NULL && current == ctx->interp;
+}
+
+#ifndef NDEBUG
+static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
+                                                 const char* reason)
+{
+    tl_py_drop_node_t* remaining = atomic_load_explicit(
+        (_Atomic(tl_py_drop_node_t*)*)&ctx->retired_head,
+        memory_order_relaxed);
+    uint64_t pins = atomic_load_explicit(
+        (_Atomic(uint64_t)*)&ctx->pins, memory_order_relaxed);
+
+    if (remaining != NULL || ctx->live_len != 0 || pins != 0) {
+        fprintf(stderr,
+            "WARNING: tl_py_handle_ctx final destroy skipped Python ref "
+            "drain (%s): live=%zu retired=%p pins=%" PRIu64 ". "
+            "Objects may leak.\n",
+            reason,
+            ctx->live_len,
+            (void*)remaining,
+            pins);
+    }
+}
+#endif
+
 static size_t tl_py_live_hash_ptr(const void* ptr)
 {
     uintptr_t x = (uintptr_t)ptr;
@@ -151,6 +184,10 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     }
 
     /* Initialize atomics */
+    atomic_init(&ctx->refcnt, 1);
+    ctx->heap_allocated = 0;
+    ctx->interp = (Py_IsInitialized() && PyGILState_Check()) ?
+        PyInterpreterState_Get() : NULL;
     atomic_init(&ctx->retired_head, NULL);
     atomic_init(&ctx->pins, 0);
     atomic_init(&ctx->retired_count, 0);
@@ -167,6 +204,74 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     ctx->live_tracking_failed = 0;
 
     return TL_OK;
+}
+
+tl_py_handle_ctx_t* tl_py_handle_ctx_new(uint32_t drain_batch_limit)
+{
+    tl_py_handle_ctx_t* ctx = PyMem_Malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    if (tl_py_handle_ctx_init(ctx, drain_batch_limit) != TL_OK) {
+        PyMem_Free(ctx);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    ctx->heap_allocated = 1;
+    return ctx;
+}
+
+void tl_py_handle_ctx_incref(tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    atomic_fetch_add_explicit(&ctx->refcnt, 1, memory_order_relaxed);
+}
+
+void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    uint64_t old_refcnt = atomic_fetch_sub_explicit(
+        &ctx->refcnt, 1, memory_order_acq_rel);
+
+#ifndef NDEBUG
+    assert(old_refcnt > 0 && "handle context refcount underflow");
+#endif
+
+    if (old_refcnt != 1) {
+        return;
+    }
+
+    /*
+     * Final destruction should happen from an attached Python thread. If that
+     * contract is violated, avoid Python C-API calls and leak Python refs
+     * rather than risking a crash.
+     */
+    if (tl_py_handle_ctx_current_interp_owns(ctx) &&
+        tl_py_pins_count(ctx) == 0) {
+        (void)tl_py_drain_retired(ctx, 1);
+        tl_py_live_release_all(ctx);
+#ifndef NDEBUG
+    } else {
+        tl_py_handle_ctx_warn_unsafe_destroy(
+            ctx,
+            PyGILState_Check() ? "wrong interpreter or active pins"
+                               : "no attached Python thread state");
+#endif
+    }
+
+    int heap_allocated = ctx->heap_allocated;
+    tl_py_handle_ctx_destroy(ctx);
+    if (heap_allocated) {
+        PyMem_Free(ctx);
+    }
 }
 
 void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
@@ -232,8 +337,8 @@ void tl_py_pins_enter(tl_py_handle_ctx_t* ctx)
 void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_pins_exit_and_maybe_drain requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_pins_exit_and_maybe_drain requires owning interpreter");
 #endif
 
     uint64_t old_pins = atomic_fetch_sub_explicit(
@@ -245,7 +350,7 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 #endif
 
     /* Last pin holder: opportunistically drain retired objects. */
-    if (old_pins == 1) {
+    if (old_pins == 1 && tl_py_handle_ctx_current_interp_owns(ctx)) {
         (void)tl_py_drain_retired(ctx, 0);
     }
 }
@@ -327,8 +432,8 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_drain_retired requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_drain_retired requires owning interpreter");
 #endif
 
     /* Reentrancy guard: __del__ during Py_DECREF could re-enter drain. */
@@ -411,8 +516,8 @@ out:
 tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_note_insert requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_live_note_insert requires owning interpreter");
 #endif
 
     if (ctx == NULL || obj == NULL) {
@@ -457,8 +562,8 @@ tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
 void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_note_drop requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_live_note_drop requires owning interpreter");
 #endif
 
     if (ctx == NULL || obj == NULL || ctx->live_cap == 0) {
@@ -492,8 +597,8 @@ void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_release_all requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_live_release_all requires owning interpreter");
 #endif
 
     if (ctx == NULL || ctx->live_entries == NULL) {
@@ -530,8 +635,8 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_handle_ctx_traverse requires GIL");
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_handle_ctx_traverse requires owning interpreter");
 #endif
     if (ctx == NULL || visit == NULL) {
         return 0;
@@ -562,19 +667,6 @@ int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* ar
     }
 
     return 0;
-}
-
-void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx)
-{
-#ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_handle_ctx_clear requires GIL");
-#endif
-    if (ctx == NULL) {
-        return;
-    }
-    (void)tl_py_drain_retired(ctx, 1);
-    tl_py_live_release_all(ctx);
 }
 
 /*===========================================================================

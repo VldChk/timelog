@@ -1,7 +1,11 @@
-# Timelog — Engineering Guide for Claude
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+# Timelog — Engineering Guide
 
 This is an **IN-MEMORY** LSM-style time-indexed storage engine in C17 with CPython bindings.
-**There is NO disk I/O** — all data lives in memory. This document is your north-star guide.
+**There is NO disk I/O** — all data lives in memory. PyPI package: `timelog-lib`, import as `timelog`.
 
 ## Mental Model
 
@@ -363,9 +367,10 @@ cleanup:
 
 ### GIL (Global Interpreter Lock)
 
-- ALWAYS hold GIL when calling Python C-API functions
-- Release GIL during long C operations: `flush`, `compact`, `stop_maintenance`, `close`
-- Re-acquire before any Python calls
+- Always have an attached Python thread state when calling Python C-API functions;
+  GIL semantics may be per-interpreter.
+- Release the active interpreter GIL during long C operations: `flush`, `compact`, `stop_maintenance`, `close`
+- Re-acquire/reattach before any Python calls
 
 ```c
 Py_BEGIN_ALLOW_THREADS
@@ -457,77 +462,37 @@ The `on_drop_handle` callback has a specific, narrow contract:
 
 ### Sanitizers (Non-Negotiable)
 
-```bash
-# AddressSanitizer + UndefinedBehaviorSanitizer
-cmake -B build-asan -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-asan
-ctest --test-dir build-asan --output-on-failure
+ASan+UBSan are **automatically enabled** in `CMAKE_BUILD_TYPE=Debug` on GCC/Clang.
+TSan requires a separate build (incompatible with ASan).
 
-# ThreadSanitizer (separate build)
-cmake -B build-tsan -DCMAKE_C_FLAGS="-fsanitize=thread -g"
-cmake --build build-tsan
-ctest --test-dir build-tsan --output-on-failure
+```bash
+# ASan + UBSan (default in Debug)
+cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build
+ctest --test-dir build --output-on-failure
+
+# ThreadSanitizer (separate build, no ASan)
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_FLAGS="-fsanitize=thread -g"
+cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure
 ```
 
 ---
 
-## File Layout
+## Project Layout
 
 ```
-core/                              # C core engine (all in-memory)
-  include/timelog/
-    timelog.h                     # PUBLIC API (source of truth)
-    tl_export.h                   # Export macros
-  src/
-    tl_timelog.c                  # Top-level orchestrator
-    internal/                     # Utilities
-      tl_alloc.c/h                # Allocation wrappers
-      tl_sync.c/h                 # Synchronization primitives
-      tl_heap.c/h                 # Min-heap for k-way merge
-      tl_intervals.c/h            # Tombstone interval set
-      tl_recvec.c/h               # Record vector
-    storage/                      # Storage structures
-      tl_page.c/h                 # Page (ts[] + h[])
-      tl_segment.c/h              # Segment (pages + fences)
-      tl_manifest.c/h             # Manifest (L0/L1 + tombstones)
-      tl_window.c/h               # Window mapping for L1
-    delta/                        # Write path
-      tl_memtable.c/h             # Mutable ingest buffer (run + OOO head)
-      tl_memrun.c/h               # Sealed immutable snapshot
-      tl_memview.c/h              # Memview (deep copy + pinned sealed)
-      tl_ooorun.c/h               # OOO run and runset (refcounted)
-      tl_flush.c/h                # Flush memrun to L0
-    query/                        # Read path
-      tl_snapshot.c/h             # Snapshot acquisition (seqlock)
-      tl_plan.c/h                 # Query planning
-      tl_filter.c/h               # Tombstone filtering
-      tl_submerge.c/h             # Internal k-way merge for delta
-      tl_active_iter.c/h          # Active buffer iterator
-      tl_memrun_iter.c/h          # Memrun iterator
-      tl_segment_iter.c/h         # Segment iterator
-      tl_merge_iter.c/h           # Top-level k-way merge iterator
-      tl_pagespan_iter.c/h        # PageSpan streaming
-      tl_point.c/h                # Point query support
-    maint/                        # Maintenance
-      tl_compaction.c/h           # L0 → L1 compaction
-      tl_adaptive.c/h             # Adaptive window segmentation
-  tests/                          # C unit tests
-
-bindings/cpython/                 # CPython extension (_timelog)
-  include/timelogpy/              # Binding headers
-  src/
-    module.c                      # Module initialization
-    py_timelog.c                  # PyTimelog type (engine wrapper)
-    py_iter.c                     # TimelogIter (snapshot iterator)
-    py_span.c                     # PageSpan (zero-copy buffer)
-    py_span_iter.c                # PageSpanIter (streaming)
-    py_span_objects.c             # PageSpanObjectsView (lazy objects)
-    py_handle.c                   # Handle encode/decode + retired queue
-    py_errors.c                   # tl_status_t → Python exception
-  tests/                          # C-level binding tests
-
-python/timelog/                   # Pure Python facade
-  _api.py                        # Timelog class with slicing syntax
+core/include/timelog/timelog.h     # PUBLIC API (source of truth for all C types/functions)
+core/src/                          # C core engine
+  tl_timelog.c                     # Top-level orchestrator
+  internal/                        # Alloc, sync, heap, intervals, recvec
+  storage/                         # Page, segment, manifest, window
+  delta/                           # Memtable, memrun, memview, OOO run, flush (write path)
+  query/                           # Snapshot, plan, filter, iterators, merge (read path)
+  maint/                           # Compaction, adaptive segmentation
+core/tests/                        # C unit tests (test_main.c entry point)
+bindings/cpython/src/              # CPython extension (_timelog): py_timelog, py_iter, py_span, py_handle, py_errors
+bindings/cpython/tests/            # C-level binding tests (embedded Python)
+python/timelog/                    # Pure Python facade (_api.py + __init__.py)
+python/tests/                      # Python facade tests (pytest)
 ```
 
 ---
@@ -623,6 +588,12 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 | `docs/configuration.md` | Runtime configuration and presets |
 | `docs/errors-and-retry-semantics.md` | Error contracts and retry rules |
 | `docs/operations.md` | Lifecycle and troubleshooting |
+| `docs/getting-started.md` | Quick-start guide |
+| `docs/performance.md` | Performance characteristics |
+| `docs/PERFORMANCE_METHODOLOGY.md` | Benchmark methodology |
+| `docs/testing-and-ci.md` | Test strategy and CI configuration |
+| `docs/pypi-release.md` | Release and publishing process |
+| `docs/glossary.md` | Terminology reference |
 | `docs/internals/hld.md` | Architecture overview |
 | `docs/internals/components/write-path.md` | Memtable/flush write mechanics |
 | `docs/internals/components/read-path.md` | Snapshot and query mechanics |
@@ -631,7 +602,6 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 | `docs/internals/components/adaptive-segmentation.md` | Adaptive window behavior |
 | `docs/internals/components/python-binding-architecture.md` | CPython binding design |
 | `docs/internals/components/tombstone-watermark-model.md` | Tombstone sequencing model |
-| `docs/archive/v1/` and `docs/archive/v2/` | Historical iteration docs |
 
 ---
 
@@ -657,204 +627,94 @@ Test coverage: 428 tests passing, verified with ASan/UBSan.
 
 ---
 
-## Quick Reference
+## Build & Test Commands
 
-### Build Commands
+### Linux (Primary Development Platform)
 
 ```bash
-# Windows Debug
-cmake -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Debug
+# Configure + build (Debug with ASan/UBSan linked automatically)
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DTIMELOG_BUILD_PYTHON=ON -DTIMELOG_BUILD_PY_TESTS=ON
+cmake --build build -j$(nproc)
+
+# Run all C tests (core + binding)
 ctest --test-dir build --output-on-failure
 
-# With sanitizers (GCC/Clang)
-cmake -B build-asan -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-asan
+# Run a single C test suite by name
+ctest --test-dir build -R timelog_tests --output-on-failure   # core only
+ctest --test-dir build -R py_handle_tests --output-on-failure # single binding suite
 
-# Python tests
+# Run test exe directly for verbose output
+./build/test_timelog 2>&1 | tail -30
+
+# Python facade tests (requires staged _timelog.so)
+PYTHONPATH=python python3 -m pytest python/tests/ -v
+
+# Run a single Python test file
+PYTHONPATH=python python3 -m pytest python/tests/test_facade.py -v
+
+# Dev install via scikit-build-core (alternative to PYTHONPATH)
+pip install -e .
+
+# Release build (no sanitizers)
+cmake -B build-rel -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rel -j$(nproc)
+
+# Sanitizers (explicit, separate build)
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug   # ASan+UBSan (default in Debug)
+cmake -B build-tsan -DCMAKE_C_FLAGS="-fsanitize=thread -g"  # TSan (separate)
+```
+
+### Windows
+
+```bash
+# Configure (Visual Studio generator)
+cmake -B build -G "Visual Studio 17 2022" -A x64
+
+# Build + test (MUST pass -C Debug on Windows)
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+
+# Python — use the py launcher with explicit version
 py -V:3.13 -m pytest python/tests/ -v
 ```
 
+### Pytest Markers
+
+```bash
+# Skip slow/special tests
+python3 -m pytest python/tests/ -v -m "not stress"
+python3 -m pytest python/tests/ -v -m "not subinterpreters and not freethreading"
+```
+
+Markers defined: `subinterpreters`, `freethreading`, `stress`.
+
+### CMake Options
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `TIMELOG_BUILD_PYTHON` | ON | Build CPython extension |
+| `TIMELOG_BUILD_PY_TESTS` | ON | Build C-level binding tests |
+| `TIMELOG_BUILD_CORE_TESTS` | ON | Build core C test executable |
+| `TIMELOG_STRICT_WARNINGS` | ON | `-Werror` / `/WX` |
+| `TIMELOG_STAGE_PYTHON_MODULE` | ON | Copy `_timelog.so` into `python/timelog/` |
+| `TIMELOG_NATIVE_OPT` | OFF | `-march=native` for benchmarks |
+
+### CI Workflows
+
+The project has extensive CI in `.github/workflows/`. Key workflows:
+- `tests-pr.yml` — C core + binding + Python tests on PR
+- `sanitizers.yml` — ASan/UBSan/TSan matrix
+- `packaging-pr.yml` — Wheel build + install verification
+- `correctness-e2e-pr.yml` / `correctness-e2e-main.yml` — Full E2E correctness
+- `coverage.yml` — Code coverage via codecov
+- `codeql.yml` — Security analysis
+- `release-pypi.yml` / `release-testpypi.yml` — PyPI publishing
+
 ### When In Doubt
 
-1. Read the relevant LLD
+1. Read the relevant design doc (see table below)
 2. Check invariants after every operation
 3. Run sanitizers
 4. Prefer immutability
 5. Test boundary conditions
 6. Remember: **NO DISK I/O** — everything is in memory
-
----
-
-## Windows Tooling (CRITICAL - Read This First!)
-
-**STOP! This project runs on Windows.** Tools are NOT in PATH. You MUST use full paths.
-
-### Tool Locations (Verified January 2026)
-
-| Tool | Full Path | Version |
-|------|-----------|---------|
-| Python | `py -V:3.13` (launcher) | 3.13.9 |
-| clang | `/c/Program Files/LLVM/bin/clang.exe` | 21.1.8 |
-| clang-tidy | `/c/Program Files/LLVM/bin/clang-tidy.exe` | 21.1.8 |
-| cppcheck | `/c/Program Files/Cppcheck/cppcheck.exe` | 2.19.0 |
-
----
-
-### Python - ALWAYS Use `py -V:3.13`
-
-```bash
-# ✅ CORRECT - Windows py launcher with version
-py -V:3.13 script.py
-py -V:3.13 -m pytest python/tests/ -v
-py -V:3.13 -m pip install -e .
-py -V:3.13 combine_sources.py
-
-# ❌ WRONG - These DO NOT work on this system
-python script.py        # "not found"
-python3 script.py       # "not found"
-py -3 script.py         # May pick wrong version
-py script.py            # May pick wrong version
-```
-
-**Why `-V:3.13`?** Multiple Python versions installed. The `-V:` flag is the ONLY reliable way to get the right one.
-
----
-
-### CMake Builds
-
-```bash
-# Configure (once per build dir)
-cmake -B build-test -G "Visual Studio 17 2022" -A x64
-
-# Build
-cmake --build build-test --config Debug
-
-# Run tests - MUST have "-C Debug" on Windows!
-ctest --test-dir build-test -C Debug --output-on-failure
-
-# Run test exe directly (see detailed output)
-U:/Projects/timelog/build-test/Debug/test_timelog.exe 2>&1 | tail -20
-```
-
-**Critical:** Without `-C Debug`, ctest on Windows finds no tests!
-
----
-
-### cppcheck - Full Path Required
-
-```bash
-# ✅ WORKING COMMAND (tested)
-"/c/Program Files/Cppcheck/cppcheck.exe" \
-    --enable=warning,style \
-    --std=c17 \
-    --suppress=missingIncludeSystem \
-    -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src \
-    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
-
-# Scan entire core/src directory
-"/c/Program Files/Cppcheck/cppcheck.exe" \
-    --enable=warning,style \
-    --std=c17 \
-    --suppress=missingIncludeSystem \
-    -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src \
-    U:/Projects/timelog/core/src/ 2>&1 | head -100
-```
-
-**Note:** Use `-I` with FULL paths. Relative paths often fail in bash on Windows.
-
----
-
-### clang-tidy - Full Path + Specific Flags
-
-```bash
-# ✅ WORKING COMMAND (tested) - bugprone + analyzer checks
-"/c/Program Files/LLVM/bin/clang-tidy.exe" \
-    U:/Projects/timelog/core/src/maint/tl_compaction.c \
-    --checks='-*,bugprone-*,clang-analyzer-*' \
-    -- -std=c17 \
-    -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src \
-    -D_CRT_SECURE_NO_WARNINGS 2>&1 | head -50
-
-# Useful check sets:
-#   bugprone-*           - Common bugs (NULL deref, use-after-move, etc.)
-#   clang-analyzer-*     - Deep static analysis
-#   performance-*        - Performance issues
-#   readability-*        - Code style (noisy, skip usually)
-#   modernize-*          - C++ only, skip for C
-
-# ❌ AVOID these noisy checks:
-#   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling  # memset/memcpy spam
-#   -bugprone-easily-swappable-parameters  # Too noisy for allocator callbacks
-```
-
-**Critical flags:**
-- `-D_CRT_SECURE_NO_WARNINGS` - Silences MSVC secure function warnings
-- `-- -std=c17` - The `--` separates clang-tidy flags from compiler flags
-
----
-
-### clang Static Analyzer
-
-```bash
-# Direct analysis on single file
-"/c/Program Files/LLVM/bin/clang.exe" \
-    --analyze \
-    -Xanalyzer -analyzer-output=text \
-    -std=c17 \
-    -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src \
-    -D_CRT_SECURE_NO_WARNINGS \
-    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
-
-# scan-build (wraps full build) - less reliable on Windows
-"/c/Program Files/LLVM/bin/scan-build.bat" \
-    cmake --build build-test --config Debug
-```
-
----
-
-### Common Pitfalls (Save Yourself Time!)
-
-| Problem | Wrong | Right |
-|---------|-------|-------|
-| Python not found | `python script.py` | `py -V:3.13 script.py` |
-| clang not found | `clang-tidy file.c` | `"/c/Program Files/LLVM/bin/clang-tidy.exe" file.c` |
-| cppcheck not found | `cppcheck file.c` | `"/c/Program Files/Cppcheck/cppcheck.exe" file.c` |
-| Relative includes fail | `-I core/include` | `-I U:/Projects/timelog/core/include` |
-| ctest finds no tests | `ctest --test-dir build` | `ctest --test-dir build -C Debug` |
-| Path with spaces | `cd C:\Program Files\...` | `cd "/c/Program Files/..."` |
-| Backslashes in bash | `U:\Projects\timelog` | `U:/Projects/timelog` |
-
----
-
-### Copy-Paste Quick Reference
-
-```bash
-# Build and test (the daily workflow)
-cmake --build U:/Projects/timelog/build-test --config Debug && \
-ctest --test-dir U:/Projects/timelog/build-test -C Debug --output-on-failure
-
-# Quick test count
-U:/Projects/timelog/build-test/Debug/test_timelog.exe 2>&1 | grep "Test Results"
-
-# Run Python tests
-py -V:3.13 -m pytest U:/Projects/timelog/python/tests/ -v
-
-# cppcheck quick scan
-"/c/Program Files/Cppcheck/cppcheck.exe" --enable=warning --std=c17 \
-    --suppress=missingIncludeSystem \
-    -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src \
-    U:/Projects/timelog/core/src/maint/tl_compaction.c 2>&1
-
-# clang-tidy quick scan
-"/c/Program Files/LLVM/bin/clang-tidy.exe" \
-    U:/Projects/timelog/core/src/maint/tl_compaction.c \
-    --checks='-*,bugprone-*,clang-analyzer-*' \
-    -- -std=c17 -I U:/Projects/timelog/core/include \
-    -I U:/Projects/timelog/core/src -D_CRT_SECURE_NO_WARNINGS 2>&1 | head -50
-```

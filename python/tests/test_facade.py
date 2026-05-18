@@ -476,7 +476,275 @@ class TestIntegration:
 
 
 # =============================================================================
-# Category 8: Error Messages
+# Category 8: PageSpan buffer protocol
+# =============================================================================
+
+
+class TestPageSpanBuffers:
+    """Buffer protocol behavior for PageSpan objects."""
+
+    def test_direct_memoryview_over_pagespan(self):
+        """memoryview(span) exposes the timestamp buffer directly."""
+        from timelog import Timelog
+
+        with Timelog(maintenance="disabled") as log:
+            log.extend([(i, f"v{i}") for i in range(8)])
+            log.flush()
+            span = next(log.views(0, 8))
+            mv = memoryview(span)
+            try:
+                assert mv.readonly
+                assert mv.ndim == 1
+                assert mv.format == "q"
+                assert mv.tolist() == list(range(len(mv)))
+            finally:
+                mv.release()
+                span.close()
+
+    def test_multiple_buffer_exports_block_close_until_all_release(self):
+        """Every active buffer export must release before PageSpan.close()."""
+        from timelog import Timelog
+
+        with Timelog(maintenance="disabled") as log:
+            log.extend([(i, i) for i in range(8)])
+            log.flush()
+            span = next(log.views(0, 8))
+
+            mv1 = memoryview(span)
+            mv2 = span.timestamps
+            try:
+                with pytest.raises(BufferError):
+                    span.close()
+
+                mv1.release()
+                with pytest.raises(BufferError):
+                    span.close()
+
+                mv2.release()
+                span.close()
+                with pytest.raises(ValueError, match="closed"):
+                    memoryview(span)
+            finally:
+                try:
+                    mv1.release()
+                except ValueError:
+                    pass
+                try:
+                    mv2.release()
+                except ValueError:
+                    pass
+
+
+# =============================================================================
+# Category 9: Weakrefs
+# =============================================================================
+
+
+class TestWeakrefs:
+    """Only Timelog supports weak references."""
+
+    def test_timelog_weakref_proxy_and_callbacks(self):
+        """Timelog weakrefs, proxies, and callbacks keep CPython semantics."""
+        from timelog import Timelog
+
+        calls = []
+        log = Timelog(maintenance="disabled")
+        proxy = weakref.proxy(log)
+        ref1 = weakref.ref(log, lambda ref: calls.append(("a", ref)))
+        ref2 = weakref.ref(log, lambda ref: calls.append(("b", ref)))
+
+        proxy.append(1, "x")
+        assert ref1() is log
+        assert ref2() is log
+
+        del log
+        gc.collect()
+        gc.collect()
+
+        assert ref1() is None
+        assert ref2() is None
+        assert sorted(label for label, _ in calls) == ["a", "b"]
+        with pytest.raises(ReferenceError):
+            proxy.closed
+
+    def test_factory_types_reject_weakrefs(self):
+        """Factory-only extension types do not expose weakref slots."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        try:
+            log.extend([(i, i) for i in range(8)])
+            log.flush()
+
+            row_iter = log.all()
+            span_iter = log.views(0, 8)
+            span = next(span_iter)
+            objects_view = span.objects()
+
+            for obj in (row_iter, span_iter, span, objects_view):
+                with pytest.raises(TypeError):
+                    weakref.ref(obj)
+        finally:
+            objects_view = locals().get("objects_view")
+            span = locals().get("span")
+            span_iter = locals().get("span_iter")
+            row_iter = locals().get("row_iter")
+            if span is not None:
+                span.close()
+            if span_iter is not None:
+                span_iter.close()
+            if row_iter is not None:
+                row_iter.close()
+            log.close()
+
+
+# =============================================================================
+# Category 10: Non-context-manager lifecycle
+# =============================================================================
+
+
+class TestNonContextManagerLifecycle:
+    """The common `log = Timelog()` usage must auto-clean safely."""
+
+    def test_scope_style_auto_close_releases_payload_objects(self):
+        """Dropping a plain Timelog variable releases engine-owned objects."""
+        from timelog import Timelog
+
+        class Obj:
+            pass
+
+        payload_refs = []
+
+        def run_scope():
+            log = Timelog(maintenance="disabled")
+            payloads = [Obj() for _ in range(4)]
+            payload_refs.extend(weakref.ref(obj) for obj in payloads)
+
+            for ts, obj in enumerate(payloads):
+                log.append(ts, obj)
+            del payloads
+
+            log.flush()
+            rows = list(log.all())
+            assert [ts for ts, _ in rows] == [0, 1, 2, 3]
+            assert all(ref() is not None for ref in payload_refs)
+            del rows
+            return weakref.ref(log)
+
+        log_ref = run_scope()
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+        assert all(ref() is None for ref in payload_refs)
+
+    def test_iterator_survives_after_user_log_reference_is_dropped(self):
+        """A row iterator keeps data valid without user-held Timelog refs."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        log.extend([(i, f"v{i}") for i in range(4)])
+        log.flush()
+        iterator = log.all()
+        log_ref = weakref.ref(log)
+
+        del log
+        gc.collect()
+
+        assert log_ref() is not None
+        assert list(iterator) == [(0, "v0"), (1, "v1"), (2, "v2"), (3, "v3")]
+        iterator.close()
+        del iterator
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+
+    def test_pagespan_survives_after_user_log_reference_is_dropped(self):
+        """PageSpan buffers and object views remain valid after `del log`."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        log.extend([(i, f"v{i}") for i in range(4)])
+        log.flush()
+        span_iter = log.views(0, 4)
+        span = next(span_iter)
+        objects_view = span.objects()
+        log_ref = weakref.ref(log)
+
+        del log
+        gc.collect()
+
+        assert log_ref() is not None
+        mv = memoryview(span)
+        try:
+            assert mv.tolist() == [0, 1, 2, 3]
+        finally:
+            mv.release()
+        assert list(objects_view) == ["v0", "v1", "v2", "v3"]
+
+        del objects_view
+        span.close()
+        span_iter.close()
+        del span, span_iter
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+
+    def test_iterator_cycle_auto_close_releases_payload_objects(self):
+        """A Timelog -> payload -> iterator -> Timelog cycle must collect."""
+        from timelog import Timelog
+
+        class Box:
+            pass
+
+        log = Timelog(maintenance="disabled")
+        box = Box()
+        log.append(1, box)
+        log.flush()
+        iterator = log.all()
+        box.iterator = iterator
+
+        log_ref = weakref.ref(log)
+        box_ref = weakref.ref(box)
+        del log, box, iterator
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+        assert box_ref() is None
+        assert not gc.garbage
+
+    def test_pagespan_cycle_auto_close_releases_payload_objects(self):
+        """A Timelog -> payload -> PageSpan graph must collect."""
+        from timelog import Timelog
+
+        class Box:
+            pass
+
+        log = Timelog(maintenance="disabled")
+        box = Box()
+        log.append(1, box)
+        log.flush()
+        span_iter = log.views(0, 10)
+        span = next(span_iter)
+        objects_view = span.objects()
+        box.refs = [span_iter, span, objects_view]
+
+        log_ref = weakref.ref(log)
+        box_ref = weakref.ref(box)
+        del log, box, span_iter, span, objects_view
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+        assert box_ref() is None
+        assert not gc.garbage
+
+
+# =============================================================================
+# Category 11: Error Messages
 # =============================================================================
 
 
@@ -493,7 +761,7 @@ class TestErrorMessages:
 
 
 # =============================================================================
-# Category 9: Finalization (Auto-close)
+# Category 12: Finalization (Auto-close)
 # =============================================================================
 
 
@@ -523,3 +791,43 @@ class TestFinalization:
         gc.collect()
 
         assert ref() is None
+
+    def test_gc_cycle_with_live_iterator_releases_safely(self):
+        """A cycle through a live row iterator must not close the engine first."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        holder = []
+        log.append(1, holder)
+        log.flush()
+        iterator = log.all()
+        holder.append(iterator)
+        ref = weakref.ref(log)
+
+        del log, holder, iterator
+        gc.collect()
+        gc.collect()
+
+        assert ref() is None
+        assert not gc.garbage
+
+    def test_gc_cycle_with_live_pagespan_releases_safely(self):
+        """A cycle through PageSpan/objects() must preserve snapshot lifetime."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        holder = []
+        log.append(1, holder)
+        log.flush()
+        span_iter = log.views(0, 10)
+        span = next(span_iter)
+        objects_view = span.objects()
+        holder.extend([span_iter, span, objects_view])
+        ref = weakref.ref(log)
+
+        del log, holder, span_iter, span, objects_view
+        gc.collect()
+        gc.collect()
+
+        assert ref() is None
+        assert not gc.garbage

@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "timelog/timelog.h"
 #include "internal/tl_defs.h"
 #include "internal/tl_alloc.h"
@@ -403,14 +404,17 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
 }
 
 void tl_close(tl_timelog_t* tl) {
+    fprintf(stderr, "tl_close: called with tl=%p\n", (void*)tl);
     if (tl == NULL) {
         return;
     }
 
     if (!tl->is_open) {
+        fprintf(stderr, "tl_close: not open, skipping\n");
         return;
     }
 
+    fprintf(stderr, "tl_close: entering full close path\n");
     tl_log_ctx_t* log = &tl->log;
     TL_LOG_INFO("timelog closing");
 

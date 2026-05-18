@@ -17,9 +17,9 @@
  *   (owner/hooks are still created and released on close)
  *
  * Thread safety:
- * - The owner refcount is NOT atomic (B4 constraint)
- * - All incref/decref operations MUST be serialized by the caller
- * - For CPython bindings, the GIL provides this serialization
+ * - Owner incref/decref operations are atomic.
+ * - The iterator object itself is not thread-safe; do not call next/close
+ *   concurrently on the same iterator.
  */
 
 #include "timelog/timelog.h"
@@ -191,18 +191,13 @@ TL_API void tl_pagespan_iter_close(tl_pagespan_iter_t* it);
 /*===========================================================================
  * Owner Reference Counting
  *
- * CONCURRENCY CONSTRAINT (B4):
- * The refcount is plain uint32_t, NOT atomic. All incref/decref operations
- * MUST be serialized by the caller. For CPython bindings, the GIL provides
- * this serialization.
- *
- * Future enhancement: If multi-threaded bindings are needed, change to
- * _Atomic uint32_t with fetch_add/fetch_sub (acq_rel ordering).
+ * Owner references may be acquired or released from different threads.
+ * Destroy runs exactly once when the last reference is released.
  *===========================================================================*/
 
 /**
  * Increment owner reference count.
- * Thread safety: Caller must ensure serialization.
+ * Thread safety: atomic.
  *
  * @param owner  Owner to incref (must not be NULL)
  */
@@ -211,7 +206,7 @@ TL_API void tl_pagespan_owner_incref(tl_pagespan_owner_t* owner);
 /**
  * Decrement owner reference count.
  * When refcnt reaches 0, destroys owner and calls release hook if provided.
- * Thread safety: Caller must ensure serialization.
+ * Thread safety: atomic.
  *
  * @param owner  Owner to decref (must not be NULL)
  */

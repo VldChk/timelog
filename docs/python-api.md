@@ -8,6 +8,12 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - Exceptions: `TimelogError`, `TimelogBusyError`
 - Iterator/span types: `TimelogIter`, `PageSpan`, `PageSpanIter`, `PageSpanObjectsView`
 
+## Runtime Support
+
+- Regular CPython 3.12+ builds are supported.
+- Isolated subinterpreters with a per-interpreter GIL are supported after Layer A.
+- Free-threaded/no-GIL builds remain unsupported until Layer B.
+
 ## Lifecycle
 
 - `Timelog(**kwargs)`
@@ -18,7 +24,7 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
-- Holding live `Timelog` objects across a manual reload/reimport of `timelog._timelog` is unsupported.
+- Live `Timelog` objects keep using their originating module state across manual reload/reimport of `timelog._timelog`.
 
 ## Write API
 

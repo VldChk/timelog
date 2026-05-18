@@ -8,14 +8,16 @@
  * Key design decisions:
  * - Streaming (no pre-allocation of span array)
  * - Each view owns a reference to the owner
- * - Owner refcount is plain uint32_t (caller serialization required)
+ * - Owner refcount is atomic so independent views can release safely
  * - Free owner before calling release hook (allocator lifetime safety)
  *===========================================================================*/
 
 #include "tl_pagespan_iter.h"
 #include "tl_snapshot.h"
+#include "../internal/tl_atomic.h"
 #include "../internal/tl_defs.h"
 #include "../internal/tl_alloc.h"
+#include "../internal/tl_refcount.h"
 #include "../internal/tl_range.h"
 #include "tl_segment_range.h"
 #include "../internal/tl_timelog_internal.h"
@@ -36,13 +38,9 @@ volatile int tl_test_pagespan_fail_iter_alloc = 0;
 
 /**
  * Owner structure - pins snapshot resources backing spans.
- *
- * CONCURRENCY CONSTRAINT:
- * The refcount is plain uint32_t, NOT atomic. All incref/decref operations
- * MUST be serialized by the caller (GIL for CPython bindings).
  */
 struct tl_pagespan_owner {
-    uint32_t                    refcnt;     /* NOT atomic - see constraint above */
+    tl_atomic_u32               refcnt;
     tl_snapshot_t*              snapshot;   /* Owned reference */
     tl_alloc_ctx_t*             alloc;      /* Borrowed from timelog */
     tl_pagespan_owner_hooks_t   hooks;      /* Copied from iter_open */
@@ -103,7 +101,7 @@ static tl_status_t owner_create(
         return TL_ENOMEM;
     }
 
-    owner->refcnt = 1;
+    tl_atomic_init_u32(&owner->refcnt, 1);
     owner->snapshot = snapshot;
     owner->alloc = alloc;
     owner->hook_armed = false;
@@ -133,7 +131,7 @@ static tl_status_t owner_create(
  */
 static void owner_destroy(tl_pagespan_owner_t* owner) {
     TL_ASSERT(owner != NULL);
-    TL_ASSERT(owner->refcnt == 0);
+    TL_ASSERT(tl_atomic_load_relaxed_u32(&owner->refcnt) == 0);
 
     /* Step 1: Copy out hooks before freeing owner */
     tl_snapshot_t* snap = owner->snapshot;
@@ -157,19 +155,19 @@ static void owner_destroy(tl_pagespan_owner_t* owner) {
 
 void tl_pagespan_owner_incref(tl_pagespan_owner_t* owner) {
     TL_ASSERT(owner != NULL);
-    TL_ASSERT(owner->refcnt > 0);       /* Must not be dead */
-    TL_ASSERT(owner->refcnt < UINT32_MAX);  /* Overflow check */
-    owner->refcnt++;
+    uint32_t old_refcnt =
+        tl_atomic_fetch_add_u32(&owner->refcnt, 1, TL_MO_RELAXED);
+    TL_VERIFY(old_refcnt >= 1 &&
+              "pagespan owner incref after final release");
+    TL_VERIFY(old_refcnt < UINT32_MAX &&
+              "pagespan owner refcount overflow");
 }
 
 void tl_pagespan_owner_decref(tl_pagespan_owner_t* owner) {
     TL_ASSERT(owner != NULL);
-    TL_ASSERT(owner->refcnt > 0);  /* Must not be dead */
-
-    owner->refcnt--;
-    if (owner->refcnt == 0) {
+    TL_REFCOUNT_RELEASE(&owner->refcnt, {
         owner_destroy(owner);
-    }
+    }, "pagespan owner double-release: refcnt was 0 before decrement");
 }
 
 /*===========================================================================

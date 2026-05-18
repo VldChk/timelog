@@ -17,6 +17,12 @@ typedef struct {
     int initialized;
     PyObject* exc_timelog_error;
     PyObject* exc_timelog_busy_error;
+    PyObject* type_timelog;
+    PyObject* type_timelog_iter;
+    PyObject* type_pagespan;
+    PyObject* type_pagespan_iter;
+    PyObject* type_pagespan_objects_view;
+    PyObject* type_pagespan_objects_view_iter;
 } tl_py_module_state_t;
 
 #if PY_VERSION_HEX >= 0x030C0000
@@ -39,23 +45,30 @@ static inline tl_py_module_state_t* TlPy_ModuleState(PyObject* module)
 
 extern const char TlPy_TimelogModuleName[];
 int TlPy_ModuleMatchesTimelogDef(PyObject* module);
+tl_py_module_state_t* TlPy_StateFromType(PyTypeObject* type);
+tl_py_module_state_t* TlPy_StateFromObject(PyObject* obj);
 
 typedef enum {
     TL_PY_MODULE_FAIL_NONE = 0,
     TL_PY_MODULE_FAIL_AFTER_ERRORS,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_TIMELOG,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_ITER,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_ITER,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW,
+    TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW_ITER,
     TL_PY_MODULE_FAIL_AFTER_EXPORT_TIMELOG,
     TL_PY_MODULE_FAIL_AFTER_EXPORT_ITER,
     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN,
     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_ITER,
     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_OBJECTS_VIEW,
-    TL_PY_MODULE_FAIL_AFTER_INTERNAL_VIEW_ITER_READY,
 } tl_py_module_failpoint_t;
 
 #ifdef TL_PY_MODULE_TEST_HOOKS
 PyObject* TlPy_Test_CreateModule(void);
 int TlPy_Test_ExecModule(PyObject* module);
 void TlPy_Test_SetExecFailpoint(tl_py_module_failpoint_t failpoint);
-int TlPy_Test_ModuleDeclaresNoSubinterpreters(void);
+int TlPy_Test_ModuleDeclaresPerInterpreterGil(void);
 Py_ssize_t TlPy_Test_ModuleStateSize(void);
 #endif
 

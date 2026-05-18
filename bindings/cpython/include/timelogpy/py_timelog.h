@@ -17,8 +17,9 @@
  *   close(). The user must ensure no other thread touches this Timelog
  *   instance while these operations are in progress.
  *
- *   This binding requires the CPython GIL and is NOT supported on
- *   free-threaded/no-GIL Python builds.
+ *   Regular CPython builds are supported, including isolated subinterpreters
+ *   with a per-interpreter GIL. Free-threaded/no-GIL Python builds remain
+ *   unsupported until the Layer B synchronization work is complete.
  *
  * Known Limitations:
  *   - Unflushed records are dropped on close(). The binding tracks all
@@ -39,10 +40,19 @@
 #include "timelog/timelog.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
+
+#include <stdatomic.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct tl_py_engine_ctx {
+    _Atomic(uint64_t) refcnt;
+    tl_timelog_t* tl;
+} tl_py_engine_ctx_t;
 
 /*===========================================================================
  * Busy Policy Enum
@@ -91,11 +101,19 @@ typedef struct {
     int closed;
 
     /**
-     * Handle/lifetime context (embedded, not pointer).
-     * Embedding simplifies shutdown sequence - no separate allocation.
-     * Contains: retired queue, pin counter, metrics.
+     * Refcounted handle/lifetime context.
+     * Iterators and PageSpan owner hooks hold independent references so GC
+     * clearing a Timelog cannot invalidate active snapshot pins.
      */
-    tl_py_handle_ctx_t handle_ctx;
+    tl_py_handle_ctx_t* handle_ctx;
+
+    /**
+     * Refcounted engine lifetime context.
+     * Iterator snapshots and PageSpan owners hold independent references so
+     * GC clearing a Timelog cannot free tl_timelog_t before their core
+     * snapshots have been released.
+     */
+    tl_py_engine_ctx_t* engine_ctx;
 
     /**
      * Per-instance lock to serialize all core calls.
@@ -116,38 +134,19 @@ typedef struct {
      */
     tl_py_busy_policy_t busy_policy;
 
-    /**
-     * Strong reference to the owning timelog._timelog module used to seed
-     * object-local exception context in the current interpreter.
-     */
-    PyObject* owning_module;
-
-    /**
-     * Object-local exception translation context copied from module state.
-     */
-    tl_py_exc_ctx_t exc_ctx;
-
-    /**
-     * Weak reference list head for Python weakref support.
-     */
-    PyObject* weakreflist;
-
 } PyTimelog;
 
 /*===========================================================================
  * Type Object
  *===========================================================================*/
 
-/**
- * PyTimelog type object.
- * Defined in py_timelog.c.
- */
-extern PyTypeObject PyTimelog_Type;
+PyObject* TlPy_CreateTimelogType(PyObject* module);
+int TlPyTimelog_Check(PyObject* op, const tl_py_module_state_t* st);
 
-/**
- * Type check macro.
- */
-#define PyTimelog_Check(op) PyObject_TypeCheck(op, &PyTimelog_Type)
+tl_py_engine_ctx_t* tl_py_engine_ctx_new(tl_timelog_t* tl);
+void tl_py_engine_ctx_incref(tl_py_engine_ctx_t* ctx);
+void tl_py_engine_ctx_decref(tl_py_engine_ctx_t* ctx);
+void tl_py_engine_ctx_close(tl_py_engine_ctx_t* ctx, int allow_threads);
 
 /**
  * Internal helper: acquire core lock and re-check closed state.
@@ -166,8 +165,8 @@ int tl_py_lock_checked(PyTimelog* self);
 #define CHECK_CLOSED(self) \
     do { \
         if ((self)->closed || (self)->tl == NULL) { \
-            return TlPy_RaiseFromExcContextFmt(&(self)->exc_ctx, TL_ESTATE, \
-                                               "Timelog is closed"); \
+            return TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
+                                           "Timelog is closed"); \
         } \
     } while (0)
 
@@ -178,8 +177,8 @@ int tl_py_lock_checked(PyTimelog* self);
 #define CHECK_CLOSED_INT(self) \
     do { \
         if ((self)->closed || (self)->tl == NULL) { \
-            TlPy_RaiseFromExcContextFmt(&(self)->exc_ctx, TL_ESTATE, \
-                                        "Timelog is closed"); \
+            TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
+                                    "Timelog is closed"); \
             return -1; \
         } \
     } while (0)

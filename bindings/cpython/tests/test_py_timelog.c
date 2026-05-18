@@ -76,6 +76,7 @@ static int tlpy_finalize_python(void)
 }
 
 static PyObject* test_module = NULL;
+static PyObject* test_timelog_type = NULL;
 static PyObject* test_timelog_error = NULL;
 static PyObject* test_timelog_busy_error = NULL;
 
@@ -93,8 +94,12 @@ static int tlpy_init_test_module(void)
     }
 
     modules = PyImport_GetModuleDict();
-    if (modules == NULL ||
-        PyDict_SetItemString(modules, "timelog._timelog", test_module) < 0) {
+    if (modules != NULL && PyDict_DelItemString(modules, "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+
+    test_timelog_type = PyObject_GetAttrString(test_module, "Timelog");
+    if (test_timelog_type == NULL) {
         return -1;
     }
 
@@ -119,6 +124,7 @@ static void tlpy_clear_test_module(void)
 
     Py_CLEAR(test_timelog_busy_error);
     Py_CLEAR(test_timelog_error);
+    Py_CLEAR(test_timelog_type);
     Py_CLEAR(test_module);
 }
 
@@ -213,21 +219,7 @@ static PyTimelog* create_timelog_default(void)
         return NULL;
     }
 
-    /* Allocate object */
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    /* Initialize */
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -262,19 +254,7 @@ static PyTimelog* create_timelog_custom(const char* maint_mode,
         Py_DECREF(val);
     }
 
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -394,11 +374,8 @@ TEST(init_extended_config)
     PyDict_SetItemString(kwargs, "adaptive_alpha", val);
     Py_DECREF(val);
 
-    PyTimelog* tl = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
+    PyTimelog* tl = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
     ASSERT_NOT_NULL(tl);
-
-    int rc = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
-    ASSERT_EQ(rc, 0);
     ASSERT_NOT_NULL(tl->tl);
 
     Py_DECREF(args);
@@ -415,7 +392,7 @@ TEST(reinit_fails)
     PyObject* args = PyTuple_New(0);
     PyObject* kwargs = PyDict_New();
 
-    int result = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
+    int result = Py_TYPE(tl)->tp_init((PyObject*)tl, args, kwargs);
     ASSERT_EQ(result, -1);
     ASSERT_EXCEPTION(PyExc_TypeError);
 
@@ -424,14 +401,13 @@ TEST(reinit_fails)
     close_and_dealloc(tl);
 }
 
-TEST(init_rejects_shadowed_sys_modules_entry)
+TEST(init_ignores_shadowed_sys_modules_entry)
 {
     PyObject* modules = PyImport_GetModuleDict();
     PyObject* fake_module = PyModule_New("timelog._timelog");
     PyObject* args = PyTuple_New(0);
     PyObject* kwargs = PyDict_New();
-    PyTimelog* tl = NULL;
-    int result;
+    PyObject* tl = NULL;
 
     ASSERT_NOT_NULL(modules);
     ASSERT_NOT_NULL(fake_module);
@@ -439,15 +415,11 @@ TEST(init_rejects_shadowed_sys_modules_entry)
     ASSERT_NOT_NULL(kwargs);
     ASSERT(PyDict_SetItemString(modules, "timelog._timelog", fake_module) == 0);
 
-    tl = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
+    tl = PyObject_Call(test_timelog_type, args, kwargs);
     ASSERT_NOT_NULL(tl);
 
-    result = PyTimelog_Type.tp_init((PyObject*)tl, args, kwargs);
-    ASSERT(PyDict_SetItemString(modules, "timelog._timelog", test_module) == 0);
-    ASSERT_EQ(result, -1);
-    ASSERT_EXCEPTION(PyExc_RuntimeError);
-
     Py_DECREF(tl);
+    ASSERT(PyDict_DelItemString(modules, "timelog._timelog") == 0);
     Py_DECREF(kwargs);
     Py_DECREF(args);
     Py_DECREF(fake_module);
@@ -505,8 +477,8 @@ TEST(close_refuses_with_pins)
     ASSERT_NOT_NULL(tl);
 
     /* Simulate active snapshot by incrementing pins */
-    tl_py_pins_enter(&tl->handle_ctx);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    tl_py_pins_enter(tl->handle_ctx);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
     PyObject* result = PyObject_CallNoArgs(close_method);
@@ -520,7 +492,7 @@ TEST(close_refuses_with_pins)
     ASSERT_EQ(tl->closed, 0);
 
     /* Release pin and close properly */
-    tl_py_pins_exit_and_maybe_drain(&tl->handle_ctx);
+    tl_py_pins_exit_and_maybe_drain(tl->handle_ctx);
     result = PyObject_CallNoArgs(close_method);
     ASSERT_NOT_NULL(result);
     Py_DECREF(result);
@@ -1583,12 +1555,6 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    /* Initialize PyTimelog type */
-    if (PyType_Ready(&PyTimelog_Type) < 0) {
-        fprintf(stderr, "Failed to initialize PyTimelog type\n");
-        return 1;
-    }
-
     printf("Running py_timelog tests...\n");
 
     /* Lifecycle tests */
@@ -1597,7 +1563,7 @@ int main(int argc, char* argv[])
     run_init_custom_config();
     run_init_extended_config();
     run_reinit_fails();
-    run_init_rejects_shadowed_sys_modules_entry();
+    run_init_ignores_shadowed_sys_modules_entry();
     run_close_idempotent();
     run_close_releases_tracked_objects();
     run_close_sets_state();

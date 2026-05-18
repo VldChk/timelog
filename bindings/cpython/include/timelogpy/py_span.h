@@ -18,7 +18,6 @@
  * Thread Safety:
  *   A PageSpan instance is NOT thread-safe. Do not access the same
  *   instance from multiple threads without external synchronization.
- *   All owner refcount operations must be serialized by the GIL.
  *
  * Lifetime:
  *   PageSpan holds a reference to the core tl_pagespan_owner_t which
@@ -38,27 +37,10 @@
 #include "timelog/timelog.h"
 #include "query/tl_pagespan_iter.h"
 #include "timelogpy/py_handle.h"
+#include "timelogpy/py_module_state.h"
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-/*===========================================================================
- * Py_NewRef Compatibility
- *
- * Py_NewRef was added in Python 3.10. For older versions, provide
- * an inline equivalent.
- *===========================================================================*/
-
-#if PY_VERSION_HEX < 0x030A0000
-#ifndef TL_Py_NewRef_DEFINED
-#define TL_Py_NewRef_DEFINED
-static inline PyObject* TL_Py_NewRef(PyObject* obj) {
-    Py_INCREF(obj);
-    return obj;
-}
-#define Py_NewRef TL_Py_NewRef
-#endif
 #endif
 
 /*===========================================================================
@@ -152,16 +134,8 @@ typedef struct {
  * Type Object
  *===========================================================================*/
 
-/**
- * PyPageSpan type object.
- * Defined in py_span.c.
- */
-extern PyTypeObject PyPageSpan_Type;
-
-/**
- * Type check macro.
- */
-#define PyPageSpan_Check(op) PyObject_TypeCheck(op, &PyPageSpan_Type)
+PyObject* TlPy_CreatePageSpanType(PyObject* module);
+int TlPyPageSpan_Check(PyObject* op, const tl_py_module_state_t* st);
 
 /*===========================================================================
  * Span Creation API (Internal)

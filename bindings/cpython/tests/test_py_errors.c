@@ -153,6 +153,12 @@ static PyObject* create_error_module(tl_py_module_state_t** out_state)
         Py_DECREF(module);
         return NULL;
     }
+    if (PyModule_AddObjectRef(module, "TimelogError", st->exc_timelog_error) < 0 ||
+        PyModule_AddObjectRef(module, "TimelogBusyError",
+                              st->exc_timelog_busy_error) < 0) {
+        Py_DECREF(module);
+        return NULL;
+    }
 
     if (out_state != NULL) {
         *out_state = st;
@@ -250,26 +256,15 @@ TEST(reinit_after_clear_recreates_cleanly)
     Py_DECREF(module);
 }
 
-TEST(exc_context_init_and_copy_from_module_state)
+TEST(state_reports_complete_error_pair)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t first = {0};
-    tl_py_exc_ctx_t second = {0};
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
     ASSERT_NOT_NULL(st);
-
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&first, st) == 0);
-    ASSERT(first.timelog_error == st->exc_timelog_error);
-    ASSERT(first.timelog_busy_error == st->exc_timelog_busy_error);
-    ASSERT(TlPy_ExcContext_Copy(&second, &first) == 0);
-    ASSERT(second.timelog_error == first.timelog_error);
-    ASSERT(second.timelog_busy_error == first.timelog_busy_error);
-
-    TlPy_ExcContext_Clear(&first);
-    TlPy_ExcContext_Clear(&second);
+    ASSERT(TlPy_StateHasCompleteErrors(st));
     Py_DECREF(module);
 }
 
@@ -277,16 +272,13 @@ TEST(raise_estate_uses_module_timelog_error)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContext(&ctx, TL_ESTATE) == NULL);
+    ASSERT(TlPy_RaiseFromState(st, TL_ESTATE) == NULL);
     ASSERT_EXCEPTION(st->exc_timelog_error);
 
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
@@ -294,16 +286,13 @@ TEST(raise_busy_uses_module_busy_error)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContext(&ctx, TL_EBUSY) == NULL);
+    ASSERT(TlPy_RaiseFromState(st, TL_EBUSY) == NULL);
     ASSERT_EXCEPTION(st->exc_timelog_busy_error);
 
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
@@ -311,16 +300,13 @@ TEST(raise_unknown_uses_timelog_error)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContext(&ctx, (tl_status_t)999) == NULL);
+    ASSERT(TlPy_RaiseFromState(st, (tl_status_t)999) == NULL);
     ASSERT_EXCEPTION(st->exc_timelog_error);
 
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
@@ -328,16 +314,14 @@ TEST(raise_formatted_appends_status_message)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
     PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
     PyObject* exc_text = NULL;
     const char* text = NULL;
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContextFmt(&ctx, TL_ESTATE, "custom context") == NULL);
+    ASSERT(TlPy_RaiseFromStateFmt(st, TL_ESTATE, "custom context") == NULL);
     ASSERT(PyErr_ExceptionMatches(st->exc_timelog_error));
 
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
@@ -352,7 +336,6 @@ TEST(raise_formatted_appends_status_message)
     Py_XDECREF(exc_type);
     Py_XDECREF(exc_value);
     Py_XDECREF(exc_tb);
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
@@ -360,16 +343,14 @@ TEST(raise_formatted_empty_format_still_sets_status_text)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
     PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
     PyObject* exc_text = NULL;
     const char* text = NULL;
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContextFmt(&ctx, TL_ESTATE, "") == NULL);
+    ASSERT(TlPy_RaiseFromStateFmt(st, TL_ESTATE, "") == NULL);
     ASSERT(PyErr_ExceptionMatches(st->exc_timelog_error));
 
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
@@ -383,7 +364,6 @@ TEST(raise_formatted_empty_format_still_sets_status_text)
     Py_XDECREF(exc_type);
     Py_XDECREF(exc_value);
     Py_XDECREF(exc_tb);
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
@@ -391,7 +371,6 @@ TEST(raise_formatted_long_message_truncates_safely)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
-    tl_py_exc_ctx_t ctx = {0};
     PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
     PyObject* exc_text = NULL;
     const char* text = NULL;
@@ -402,9 +381,8 @@ TEST(raise_formatted_long_message_truncates_safely)
 
     module = create_error_module(&st);
     ASSERT_NOT_NULL(module);
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, st) == 0);
 
-    ASSERT(TlPy_RaiseFromExcContextFmt(&ctx, TL_ESTATE, "%s", long_msg) == NULL);
+    ASSERT(TlPy_RaiseFromStateFmt(st, TL_ESTATE, "%s", long_msg) == NULL);
     ASSERT(PyErr_ExceptionMatches(st->exc_timelog_error));
 
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
@@ -419,18 +397,15 @@ TEST(raise_formatted_long_message_truncates_safely)
     Py_XDECREF(exc_type);
     Py_XDECREF(exc_value);
     Py_XDECREF(exc_tb);
-    TlPy_ExcContext_Clear(&ctx);
     Py_DECREF(module);
 }
 
-TEST(runtime_fallback_without_context_uses_runtimeerror)
+TEST(runtime_fallback_without_state_uses_runtimeerror)
 {
-    tl_py_exc_ctx_t ctx = {0};
-
-    ASSERT(TlPy_RaiseFromExcContext(&ctx, TL_ESTATE) == NULL);
+    ASSERT(TlPy_RaiseFromState(NULL, TL_ESTATE) == NULL);
     ASSERT_EXCEPTION(PyExc_RuntimeError);
 
-    ASSERT(TlPy_RaiseFromExcContext(&ctx, TL_EBUSY) == NULL);
+    ASSERT(TlPy_RaiseFromState(NULL, TL_EBUSY) == NULL);
     ASSERT_EXCEPTION(PyExc_RuntimeError);
 }
 
@@ -443,14 +418,14 @@ int main(void)
     run_busy_error_subclasses_timelog_error();
     run_clear_errors_clears_state_owned_refs();
     run_reinit_after_clear_recreates_cleanly();
-    run_exc_context_init_and_copy_from_module_state();
+    run_state_reports_complete_error_pair();
     run_raise_estate_uses_module_timelog_error();
     run_raise_busy_uses_module_busy_error();
     run_raise_unknown_uses_timelog_error();
     run_raise_formatted_appends_status_message();
     run_raise_formatted_empty_format_still_sets_status_text();
     run_raise_formatted_long_message_truncates_safely();
-    run_runtime_fallback_without_context_uses_runtimeerror();
+    run_runtime_fallback_without_state_uses_runtimeerror();
 
     printf("\\nSummary: %d run, %d failed\\n", tests_run, tests_failed);
 

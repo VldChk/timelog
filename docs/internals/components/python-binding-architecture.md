@@ -18,7 +18,9 @@ Sources:
 
 `Implementation note`
 - Binding uses handle encode/decode and retirement draining patterns.
-- GIL discipline is required for Python C-API interactions.
+- Python C-API interactions require an attached Python thread state. On
+  regular builds that also means the active interpreter's GIL; on
+  per-interpreter-GIL builds the lock is interpreter-local.
 
 ## Iterators and Views
 

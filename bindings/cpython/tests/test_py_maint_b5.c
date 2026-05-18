@@ -74,6 +74,7 @@ static void tlpy_set_pythonhome(void)
 /* Module storage for full init */
 static PyObject* test_module = NULL;
 static tl_py_module_state_t* test_module_state = NULL;
+static PyObject* test_timelog_type = NULL;
 static PyObject* test_timelog_busy_error = NULL;
 
 /* Full init for PyTimelog tests */
@@ -100,20 +101,19 @@ static int tlpy_init_python_full(void)
         return -1;
     }
 
+    if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+
+    test_timelog_type = PyObject_GetAttrString(test_module, "Timelog");
+    if (test_timelog_type == NULL) {
+        fprintf(stderr, "Failed to fetch Timelog type\n");
+        return -1;
+    }
+
     test_timelog_busy_error = PyObject_GetAttrString(test_module, "TimelogBusyError");
     if (test_timelog_busy_error == NULL) {
         fprintf(stderr, "Failed to fetch TimelogBusyError\n");
-        return -1;
-    }
-
-    if (PyDict_SetItemString(PyImport_GetModuleDict(), "timelog._timelog", test_module) < 0) {
-        fprintf(stderr, "Failed to register test module in sys.modules\n");
-        return -1;
-    }
-
-    /* Ready PyTimelog type */
-    if (PyType_Ready(&PyTimelog_Type) < 0) {
-        fprintf(stderr, "Failed to initialize PyTimelog type\n");
         return -1;
     }
 
@@ -126,6 +126,7 @@ static int tlpy_finalize_python(void)
         PyErr_Clear();
     }
     Py_CLEAR(test_timelog_busy_error);
+    Py_CLEAR(test_timelog_type);
     Py_XDECREF(test_module);
     test_module = NULL;
     test_module_state = NULL;
@@ -250,19 +251,7 @@ static PyTimelog* create_timelog_custom(const char* maint_mode,
         Py_DECREF(val);
     }
 
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -315,7 +304,7 @@ static PyTimelog* create_timelog_custom_with_memtable(const char* maint_mode,
         Py_DECREF(val);
     }
 
-    PyObject* obj = PyObject_Call((PyObject*)&PyTimelog_Type, args, kwargs);
+    PyObject* obj = PyObject_Call(test_timelog_type, args, kwargs);
     Py_DECREF(kwargs);
     Py_DECREF(args);
 
@@ -571,8 +560,8 @@ TEST(dealloc_with_pins_warning)
     ASSERT_NOT_NULL(tl);
 
     /* Simulate active snapshot by incrementing pins */
-    tl_py_pins_enter(&tl->handle_ctx);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    tl_py_pins_enter(tl->handle_ctx);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /*
      * Dealloc without releasing pins.
@@ -874,22 +863,16 @@ TEST(ebusy_extend_partial_commit)
 
 TEST(error_mapping_overflow)
 {
-    tl_py_exc_ctx_t ctx = {0};
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, test_module_state) == 0);
-    PyObject* res = TlPy_RaiseFromExcContext(&ctx, TL_EOVERFLOW);
+    PyObject* res = TlPy_RaiseFromState(test_module_state, TL_EOVERFLOW);
     ASSERT_NULL(res);
     ASSERT_EXCEPTION(PyExc_OverflowError);
-    TlPy_ExcContext_Clear(&ctx);
 }
 
 TEST(error_mapping_enomem)
 {
-    tl_py_exc_ctx_t ctx = {0};
-    ASSERT(TlPy_ExcContext_InitFromModuleState(&ctx, test_module_state) == 0);
-    PyObject* res = TlPy_RaiseFromExcContext(&ctx, TL_ENOMEM);
+    PyObject* res = TlPy_RaiseFromState(test_module_state, TL_ENOMEM);
     ASSERT_NULL(res);
     ASSERT_EXCEPTION(PyExc_MemoryError);
-    TlPy_ExcContext_Clear(&ctx);
 }
 
 /*===========================================================================

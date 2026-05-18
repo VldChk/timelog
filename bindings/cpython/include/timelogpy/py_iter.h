@@ -27,28 +27,13 @@
 #include "timelog/timelog.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
+#include "timelogpy/py_module_state.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/*===========================================================================
- * Py_NewRef Compatibility
- *
- * Py_NewRef was added in Python 3.10. For older versions, provide
- * an inline equivalent.
- *===========================================================================*/
-
-#if PY_VERSION_HEX < 0x030A0000
-#ifndef TL_Py_NewRef_DEFINED
-#define TL_Py_NewRef_DEFINED
-static inline PyObject* TL_Py_NewRef(PyObject* obj) {
-    Py_INCREF(obj);
-    return obj;
-}
-#define Py_NewRef TL_Py_NewRef
-#endif
-#endif
+typedef struct tl_py_engine_ctx tl_py_engine_ctx_t;
 
 /*===========================================================================
  * PyTimelogIter Type
@@ -83,11 +68,15 @@ typedef struct {
     tl_iter_t* iter;
 
     /**
-     * Handle lifetime context (borrowed pointer to owner->handle_ctx).
-     * Stored explicitly to avoid dereferencing owner during cleanup.
-     * Safe because owner strong ref guarantees handle_ctx lifetime.
+     * Refcounted handle lifetime context held independently of owner.
      */
     tl_py_handle_ctx_t* handle_ctx;
+
+    /**
+     * Refcounted engine lifetime context.
+     * Held until iter/snapshot cleanup completes.
+     */
+    tl_py_engine_ctx_t* engine_ctx;
 
     /**
      * Query range bounds for view() support.
@@ -96,11 +85,6 @@ typedef struct {
      */
     tl_ts_t range_t1;
     tl_ts_t range_t2;
-
-    /**
-     * Object-local exception translation context copied from the owner.
-     */
-    tl_py_exc_ctx_t exc_ctx;
 
     /**
      * Exact count of remaining rows visible in this iterator snapshot.
@@ -132,16 +116,8 @@ typedef struct {
  * Type Object
  *===========================================================================*/
 
-/**
- * PyTimelogIter type object.
- * Defined in py_iter.c.
- */
-extern PyTypeObject PyTimelogIter_Type;
-
-/**
- * Type check macro.
- */
-#define PyTimelogIter_Check(op) PyObject_TypeCheck(op, &PyTimelogIter_Type)
+PyObject* TlPy_CreateTimelogIterType(PyObject* module);
+int TlPyTimelogIter_Check(PyObject* op, const tl_py_module_state_t* st);
 
 #ifdef __cplusplus
 }

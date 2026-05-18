@@ -16,6 +16,16 @@
 static int tests_run = 0;
 static int tests_failed = 0;
 
+static const char* const test_managed_export_names[] = {
+    "TimelogError",
+    "TimelogBusyError",
+    "Timelog",
+    "TimelogIter",
+    "PageSpan",
+    "PageSpanIter",
+    "PageSpanObjectsView",
+};
+
 static void tlpy_set_pythonhome(void)
 {
 #ifdef TIMELOG_PYTHON_EXECUTABLE
@@ -366,6 +376,150 @@ static int close_timelog_instance(PyObject* timelog)
     return 0;
 }
 
+static int remove_active_timelog_module(void)
+{
+    PyObject* modules = PyImport_GetModuleDict();
+    if (modules == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "sys.modules is unavailable");
+        return -1;
+    }
+    if (PyDict_DelItemString(modules, "timelog._timelog") < 0) {
+        if (PyErr_ExceptionMatches(PyExc_KeyError)) {
+            PyErr_Clear();
+            return 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int assert_exported_type_is_heap(PyObject* module, const char* attr_name)
+{
+    PyObject* type_obj = get_attr(module, attr_name);
+    int ok = 0;
+
+    if (type_obj == NULL) {
+        return -1;
+    }
+
+    if (!PyType_Check(type_obj)) {
+        printf("FAIL\n    Expected %s to be a type\n    at %s:%d\n",
+               attr_name, __FILE__, __LINE__);
+        tests_failed++;
+        goto done;
+    }
+
+    if ((((PyTypeObject*)type_obj)->tp_flags & Py_TPFLAGS_HEAPTYPE) == 0) {
+        printf("FAIL\n    Expected %s to be a heap type\n    at %s:%d\n",
+               attr_name, __FILE__, __LINE__);
+        tests_failed++;
+        goto done;
+    }
+
+    ok = 1;
+
+done:
+    Py_DECREF(type_obj);
+    return ok ? 0 : -1;
+}
+
+static int assert_state_type_is_heap(PyObject* type_obj, const char* label)
+{
+    if (type_obj == NULL) {
+        printf("FAIL\n    Expected module-state type %s\n    at %s:%d\n",
+               label, __FILE__, __LINE__);
+        tests_failed++;
+        return -1;
+    }
+
+    if (!PyType_Check(type_obj)) {
+        printf("FAIL\n    Expected module-state %s to be a type\n    at %s:%d\n",
+               label, __FILE__, __LINE__);
+        tests_failed++;
+        return -1;
+    }
+
+    if ((((PyTypeObject*)type_obj)->tp_flags & Py_TPFLAGS_HEAPTYPE) == 0) {
+        printf("FAIL\n    Expected module-state %s to be a heap type\n    at %s:%d\n",
+               label, __FILE__, __LINE__);
+        tests_failed++;
+        return -1;
+    }
+
+    return 0;
+}
+
+TEST(public_exports_are_heap_types)
+{
+    PyObject* module = TlPy_Test_CreateModule();
+
+    ASSERT_NOT_NULL(module);
+    ASSERT(TlPy_Test_ExecModule(module) == 0);
+
+    ASSERT(assert_exported_type_is_heap(module, "Timelog") == 0);
+    ASSERT(assert_exported_type_is_heap(module, "TimelogIter") == 0);
+    ASSERT(assert_exported_type_is_heap(module, "PageSpan") == 0);
+    ASSERT(assert_exported_type_is_heap(module, "PageSpanIter") == 0);
+    ASSERT(assert_exported_type_is_heap(module, "PageSpanObjectsView") == 0);
+
+    Py_DECREF(module);
+}
+
+TEST(module_state_owns_all_heap_types)
+{
+    PyObject* module = TlPy_Test_CreateModule();
+    tl_py_module_state_t* st = NULL;
+
+    ASSERT_NOT_NULL(module);
+    ASSERT(TlPy_Test_ExecModule(module) == 0);
+
+    st = TlPy_ModuleState(module);
+    ASSERT_NOT_NULL(st);
+
+    ASSERT(assert_state_type_is_heap(st->type_timelog, "Timelog") == 0);
+    ASSERT(assert_state_type_is_heap(st->type_timelog_iter, "TimelogIter") == 0);
+    ASSERT(assert_state_type_is_heap(st->type_pagespan, "PageSpan") == 0);
+    ASSERT(assert_state_type_is_heap(st->type_pagespan_iter, "PageSpanIter") == 0);
+    ASSERT(assert_state_type_is_heap(st->type_pagespan_objects_view,
+                                     "PageSpanObjectsView") == 0);
+    ASSERT(assert_state_type_is_heap(st->type_pagespan_objects_view_iter,
+                                     "PageSpanObjectsViewIter") == 0);
+
+    ASSERT(assert_module_attr_identity(module, "Timelog", st->type_timelog) == 0);
+    ASSERT(assert_module_attr_identity(module, "TimelogIter",
+                                       st->type_timelog_iter) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpan", st->type_pagespan) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpanIter",
+                                       st->type_pagespan_iter) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpanObjectsView",
+                                       st->type_pagespan_objects_view) == 0);
+    ASSERT(module_attr_absent(module, "PageSpanObjectsViewIter") == 1);
+
+    Py_DECREF(module);
+}
+
+TEST(timelog_constructs_without_sys_modules_registration)
+{
+    PyObject* module = TlPy_Test_CreateModule();
+    PyObject* timelog_type = NULL;
+    PyObject* instance = NULL;
+
+    ASSERT_NOT_NULL(module);
+    ASSERT(TlPy_Test_ExecModule(module) == 0);
+    ASSERT(remove_active_timelog_module() == 0);
+
+    timelog_type = get_attr(module, "Timelog");
+    ASSERT_NOT_NULL(timelog_type);
+
+    instance = PyObject_CallNoArgs(timelog_type);
+    ASSERT_NOT_NULL(instance);
+    ASSERT(close_timelog_instance(instance) == 0);
+
+    Py_DECREF(instance);
+    Py_DECREF(timelog_type);
+    Py_DECREF(module);
+}
+
 TEST(same_module_second_exec_is_noop_success)
 {
     PyObject* module = TlPy_Test_CreateModule();
@@ -388,7 +542,7 @@ TEST(same_module_second_exec_is_noop_success)
 
     ASSERT_NOT_NULL(module);
     ASSERT(TlPy_Test_ModuleStateSize() > 0);
-    ASSERT(TlPy_Test_ModuleDeclaresNoSubinterpreters() == 1);
+    ASSERT(TlPy_Test_ModuleDeclaresPerInterpreterGil() == 1);
 
     ASSERT(TlPy_Test_ExecModule(module) == 0);
 
@@ -441,6 +595,89 @@ TEST(same_module_second_exec_is_noop_success)
     Py_DECREF(second_error);
     Py_DECREF(second_busy_error);
     Py_DECREF(module);
+}
+
+TEST(complete_state_reexec_restores_missing_exports)
+{
+    PyObject* module = TlPy_Test_CreateModule();
+    tl_py_module_state_t* st;
+    size_t i;
+
+    ASSERT_NOT_NULL(module);
+    ASSERT(TlPy_Test_ExecModule(module) == 0);
+
+    st = TlPy_ModuleState(module);
+    ASSERT_NOT_NULL(st);
+    ASSERT(st->initialized == 1);
+
+    for (i = 0; i < sizeof(test_managed_export_names) /
+                    sizeof(test_managed_export_names[0]); i++) {
+        ASSERT(PyObject_DelAttrString(module, test_managed_export_names[i]) == 0);
+    }
+    ASSERT(module_attr_absent(module, "Timelog") == 1);
+
+    ASSERT(TlPy_Test_ExecModule(module) == 0);
+    ASSERT(st->initialized == 1);
+    ASSERT(assert_state_error_identity(module, st) == 0);
+    ASSERT(assert_module_attr_identity(module, "Timelog", st->type_timelog) == 0);
+    ASSERT(assert_module_attr_identity(module, "TimelogIter",
+                                       st->type_timelog_iter) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpan", st->type_pagespan) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpanIter",
+                                       st->type_pagespan_iter) == 0);
+    ASSERT(assert_module_attr_identity(module, "PageSpanObjectsView",
+                                       st->type_pagespan_objects_view) == 0);
+
+    Py_DECREF(module);
+}
+
+TEST(export_failure_restores_previous_module_attrs)
+{
+    PyObject* module = TlPy_Test_CreateModule();
+    PyObject* sentinel = PyLong_FromLong(42);
+    tl_py_module_state_t* st;
+    size_t i;
+    int failpoint_armed = 0;
+
+    ASSERT_NOT_NULL(module);
+    ASSERT_NOT_NULL(sentinel);
+
+    for (i = 0; i < sizeof(test_managed_export_names) /
+                    sizeof(test_managed_export_names[0]); i++) {
+        ASSERT(PyObject_SetAttrString(module, test_managed_export_names[i],
+                                      sentinel) == 0);
+    }
+
+    TlPy_Test_SetExecFailpoint(TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN);
+    failpoint_armed = 1;
+    ASSERT(TlPy_Test_ExecModule(module) < 0);
+    ASSERT(assert_runtime_error_contains("after PageSpan export") == 0);
+    TlPy_Test_SetExecFailpoint(TL_PY_MODULE_FAIL_NONE);
+    failpoint_armed = 0;
+
+    st = TlPy_ModuleState(module);
+    ASSERT_NOT_NULL(st);
+    ASSERT(st->initialized == 0);
+    ASSERT(TlPy_StateHasCompleteErrors(st));
+    ASSERT(st->type_timelog != NULL);
+    ASSERT(st->type_timelog_iter != NULL);
+    ASSERT(st->type_pagespan != NULL);
+    ASSERT(st->type_pagespan_iter != NULL);
+    ASSERT(st->type_pagespan_objects_view != NULL);
+    ASSERT(st->type_pagespan_objects_view_iter != NULL);
+
+    for (i = 0; i < sizeof(test_managed_export_names) /
+                    sizeof(test_managed_export_names[0]); i++) {
+        ASSERT(assert_module_attr_identity(module, test_managed_export_names[i],
+                                           sentinel) == 0);
+    }
+
+    Py_DECREF(sentinel);
+    Py_DECREF(module);
+
+    if (failpoint_armed) {
+        TlPy_Test_SetExecFailpoint(TL_PY_MODULE_FAIL_NONE);
+    }
 }
 
 TEST(same_module_reexec_after_manual_reset_preserves_exports)
@@ -529,21 +766,31 @@ TEST(retry_after_each_failpoint)
 {
     const tl_py_module_failpoint_t failpoints[] = {
         TL_PY_MODULE_FAIL_AFTER_ERRORS,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_TIMELOG,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_ITER,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_ITER,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW,
+        TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW_ITER,
         TL_PY_MODULE_FAIL_AFTER_EXPORT_TIMELOG,
         TL_PY_MODULE_FAIL_AFTER_EXPORT_ITER,
         TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN,
         TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_ITER,
         TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_OBJECTS_VIEW,
-        TL_PY_MODULE_FAIL_AFTER_INTERNAL_VIEW_ITER_READY,
     };
     const char* const expected_messages[] = {
         "after errors",
+        "after Timelog type creation",
+        "after TimelogIter type creation",
+        "after PageSpan type creation",
+        "after PageSpanIter type creation",
+        "after PageSpanObjectsView type creation",
+        "after PageSpanObjectsViewIter type creation",
         "after Timelog export",
         "after TimelogIter export",
         "after PageSpan export",
         "after PageSpanIter export",
         "after PageSpanObjectsView export",
-        "after PageSpanObjectsViewIter ready",
     };
     size_t i;
 
@@ -648,6 +895,16 @@ TEST(two_module_objects_keep_distinct_module_state_and_exceptions)
     ASSERT(left_error == left_state->exc_timelog_error);
     ASSERT(right_error == right_state_after_retry->exc_timelog_error);
     ASSERT(left_error != right_error);
+    ASSERT(left_state->type_timelog != right_state_after_retry->type_timelog);
+    ASSERT(left_state->type_timelog_iter !=
+           right_state_after_retry->type_timelog_iter);
+    ASSERT(left_state->type_pagespan != right_state_after_retry->type_pagespan);
+    ASSERT(left_state->type_pagespan_iter !=
+           right_state_after_retry->type_pagespan_iter);
+    ASSERT(left_state->type_pagespan_objects_view !=
+           right_state_after_retry->type_pagespan_objects_view);
+    ASSERT(left_state->type_pagespan_objects_view_iter !=
+           right_state_after_retry->type_pagespan_objects_view_iter);
 
     Py_DECREF(left_error);
     Py_DECREF(right_error);
@@ -680,6 +937,9 @@ TEST(dual_module_timelog_instances_keep_runtime_exception_context)
     ASSERT_NOT_NULL(left_obj);
     right_obj = new_timelog_instance(right);
     ASSERT_NOT_NULL(right_obj);
+    ASSERT(Py_TYPE(left_obj) == (PyTypeObject*)left_state->type_timelog);
+    ASSERT(Py_TYPE(right_obj) == (PyTypeObject*)right_state->type_timelog);
+    ASSERT(Py_TYPE(left_obj) != Py_TYPE(right_obj));
 
     ASSERT(close_timelog_instance(left_obj) == 0);
     ASSERT(close_timelog_instance(right_obj) == 0);
@@ -706,7 +966,12 @@ int main(void)
 
     printf("Running direct module exec tests:\n\n");
 
+    run_public_exports_are_heap_types();
+    run_module_state_owns_all_heap_types();
+    run_timelog_constructs_without_sys_modules_registration();
     run_same_module_second_exec_is_noop_success();
+    run_complete_state_reexec_restores_missing_exports();
+    run_export_failure_restores_previous_module_attrs();
     run_same_module_reexec_after_manual_reset_preserves_exports();
     run_retry_after_each_failpoint();
     run_two_module_objects_keep_distinct_module_state_and_exceptions();

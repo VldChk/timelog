@@ -15,45 +15,16 @@
 
 
 /*===========================================================================
- * Py_NewRef Compatibility
- *===========================================================================*/
-
-#if PY_VERSION_HEX < 0x030A0000
-#ifndef TL_Py_NewRef_DEFINED
-#define TL_Py_NewRef_DEFINED
-static inline PyObject* TL_Py_NewRef_OV(PyObject* obj) {
-    Py_INCREF(obj);
-    return obj;
-}
-#define Py_NewRef TL_Py_NewRef_OV
-#endif
-#endif
-
-/*===========================================================================
- * Block Direct Construction
- *===========================================================================*/
-
-static PyObject* PyPageSpanObjectsView_new_error(PyTypeObject* type,
-                                                  PyObject* args,
-                                                  PyObject* kwds)
-{
-    (void)type;
-    (void)args;
-    (void)kwds;
-
-    PyErr_SetString(PyExc_TypeError,
-        "PageSpanObjectsView cannot be instantiated directly; "
-        "use PageSpan.objects()");
-    return NULL;
-}
-
-/*===========================================================================
  * Factory Function
  *===========================================================================*/
 
 PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 {
-    if (!PyPageSpan_Check(span)) {
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject(span);
+    if (mod_st == NULL) {
+        return NULL;
+    }
+    if (!TlPyPageSpan_Check(span, mod_st)) {
         PyErr_SetString(PyExc_TypeError, "expected PageSpan");
         return NULL;
     }
@@ -64,8 +35,9 @@ PyObject* PyPageSpanObjectsView_Create(PyObject* span)
         return NULL;
     }
 
-    PyPageSpanObjectsView* self = PyObject_New(PyPageSpanObjectsView,
-                                                &PyPageSpanObjectsView_Type);
+    PyTypeObject* view_type = (PyTypeObject*)mod_st->type_pagespan_objects_view;
+    PyPageSpanObjectsView* self =
+        (PyPageSpanObjectsView*)view_type->tp_alloc(view_type, 0);
     if (!self) {
         return NULL;
     }
@@ -80,8 +52,26 @@ PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 
 static void PyPageSpanObjectsView_dealloc(PyPageSpanObjectsView* self)
 {
+    PyTypeObject* tp = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
     Py_XDECREF(self->span);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
+}
+
+static int PyPageSpanObjectsView_traverse(PyPageSpanObjectsView* self,
+                                          visitproc visit,
+                                          void* arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->span);
+    return 0;
+}
+
+static int PyPageSpanObjectsView_clear(PyPageSpanObjectsView* self)
+{
+    Py_CLEAR(self->span);
+    return 0;
 }
 
 /*===========================================================================
@@ -133,11 +123,6 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
     return Py_NewRef(obj);
 }
 
-static PySequenceMethods objectsview_as_sequence = {
-    .sq_length = (lenfunc)PyPageSpanObjectsView_length,
-    .sq_item = (ssizeargfunc)PyPageSpanObjectsView_getitem,
-};
-
 /*===========================================================================
  * Iterator Protocol
  *===========================================================================*/
@@ -148,13 +133,28 @@ typedef struct {
     Py_ssize_t index;   /* Current position */
 } PyPageSpanObjectsViewIter;
 
-/* Forward declaration (non-static, exported via header) */
-extern PyTypeObject PyPageSpanObjectsViewIter_Type;
-
 static void objectsviewiter_dealloc(PyPageSpanObjectsViewIter* self)
 {
+    PyTypeObject* tp = Py_TYPE(self);
+    PyObject_GC_UnTrack(self);
     Py_XDECREF(self->view);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
+}
+
+static int objectsviewiter_traverse(PyPageSpanObjectsViewIter* self,
+                                    visitproc visit,
+                                    void* arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->view);
+    return 0;
+}
+
+static int objectsviewiter_clear(PyPageSpanObjectsViewIter* self)
+{
+    Py_CLEAR(self->view);
+    return 0;
 }
 
 static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
@@ -188,23 +188,16 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
     return Py_NewRef(obj);
 }
 
-/* Exported (non-static) so module.c can call PyType_Ready */
-PyTypeObject PyPageSpanObjectsViewIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpanObjectsViewIter",
-    .tp_basicsize = sizeof(PyPageSpanObjectsViewIter),
-    .tp_dealloc = (destructor)objectsviewiter_dealloc,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_iter = PyObject_SelfIter,
-    .tp_iternext = (iternextfunc)objectsviewiter_next,
-};
-
 static PyObject* PyPageSpanObjectsView_iter(PyPageSpanObjectsView* self)
 {
-    /* Type readied by module init (module.c) - no lazy init needed. */
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject((PyObject*)self);
+    if (mod_st == NULL) {
+        return NULL;
+    }
 
-    PyPageSpanObjectsViewIter* iter = PyObject_New(PyPageSpanObjectsViewIter,
-                                                    &PyPageSpanObjectsViewIter_Type);
+    PyTypeObject* iter_type = (PyTypeObject*)mod_st->type_pagespan_objects_view_iter;
+    PyPageSpanObjectsViewIter* iter =
+        (PyPageSpanObjectsViewIter*)iter_type->tp_alloc(iter_type, 0);
     if (!iter) {
         return NULL;
     }
@@ -266,23 +259,68 @@ static PyMethodDef PyPageSpanObjectsView_methods[] = {
 };
 
 /*===========================================================================
- * Type Object
+ * Type Specifications
  *===========================================================================*/
 
-PyTypeObject PyPageSpanObjectsView_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpanObjectsView",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyPageSpanObjectsView_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Lazy sequence view over decoded Python objects from a PageSpan.\n\n"
         "Supports len(), indexing, and iteration.\n"
         "Cannot be instantiated directly; use PageSpan.objects()."
-    ),
-    .tp_basicsize = sizeof(PyPageSpanObjectsView),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = PyPageSpanObjectsView_new_error,
-    .tp_dealloc = (destructor)PyPageSpanObjectsView_dealloc,
-    .tp_as_sequence = &objectsview_as_sequence,
-    .tp_iter = (getiterfunc)PyPageSpanObjectsView_iter,
-    .tp_methods = PyPageSpanObjectsView_methods,
+    )},
+    {Py_tp_dealloc, (void*)PyPageSpanObjectsView_dealloc},
+    {Py_tp_traverse, (void*)PyPageSpanObjectsView_traverse},
+    {Py_tp_clear, (void*)PyPageSpanObjectsView_clear},
+    {Py_tp_iter, (void*)PyPageSpanObjectsView_iter},
+    {Py_tp_methods, PyPageSpanObjectsView_methods},
+    {Py_sq_length, (void*)PyPageSpanObjectsView_length},
+    {Py_sq_item, (void*)PyPageSpanObjectsView_getitem},
+    {0, NULL}
 };
+
+static PyType_Spec PyPageSpanObjectsView_spec = {
+    .name = "timelog._timelog.PageSpanObjectsView",
+    .basicsize = sizeof(PyPageSpanObjectsView),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpanObjectsView_slots,
+};
+
+static PyType_Slot PyPageSpanObjectsViewIter_slots[] = {
+    {Py_tp_dealloc, (void*)objectsviewiter_dealloc},
+    {Py_tp_traverse, (void*)objectsviewiter_traverse},
+    {Py_tp_clear, (void*)objectsviewiter_clear},
+    {Py_tp_iter, PyObject_SelfIter},
+    {Py_tp_iternext, (void*)objectsviewiter_next},
+    {0, NULL}
+};
+
+static PyType_Spec PyPageSpanObjectsViewIter_spec = {
+    .name = "timelog._timelog.PageSpanObjectsViewIter",
+    .basicsize = sizeof(PyPageSpanObjectsViewIter),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpanObjectsViewIter_slots,
+};
+
+PyObject* TlPy_CreatePageSpanObjectsViewType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpanObjectsView_spec, NULL);
+}
+
+PyObject* TlPy_CreatePageSpanObjectsViewIterType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpanObjectsViewIter_spec, NULL);
+}
+
+int TlPyPageSpanObjectsView_Check(PyObject* op, const tl_py_module_state_t* st)
+{
+    return op != NULL && st != NULL && st->type_pagespan_objects_view != NULL &&
+           PyObject_TypeCheck(op, (PyTypeObject*)st->type_pagespan_objects_view);
+}

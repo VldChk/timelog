@@ -35,6 +35,7 @@
 
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_span.h"
+#include "timelogpy/py_module_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,11 +70,6 @@ typedef struct {
     PyObject* timelog;
 
     /**
-     * Object-local exception translation context copied from the creator.
-     */
-    tl_py_exc_ctx_t exc_ctx;
-
-    /**
      * State flag.
      * 0 = open (resources valid)
      * 1 = closed (resources released)
@@ -86,16 +82,8 @@ typedef struct {
  * Type Object
  *===========================================================================*/
 
-/**
- * PyPageSpanIter type object.
- * Defined in py_span_iter.c.
- */
-extern PyTypeObject PyPageSpanIter_Type;
-
-/**
- * Type check macro.
- */
-#define PyPageSpanIter_Check(op) PyObject_TypeCheck(op, &PyPageSpanIter_Type)
+PyObject* TlPy_CreatePageSpanIterType(PyObject* module);
+int TlPyPageSpanIter_Check(PyObject* op, const tl_py_module_state_t* st);
 
 /*===========================================================================
  * Factory Function (Internal)

@@ -1,26 +1,32 @@
 # PR Test CI
 
-This repository includes a dedicated PR workflow at `.github/workflows/tests-pr.yml` that runs on every pull request on both Linux and Windows.
+This repository includes a dedicated PR workflow at `.github/workflows/tests-pr.yml` that runs on every pull request on Linux and Windows for CPython 3.12 and 3.13. It also has a required Linux CPython 3.14 subinterpreter job for Layer A.
 
 ## What It Runs
 
 1. Pure C core tests (`timelog_tests`) split by `TL_TEST_GROUPS`.
-2. C-level CPython binding tests via `ctest -R ^py_.*_tests$`.
-3. Python facade tests in `python/tests` via `pytest`.
-4. Demo/methodology/correctness tests in `demo/tests` via `unittest`.
+2. Production-source Layer A static regression check.
+3. C-level CPython binding tests via `ctest -R ^py_.*_tests$`.
+4. Python facade tests in `python/tests` via `pytest`.
+5. Demo/methodology/correctness tests in `demo/tests` via `unittest`.
+6. Layer A subinterpreter tests on CPython 3.14 via `demo/ci/run_compat_baseline.py --legs subinterpreters`.
 
 ## Advisory Compatibility Baseline
 
-The repository also includes a non-required PR workflow at `.github/workflows/compatibility-baseline-pr.yml`.
+The repository also includes compatibility workflows at
+`.github/workflows/compatibility-baseline-pr.yml` and
+`.github/workflows/compatibility-baseline-main.yml`.
 
 Purpose:
-1. Make current subinterpreter and free-threaded incompatibilities visible without breaking required PR checks.
-2. Preserve permanent baseline coverage so future support work turns `XFAIL` into `PASS` instead of adding new tests late.
+1. Mirror Layer A subinterpreter behavior on additional compatibility hosts, including Windows CPython 3.14.
+2. Keep free-threaded compatibility visible without declaring no-GIL support.
+3. Preserve permanent baseline coverage so future support work turns `XFAIL` into `PASS` instead of adding new tests late.
 
 Current policy:
-1. Missing host capability is reported as `SKIP`.
-2. Known Timelog incompatibility is reported as `XFAIL`.
-3. `XPASS`, `FAIL`, and `ERROR` fail the advisory job.
+1. Missing host capability is reported as `SKIP`, but a leg that collects no passing or expected-failing tests is a failure.
+2. Layer A subinterpreter tests are required to pass on hosts with `concurrent.interpreters`.
+3. Layer B free-threaded incompatibility remains advisory and is reported as `XFAIL`.
+4. `XPASS`, `FAIL`, `ERROR`, and all-skip capability legs fail the compatibility job.
 
 Compatibility markers:
 1. `subinterpreters`
@@ -66,12 +72,20 @@ The grouped core run uses these 13 groups from `core/tests/test_main.c`:
 
 Set these GitHub checks as required:
 
-1. `Tests (PR) / test (ubuntu-latest, 3.13)`
-2. `Tests (PR) / test (windows-latest, 3.13)`
-3. `Packaging (PR) / packaging-pr`
-4. `Dependency Review / dependency-review`
+1. `Tests (PR) / test (ubuntu-latest, 3.12)`
+2. `Tests (PR) / test (ubuntu-latest, 3.13)`
+3. `Tests (PR) / test (windows-latest, 3.12)`
+4. `Tests (PR) / test (windows-latest, 3.13)`
+5. `Tests (PR) / subinterpreters (ubuntu-latest, 3.14)`
+6. `Packaging (PR) / packaging-pr`
+7. `Dependency Review / dependency-review`
 
-The compatibility baseline workflow is intentionally not listed here. It is advisory in Step 1 and must not block merges while the implementation work is still incomplete.
+Repository settings should also require
+`Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-ubuntu)`
+and
+`Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-windows)`
+once CPython 3.14 runner availability is stable for the project. Free-threaded
+compatibility remains informational until no-GIL support is explicitly declared.
 
 ## Packaging and Release Workflows
 
@@ -87,6 +101,7 @@ See `docs/pypi-release.md` for publish runbooks and OIDC setup.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIMELOG_BUILD_PYTHON=ON -DTIMELOG_BUILD_PY_TESTS=ON
 cmake --build build --target timelog_e2e_build -j 2
+python demo/ci/check_layer_a_static.py
 python demo/ci/run_core_test_groups.py --build-dir build --config Release --summary-json demo/benchmark_runs/core.local.json --summary-md demo/benchmark_runs/core.local.md
 ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$'
 cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests -q
