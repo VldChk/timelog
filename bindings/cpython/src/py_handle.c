@@ -202,6 +202,13 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     ctx->live_tombstones = 0;
     ctx->live_tracking_failed = 0;
 
+    /* Initialize the live-table mutex. On 3.13+ this is statically
+     * zero-initializable and cannot fail; on 3.12 the PyThread_type_lock
+     * fallback can fail (returns -1). */
+    if (tl_py_mutex_init(&ctx->live_lock) != 0) {
+        return TL_ENOMEM;
+    }
+
     return TL_OK;
 }
 
@@ -279,6 +286,12 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
     if (ctx == NULL) {
         return;
     }
+
+    /* Tear down the live-table mutex. By the lifetime invariant in
+     * py_handle.h, no thread is inside a live_lock-protected section
+     * when refcount has reached zero. Deinit is NULL-safe on the 3.12
+     * fallback path. */
+    tl_py_mutex_deinit(&ctx->live_lock);
 
     /* Warn on leaked resources (cannot DECREF without GIL). */
 #ifndef NDEBUG

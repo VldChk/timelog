@@ -29,6 +29,7 @@
 #include <Python.h>
 
 #include "timelog/timelog.h"
+#include "timelogpy/py_compat.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -162,13 +163,31 @@ typedef struct tl_py_handle_ctx {
      * Live handle tracking (multiset by pointer identity).
      * Used to DECREF all remaining objects on close().
      *
-     * NOTE: Accessed only with GIL held (append/extend/drain/close).
+     * Mutation and scan are protected by `live_lock`. Per the
+     * collect/unlock/execute rule (LLD §5.4), callers must drop the
+     * lock before any Python decref happens.
      */
     struct tl_py_live_entry* live_entries;
     size_t                  live_cap;
     size_t                  live_len;
     size_t                  live_tombstones;
     uint8_t                 live_tracking_failed;
+
+    /**
+     * Lock protecting the live-handle table (entries, cap, len,
+     * tombstones, tracking_failed). Mandatory under free-threaded
+     * builds; on 3.12 with the PyThread_type_lock fallback it still
+     * provides correctness under any in-process overlap path. Held
+     * ONLY around bounded sections that mutate or scan the table;
+     * never across Py_DECREF, warnings, weakref callbacks, or any
+     * code that may execute Python.
+     *
+     * Lifetime invariant: no thread may be inside a live_lock-
+     * protected section without holding a refcount on this ctx.
+     * Refcount-zero destruction is guaranteed to happen only after
+     * all such sections have unwound.
+     */
+    tl_py_mutex_t live_lock;
 
 } tl_py_handle_ctx_t;
 
