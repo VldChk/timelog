@@ -10,6 +10,7 @@
 #include <Python.h>
 #include <string.h>  /* For strcmp, memset */
 
+#include "timelogpy/py_compat.h"
 #include "timelogpy/py_span_iter.h"
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_timelog.h"
@@ -204,27 +205,52 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
  * the release hook if that was the last ref.
  *===========================================================================*/
 
-static void pagespaniter_cleanup(PyPageSpanIter* self)
+/* Detach iterator resources under CS. Caller must release outside. */
+static int pagespaniter_detach_locked(PyPageSpanIter* self,
+                                       tl_pagespan_iter_t** out_iter,
+                                       PyObject** out_timelog)
 {
     if (self->closed) {
-        return;
+        *out_iter = NULL;
+        *out_timelog = NULL;
+        return 0;
     }
     self->closed = 1;
-
-    /* Releases iterator's owner ref; hook fires if that was the last. */
-    tl_pagespan_iter_t* iter = self->iter;
+    *out_iter = self->iter;
     self->iter = NULL;
+    *out_timelog = self->timelog;
+    self->timelog = NULL;
+    return 1;
+}
 
+static void pagespaniter_release_resources(tl_pagespan_iter_t* iter,
+                                            PyObject* timelog)
+{
     if (iter != NULL) {
+        /* Releases iterator's owner ref; release hook fires if last ref. */
         tl_pagespan_iter_close(iter);
     }
-
-    /* Preserve exception state across Py_CLEAR (may run __del__). */
-    {
+    if (timelog != NULL) {
+        /* Preserve exception state across Py_DECREF (may run __del__). */
         PyObject *exc_type, *exc_value, *exc_tb;
         PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-        Py_CLEAR(self->timelog);
+        Py_DECREF(timelog);
         PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
+}
+
+static void pagespaniter_cleanup(PyPageSpanIter* self)
+{
+    tl_pagespan_iter_t* iter = NULL;
+    PyObject* timelog = NULL;
+    int detached;
+
+    TL_PY_OBJ_LOCK(self);
+    detached = pagespaniter_detach_locked(self, &iter, &timelog);
+    TL_PY_OBJ_UNLOCK();
+
+    if (detached) {
+        pagespaniter_release_resources(iter, timelog);
     }
 }
 
@@ -263,35 +289,57 @@ static void PyPageSpanIter_dealloc(PyPageSpanIter* self)
 
 static PyObject* PyPageSpanIter_iternext(PyPageSpanIter* self)
 {
-    if (self->closed || self->iter == NULL) {
-        return NULL;  /* StopIteration */
-    }
+    /* Hold CS through the engine call so a concurrent close cannot free
+     * self->iter mid-call. tl_pagespan_iter_next is pure C, honoring the
+     * "no Python work under internal locks" invariant. */
     tl_pagespan_view_t view;
     memset(&view, 0, sizeof(view));
+    tl_status_t st = TL_EOF;
+    int was_closed = 0;
+    int do_release = 0;
+    tl_pagespan_iter_t* iter_local = NULL;
+    PyObject* timelog_local = NULL;
+    /* Capture timelog under CS for PyPageSpan_FromView below. */
+    PyObject* timelog_ref = NULL;
 
-    tl_status_t st = tl_pagespan_iter_next(self->iter, &view);
-
-    if (st == TL_OK) {
-        /* PyPageSpan_FromView consumes view.owner on success. */
-        PyObject* span = PyPageSpan_FromView(&view, self->timelog);
-        if (span == NULL) {
-            /* Creation failed; release the view's owner ref. */
-            tl_pagespan_view_release(&view);
-            return NULL;
+    TL_PY_OBJ_LOCK(self);
+    if (self->closed || self->iter == NULL) {
+        was_closed = 1;
+    } else {
+        st = tl_pagespan_iter_next(self->iter, &view);
+        if (st == TL_OK) {
+            /* PyPageSpan_FromView needs a Python ref to the timelog. Take
+             * a strong ref under CS so close cannot null it from us. */
+            timelog_ref = self->timelog ? Py_NewRef(self->timelog) : NULL;
+        } else {
+            do_release = pagespaniter_detach_locked(
+                self, &iter_local, &timelog_local);
         }
-        return span;
     }
+    TL_PY_OBJ_UNLOCK();
 
-    if (st == TL_EOF) {
-        /* Exhausted. */
-        pagespaniter_cleanup(self);
+    if (was_closed) {
         return NULL;  /* StopIteration */
     }
+    if (st != TL_OK) {
+        if (do_release) {
+            pagespaniter_release_resources(iter_local, timelog_local);
+        }
+        if (st == TL_EOF) {
+            return NULL;
+        }
+        return TlPy_RaiseFromObject((PyObject*)self, st);
+    }
 
-    /* Error. */
-    pagespaniter_cleanup(self);
-    TlPy_RaiseFromObject((PyObject*)self, st);
-    return NULL;
+    /* PyPageSpan_FromView consumes view.owner on success. */
+    PyObject* span = PyPageSpan_FromView(&view, timelog_ref);
+    Py_XDECREF(timelog_ref);
+    if (span == NULL) {
+        /* Creation failed; release the view's owner ref. */
+        tl_pagespan_view_release(&view);
+        return NULL;
+    }
+    return span;
 }
 
 /*===========================================================================
@@ -325,7 +373,11 @@ static PyObject* PyPageSpanIter_exit(PyPageSpanIter* self, PyObject* args)
 static PyObject* PyPageSpanIter_get_closed(PyPageSpanIter* self, void* closure)
 {
     (void)closure;
-    return PyBool_FromLong(self->closed);
+    int closed;
+    TL_PY_OBJ_LOCK(self);
+    closed = self->closed;
+    TL_PY_OBJ_UNLOCK();
+    return PyBool_FromLong(closed);
 }
 
 /*===========================================================================
