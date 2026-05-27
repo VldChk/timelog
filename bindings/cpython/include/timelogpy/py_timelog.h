@@ -36,6 +36,8 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
 #include "timelog/timelog.h"
 #include "timelogpy/py_handle.h"
@@ -90,15 +92,24 @@ typedef struct {
     /**
      * Engine instance.
      * Set to NULL after close() to prevent use-after-free.
+     *
+     * Atomic so fast-path checks (CHECK_CLOSED) and the strict/best_effort
+     * core-call paths can read without taking core_lock. Writes happen
+     * under core_lock with memory_order_release.
      */
-    tl_timelog_t* tl;
+    _Atomic(tl_timelog_t*) tl;
 
     /**
      * Lifecycle state.
      * 0 = open, 1 = closed.
      * Set early in close() to prevent reentrancy.
+     *
+     * Atomic mirror of the lifecycle state (LLD §5.4 invariant L1): any
+     * fast-path unlocked closed check must be atomically synchronized,
+     * not racy. Writers hold core_lock and use memory_order_release;
+     * readers may use memory_order_acquire without the lock.
      */
-    int closed;
+    _Atomic(uint8_t) closed;
 
     /**
      * Refcounted handle/lifetime context.
@@ -164,7 +175,8 @@ int tl_py_lock_checked(PyTimelog* self);
  */
 #define CHECK_CLOSED(self) \
     do { \
-        if ((self)->closed || (self)->tl == NULL) { \
+        if (atomic_load_explicit(&(self)->closed, memory_order_acquire) || \
+            atomic_load_explicit(&(self)->tl, memory_order_acquire) == NULL) { \
             return TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
                                            "Timelog is closed"); \
         } \
@@ -176,7 +188,8 @@ int tl_py_lock_checked(PyTimelog* self);
  */
 #define CHECK_CLOSED_INT(self) \
     do { \
-        if ((self)->closed || (self)->tl == NULL) { \
+        if (atomic_load_explicit(&(self)->closed, memory_order_acquire) || \
+            atomic_load_explicit(&(self)->tl, memory_order_acquire) == NULL) { \
             TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
                                     "Timelog is closed"); \
             return -1; \

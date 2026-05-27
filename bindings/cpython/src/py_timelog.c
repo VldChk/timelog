@@ -1049,21 +1049,26 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     cfg.on_drop_handle = tl_py_on_drop_handle;
     cfg.on_drop_ctx = self->handle_ctx;
 
-    /* Open the timelog */
-    tl_status_t st = tl_open(&cfg, &self->tl);
+    /* Open the timelog. tl_open writes its result through a plain
+     * tl_timelog_t** out-parameter; self->tl is _Atomic so we can't take
+     * its address directly (would be UB per C11). Stage through a local
+     * and publish under memory_order_release once the engine is open. */
+    tl_timelog_t* tl_local = NULL;
+    tl_status_t st = tl_open(&cfg, &tl_local);
     if (st != TL_OK) {
         tl_py_timelog_drop_handle_ctx(self);
-        self->tl = NULL;
-        self->closed = 1;
+        atomic_store_explicit(&self->tl, NULL, memory_order_release);
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
         TL_PY_RAISE_STATUS(self, st);
         return -1;
     }
+    atomic_store_explicit(&self->tl, tl_local, memory_order_release);
 
-    self->engine_ctx = tl_py_engine_ctx_new(self->tl);
+    self->engine_ctx = tl_py_engine_ctx_new(tl_local);
     if (self->engine_ctx == NULL) {
-        tl_close(self->tl);
-        self->tl = NULL;
-        self->closed = 1;
+        tl_close(tl_local);
+        atomic_store_explicit(&self->tl, NULL, memory_order_release);
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
         tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
@@ -1073,8 +1078,8 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     if (self->core_lock == NULL) {
         /* Best-effort shutdown on allocation failure */
         tl_py_engine_ctx_close(self->engine_ctx, 0);
-        self->tl = NULL;
-        self->closed = 1;
+        atomic_store_explicit(&self->tl, NULL, memory_order_release);
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
         tl_py_timelog_drop_engine_ctx(self);
         tl_py_timelog_drop_handle_ctx(self);
         PyErr_NoMemory();
@@ -1082,7 +1087,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     /* Success - store introspection fields */
-    self->closed = 0;
+    atomic_store_explicit(&self->closed, 0, memory_order_release);
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
 
@@ -1131,8 +1136,8 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
      * before reaching this helper and is rechecked here for race safety.
      */
     defer_engine_close = (pins != 0);
-    self->closed = 1;
-    self->tl = NULL;
+    atomic_store_explicit(&self->closed, 1, memory_order_release);
+    atomic_store_explicit(&self->tl, NULL, memory_order_release);
     engine_ctx = self->engine_ctx;
     self->engine_ctx = NULL;
     TL_PY_UNLOCK(self);
@@ -1184,13 +1189,13 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
 static PyObject*
 PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
-    if (self->closed) {
+    if (atomic_load_explicit(&self->closed, memory_order_acquire)) {
         Py_RETURN_NONE;
     }
 
     /* Engine already NULL (partial init failure). */
-    if (self->tl == NULL) {
-        self->closed = 1;
+    if (atomic_load_explicit(&self->tl, memory_order_acquire) == NULL) {
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
         tl_py_timelog_drop_engine_ctx(self);
         tl_py_timelog_drop_handle_ctx(self);
         Py_RETURN_NONE;
@@ -2616,7 +2621,10 @@ static PyObject* PyTimelog_page_spans(PyTimelog* self,
 
 static PyObject* PyTimelog_get_closed(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    return PyBool_FromLong(self->closed);
+    /* Unlocked read; must be atomic so concurrent Python threads (e.g.,
+     * one reading .closed while another runs .close()) cannot race. */
+    uint8_t c = atomic_load_explicit(&self->closed, memory_order_acquire);
+    return PyBool_FromLong((long)c);
 }
 
 static PyObject* PyTimelog_get_time_unit(PyTimelog* self, void* Py_UNUSED(closure))
