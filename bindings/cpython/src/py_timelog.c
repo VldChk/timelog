@@ -1153,8 +1153,12 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
 
     uint64_t alloc_failures = self->handle_ctx != NULL ?
         tl_py_alloc_failures(self->handle_ctx) : 0;
-    int live_tracking_failed = (self->handle_ctx != NULL &&
-                                self->handle_ctx->live_tracking_failed != 0);
+    int live_tracking_failed = 0;
+    if (self->handle_ctx != NULL) {
+        live_tracking_failed = atomic_load_explicit(
+            &self->handle_ctx->live_tracking_failed,
+            memory_order_acquire) != 0;
+    }
 
     tl_py_timelog_drop_handle_ctx(self);
 

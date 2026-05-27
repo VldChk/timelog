@@ -327,7 +327,8 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
-    ctx->live_tracking_failed = 0;
+    atomic_store_explicit(&ctx->live_tracking_failed, 0,
+                          memory_order_relaxed);
 }
 
 /*===========================================================================
