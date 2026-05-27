@@ -51,7 +51,9 @@ TIMELOG_BUILD_DEMOS = false
 TIMELOG_BUILD_SHARED = false
 
 [tool.cibuildwheel]
-build = "cp312-* cp313-* cp314-*"
+# Build for regular CPython 3.12-3.14 and free-threaded 3.14t.
+# 3.13t is intentionally omitted (spec §6.10: "explicitly tested only").
+build = "cp312-* cp313-* cp314-* cp314t-*"
 skip = "*-musllinux_*"
 test-command = "pytest {project}/python/tests -q"
 test-extras = ["test"]

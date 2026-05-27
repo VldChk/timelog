@@ -74,11 +74,19 @@ class Timelog(_CTimelog):
     snapshot-isolated reads, and zero-copy bulk access via ``views()``.
 
     Thread Safety:
-        Single-writer. Multiple-thread access requires external
-        synchronization. Iterators are snapshot-based and safe for
-        concurrent reads. Regular CPython builds, including isolated
-        subinterpreters with a per-interpreter GIL, are supported.
-        Free-threaded/no-GIL builds remain unsupported until Layer B.
+        Single-writer API contract. Multiple-thread *writes* on a single
+        Timelog instance require external serialization. Iterators are
+        snapshot-based and safe for concurrent reads from independent
+        threads.
+
+        Supported builds:
+            * Regular CPython 3.12-3.14 (single interpreter).
+            * Isolated subinterpreters with per-interpreter GIL (3.12+).
+            * Free-threaded CPython 3.14t (Py_GIL_DISABLED=1) — the
+              module declares Py_mod_gil = Py_MOD_GIL_NOT_USED and
+              synchronizes all mutable extension state with per-object
+              critical sections, an explicit live_lock, and atomic
+              context refcounts.
 
     Warning:
         ``close()`` drops unflushed records. Call ``flush()`` first to

@@ -7,19 +7,29 @@
  * and maintenance.
  *
  * Thread Safety:
- *   Single-writer model: the same instance must not be used concurrently
- *   for writes or lifecycle operations without external synchronization.
- *   The binding serializes core calls to prevent concurrent use while the
- *   GIL is released, but this is not a guarantee of full thread safety.
- *   Snapshot-based iterators are safe for concurrent reads.
+ *   Single-writer API contract: the same instance must not be used
+ *   concurrently for *writes* or lifecycle operations without external
+ *   serialization. Snapshot-based iterators are safe for concurrent reads
+ *   from independent threads.
  *
- *   The GIL is released during flush(), compact(), stop_maintenance(), and
- *   close(). The user must ensure no other thread touches this Timelog
- *   instance while these operations are in progress.
+ *   The binding's internal synchronization (LLD §5.4) is:
+ *     - per-instance core_lock (PyThread_type_lock)
+ *     - atomic mirrors for the hot-path closed/tl fields
+ *     - per-object Py_BEGIN_CRITICAL_SECTION on mutable extension fields
+ *     - live_lock on the handle context's live-handle table
+ *     - atomic refcount on the core tl_pagespan_owner
+ *     - lock-free retired-stack between maintenance thread and drain
  *
- *   Regular CPython builds are supported, including isolated subinterpreters
- *   with a per-interpreter GIL. Free-threaded/no-GIL Python builds remain
- *   unsupported until the Layer B synchronization work is complete.
+ *   Thread states required, not the GIL: Python C-API access requires an
+ *   attached thread state on the owning interpreter. The binding releases
+ *   the active interpreter's GIL during flush(), compact(),
+ *   stop_maintenance(), and close().
+ *
+ *   Supported builds:
+ *     - Regular CPython 3.12-3.14 (single interpreter).
+ *     - Isolated subinterpreters with per-interpreter GIL (3.12+).
+ *     - Free-threaded CPython 3.14t (Py_GIL_DISABLED=1): the module's
+ *       PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED.
  *
  * Known Limitations:
  *   - Unflushed records are dropped on close(). The binding tracks all

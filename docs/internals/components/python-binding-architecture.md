@@ -19,8 +19,12 @@ Sources:
 `Implementation note`
 - Binding uses handle encode/decode and retirement draining patterns.
 - Python C-API interactions require an attached Python thread state. On
-  regular builds that also means the active interpreter's GIL; on
-  per-interpreter-GIL builds the lock is interpreter-local.
+  regular builds that also coincides with the active interpreter's GIL;
+  on per-interpreter-GIL builds the lock is interpreter-local; on
+  free-threaded (Py_GIL_DISABLED) builds the GIL is absent and the
+  attached thread state is the only precondition the binding relies on.
+  All mutable extension state is explicitly synchronized — see LLD §5.4
+  for the synchronization matrix.
 
 ## Iterators and Views
 

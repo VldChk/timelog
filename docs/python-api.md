@@ -10,9 +10,12 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 ## Runtime Support
 
-- Regular CPython 3.12+ builds are supported.
-- Isolated subinterpreters with a per-interpreter GIL are supported after Layer A.
-- Free-threaded/no-GIL builds remain unsupported until Layer B.
+- Regular CPython 3.12-3.14 builds are supported.
+- Isolated subinterpreters with a per-interpreter GIL are supported (Layer A complete).
+- Free-threaded CPython 3.14t (Py_GIL_DISABLED=1) is supported (Layer B complete).
+  The extension declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and synchronizes all
+  mutable state with per-object critical sections, an explicit live_lock, and
+  atomic refcounts on the engine/handle contexts and the core pagespan owner.
 
 ## Lifecycle
 
