@@ -7,7 +7,6 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <stdio.h>
 
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
@@ -95,8 +94,6 @@ static int tl_py_iter_test_should_fail_next_batch(void)
 
 static void pytimelogiter_cleanup(PyTimelogIter* self)
 {
-    fprintf(stderr, "pytimelogiter_cleanup: self=%p closed=%d engine_ctx=%p\n",
-            (void*)self, (int)self->closed, (void*)self->engine_ctx);
     if (self->closed) {
         return;  /* Already cleaned up */
     }
@@ -166,14 +163,12 @@ static int PyTimelogIter_traverse(PyTimelogIter* self, visitproc visit, void* ar
 
 static int PyTimelogIter_clear(PyTimelogIter* self)
 {
-    fprintf(stderr, "PyTimelogIter_clear: self=%p\n", (void*)self);
     pytimelogiter_cleanup(self);
     return 0;
 }
 
 static void PyTimelogIter_dealloc(PyTimelogIter* self)
 {
-    fprintf(stderr, "PyTimelogIter_dealloc: self=%p\n", (void*)self);
     PyTypeObject* tp = Py_TYPE(self);
     PyObject_GC_UnTrack(self);
     pytimelogiter_cleanup(self);  /* Idempotent */

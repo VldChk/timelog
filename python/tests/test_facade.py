@@ -563,6 +563,7 @@ class TestWeakrefs:
 
         assert ref1() is None
         assert ref2() is None
+        assert len(calls) == 2
         assert sorted(label for label, _ in calls) == ["a", "b"]
         with pytest.raises(ReferenceError):
             proxy.closed
@@ -572,6 +573,7 @@ class TestWeakrefs:
         from timelog import Timelog
 
         log = Timelog(maintenance="disabled")
+        objects_iter = None
         try:
             log.extend([(i, i) for i in range(8)])
             log.flush()
@@ -580,8 +582,9 @@ class TestWeakrefs:
             span_iter = log.views(0, 8)
             span = next(span_iter)
             objects_view = span.objects()
+            objects_iter = iter(objects_view)
 
-            for obj in (row_iter, span_iter, span, objects_view):
+            for obj in (row_iter, span_iter, span, objects_view, objects_iter):
                 with pytest.raises(TypeError):
                     weakref.ref(obj)
         finally:
@@ -595,6 +598,7 @@ class TestWeakrefs:
                 span_iter.close()
             if row_iter is not None:
                 row_iter.close()
+            del objects_iter
             log.close()
 
 
@@ -638,6 +642,35 @@ class TestNonContextManagerLifecycle:
         assert log_ref() is None
         assert all(ref() is None for ref in payload_refs)
 
+    def test_default_background_auto_close_releases_payload_objects(self):
+        """Default `log = Timelog()` usage releases objects without close()."""
+        from timelog import Timelog
+
+        class Obj:
+            pass
+
+        payload_refs = []
+
+        def run_scope():
+            log = Timelog(maintenance_wakeup_ms=1)
+            payloads = [Obj() for _ in range(32)]
+            payload_refs.extend(weakref.ref(obj) for obj in payloads)
+
+            log.extend((ts, obj) for ts, obj in enumerate(payloads))
+            del payloads
+
+            log.flush()
+            assert len(list(log.all())) == 32
+            assert all(ref() is not None for ref in payload_refs)
+            return weakref.ref(log)
+
+        log_ref = run_scope()
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+        assert all(ref() is None for ref in payload_refs)
+
     def test_iterator_survives_after_user_log_reference_is_dropped(self):
         """A row iterator keeps data valid without user-held Timelog refs."""
         from timelog import Timelog
@@ -653,6 +686,34 @@ class TestNonContextManagerLifecycle:
 
         assert log_ref() is not None
         assert list(iterator) == [(0, "v0"), (1, "v1"), (2, "v2"), (3, "v3")]
+        iterator.close()
+        del iterator
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+
+    def test_large_iterator_survives_plain_scope_with_background_maintenance(self):
+        """A large iterator remains valid after `del log` in normal usage."""
+        from timelog import Timelog
+
+        n = 5000
+        log = Timelog(
+            maintenance="background",
+            maintenance_wakeup_ms=1,
+            memtable_max_bytes=65536,
+            target_page_bytes=512,
+        )
+        log.extend((i, f"v{i}") for i in range(n))
+        log.flush()
+        iterator = log.range(0, n)
+        log_ref = weakref.ref(log)
+
+        del log
+        gc.collect()
+
+        assert log_ref() is not None
+        assert list(iterator) == [(i, f"v{i}") for i in range(n)]
         iterator.close()
         del iterator
         gc.collect()
@@ -704,6 +765,36 @@ class TestNonContextManagerLifecycle:
         log.append(1, box)
         log.flush()
         iterator = log.all()
+        box.iterator = iterator
+
+        log_ref = weakref.ref(log)
+        box_ref = weakref.ref(box)
+        del log, box, iterator
+        gc.collect()
+        gc.collect()
+
+        assert log_ref() is None
+        assert box_ref() is None
+        assert not gc.garbage
+
+    def test_large_background_iterator_cycle_auto_closes_safely(self):
+        """A multi-page background Timelog cycle must collect with active pins."""
+        from timelog import Timelog
+
+        class Box:
+            pass
+
+        n = 5000
+        log = Timelog(
+            maintenance="background",
+            maintenance_wakeup_ms=1,
+            memtable_max_bytes=65536,
+            target_page_bytes=512,
+        )
+        box = Box()
+        log.extend([(0, box), *((i, f"v{i}") for i in range(1, n))])
+        log.flush()
+        iterator = log.range(0, n)
         box.iterator = iterator
 
         log_ref = weakref.ref(log)

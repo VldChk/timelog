@@ -124,8 +124,6 @@ void tl_py_engine_ctx_decref(tl_py_engine_ctx_t* ctx)
 
     uint64_t old_refcnt = atomic_fetch_sub_explicit(
         &ctx->refcnt, 1, memory_order_acq_rel);
-    fprintf(stderr, "engine_ctx_decref: ctx=%p old=%lu (now %lu)\n",
-            (void*)ctx, (unsigned long)old_refcnt, (unsigned long)(old_refcnt - 1));
 
 #ifndef NDEBUG
     assert(old_refcnt > 0 && "engine context refcount underflow");
@@ -135,7 +133,11 @@ void tl_py_engine_ctx_decref(tl_py_engine_ctx_t* ctx)
         return;
     }
 
-    fprintf(stderr, "engine_ctx_decref: REACHED 0, closing ctx=%p\n", (void*)ctx);
+    /*
+     * During interpreter finalization this may join the core maintenance
+     * worker without releasing the current Python thread state. The core
+     * worker must remain Python-agnostic and must never call Python C-API.
+     */
     tl_py_engine_ctx_close(ctx, !TL_PY_IS_FINALIZING());
     PyMem_Free(ctx);
 }
@@ -1110,15 +1112,8 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
     }
     int finalizing = TL_PY_IS_FINALIZING();
     int allow_threads = (!finalizing && !from_finalizer);
-    uint64_t pins = self->handle_ctx != NULL ? tl_py_pins_count(self->handle_ctx) : 0;
-
-    /*
-     * Finalizer/GC paths must not destroy the core engine while active
-     * snapshots exist. Iterators/PageSpan owners hold engine_ctx refs and will
-     * close the engine after releasing their snapshots. Explicit close()
-     * rejects pins before reaching this helper.
-     */
-    int defer_engine_close = (pins != 0);
+    uint64_t pins = 0;
+    int defer_engine_close = 0;
     tl_py_engine_ctx_t* engine_ctx = NULL;
 
     TL_PY_LOCK(self);
@@ -1126,6 +1121,16 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         TL_PY_UNLOCK(self);
         return;
     }
+    pins = self->handle_ctx != NULL ? tl_py_pins_count(self->handle_ctx) : 0;
+    /*
+     * Finalizer/GC paths must not destroy the core engine while active
+     * snapshots exist. Sample pins while holding core_lock so an iterator
+     * cannot acquire a snapshot between the sample and close detach.
+     * Iterators/PageSpan owners hold engine_ctx refs and will close the
+     * engine after releasing their snapshots. Explicit close() rejects pins
+     * before reaching this helper and is rechecked here for race safety.
+     */
+    defer_engine_close = (pins != 0);
     self->closed = 1;
     self->tl = NULL;
     engine_ctx = self->engine_ctx;

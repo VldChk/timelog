@@ -15,10 +15,9 @@ SCAN_ROOTS = (
     ROOT / "bindings" / "cpython" / "include",
 )
 
-TEXT_SCAN_FILES = (
+EXTRA_TEXT_SCAN_FILES = (
     ROOT / "python" / "timelog" / "__init__.py",
     ROOT / "bindings" / "cpython" / "include" / "timelogpy" / "py_timelog.h",
-    ROOT / "docs" / "python-api.md",
 )
 
 
@@ -86,7 +85,14 @@ RULES = (
 TEXT_RULES = (
     Rule(
         "stale GIL-only claim",
-        re.compile(r"[Rr]equires the CPython GIL"),
+        re.compile(
+            r"(?:"
+            r"\b(?:requires|needs|must\s+hold|depends\s+on)\s+"
+            r"(?:the\s+)?(?:CPython\s+)?GIL\b"
+            r"|\bGIL[- ](?:only|based)\b"
+            r")",
+            re.IGNORECASE,
+        ),
     ),
 )
 
@@ -98,6 +104,20 @@ def iter_source_files() -> list[Path]:
             path
             for path in root.rglob("*")
             if path.suffix in {".c", ".h"} and path.is_file()
+        )
+    return sorted(files)
+
+
+def iter_text_files() -> list[Path]:
+    files = {
+        path for path in EXTRA_TEXT_SCAN_FILES
+        if path.is_file()
+    }
+    docs_root = ROOT / "docs"
+    if docs_root.is_dir():
+        files.update(
+            path for path in docs_root.rglob("*.md")
+            if path.is_file()
         )
     return sorted(files)
 
@@ -156,7 +176,7 @@ def main() -> int:
                     violations.append(f"{rel}:{lineno}: {rule.name}: {line.strip()}")
         violations.extend(check_heap_traverse_invariants(path, text))
 
-    for path in TEXT_SCAN_FILES:
+    for path in iter_text_files():
         rel = path.relative_to(ROOT)
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             for rule in TEXT_RULES:

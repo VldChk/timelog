@@ -9,7 +9,8 @@
  * - Lock-free Treiber stack for retired object queue (MPSC pattern)
  * - Pin counter prevents drain while snapshots are active
  * - on_drop callback does NOT acquire GIL or call Python C-API
- * - All Py_DECREF happens in drain() on Python threads with GIL held
+ * - All Py_DECREF happens in drain() on the owning interpreter's attached
+ *   Python thread state
  *
  * Memory ordering model:
  * - Pin increment: RELAXED (gating counter, not a publication barrier;
@@ -52,7 +53,6 @@ static int tl_py_handle_ctx_current_interp_owns(const tl_py_handle_ctx_t* ctx)
     return current != NULL && current == ctx->interp;
 }
 
-#ifndef NDEBUG
 static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
                                                  const char* reason)
 {
@@ -73,7 +73,6 @@ static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
             pins);
     }
 }
-#endif
 
 static size_t tl_py_live_hash_ptr(const void* ptr)
 {
@@ -258,13 +257,14 @@ void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx)
         tl_py_pins_count(ctx) == 0) {
         (void)tl_py_drain_retired(ctx, 1);
         tl_py_live_release_all(ctx);
-#ifndef NDEBUG
     } else {
+        const char* reason = "no attached Python thread state";
+        if (Py_IsInitialized() && PyGILState_Check()) {
+            reason = "wrong interpreter or active pins";
+        }
         tl_py_handle_ctx_warn_unsafe_destroy(
             ctx,
-            PyGILState_Check() ? "wrong interpreter or active pins"
-                               : "no attached Python thread state");
-#endif
+            reason);
     }
 
     int heap_allocated = ctx->heap_allocated;
@@ -425,8 +425,9 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 /*===========================================================================
  * Drain Implementation
  *
- * PRECONDITION: Caller must hold the GIL.
- * Performs deferred Py_DECREF for retired objects on a Python thread.
+ * PRECONDITION: Caller runs on the owning interpreter with an attached
+ * Python thread state.
+ * Performs deferred Py_DECREF for retired objects on that thread.
  *===========================================================================*/
 
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)

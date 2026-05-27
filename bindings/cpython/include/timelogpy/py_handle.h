@@ -9,7 +9,7 @@
  * - Encode PyObject* to tl_handle_t and decode back
  * - Track active snapshot pins to prevent premature release
  * - Queue retired objects for deferred DECREF via lock-free stack
- * - Drain retired objects when safe (pins == 0 and GIL held)
+ * - Drain retired objects when safe (pins == 0 on the owning interpreter)
  * - Track live handles (multiset) to release all objects on close()
  *
  * Thread safety:
@@ -231,7 +231,8 @@ void tl_py_pins_enter(tl_py_handle_ctx_t* ctx);
  * Exit a pinned region (after snapshot release).
  * If pins drops to 0, triggers opportunistic drain.
  *
- * PRECONDITION: Caller must hold the GIL (drain may run).
+ * PRECONDITION: Caller runs on the owning interpreter with an attached
+ * Python thread state (drain may run).
  *
  * @param ctx Handle context
  */
@@ -264,14 +265,15 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle);
 /*===========================================================================
  * Drain API
  *
- * Performs deferred DECREF on retired objects.
- * Must be called with GIL held.
+ * Performs deferred DECREF on retired objects. Must be called on the owning
+ * interpreter with an attached Python thread state.
  *===========================================================================*/
 
 /**
  * Drain retired objects, performing DECREF for each.
  *
- * PRECONDITION: Caller must hold the GIL.
+ * PRECONDITION: Caller runs on the owning interpreter with an attached
+ * Python thread state.
  *
  * Behavior:
  * - If pins > 0 and force=0: returns immediately without draining

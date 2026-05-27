@@ -310,6 +310,37 @@ TEST(init_custom_config)
     close_and_dealloc(tl);
 }
 
+TEST(engine_ctx_finalizer_deferred_by_active_pin)
+{
+    /*
+     * Simulate the iterator/PageSpan lifetime contract directly: if a
+     * Timelog dies while a snapshot pin exists, PyTimelog finalization must
+     * detach but not close the core engine. The holder's last engine_ctx
+     * decref is then responsible for tl_close().
+     */
+    PyTimelog* tl = create_timelog_custom("disabled", "raise");
+    ASSERT_NOT_NULL(tl);
+    ASSERT_NOT_NULL(tl->engine_ctx);
+    ASSERT_NOT_NULL(tl->handle_ctx);
+
+    tl_py_engine_ctx_t* engine_ctx = tl->engine_ctx;
+    tl_py_handle_ctx_t* handle_ctx = tl->handle_ctx;
+    tl_py_engine_ctx_incref(engine_ctx);
+    tl_py_handle_ctx_incref(handle_ctx);
+    tl_py_pins_enter(handle_ctx);
+
+    ASSERT_EQ(atomic_load_explicit(&engine_ctx->refcnt, memory_order_acquire), 2);
+
+    Py_DECREF((PyObject*)tl);
+
+    ASSERT_NOT_NULL(engine_ctx->tl);
+    ASSERT_EQ(atomic_load_explicit(&engine_ctx->refcnt, memory_order_acquire), 1);
+
+    tl_py_pins_exit_and_maybe_drain(handle_ctx);
+    tl_py_handle_ctx_decref(handle_ctx);
+    tl_py_engine_ctx_decref(engine_ctx);
+}
+
 TEST(init_extended_config)
 {
     PyObject* args = PyTuple_New(0);
@@ -1561,6 +1592,7 @@ int main(int argc, char* argv[])
     printf("\n[Lifecycle]\n");
     run_init_defaults();
     run_init_custom_config();
+    run_engine_ctx_finalizer_deferred_by_active_pin();
     run_init_extended_config();
     run_reinit_fails();
     run_init_ignores_shadowed_sys_modules_entry();
