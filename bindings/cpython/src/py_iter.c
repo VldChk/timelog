@@ -8,6 +8,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include "timelogpy/py_compat.h"
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_handle.h"
@@ -92,31 +93,62 @@ static int tl_py_iter_test_should_fail_next_batch(void)
  * It is idempotent (safe to call multiple times).
  *===========================================================================*/
 
-static void pytimelogiter_cleanup(PyTimelogIter* self)
+/*
+ * Detach iterator resources under the iter's critical section. If the iter
+ * is already closed, returns 0 (nothing to release). Otherwise, snapshots
+ * all owned resources into the out-params, NULLs the fields, sets closed=1,
+ * and returns 1. Caller MUST call pytimelogiter_release_resources outside
+ * the critical section with the returned values.
+ *
+ * Splitting cleanup this way lets iternext / next_batch hold the CS through
+ * the engine call (preventing close-vs-engine-call UAF) while still honoring
+ * spec §5.4: no Py_DECREF / hook / __del__ work under any internal lock.
+ */
+static int pytimelogiter_detach_locked(
+    PyTimelogIter* self,
+    tl_iter_t** out_it,
+    tl_snapshot_t** out_snap,
+    tl_py_handle_ctx_t** out_handle_ctx,
+    tl_py_engine_ctx_t** out_engine_ctx,
+    PyObject** out_owner)
 {
     if (self->closed) {
-        return;  /* Already cleaned up */
+        *out_it = NULL;
+        *out_snap = NULL;
+        *out_handle_ctx = NULL;
+        *out_engine_ctx = NULL;
+        *out_owner = NULL;
+        return 0;
     }
     self->closed = 1;
 
-    /* Clear pointers before Py_DECREF to prevent reentrancy via __del__. */
-    tl_iter_t* it = self->iter;
+    *out_it = self->iter;
     self->iter = NULL;
 
-    tl_snapshot_t* snap = self->pinned_snapshot;
+    *out_snap = self->pinned_snapshot;
     self->pinned_snapshot = NULL;
 
     self->remaining_count = 0;
 
-    tl_py_handle_ctx_t* ctx = self->handle_ctx;
-    /* handle_ctx is borrowed; keep for pin exit below */
+    *out_handle_ctx = self->handle_ctx;
+    self->handle_ctx = NULL;
 
-    tl_py_engine_ctx_t* engine_ctx = self->engine_ctx;
+    *out_engine_ctx = self->engine_ctx;
     self->engine_ctx = NULL;
 
-    PyObject* owner = self->owner;
+    *out_owner = self->owner;
     self->owner = NULL;
 
+    return 1;
+}
+
+static void pytimelogiter_release_resources(
+    tl_iter_t* it,
+    tl_snapshot_t* snap,
+    tl_py_handle_ctx_t* handle_ctx,
+    tl_py_engine_ctx_t* engine_ctx,
+    PyObject* owner)
+{
     /*
      * Release order: iter/snapshot first (C only), then pins_exit/DECREF
      * (may run Python code). Preserve exception state across the latter.
@@ -124,30 +156,45 @@ static void pytimelogiter_cleanup(PyTimelogIter* self)
     if (it) {
         tl_iter_destroy(it);
     }
-
     if (snap) {
         tl_snapshot_release(snap);
     }
 
-    /* Preserve exception state across Py_DECREF / drain. */
     PyObject *exc_type, *exc_value, *exc_tb;
     PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
 
-    if (ctx) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
+    if (handle_ctx) {
+        tl_py_pins_exit_and_maybe_drain(handle_ctx);
     }
-
     if (engine_ctx) {
         tl_py_engine_ctx_decref(engine_ctx);
     }
-
-    if (ctx) {
-        tl_py_handle_ctx_decref(ctx);
+    if (handle_ctx) {
+        tl_py_handle_ctx_decref(handle_ctx);
     }
 
     Py_XDECREF(owner);
 
     PyErr_Restore(exc_type, exc_value, exc_tb);
+}
+
+static void pytimelogiter_cleanup(PyTimelogIter* self)
+{
+    tl_iter_t* it = NULL;
+    tl_snapshot_t* snap = NULL;
+    tl_py_handle_ctx_t* handle_ctx = NULL;
+    tl_py_engine_ctx_t* engine_ctx = NULL;
+    PyObject* owner = NULL;
+    int detached;
+
+    TL_PY_OBJ_LOCK(self);
+    detached = pytimelogiter_detach_locked(
+        self, &it, &snap, &handle_ctx, &engine_ctx, &owner);
+    TL_PY_OBJ_UNLOCK();
+
+    if (detached) {
+        pytimelogiter_release_resources(it, snap, handle_ctx, engine_ctx, owner);
+    }
 }
 
 /*===========================================================================
@@ -182,56 +229,88 @@ static void PyTimelogIter_dealloc(PyTimelogIter* self)
 
 static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 {
-    /* NULL without exception signals StopIteration (CPython convention). */
-    if (self->closed) {
-        return NULL;
-    }
-
+    /*
+     * Hold the iter's CS during tl_iter_next. The engine call is pure C
+     * (does not execute Python), so the spec hard invariant ("no Python
+     * work under internal locks") is honored. The CS prevents a concurrent
+     * close() from running tl_iter_destroy(self->iter) while the engine
+     * call is in flight (which would be UAF).
+     *
+     * Py_BEGIN_CRITICAL_SECTION introduces a scope; structure the function
+     * as a single LOCK/UNLOCK pair so locally-declared inner state cannot
+     * leak past the close brace.
+     */
     tl_record_t rec;
-    tl_status_t st = tl_iter_next(self->iter, &rec);
+    tl_status_t st = TL_EOF;
+    int was_closed = 0;
+    int do_release = 0;
+    tl_iter_t* it = NULL;
+    tl_snapshot_t* snap = NULL;
+    tl_py_handle_ctx_t* handle_ctx = NULL;
+    tl_py_engine_ctx_t* engine_ctx = NULL;
+    PyObject* owner = NULL;
 
-    if (st == TL_OK) {
-        /* Fail closed on materialization error to avoid silent row loss. */
-        if (tl_py_iter_test_should_fail_iternext()) {
-            pytimelogiter_cleanup(self);
-            return NULL;
+    TL_PY_OBJ_LOCK(self);
+    if (self->closed) {
+        was_closed = 1;
+    } else {
+        st = tl_iter_next(self->iter, &rec);
+        if (st == TL_OK) {
+            if (self->remaining_valid && self->remaining_count > 0) {
+                self->remaining_count--;
+            }
+        } else {
+            /* EOF or error — detach under CS so concurrent observers see the
+             * closed transition coherently. */
+            do_release = pytimelogiter_detach_locked(
+                self, &it, &snap, &handle_ctx, &engine_ctx, &owner);
         }
-
-        PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
-
-        PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
-        if (!ts) {
-            Py_DECREF(obj);
-            pytimelogiter_cleanup(self);
-            return NULL;
-        }
-
-        PyObject* tup = PyTuple_New(2);
-        if (!tup) {
-            Py_DECREF(ts);
-            Py_DECREF(obj);
-            pytimelogiter_cleanup(self);
-            return NULL;
-        }
-
-        PyTuple_SET_ITEM(tup, 0, ts);  /* steals ref */
-        PyTuple_SET_ITEM(tup, 1, obj);
-
-        if (self->remaining_valid && self->remaining_count > 0) {
-            self->remaining_count--;
-        }
-
-        return tup;
     }
+    TL_PY_OBJ_UNLOCK();
 
-    if (st == TL_EOF) {
-        pytimelogiter_cleanup(self);
+    if (was_closed) {
         return NULL;  /* StopIteration */
     }
 
-    /* Error path - cleanup and raise */
-    pytimelogiter_cleanup(self);
-    return TlPy_RaiseFromObject((PyObject*)self, st);
+    if (st != TL_OK) {
+        if (do_release) {
+            pytimelogiter_release_resources(it, snap, handle_ctx, engine_ctx, owner);
+        }
+        if (st == TL_EOF) {
+            return NULL;  /* StopIteration */
+        }
+        return TlPy_RaiseFromObject((PyObject*)self, st);
+    }
+
+    /* Materialization can run Python (refcount ops, allocations) and must
+     * happen OUTSIDE the iter's CS. The handle decoded from rec.handle is
+     * pinned by the engine snapshot until the iter is closed. */
+    if (tl_py_iter_test_should_fail_iternext()) {
+        pytimelogiter_cleanup(self);
+        return NULL;
+    }
+
+    PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
+
+    PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
+    if (!ts) {
+        Py_DECREF(obj);
+        pytimelogiter_cleanup(self);
+        return NULL;
+    }
+
+    PyObject* tup = PyTuple_New(2);
+    if (!tup) {
+        Py_DECREF(ts);
+        Py_DECREF(obj);
+        pytimelogiter_cleanup(self);
+        return NULL;
+    }
+
+    PyTuple_SET_ITEM(tup, 0, ts);  /* steals ref */
+    PyTuple_SET_ITEM(tup, 1, obj);
+
+    return tup;
 }
 
 /*===========================================================================
@@ -271,8 +350,19 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         return NULL;
     }
 
-    if (n == 0 || self->closed) {
+    if (n == 0) {
         return PyList_New(0);
+    }
+
+    /* Fast-path closed check under CS so it's race-safe. */
+    {
+        int closed_now;
+        TL_PY_OBJ_LOCK(self);
+        closed_now = self->closed;
+        TL_PY_OBJ_UNLOCK();
+        if (closed_now) {
+            return PyList_New(0);
+        }
     }
 
     PyObject* list = PyList_New(n);
@@ -282,52 +372,75 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
 
     Py_ssize_t i = 0;
     for (; i < n; i++) {
+        /* Per-record CS: lock, engine call, update counter, unlock. The
+         * engine call is the irreducible race window; holding CS through
+         * it prevents close from freeing the iter mid-call. Materialize
+         * the Python tuple outside the CS. */
         tl_record_t rec;
-        tl_status_t st = tl_iter_next(self->iter, &rec);
+        tl_status_t st = TL_EOF;
+        int was_closed = 0;
+        int do_release = 0;
+        tl_iter_t* it_local = NULL;
+        tl_snapshot_t* snap_local = NULL;
+        tl_py_handle_ctx_t* hctx_local = NULL;
+        tl_py_engine_ctx_t* ectx_local = NULL;
+        PyObject* owner_local = NULL;
 
-        if (st == TL_OK) {
-            /* Fail closed on materialization error to avoid silent row loss. */
-            if (tl_py_iter_test_should_fail_next_batch()) {
-                pytimelogiter_cleanup(self);
-                goto fail;
+        TL_PY_OBJ_LOCK(self);
+        if (self->closed) {
+            was_closed = 1;
+        } else {
+            st = tl_iter_next(self->iter, &rec);
+            if (st == TL_OK) {
+                if (self->remaining_valid && self->remaining_count > 0) {
+                    self->remaining_count--;
+                }
+            } else {
+                do_release = pytimelogiter_detach_locked(
+                    self, &it_local, &snap_local, &hctx_local,
+                    &ectx_local, &owner_local);
             }
-
-            PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
-
-            PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
-            if (!ts) {
-                Py_DECREF(obj);
-                pytimelogiter_cleanup(self);
-                goto fail;
-            }
-
-            PyObject* tup = PyTuple_New(2);
-            if (!tup) {
-                Py_DECREF(ts);
-                Py_DECREF(obj);
-                pytimelogiter_cleanup(self);
-                goto fail;
-            }
-
-            PyTuple_SET_ITEM(tup, 0, ts);
-            PyTuple_SET_ITEM(tup, 1, obj);
-            PyList_SET_ITEM(list, i, tup);
-
-            if (self->remaining_valid && self->remaining_count > 0) {
-                self->remaining_count--;
-            }
-            continue;
         }
+        TL_PY_OBJ_UNLOCK();
 
-        if (st == TL_EOF) {
-            pytimelogiter_cleanup(self);
+        if (was_closed) {
             break;
         }
+        if (st != TL_OK) {
+            if (do_release) {
+                pytimelogiter_release_resources(
+                    it_local, snap_local, hctx_local, ectx_local, owner_local);
+            }
+            if (st == TL_EOF) {
+                break;
+            }
+            TlPy_RaiseFromObject((PyObject*)self, st);
+            goto fail;
+        }
 
-        /* Error path */
-        pytimelogiter_cleanup(self);
-        TlPy_RaiseFromObject((PyObject*)self, st);
-        goto fail;
+        /* Materialize outside CS. */
+        if (tl_py_iter_test_should_fail_next_batch()) {
+            pytimelogiter_cleanup(self);
+            goto fail;
+        }
+
+        PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
+        PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
+        if (!ts) {
+            Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
+            goto fail;
+        }
+        PyObject* tup = PyTuple_New(2);
+        if (!tup) {
+            Py_DECREF(ts);
+            Py_DECREF(obj);
+            pytimelogiter_cleanup(self);
+            goto fail;
+        }
+        PyTuple_SET_ITEM(tup, 0, ts);
+        PyTuple_SET_ITEM(tup, 1, obj);
+        PyList_SET_ITEM(list, i, tup);
     }
 
     /* Trim list if exhausted before n. */
@@ -350,25 +463,36 @@ fail:
 
 static Py_ssize_t PyTimelogIter_len(PyTimelogIter* self)
 {
-    if (!self->remaining_valid) {
+    int valid;
+    uint64_t count;
+    TL_PY_OBJ_LOCK(self);
+    valid = self->remaining_valid;
+    count = self->remaining_count;
+    TL_PY_OBJ_UNLOCK();
+
+    if (!valid) {
         PyErr_SetString(PyExc_RuntimeError,
             "iterator remaining length is unavailable");
         return -1;
     }
 
-    if (self->remaining_count > (uint64_t)PY_SSIZE_T_MAX) {
+    if (count > (uint64_t)PY_SSIZE_T_MAX) {
         PyErr_SetString(PyExc_OverflowError,
             "iterator length does not fit in Py_ssize_t");
         return -1;
     }
 
-    return (Py_ssize_t)self->remaining_count;
+    return (Py_ssize_t)count;
 }
 
 static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
 {
     (void)closure;
-    return PyBool_FromLong(self->closed);
+    int closed;
+    TL_PY_OBJ_LOCK(self);
+    closed = self->closed;
+    TL_PY_OBJ_UNLOCK();
+    return PyBool_FromLong(closed);
 }
 
 /*===========================================================================
@@ -377,15 +501,29 @@ static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
 
 static PyObject* PyTimelogIter_view(PyTimelogIter* self, PyObject* Py_UNUSED(noargs))
 {
-    if (self->closed) {
+    int closed;
+    PyObject* owner;
+    tl_ts_t t1, t2;
+    TL_PY_OBJ_LOCK(self);
+    closed = self->closed;
+    /* Strong ref so close cannot drop owner between snapshot and use. */
+    owner = self->owner ? Py_NewRef(self->owner) : NULL;
+    t1 = self->range_t1;
+    t2 = self->range_t2;
+    TL_PY_OBJ_UNLOCK();
+
+    if (closed) {
+        Py_XDECREF(owner);
         PyErr_SetString(PyExc_ValueError, "iterator is closed");
         return NULL;
     }
-    if (!self->owner) {
+    if (!owner) {
         PyErr_SetString(PyExc_RuntimeError, "iterator owner is no longer available");
         return NULL;
     }
-    return PyPageSpanIter_Create(self->owner, self->range_t1, self->range_t2, "segment");
+    PyObject* result = PyPageSpanIter_Create(owner, t1, t2, "segment");
+    Py_DECREF(owner);
+    return result;
 }
 
 static PyMethodDef PyTimelogIter_methods[] = {
