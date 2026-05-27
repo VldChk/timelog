@@ -457,6 +457,17 @@ static struct PyModuleDef_Slot timelog_slots[] = {
 #if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
 #endif
+#if PY_VERSION_HEX >= 0x030D0000
+    /* Layer B: this module is safe to use without the GIL on free-threaded
+     * CPython 3.13+. All mutable state is explicitly synchronized:
+     *   - PyTimelog: per-instance core_lock + atomic closed/tl mirrors
+     *   - tl_py_handle_ctx_t: live_lock + atomic retired-stack + interp pin
+     *   - PyPageSpan / PyTimelogIter / PyPageSpanIter / PyPageSpanObjectsView:
+     *     per-object critical sections on mutable fields
+     *   - tl_pagespan_owner.refcnt: atomic
+     *   - maintenance thread: never calls Python C-API */
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
     {0, NULL},
 };
 

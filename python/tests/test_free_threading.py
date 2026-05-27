@@ -1,4 +1,12 @@
-"""Compatibility-baseline tests for free-threaded import behavior."""
+"""Compatibility-baseline tests for free-threaded import behavior.
+
+Layer B contract:
+    Importing the timelog C extension on a free-threaded CPython build
+    (Py_GIL_DISABLED=1) must NOT cause the runtime to re-enable the
+    GIL. The module's PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED,
+    which the runtime honors only when the extension is correctly
+    synchronized for genuine parallelism.
+"""
 
 from __future__ import annotations
 
@@ -13,11 +21,6 @@ import pytest
 
 pytestmark = [pytest.mark.freethreading]
 
-_LAYER_B_XFAIL_REASON = (
-    "Layer B is not implemented yet: timelog does not declare no-GIL support "
-    "and still relies on GIL-era binding assumptions."
-)
-
 
 def test_import_does_not_enable_gil(compat_runtime, compat_package_root):
     compat_runtime.require_free_threaded_build()
@@ -28,22 +31,7 @@ def test_import_does_not_enable_gil(compat_runtime, compat_package_root):
         import sys
 
         before = sys._is_gil_enabled()
-
-        try:
-            import timelog
-        except Exception as exc:
-            print(
-                json.dumps(
-                    {
-                        "before": before,
-                        "after": None,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-            )
-            raise
-
+        import timelog  # noqa: F401
         after = sys._is_gil_enabled()
         print(json.dumps({"before": before, "after": after}))
         """
@@ -57,20 +45,18 @@ def test_import_does_not_enable_gil(compat_runtime, compat_package_root):
         env["PYTHONPATH"] = compat_package_root
     env["PYTHON_GIL"] = "0"
 
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-c", script],
-            check=True,
-            capture_output=True,
-            env=env,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        payload = json.loads(exc.stdout.strip().splitlines()[-1])
-        assert payload["before"] is False
-        pytest.xfail(_LAYER_B_XFAIL_REASON)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
 
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
-    assert payload["before"] is False
-    if payload["after"] != payload["before"]:
-        pytest.xfail(_LAYER_B_XFAIL_REASON)
+    assert payload["before"] is False, "PYTHON_GIL=0 should disable GIL before import"
+    assert payload["after"] is False, (
+        "Importing timelog re-enabled the GIL on a free-threaded build. "
+        "This indicates Py_mod_gil = Py_MOD_GIL_NOT_USED was not set, or "
+        "the runtime refused the declaration."
+    )
