@@ -22,7 +22,10 @@ LEG_CONFIG = {
         "marker": "subinterpreters",
     },
     "freethreading": {
-        "paths": ["python/tests/test_free_threading.py"],
+        "paths": [
+            "python/tests/test_free_threading.py",
+            "python/tests/test_freethreaded_stress.py",
+        ],
         "marker": "freethreading",
     },
     "stress": {
