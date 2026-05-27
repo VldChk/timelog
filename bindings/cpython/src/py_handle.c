@@ -43,14 +43,36 @@ struct tl_py_live_entry {
     uint8_t   state;
 };
 
-static int tl_py_handle_ctx_current_interp_owns(const tl_py_handle_ctx_t* ctx)
+/*
+ * Returns 1 if the current thread has an attached Python thread state that
+ * belongs to the same interpreter that owns this ctx.
+ *
+ * Free-threaded discipline (LLD §5.5): "attached thread state" is the right
+ * precondition for Python C-API access, NOT "GIL held". On 3.13+ we use
+ * PyThreadState_GetUnchecked (public API, does not assume GIL semantics)
+ * and PyThreadState_GetInterpreter to query the interpreter without
+ * touching opaque thread-state internals.
+ *
+ * On 3.12 (regular GIL builds only — no free-threaded mode exists), the
+ * GIL-presence check is correct and equivalent.
+ */
+static int tl_py_attached_to_interp(const tl_py_handle_ctx_t* ctx)
 {
-    if (ctx == NULL || !Py_IsInitialized() || !PyGILState_Check()) {
+    if (ctx == NULL || !Py_IsInitialized()) {
         return 0;
     }
-
-    PyInterpreterState* current = PyInterpreterState_Get();
-    return current != NULL && current == ctx->interp;
+#if PY_VERSION_HEX >= 0x030D0000
+    PyThreadState* ts = PyThreadState_GetUnchecked();
+    if (ts == NULL) {
+        return 0;
+    }
+    return PyThreadState_GetInterpreter(ts) == ctx->interp;
+#else
+    if (!PyGILState_Check()) {
+        return 0;
+    }
+    return PyInterpreterState_Get() == ctx->interp;
+#endif
 }
 
 static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
@@ -260,7 +282,7 @@ void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx)
      * contract is violated, avoid Python C-API calls and leak Python refs
      * rather than risking a crash.
      */
-    if (tl_py_handle_ctx_current_interp_owns(ctx) &&
+    if (tl_py_attached_to_interp(ctx) &&
         tl_py_pins_count(ctx) == 0) {
         (void)tl_py_drain_retired(ctx, 1);
         tl_py_live_release_all(ctx);
@@ -351,7 +373,7 @@ void tl_py_pins_enter(tl_py_handle_ctx_t* ctx)
 void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_pins_exit_and_maybe_drain requires owning interpreter");
 #endif
 
@@ -364,7 +386,7 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 #endif
 
     /* Last pin holder: opportunistically drain retired objects. */
-    if (old_pins == 1 && tl_py_handle_ctx_current_interp_owns(ctx)) {
+    if (old_pins == 1 && tl_py_attached_to_interp(ctx)) {
         (void)tl_py_drain_retired(ctx, 0);
     }
 }
@@ -447,7 +469,7 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_drain_retired requires owning interpreter");
 #endif
 
@@ -606,7 +628,7 @@ static void tl_py_live_drop_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_live_note_insert requires owning interpreter");
 #endif
 
@@ -623,7 +645,7 @@ tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
 void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_live_note_drop requires owning interpreter");
 #endif
 
@@ -639,7 +661,7 @@ void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_live_release_all requires owning interpreter");
 #endif
 
@@ -739,7 +761,7 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
 {
 #ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+    assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_handle_ctx_traverse requires owning interpreter");
 #endif
     if (ctx == NULL || visit == NULL) {
