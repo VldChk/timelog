@@ -17,7 +17,21 @@ concurrency:
 
 jobs:
   packaging-pr:
+    strategy:
+      fail-fast: false
+      matrix:
+        # cp313 is the default regular build; cp314t verifies that the
+        # free-threaded ABI wheel imports and runs the full suite under
+        # Py_GIL_DISABLED.
+        include:
+          - python: "3.13"
+            cibw_build: "cp313-manylinux_x86_64"
+            wheel_tag: "cp313"
+          - python: "3.14"
+            cibw_build: "cp314t-manylinux_x86_64"
+            wheel_tag: "cp314t"
     runs-on: ubuntu-latest
+    name: packaging-pr (${{ matrix.wheel_tag }})
 
     steps:
       - name: Checkout
@@ -26,17 +40,19 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Install packaging tools
         run: python -m pip install --upgrade pip build twine cibuildwheel
 
       - name: Build sdist
+        if: matrix.wheel_tag == 'cp313'
         run: python -m build --sdist
 
-      - name: Build representative wheel (cp313-manylinux_x86_64)
+      - name: Build representative wheel (${{ matrix.cibw_build }})
         env:
-          CIBW_BUILD: cp313-manylinux_x86_64
+          CIBW_BUILD: ${{ matrix.cibw_build }}
           CIBW_ARCHS_LINUX: x86_64
           CIBW_CONFIG_SETTINGS: >-
             cmake.define.TIMELOG_BUILD_PYTHON=true
@@ -58,7 +74,7 @@ jobs:
           python -m venv .venv-wheel
           source .venv-wheel/bin/activate
           python -m pip install --upgrade pip
-          wheel_path="$(ls dist/timelog_lib-*.whl)"
+          wheel_path="$(ls dist/timelog_lib-*${{ matrix.wheel_tag }}*.whl)"
           python -m pip install "${wheel_path}[test]"
           python -m pytest python/tests -q
           python - <<'PY'
@@ -70,9 +86,27 @@ jobs:
           print(__version__)
           PY
 
+      - name: Verify Py_mod_gil declaration honored (free-threaded only)
+        if: matrix.wheel_tag == 'cp314t'
+        shell: bash
+        run: |
+          source .venv-wheel/bin/activate
+          PYTHON_GIL=0 python - <<'PY'
+          import sys
+          before = sys._is_gil_enabled()
+          import timelog
+          after = sys._is_gil_enabled()
+          assert before is False, "PYTHON_GIL=0 should disable GIL"
+          assert after is False, (
+              "Importing timelog re-enabled the GIL on a free-threaded "
+              "build. Py_mod_gil = Py_MOD_GIL_NOT_USED was not honored."
+          )
+          print("Free-threaded import keeps GIL disabled. OK.")
+          PY
+
       - name: Upload packaging artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: packaging-pr-dist
+          name: packaging-pr-dist-${{ matrix.wheel_tag }}
           path: dist/*
