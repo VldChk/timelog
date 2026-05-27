@@ -171,7 +171,9 @@ typedef struct tl_py_handle_ctx {
     size_t                  live_cap;
     size_t                  live_len;
     size_t                  live_tombstones;
-    uint8_t                 live_tracking_failed;
+    /* Atomic so close-time consumers can sample without taking live_lock.
+     * Writes happen under live_lock for ordering with table mutations. */
+    _Atomic(uint8_t)        live_tracking_failed;
 
     /**
      * Lock protecting the live-handle table (entries, cap, len,

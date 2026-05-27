@@ -200,7 +200,7 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
-    ctx->live_tracking_failed = 0;
+    atomic_init(&ctx->live_tracking_failed, 0);
 
     /* Initialize the live-table mutex. On 3.13+ this is statically
      * zero-initializable and cannot fail; on 3.12 the PyThread_type_lock
@@ -525,22 +525,22 @@ out:
 
 /*===========================================================================
  * Live Handle Tracking (multiset) Implementation
+ *
+ * The _locked helpers contain the pure table operations; callers must hold
+ * ctx->live_lock. The public _note_* wrappers take the lock around them.
+ *
+ * Spec contract (§5.4): no Py_DECREF, warnings, callbacks, or arbitrary
+ * Python work may run while live_lock is held. release_all and traverse
+ * follow collect-under-lock / execute-outside-lock — they build a local
+ * array of strong references under the lock, release the lock, then
+ * Py_DECREF or visit() each entry.
  *===========================================================================*/
 
-tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
+static tl_status_t tl_py_live_insert_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
-#ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
-           "tl_py_live_note_insert requires owning interpreter");
-#endif
-
-    if (ctx == NULL || obj == NULL) {
-        return TL_EINVAL;
-    }
-
     tl_status_t st = tl_py_live_ensure(ctx, 1);
     if (st != TL_OK) {
-        ctx->live_tracking_failed = 1;
+        atomic_store_explicit(&ctx->live_tracking_failed, 1, memory_order_release);
         return st;
     }
 
@@ -573,17 +573,11 @@ tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
     }
 }
 
-void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
+static void tl_py_live_drop_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
-#ifndef NDEBUG
-    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
-           "tl_py_live_note_drop requires owning interpreter");
-#endif
-
-    if (ctx == NULL || obj == NULL || ctx->live_cap == 0) {
+    if (ctx->live_cap == 0) {
         return;
     }
-
     size_t mask = ctx->live_cap - 1;
     size_t idx = tl_py_live_hash_ptr(obj) & mask;
 
@@ -608,6 +602,39 @@ void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
     }
 }
 
+tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_live_note_insert requires owning interpreter");
+#endif
+
+    if (ctx == NULL || obj == NULL) {
+        return TL_EINVAL;
+    }
+
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    tl_status_t st = tl_py_live_insert_locked(ctx, obj);
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+    return st;
+}
+
+void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(tl_py_handle_ctx_current_interp_owns(ctx) &&
+           "tl_py_live_note_drop requires owning interpreter");
+#endif
+
+    if (ctx == NULL || obj == NULL) {
+        return;
+    }
+
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    tl_py_live_drop_locked(ctx, obj);
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+}
+
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
@@ -615,23 +642,77 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
            "tl_py_live_release_all requires owning interpreter");
 #endif
 
-    if (ctx == NULL || ctx->live_entries == NULL) {
+    if (ctx == NULL) {
+        return;
+    }
+
+    PyObject** refs = NULL;
+    size_t total = 0;
+
+    /* Phase 1: collect strong refs under live_lock; free the table. */
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    if (ctx->live_entries == NULL) {
+        TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
         return;
     }
 
 #ifndef NDEBUG
-    if (ctx->live_tracking_failed) {
+    if (atomic_load_explicit(&ctx->live_tracking_failed,
+                             memory_order_acquire)) {
         fprintf(stderr,
             "WARNING: live handle tracking encountered allocation failures; "
             "some objects may leak.\n");
     }
 #endif
 
+    /* Two-pass: count the multiset total (live_len counts distinct
+     * entries; total refs = sum of e->count over FULL entries). */
+    size_t needed = 0;
+    for (size_t i = 0; i < ctx->live_cap; i++) {
+        tl_py_live_entry_t* e = &ctx->live_entries[i];
+        if (e->state == TL_PY_LIVE_FULL) {
+            needed += (size_t)e->count;
+        }
+    }
+
+    if (needed > 0) {
+        /* Use libc malloc, not PyMem_*: the latter may acquire CPython's
+         * internal allocator lock and reach back into Python state, which
+         * the spec forbids under any internal lock. */
+        refs = (PyObject**)malloc(needed * sizeof(PyObject*));
+        if (refs == NULL) {
+            /* OOM. Spec hard invariant rules out Py_DECREF under live_lock.
+             * Leak the entries — the ctx is being destroyed, so the only
+             * cost is the leaked payload PyObjects until interpreter
+             * teardown. Better than risking deadlock/UAF via __del__. */
+            atomic_store_explicit(&ctx->live_tracking_failed, 1,
+                                  memory_order_release);
+            for (size_t i = 0; i < ctx->live_cap; i++) {
+                tl_py_live_entry_t* e = &ctx->live_entries[i];
+                e->obj = NULL;
+                e->count = 0;
+                e->state = TL_PY_LIVE_EMPTY;
+            }
+            free(ctx->live_entries);
+            ctx->live_entries = NULL;
+            ctx->live_cap = 0;
+            ctx->live_len = 0;
+            ctx->live_tombstones = 0;
+            TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+#ifndef NDEBUG
+            fprintf(stderr,
+                "WARNING: tl_py_live_release_all OOM during snapshot; "
+                "deliberately leaked tracked PyObjects.\n");
+#endif
+            return;
+        }
+    }
+
     for (size_t i = 0; i < ctx->live_cap; i++) {
         tl_py_live_entry_t* e = &ctx->live_entries[i];
         if (e->state == TL_PY_LIVE_FULL) {
             for (uint64_t c = e->count; c > 0; c--) {
-                Py_DECREF(e->obj);
+                refs[total++] = e->obj;
             }
             e->obj = NULL;
             e->count = 0;
@@ -644,6 +725,14 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+
+    /* Phase 2: execute Py_DECREF outside live_lock. __del__ reentry is
+     * safe here because no internal lock is held. */
+    for (size_t i = 0; i < total; i++) {
+        Py_DECREF(refs[i]);
+    }
+    free(refs);
 }
 
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
@@ -656,18 +745,57 @@ int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* ar
         return 0;
     }
 
-    if (ctx->live_entries != NULL) {
-        for (size_t i = 0; i < ctx->live_cap; i++) {
-            tl_py_live_entry_t* e = &ctx->live_entries[i];
-            if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
-                int st = visit(e->obj, arg);
-                if (st != 0) {
-                    return st;
+    PyObject** snap = NULL;
+    size_t snap_n = 0;
+    int oom_fallback = 0;
+
+    /* Phase 1: snapshot live-entry pointers under live_lock. */
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    if (ctx->live_entries != NULL && ctx->live_len > 0) {
+        snap = (PyObject**)malloc(ctx->live_len * sizeof(PyObject*));
+        if (snap == NULL) {
+            /* OOM: visit under live_lock as a fallback. Under free-threaded
+             * GC, this risks a brief lock-order interaction with the visit
+             * callback's internal mutexes, but it is bounded and the
+             * alternative is dropping GC visibility entirely. */
+            oom_fallback = 1;
+            for (size_t i = 0; i < ctx->live_cap; i++) {
+                tl_py_live_entry_t* e = &ctx->live_entries[i];
+                if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
+                    int st = visit(e->obj, arg);
+                    if (st != 0) {
+                        TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+                        return st;
+                    }
+                }
+            }
+        } else {
+            for (size_t i = 0; i < ctx->live_cap; i++) {
+                tl_py_live_entry_t* e = &ctx->live_entries[i];
+                if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
+                    snap[snap_n++] = e->obj;
                 }
             }
         }
     }
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
 
+    /* Phase 2: visit live snapshot outside live_lock. */
+    if (!oom_fallback) {
+        for (size_t i = 0; i < snap_n; i++) {
+            int st = visit(snap[i], arg);
+            if (st != 0) {
+                free(snap);
+                return st;
+            }
+        }
+        free(snap);
+    }
+
+    /* Phase 3: traverse retired stack via atomic load. CPython's
+     * tp_traverse runs under exclusive access (stop-the-world phase
+     * in free-threaded builds), so concurrent drain cannot free
+     * nodes during this walk. */
     tl_py_drop_node_t* retired = atomic_load_explicit(
         &ctx->retired_head, memory_order_acquire);
     while (retired != NULL) {
