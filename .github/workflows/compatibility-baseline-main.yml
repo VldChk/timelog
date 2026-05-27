@@ -37,14 +37,16 @@ jobs:
             compat-legs: "subinterpreters"
             stress-tests: "0"
             short-stress: "0"
-          # If hosted 3.14t resolution proves flaky, fall back to 3.13t for
-          # this advisory job only. Keep the regular subinterpreter leg on 3.14.
+          # Layer B is supported (Py_mod_gil = Py_MOD_GIL_NOT_USED). The
+          # freethreading leg now runs both the Py_mod_gil-honored import
+          # check and the LLD §7.5-7.9 stress suite under short_stress
+          # so CI runtime stays bounded but races still surface.
           - leg-label: freethreading-3.14t-ubuntu
             os: ubuntu-latest
             python-version: "3.14t"
             compat-legs: "freethreading"
             stress-tests: "0"
-            short-stress: "0"
+            short-stress: "1"
 
     steps:
       - name: Checkout
@@ -55,6 +57,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
+
+      - name: Verify free-threaded build (freethreading leg only)
+        if: matrix.leg-label == 'freethreading-3.14t-ubuntu'
+        run: |
+          python -c "import sysconfig; \
+            assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1, \
+            'expected Py_GIL_DISABLED=1 build but got regular interpreter'"
 
       - name: Install Python test dependencies
         run: python -m pip install --upgrade pip -r requirements-test.txt
