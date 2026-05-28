@@ -361,6 +361,75 @@ tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
     return st;
 }
 
+/*
+ * Acquire a consistent snapshot with all lifetime guards taken atomically
+ * under core_lock, closing the pin-before-own TOCTOU.
+ *
+ * Under the lock (where a concurrent close() cannot interleave) we:
+ *   - own a reference on handle_ctx (so drain bookkeeping survives the
+ *     unlock even if close() nulls self->handle_ctx);
+ *   - own a reference on engine_ctx (so the core tl_timelog_t cannot be
+ *     freed by a concurrent close's final engine_ctx_decref while our
+ *     snapshot still points into it — tl_close asserts snapshot_count==0);
+ *   - enter the pin (blocks retired-object drain while the snapshot lives);
+ *   - acquire the snapshot itself.
+ *
+ * On success returns 0 and the caller owns (snap, hctx, ectx); it MUST
+ * release them via tl_py_release_snapshot_pinned(). On failure returns -1
+ * with a Python exception set and no guards held.
+ */
+static int tl_py_acquire_snapshot_pinned(PyTimelog* self,
+                                         tl_snapshot_t** out_snap,
+                                         tl_py_handle_ctx_t** out_hctx,
+                                         tl_py_engine_ctx_t** out_ectx)
+{
+    *out_snap = NULL;
+    *out_hctx = NULL;
+    *out_ectx = NULL;
+
+    if (tl_py_lock_checked(self) < 0) {
+        return -1;
+    }
+
+    /* Under core_lock: self->handle_ctx / engine_ctx / tl are all stable. */
+    tl_py_handle_ctx_t* hctx = self->handle_ctx;
+    tl_py_engine_ctx_t* ectx = self->engine_ctx;
+    tl_py_handle_ctx_incref(hctx);
+    tl_py_engine_ctx_incref(ectx);
+    tl_py_pins_enter(hctx);
+
+    tl_status_t st = tl_snapshot_acquire(self->tl, out_snap);
+    TL_PY_UNLOCK(self);
+
+    if (st != TL_OK) {
+        tl_py_pins_exit_and_maybe_drain(hctx);
+        tl_py_engine_ctx_decref(ectx);
+        tl_py_handle_ctx_decref(hctx);
+        TL_PY_RAISE_STATUS(self, st);
+        return -1;
+    }
+
+    *out_hctx = hctx;
+    *out_ectx = ectx;
+    return 0;
+}
+
+static void tl_py_release_snapshot_pinned(tl_snapshot_t* snap,
+                                          tl_py_handle_ctx_t* hctx,
+                                          tl_py_engine_ctx_t* ectx)
+{
+    /* Order: release the snapshot first (drops engine snapshot_count) so
+     * that if our engine_ctx_decref below is the last ref and triggers
+     * tl_close, snapshot_count is already 0. Then exit the pin (may drain),
+     * then drop the ctx refs. None of this runs under core_lock. */
+    if (snap != NULL) {
+        tl_snapshot_release(snap);
+    }
+    tl_py_pins_exit_and_maybe_drain(hctx);
+    tl_py_engine_ctx_decref(ectx);
+    tl_py_handle_ctx_decref(hctx);
+}
+
 /*===========================================================================
  * Dict kwarg helpers for grouped config (adaptive={...}, compaction={...})
  *===========================================================================*/
@@ -1185,11 +1254,17 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         TL_PY_PRESERVE_EXC_END;
     }
 
-    if (self->core_lock) {
-        PyThread_type_lock lk = self->core_lock;
-        self->core_lock = NULL;
-        PyThread_free_lock(lk);
-    }
+    /*
+     * Do NOT free core_lock here. close() runs while the PyTimelog is still
+     * reachable from Python: a concurrent thread can pass the unlocked
+     * preflight in a method, then this thread frees core_lock, then the
+     * other thread's TL_PY_LOCK dereferences freed lock storage (UAF) — or
+     * worse, TL_PY_LOCK becomes a silent no-op (core_lock==NULL) and the
+     * method runs its locked section unsynchronized. core_lock is freed
+     * only in tp_dealloc, when refcount has reached zero and no other thread
+     * can reach the object. After close, methods still acquire the live
+     * lock and bail on the atomic closed flag.
+     */
 }
 
 static PyObject*
@@ -1856,23 +1931,16 @@ PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_snapshot_t* snap = NULL;
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
     tl_stats_t stats;
 
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_stats(snap, &stats);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_stats(snap, &stats);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st != TL_OK) {
         return TL_PY_RAISE_STATUS(self, st);
@@ -1995,21 +2063,14 @@ PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_min_ts(snap, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_min_ts(snap, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
@@ -2028,21 +2089,14 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_max_ts(snap, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_max_ts(snap, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
@@ -2070,21 +2124,14 @@ PyTimelog_next_ts(PyTimelog* self, PyObject* args)
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_next_ts(snap, (tl_ts_t)ts_ll, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_next_ts(snap, (tl_ts_t)ts_ll, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
@@ -2112,21 +2159,14 @@ PyTimelog_prev_ts(PyTimelog* self, PyObject* args)
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_prev_ts(snap, (tl_ts_t)ts_ll, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_prev_ts(snap, (tl_ts_t)ts_ll, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
@@ -2147,22 +2187,14 @@ PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_snapshot_t* snap = NULL;
-
-    tl_py_pins_enter(self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
 
-    st = tl_validate(snap);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(self->handle_ctx);
+    tl_status_t st = tl_validate(snap);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st != TL_OK) {
         return TL_PY_RAISE_STATUS(self, st);
@@ -2313,36 +2345,23 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 {
     CHECK_CLOSED(self);
 
-    tl_py_handle_ctx_t* ctx = self->handle_ctx;
     tl_py_module_state_t* mod_st = TlPy_StateFromObject((PyObject*)self);
     if (mod_st == NULL) {
         return NULL;
     }
-    if (ctx == NULL) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "timelog handle context is unavailable");
-        return NULL;
-    }
-    if (self->engine_ctx == NULL) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "timelog engine context is unavailable");
-        return NULL;
-    }
 
-    /* Enter pins BEFORE snapshot acquisition. */
-    tl_py_pins_enter(ctx);
-
+    /* Acquire snapshot + pin + owned handle_ctx/engine_ctx refs atomically
+     * under core_lock (closes the pin-before-own TOCTOU). On success these
+     * owned refs and the pin are TRANSFERRED to the iterator below — no
+     * additional incref — so the iterator's cleanup releases them exactly
+     * once. */
     tl_snapshot_t* snap = NULL;
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
-        return TL_PY_RAISE_STATUS(self, st);
-    }
+    tl_status_t st;
 
     tl_iter_t* it = NULL;
     switch (mode) {
@@ -2364,15 +2383,13 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 
         default:
             /* Unreachable: enum covers all cases, but satisfy -Wswitch-default */
-            tl_snapshot_release(snap);
-            tl_py_pins_exit_and_maybe_drain(ctx);
+            tl_py_release_snapshot_pinned(snap, hctx, ectx);
             PyErr_SetString(PyExc_SystemError, "Invalid iterator mode");
             return NULL;
     }
 
     if (st != TL_OK) {
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(ctx);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
         return TL_PY_RAISE_STATUS(self, st);
     }
 
@@ -2380,18 +2397,18 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
     PyTimelogIter* pyit = (PyTimelogIter*)iter_type->tp_alloc(iter_type, 0);
     if (!pyit) {
         tl_iter_destroy(it);
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(ctx);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
         return PyErr_NoMemory();
     }
 
+    /* Transfer the helper's owned pin + handle_ctx/engine_ctx refs and the
+     * snapshot to the iterator. No extra incref: the iterator's cleanup
+     * (pins_exit + decref both ctxs + snapshot release) balances exactly. */
     pyit->owner = Py_NewRef((PyObject*)self);
     pyit->pinned_snapshot = snap;
     pyit->iter = it;
-    tl_py_handle_ctx_incref(ctx);
-    pyit->handle_ctx = ctx;
-    tl_py_engine_ctx_incref(self->engine_ctx);
-    pyit->engine_ctx = self->engine_ctx;
+    pyit->handle_ctx = hctx;
+    pyit->engine_ctx = ectx;
     pyit->remaining_count = 0;
     pyit->remaining_valid = 0;
     pyit->closed = 0;
@@ -2438,19 +2455,18 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         Py_END_ALLOW_THREADS
     }
     if (st != TL_OK) {
-        /* Clear pointers before Py_DECREF to prevent UAF via __del__. */
+        /* Clear the iterator's pointers before Py_DECREF so its cleanup
+         * does not double-release the resources we release manually here
+         * via tl_py_release_snapshot_pinned. */
         pyit->iter = NULL;
         pyit->pinned_snapshot = NULL;
         pyit->handle_ctx = NULL;
         pyit->engine_ctx = NULL;
         pyit->closed = 1;
         tl_iter_destroy(it);
-        tl_snapshot_release(snap);
         Py_DECREF(pyit->owner);
         pyit->owner = NULL;
-        tl_py_pins_exit_and_maybe_drain(ctx);
-        tl_py_engine_ctx_decref(self->engine_ctx);
-        tl_py_handle_ctx_decref(ctx);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
         Py_DECREF(pyit);
         return TL_PY_RAISE_STATUS(self, st);
     }

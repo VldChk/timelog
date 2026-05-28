@@ -115,65 +115,63 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
 
     PyTimelog* tl_obj = (PyTimelog*)timelog;
 
-    /* Check closed state. */
-    if (tl_obj->closed || tl_obj->tl == NULL) {
-        TlPy_RaiseFromObjectFmt((PyObject*)tl_obj, TL_ESTATE,
-                                "Timelog is closed");
-        return NULL;
-    }
-    if (tl_obj->handle_ctx == NULL) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "timelog handle context is unavailable");
-        return NULL;
-    }
-    if (tl_obj->engine_ctx == NULL) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "timelog engine context is unavailable");
-        return NULL;
-    }
-
-    /* Enter pins BEFORE iter_open (snapshot acquisition). */
-    tl_py_pins_enter(tl_obj->handle_ctx);
-
-    /* Hook context: armed=0 prevents double cleanup on iter_open failure. */
+    /* Allocate the hook context before taking the lock (no lifecycle state
+     * touched yet). armed=0 prevents double cleanup on iter_open failure. */
     tl_py_pagespan_hook_ctx_t* hook_ctx = PyMem_Malloc(sizeof(*hook_ctx));
     if (hook_ctx == NULL) {
-        tl_py_pins_exit_and_maybe_drain(tl_obj->handle_ctx);
         PyErr_NoMemory();
         return NULL;
     }
-    tl_py_handle_ctx_incref(tl_obj->handle_ctx);
-    hook_ctx->ctx = tl_obj->handle_ctx;
-    tl_py_engine_ctx_incref(tl_obj->engine_ctx);
-    hook_ctx->engine_ctx = tl_obj->engine_ctx;
     hook_ctx->armed = 0;
+    hook_ctx->ctx = NULL;
+    hook_ctx->engine_ctx = NULL;
 
-    /* Set up release hook for core owner. */
+    /*
+     * Acquire all lifetime guards under core_lock so a concurrent close()
+     * cannot free handle_ctx/engine_ctx in the window between the open-state
+     * check and the pin/incref (the pin-before-own TOCTOU). Under the lock:
+     * recheck open (tl_py_lock_checked), own a handle_ctx + engine_ctx ref,
+     * enter the pin, then open the core iterator. The owned refs + pin are
+     * transferred to the hook context (released by tl_py_pagespan_on_release
+     * when the owner refcount reaches zero).
+     */
+    if (tl_py_lock_checked(tl_obj) < 0) {
+        PyMem_Free(hook_ctx);
+        return NULL;
+    }
+
+    tl_py_handle_ctx_t* hctx = tl_obj->handle_ctx;
+    tl_py_engine_ctx_t* ectx = tl_obj->engine_ctx;
+    if (hctx == NULL || ectx == NULL) {
+        TL_PY_UNLOCK(tl_obj);
+        PyMem_Free(hook_ctx);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "timelog context is unavailable");
+        return NULL;
+    }
+    tl_py_handle_ctx_incref(hctx);
+    tl_py_engine_ctx_incref(ectx);
+    tl_py_pins_enter(hctx);
+    hook_ctx->ctx = hctx;
+    hook_ctx->engine_ctx = ectx;
+
     tl_pagespan_owner_hooks_t hooks = {
         .user = hook_ctx,
         .on_release = tl_py_pagespan_on_release
     };
 
-    /* Open core iterator (acquires snapshot, creates owner). */
     uint32_t flags = TL_PAGESPAN_DEFAULT;
     tl_pagespan_iter_t* core_iter = NULL;
-
-    if (tl_py_lock_checked(tl_obj) < 0) {
-        tl_py_engine_ctx_decref(hook_ctx->engine_ctx);
-        tl_py_handle_ctx_decref(hook_ctx->ctx);
-        PyMem_Free(hook_ctx);
-        tl_py_pins_exit_and_maybe_drain(tl_obj->handle_ctx);
-        return NULL;
-    }
     tl_status_t st = tl_pagespan_iter_open(tl_obj->tl, t1, t2, flags, &hooks, &core_iter);
     TL_PY_UNLOCK(tl_obj);
 
     if (st != TL_OK) {
-        /* iter_open failed: hook not armed, manual cleanup required. */
-        tl_py_engine_ctx_decref(hook_ctx->engine_ctx);
-        tl_py_handle_ctx_decref(hook_ctx->ctx);
+        /* iter_open failed: hook not armed, manual cleanup required.
+         * Release outside the lock (pins_exit may drain Python objects). */
+        tl_py_pins_exit_and_maybe_drain(hctx);
+        tl_py_engine_ctx_decref(ectx);
+        tl_py_handle_ctx_decref(hctx);
         PyMem_Free(hook_ctx);
-        tl_py_pins_exit_and_maybe_drain(tl_obj->handle_ctx);
         TlPy_RaiseFromObject((PyObject*)tl_obj, st);
         return NULL;
     }
