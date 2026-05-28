@@ -61,20 +61,27 @@ class TestConcurrentReadStress:
         from timelog import Timelog
 
         n_readers = 4
-        per_reader = _iters(compat_runtime.short_stress, full=2_000, quick=100)
+        per_reader = _iters(compat_runtime.short_stress, full=500, quick=100)
+        # Bound the writer so total runtime is predictable regardless of
+        # reader scheduling — the goal is concurrent read/write safety, not
+        # an unbounded soak. The writer also stops as soon as readers finish.
+        writer_budget = _iters(compat_runtime.short_stress, full=20_000, quick=2_000)
+        # Readers scan a FIXED window so per-op work does not grow with the
+        # writer's appends (which would make `all` super-linear).
+        scan_window = 4096
         errors: list[BaseException] = []
         stop = threading.Event()
 
         log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
         try:
-            # Seed so readers have data to scan.
-            log.extend([(i, str(i)) for i in range(1024)])
+            log.extend([(i, str(i)) for i in range(scan_window)])
             log.flush()
 
             def writer() -> None:
                 try:
-                    i = 1024
-                    while not stop.is_set():
+                    i = scan_window
+                    end = scan_window + writer_budget
+                    while i < end and not stop.is_set():
                         log.append(i, str(i))
                         i += 1
                         if i % 256 == 0:
@@ -88,14 +95,20 @@ class TestConcurrentReadStress:
                     for _ in range(per_reader):
                         op = rng.choice(("all", "views", "page_spans", "slice"))
                         if op == "all":
+                            # Bounded scan: stop after scan_window rows so the
+                            # growing log doesn't make this op super-linear.
                             it = log.all()
                             try:
-                                count = sum(1 for _ in it)
+                                count = 0
+                                for _row in it:
+                                    count += 1
+                                    if count >= scan_window:
+                                        break
                             finally:
                                 it.close()
                             assert count >= 0
                         elif op == "views":
-                            sit = log.views(0, 100_000)
+                            sit = log.views(0, scan_window)
                             try:
                                 for span in sit:
                                     _ = span.start_ts
@@ -103,15 +116,17 @@ class TestConcurrentReadStress:
                             finally:
                                 sit.close()
                         elif op == "page_spans":
-                            psit = log.page_spans(0, 100_000)
+                            psit = log.page_spans(0, scan_window)
                             try:
                                 for span in psit:
                                     _ = span.end_ts
                                     span.close()
                             finally:
                                 psit.close()
-                        else:  # slice
-                            _ = log[0:64]
+                        else:  # slice — materialize so the iterator is
+                                # fully consumed and released (an un-consumed
+                                # slice iterator would pin a snapshot).
+                            _ = list(log[0:64])
                 except BaseException as exc:
                     errors.append(exc)
 
@@ -127,8 +142,9 @@ class TestConcurrentReadStress:
 
             assert not errors, f"reader/writer errors: {errors!r}"
         finally:
-            # All iterators are closed inside reader() via try/finally; gc
-            # collects any stragglers so pins drop before close.
+            # Every iterator/span is closed inside reader() via try/finally
+            # and slices are materialized, so no pins should remain. gc
+            # collects any stragglers before close as a belt-and-suspenders.
             gc.collect()
             gc.collect()
             log.close()
