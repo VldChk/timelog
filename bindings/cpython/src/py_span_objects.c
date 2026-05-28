@@ -99,11 +99,14 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
 {
     PyPageSpan* span = (PyPageSpan*)self->span;
 
-    /* Snapshot state + the indexed handle under the span's CS; build the
-     * Python ref outside the CS. */
-    int err = 0; /* 0=ok 1=closed 2=no-h 3=out-of-range */
-    Py_ssize_t len = 0;
-    tl_handle_t h = 0;
+    /* Decode AND Py_NewRef the payload UNDER the span's CS. Holding the
+     * span's CS prevents this span's close() from detaching the owner, so
+     * its snapshot (and the pin that blocks retired-object drain) stay
+     * live — the decoded object cannot be freed before we incref it. The
+     * incref is a lone INCREF of a distinct object (permitted, py_compat.h);
+     * Py_DECREF on error is moot since we only succeed here. */
+    int err = 0; /* 0=ok 1=closed 2=no-h 3=out-of-range 4=bad-handle */
+    PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK(span);
     if (span->closed) {
@@ -111,12 +114,17 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
     } else if (span->h == NULL) {
         err = 2;
     } else {
-        len = (Py_ssize_t)span->len;
+        Py_ssize_t len = (Py_ssize_t)span->len;
         Py_ssize_t adj = index < 0 ? index + len : index;
         if (adj < 0 || adj >= len) {
             err = 3;
         } else {
-            h = span->h[adj];
+            PyObject* decoded = tl_py_handle_decode(span->h[adj]);
+            if (decoded == NULL) {
+                err = 4;
+            } else {
+                obj = Py_NewRef(decoded);
+            }
         }
     }
     TL_PY_OBJ_UNLOCK();
@@ -133,13 +141,11 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
         PyErr_SetString(PyExc_IndexError, "index out of range");
         return NULL;
     }
-
-    PyObject* obj = tl_py_handle_decode(h);
-    if (!obj) {
+    if (err == 4) {
         PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
-    return Py_NewRef(obj);
+    return obj;
 }
 
 /*===========================================================================
@@ -192,11 +198,14 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
      *  - self->index (read+advance on this iter)
      *  - span->closed/h/len (read on the span)
      * Use the two-object critical section to acquire both atomically and
-     * avoid lock-order issues. The handle decode + Py_NewRef happen
-     * outside both critical sections.
+     * avoid lock-order issues. The payload is decoded AND Py_NewRef'd
+     * UNDER the span's CS (held via LOCK2): the span's CS prevents its
+     * close()/owner-detach, so the snapshot + drain-blocking pin stay live
+     * and the decoded object cannot be freed before we incref it. Only the
+     * final result return happens after the CS.
      */
-    int err = 0;  /* 0=ok 1=eof 2=no-h */
-    tl_handle_t h = 0;
+    int err = 0;  /* 0=ok 1=eof 2=no-h 3=bad-handle */
+    PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK2(self, span);
     if (span->closed || self->view == NULL) {
@@ -208,8 +217,13 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
         if (self->index >= len) {
             err = 1;
         } else {
-            h = span->h[self->index];
-            self->index++;
+            PyObject* decoded = tl_py_handle_decode(span->h[self->index]);
+            if (decoded == NULL) {
+                err = 3;
+            } else {
+                obj = Py_NewRef(decoded);
+                self->index++;
+            }
         }
     }
     TL_PY_OBJ_UNLOCK2();
@@ -221,13 +235,11 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
         PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
         return NULL;
     }
-
-    PyObject* obj = tl_py_handle_decode(h);
-    if (!obj) {
+    if (err == 3) {
         PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
-    return Py_NewRef(obj);
+    return obj;
 }
 
 static PyObject* PyPageSpanObjectsView_iter(PyPageSpanObjectsView* self)
