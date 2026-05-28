@@ -92,44 +92,72 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
  *===========================================================================*/
 
 /*
- * Cleanup using collect-under-CS / execute-outside-CS:
- *  Phase 1 (under critical section): if already closed, return; otherwise
- *  mark closed and snapshot owner + timelog into locals, then NULL the
- *  fields so concurrent readers see a closed-but-consistent span.
- *  Phase 2 (outside critical section): release the owner ref (hook may
- *  run drain) and Py_CLEAR the timelog ref (may run __del__).
- *  Spec §5.4: no Py_DECREF / hook / __del__ work under any internal lock.
+ * Detach the span's owned resources in ONE critical section, making the
+ * "check exports + mark closed + detach owner" sequence atomic with respect
+ * to a concurrent getbuffer (which checks closed + increments exports under
+ * the same CS). This closes the close-vs-buffer-export TOCTOU.
+ *
+ * Returns:
+ *   1  detached — caller MUST release (*out_owner, *out_timelog) outside CS
+ *   0  already closed — nothing to do
+ *  -1  busy — a buffer is exported and force==0; no state change
+ *
+ * force==1 (dealloc) detaches regardless of exports.
  */
-static void pagespan_cleanup(PyPageSpan* self)
+static int pagespan_detach_locked(PyPageSpan* self, int force,
+                                  tl_pagespan_owner_t** out_owner,
+                                  PyObject** out_timelog)
 {
-    tl_pagespan_owner_t* owner = NULL;
-    PyObject* timelog = NULL;
+    int result;
+    *out_owner = NULL;
+    *out_timelog = NULL;
 
     TL_PY_OBJ_LOCK(self);
-    if (!self->closed) {
+    if (self->closed) {
+        result = 0;
+    } else if (!force && self->exports > 0) {
+        result = -1;
+    } else {
         self->closed = 1;
         /* Clear borrowed pointers before releasing owner; the underlying
          * snapshot pages may be freed when the hook runs. */
         self->ts = NULL;
         self->h = NULL;
         self->len = 0;
-        owner = self->owner;
-        timelog = self->timelog;
+        *out_owner = self->owner;
+        *out_timelog = self->timelog;
         self->owner = NULL;
         self->timelog = NULL;
+        result = 1;
     }
     TL_PY_OBJ_UNLOCK();
+    return result;
+}
 
+/* Release detached resources OUTSIDE any critical section (the owner hook
+ * may drain; Py_DECREF may run __del__). Spec §5.4: no such work under a
+ * lock. */
+static void pagespan_release_detached(tl_pagespan_owner_t* owner,
+                                      PyObject* timelog)
+{
     if (owner != NULL) {
         tl_pagespan_owner_decref(owner);
     }
-
     if (timelog != NULL) {
-        /* Preserve exception state across Py_DECREF (may run __del__). */
         PyObject *exc_type, *exc_value, *exc_tb;
         PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
         Py_DECREF(timelog);
         PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
+}
+
+/* Force cleanup (dealloc/clear-without-exports). Ignores exports. */
+static void pagespan_cleanup(PyPageSpan* self)
+{
+    tl_pagespan_owner_t* owner = NULL;
+    PyObject* timelog = NULL;
+    if (pagespan_detach_locked(self, 1, &owner, &timelog) == 1) {
+        pagespan_release_detached(owner, timelog);
     }
 }
 
@@ -146,16 +174,15 @@ static int PyPageSpan_traverse(PyPageSpan* self, visitproc visit, void* arg)
 
 static int PyPageSpan_clear(PyPageSpan* self)
 {
-    /* Cannot cleanup while buffers are exported (exporter holds a strong
-     * ref to self, so dealloc cannot run; cleanup is deferred). */
-    int has_exports;
-    TL_PY_OBJ_LOCK(self);
-    has_exports = self->exports > 0;
-    TL_PY_OBJ_UNLOCK();
-    if (has_exports) {
-        return 0;
+    /* Defer cleanup while buffers are exported (the exporter holds a strong
+     * ref to self, so dealloc cannot run; cleanup happens on the last
+     * releasebuffer/close). force=0 makes the exports check atomic with the
+     * detach. */
+    tl_pagespan_owner_t* owner = NULL;
+    PyObject* timelog = NULL;
+    if (pagespan_detach_locked(self, 0, &owner, &timelog) == 1) {
+        pagespan_release_detached(owner, timelog);
     }
-    pagespan_cleanup(self);
     return 0;
 }
 
@@ -280,18 +307,21 @@ static PyObject* PyPageSpan_close(PyPageSpan* self, PyObject* noargs)
 {
     (void)noargs;
 
-    int has_exports;
-    TL_PY_OBJ_LOCK(self);
-    has_exports = self->exports > 0;
-    TL_PY_OBJ_UNLOCK();
-
-    if (has_exports) {
+    /* Atomic: the exports check and the closed/detach transition happen in
+     * one critical section, so a concurrent getbuffer cannot export a
+     * buffer in a window between "exports==0" and "mark closed". */
+    tl_pagespan_owner_t* owner = NULL;
+    PyObject* timelog = NULL;
+    int r = pagespan_detach_locked(self, 0, &owner, &timelog);
+    if (r == -1) {
         PyErr_SetString(PyExc_BufferError,
             "cannot close PageSpan: buffer is exported");
         return NULL;
     }
-
-    pagespan_cleanup(self);
+    if (r == 1) {
+        pagespan_release_detached(owner, timelog);
+    }
+    /* r == 0 (already closed) is idempotent success. */
     Py_RETURN_NONE;
 }
 
@@ -305,17 +335,13 @@ static PyObject* PyPageSpan_exit(PyPageSpan* self, PyObject* args)
 {
     (void)args;
 
-    int has_exports;
-    TL_PY_OBJ_LOCK(self);
-    has_exports = self->exports > 0;
-    TL_PY_OBJ_UNLOCK();
-
-    if (has_exports) {
-        /* Skip cleanup silently; use close() for strict error checking. */
-        Py_RETURN_FALSE;
+    /* Atomic exports check + detach. force=0: if a buffer is exported,
+     * skip cleanup silently (use close() for strict error checking). */
+    tl_pagespan_owner_t* owner = NULL;
+    PyObject* timelog = NULL;
+    if (pagespan_detach_locked(self, 0, &owner, &timelog) == 1) {
+        pagespan_release_detached(owner, timelog);
     }
-
-    pagespan_cleanup(self);
     Py_RETURN_FALSE;  /* Don't suppress exceptions */
 }
 
