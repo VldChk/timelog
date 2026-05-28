@@ -440,19 +440,26 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
     node->ts = ts;
 
     /*
-     * Treiber stack push: RELEASE CAS makes node visible to drain.
+     * Treiber stack push (multi-producer). The CAS is ACQ_REL, not plain
+     * RELEASE: the acquire half makes each producer synchronize-with the
+     * producer that published the head it links behind, so all live nodes
+     * form a single happens-before chain that the draining consumer (an
+     * ACQ_REL exchange) joins. A release-only CAS would leave deeper nodes
+     * reachable only via the C11 release-sequence-through-RMW rule, which
+     * C++20 weakened and which ThreadSanitizer does not model — surfacing a
+     * (benign-under-strict-C11 but fragile) malloc/free race on node memory.
      * Weak CAS is fine since we loop on failure.
      */
     tl_py_drop_node_t* head;
     do {
-        head = atomic_load_explicit(&ctx->retired_head, memory_order_relaxed);
+        head = atomic_load_explicit(&ctx->retired_head, memory_order_acquire);
         node->next = head;
     } while (!atomic_compare_exchange_weak_explicit(
                 &ctx->retired_head,
                 &head,
                 node,
-                memory_order_release,
-                memory_order_relaxed));
+                memory_order_acq_rel,
+                memory_order_acquire));
 
     /* Metrics counter (relaxed). */
     atomic_fetch_add_explicit(&ctx->retired_count, 1, memory_order_relaxed);
@@ -508,19 +515,22 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 
     while (list != NULL) {
         if (batch_limit != 0 && count >= batch_limit) {
-            /* Re-attach remaining nodes atomically (on_drop may be concurrent). */
+            /* Re-attach remaining nodes atomically (on_drop may be concurrent).
+             * ACQ_REL CAS for the same reason as the push path: keep all live
+             * nodes on one happens-before chain so a later drain can free them
+             * without a TSan-visible (and release-sequence-fragile) race. */
             tl_py_drop_node_t* remaining = list;
             tl_py_drop_node_t* current_head;
             do {
                 current_head = atomic_load_explicit(
-                    &ctx->retired_head, memory_order_relaxed);
+                    &ctx->retired_head, memory_order_acquire);
                 list_tail->next = current_head;
             } while (!atomic_compare_exchange_weak_explicit(
                         &ctx->retired_head,
                         &current_head,
                         remaining,
-                        memory_order_release,
-                        memory_order_relaxed));
+                        memory_order_acq_rel,
+                        memory_order_acquire));
             break;
         }
 
