@@ -365,16 +365,36 @@ cleanup:
 
 ## CPython Binding Rules
 
-### GIL (Global Interpreter Lock)
+### Thread State and Locking (post-Layer-B)
 
-- Always have an attached Python thread state when calling Python C-API functions;
-  GIL semantics may be per-interpreter.
-- Release the active interpreter GIL during long C operations: `flush`, `compact`, `stop_maintenance`, `close`
-- Re-acquire/reattach before any Python calls
+The binding supports three CPython modes: regular (single interpreter),
+subinterpreters with per-interpreter GIL (3.12+), and free-threaded
+(3.14t, `Py_mod_gil = Py_MOD_GIL_NOT_USED`). The thread-safety
+contract:
+
+- **Always have an attached Python thread state** when calling Python C-API.
+  Under free-threaded builds the GIL is absent; an attached thread state on
+  the correct interpreter is the only precondition. Probe with
+  `PyThreadState_GetUnchecked()` + `PyThreadState_GetInterpreter()` on 3.13+
+  (see `tl_py_attached_to_interp`), NOT `PyGILState_Check()`.
+- **Release the active interpreter's GIL** (if held) around long C work:
+  `flush`, `compact`, `stop_maintenance`, `close`. Use `Py_BEGIN_ALLOW_THREADS`.
+- **Internal locks** (see LLD §5.4):
+  - L1 `PyTimelog.core_lock` (`PyThread_type_lock`): lifecycle + engine entry.
+  - L2 `handle_ctx.live_lock` (`PyMutex` / `PyThread_type_lock` fallback):
+    live-handle hash table.
+  - L4 per-object `TL_PY_OBJ_LOCK` (`Py_BEGIN_CRITICAL_SECTION`): mutable
+    fields on PyTimelog{Iter}, PyPageSpan{Iter}, PyPageSpanObjects{View,Iter}.
+- **Hard invariant**: no `Py_DECREF`, weakref callback, warning, or any code
+  that may execute Python may run while ANY internal lock is held. Use the
+  collect-under-lock / execute-outside-lock pattern.
+- **Atomics**: `PyTimelog.closed` and `PyTimelog.tl` are `_Atomic`. Hot-path
+  `CHECK_CLOSED` macros use `atomic_load_explicit(acquire)`. Writes happen
+  under `core_lock` with `atomic_store_explicit(release)`.
 
 ```c
 Py_BEGIN_ALLOW_THREADS
-// Long-running C work (NO Python calls!)
+// Long-running C work (NO Python calls, NO internal locks held!)
 Py_END_ALLOW_THREADS
 ```
 
