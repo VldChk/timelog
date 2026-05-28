@@ -111,9 +111,22 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
  *   builds.
  *
  * SCOPE:
- *   Critical sections are leaf scopes. Do NOT hold them across engine
- *   calls (tl_*), Py_DECREF, allocations, warnings, or any code that may
- *   execute Python (LLD §5.4 "no Python work under internal locks").
+ *   Critical sections are leaf scopes. Do NOT hold them across Py_DECREF,
+ *   allocations that can run Python, warnings, finalizers, or any code that
+ *   may re-enter Python and try to take a lock (LLD §5.4 "no Python work
+ *   under internal locks").
+ *
+ *   Permitted under a single-object critical section:
+ *     - A lone Py_INCREF / Py_NewRef of a DISTINCT object (e.g. capturing a
+ *       strong ref to self->timelog/self->owner before releasing the lock).
+ *       INCREF executes no Python and cannot recurse into the same object's
+ *       critical section, so it is safe and is used to pin a borrowed field
+ *       for use after unlock.
+ *     - The pure-C engine iterator step (tl_iter_next / tl_pagespan_iter_next)
+ *       is deliberately held under the iterator's own critical section: it
+ *       executes no Python, acquires no lock another thread could hold while
+ *       waiting on this CS, and doing so closes the close-vs-iternext UAF
+ *       window. Do NOT generalize this to other tl_* calls that may block.
  *===========================================================================*/
 
 #if PY_VERSION_HEX >= 0x030D0000

@@ -1111,8 +1111,14 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         return;
     }
 
-    /* Idempotence guard */
-    if (self->closed || self->tl == NULL || self->engine_ctx == NULL) {
+    /* Idempotence guard (unlocked fast path). Gate only on the atomic
+     * lifecycle fields; engine_ctx is a plain pointer written under
+     * core_lock, so reading it unlocked here would be a data race. The
+     * atomic closed/tl loads are sufficient — engine_ctx transitions to
+     * NULL in lockstep with tl under core_lock, and the authoritative
+     * re-check below runs under the lock. */
+    if (atomic_load_explicit(&self->closed, memory_order_acquire) ||
+        atomic_load_explicit(&self->tl, memory_order_acquire) == NULL) {
         return;
     }
     int finalizing = TL_PY_IS_FINALIZING();

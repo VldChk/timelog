@@ -194,19 +194,20 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
     /* CPython contract: view->obj = NULL on error. */
     view->obj = NULL;
 
-    /* Reject writable up front (no state needed). */
-    if (flags & PyBUF_WRITABLE) {
-        PyErr_SetString(PyExc_BufferError, "PageSpan buffer is read-only");
-        return -1;
-    }
-
-    int err = 0;          /* 0 = ok, 1 = closed, 2 = overflow */
+    /* err codes: 0 ok, 1 closed, 2 overflow, 3 writable-rejected.
+     * The closed check is evaluated BEFORE the writable rejection to
+     * preserve the historical exception precedence (a closed span raises
+     * ValueError, not BufferError, even when a writable buffer was
+     * requested). */
+    int err = 0;
     void* ts_local = NULL;
     Py_ssize_t n_local = 0;
 
     TL_PY_OBJ_LOCK(self);
     if (self->closed || self->ts == NULL) {
         err = 1;
+    } else if (flags & PyBUF_WRITABLE) {
+        err = 3;
     } else if (self->len > (size_t)PY_SSIZE_T_MAX ||
                (Py_ssize_t)self->len >
                    PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(tl_ts_t)) {
@@ -243,6 +244,10 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
 
     if (err == 1) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
+        return -1;
+    }
+    if (err == 3) {
+        PyErr_SetString(PyExc_BufferError, "PageSpan buffer is read-only");
         return -1;
     }
     if (err == 2) {
@@ -345,30 +350,35 @@ static PyObject* PyPageSpan_copy_timestamps(PyPageSpan* self, PyObject* noargs)
 
     /* Pin the owner across the copy so the underlying ts array cannot
      * be freed by a concurrent close. Under the critical section we
-     * read length + ts pointer + the owner ref, incref the owner, then
-     * iterate outside the CS using the pinned values. */
-    int closed;
+     * validate state, snapshot length + ts pointer + owner, and incref
+     * the owner ONLY once all preconditions hold — so no exit path can
+     * leave the owner incref'd without a matching decref. Then iterate
+     * outside the CS using the pinned values.
+     *
+     * err codes: 0 ok, 1 closed, 2 no-buffer. */
+    int err = 0;
     Py_ssize_t n = 0;
     const tl_ts_t* ts_local = NULL;
     tl_pagespan_owner_t* owner = NULL;
 
     TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    if (!closed) {
+    if (self->closed) {
+        err = 1;
+    } else if (self->owner == NULL || self->ts == NULL) {
+        err = 2;
+    } else {
         n = (Py_ssize_t)self->len;
         ts_local = self->ts;
         owner = self->owner;
-        if (owner != NULL) {
-            tl_pagespan_owner_incref(owner);
-        }
+        tl_pagespan_owner_incref(owner);
     }
     TL_PY_OBJ_UNLOCK();
 
-    if (closed) {
+    if (err == 1) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
-    if (owner == NULL || ts_local == NULL) {
+    if (err == 2) {
         PyErr_SetString(PyExc_RuntimeError,
             "PageSpan has no underlying buffer");
         return NULL;

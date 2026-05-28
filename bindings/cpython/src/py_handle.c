@@ -815,22 +815,22 @@ int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* ar
         free(snap);
     }
 
-    /* Phase 3: traverse retired stack via atomic load. CPython's
-     * tp_traverse runs under exclusive access (stop-the-world phase
-     * in free-threaded builds), so concurrent drain cannot free
-     * nodes during this walk. */
-    tl_py_drop_node_t* retired = atomic_load_explicit(
-        &ctx->retired_head, memory_order_acquire);
-    while (retired != NULL) {
-        if (retired->obj != NULL) {
-            int st = visit(retired->obj, arg);
-            if (st != 0) {
-                return st;
-            }
-        }
-        retired = retired->next;
-    }
-
+    /*
+     * The retired Treiber stack is deliberately NOT walked here. Walking it
+     * would read node->next non-atomically while a concurrent
+     * tl_py_drain_retired() on another thread atomically claims the list and
+     * free()s the nodes — a use-after-free under free-threaded builds where
+     * tp_traverse can be invoked outside a stop-the-world collection (e.g.
+     * gc.get_referents() / gc.get_objects()).
+     *
+     * This loses nothing for GC correctness: an object enters the retired
+     * stack via on_drop_handle but is removed from the live table only later,
+     * during drain (tl_py_live_note_drop). So every retired-but-not-drained
+     * object that was successfully live-tracked is still reported by the
+     * Phase-1 live-table walk above. Objects that were never tracked (insert
+     * OOM) are already best-effort and may leak — acceptable, and not a
+     * UAF.
+     */
     return 0;
 }
 
