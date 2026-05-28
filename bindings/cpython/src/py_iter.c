@@ -249,6 +249,9 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     tl_py_handle_ctx_t* handle_ctx = NULL;
     tl_py_engine_ctx_t* engine_ctx = NULL;
     PyObject* owner = NULL;
+    /* Strong ref to the decoded payload, taken UNDER the CS so a concurrent
+     * close()+drain cannot free it before we materialize the result. */
+    PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK(self);
     if (self->closed) {
@@ -256,6 +259,12 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     } else {
         st = tl_iter_next(self->iter, &rec);
         if (st == TL_OK) {
+            /* Pin the payload before releasing the CS. The CS keeps the
+             * iterator's pin/snapshot alive, so the decoded object is still
+             * live here; the incref makes it survive a subsequent concurrent
+             * close()+drain. (Lone INCREF of a distinct object under a
+             * single-object CS — permitted, see py_compat.h.) */
+            obj = Py_NewRef(tl_py_handle_decode(rec.handle));
             if (self->remaining_valid && self->remaining_count > 0) {
                 self->remaining_count--;
             }
@@ -282,15 +291,13 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
         return TlPy_RaiseFromObject((PyObject*)self, st);
     }
 
-    /* Materialization can run Python (refcount ops, allocations) and must
-     * happen OUTSIDE the iter's CS. The handle decoded from rec.handle is
-     * pinned by the engine snapshot until the iter is closed. */
+    /* obj is now an owned strong ref. Remaining materialization (the
+     * timestamp Long + the result tuple) runs OUTSIDE the CS. */
     if (tl_py_iter_test_should_fail_iternext()) {
+        Py_DECREF(obj);
         pytimelogiter_cleanup(self);
         return NULL;
     }
-
-    PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
 
     PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
     if (!ts) {
@@ -385,6 +392,7 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         tl_py_handle_ctx_t* hctx_local = NULL;
         tl_py_engine_ctx_t* ectx_local = NULL;
         PyObject* owner_local = NULL;
+        PyObject* obj = NULL;  /* payload ref taken under CS (see iternext) */
 
         TL_PY_OBJ_LOCK(self);
         if (self->closed) {
@@ -392,6 +400,9 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
         } else {
             st = tl_iter_next(self->iter, &rec);
             if (st == TL_OK) {
+                /* Pin the payload before releasing the CS so a concurrent
+                 * close()+drain cannot free it before materialization. */
+                obj = Py_NewRef(tl_py_handle_decode(rec.handle));
                 if (self->remaining_valid && self->remaining_count > 0) {
                     self->remaining_count--;
                 }
@@ -418,13 +429,13 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
             goto fail;
         }
 
-        /* Materialize outside CS. */
+        /* obj is owned; build the tuple outside the CS. */
         if (tl_py_iter_test_should_fail_next_batch()) {
+            Py_DECREF(obj);
             pytimelogiter_cleanup(self);
             goto fail;
         }
 
-        PyObject* obj = Py_NewRef(tl_py_handle_decode(rec.handle));
         PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
         if (!ts) {
             Py_DECREF(obj);
