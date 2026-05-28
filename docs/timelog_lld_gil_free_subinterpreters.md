@@ -67,22 +67,23 @@ Impact:
 - methods cannot directly and safely recover per-module state;
 - global error/type linkage leaks across interpreters.
 
-### B4. GIL-based internal invariants
+### B4. Pre-Layer-B synchronization invariants
 
-`py_handle.c` explicitly asserts `PyGILState_Check()` for retired-object draining and live-tracking operations. Separately, the core PageSpan owner still uses a plain `uint32_t` refcount with comments that the GIL provides serialization. The binding also releases the GIL around engine operations and uses per-instance `core_lock`, but not all mutable extension state is explicitly protected by a lock.
+`py_handle.c` now ties retired-object draining and live-tracking operations to the owning interpreter, and the core PageSpan owner refcount is atomic. The binding also releases the GIL around engine operations and uses per-instance `core_lock`, but not all mutable extension state is protected by the object-level synchronization needed for a free-threaded/no-GIL build.
 
 Impact:
 - free-threaded build correctness is not established;
 - some shared extension state is only accidentally safe today because the GIL serializes access;
-- `views()` / `PageSpan` lifetime currently relies on a core-side refcount contract that is incompatible with real no-GIL support;
-- `PyGILState_*` interactions become delicate under subinterpreters.
+- `views()` / `PageSpan` lifetime no longer depends on interpreter-lock serialization of owner refs, but PageSpan object fields still need object-level critical sections for no-GIL support;
+- thread-state and interpreter ownership checks remain required anywhere Python references are drained or released.
 
-### B5. Public facade and docs still advertise GIL-only support
+### B5. Public facade and docs must stay phase-accurate
 
-The binding headers and Python facade still say the extension requires the CPython GIL and is unsupported on free-threaded / no-GIL builds.
+The binding headers and Python facade must distinguish regular CPython and
+per-interpreter-GIL support from the still-unsupported free-threaded/no-GIL
+target.
 
 Impact:
-- the LLD and the user-facing contract contradict each other;
 - release notes, docs, and runtime claims can drift from the actual implementation state;
 - support declarations must move in lockstep across the C layer, Python facade, packaging, and CI.
 
@@ -139,7 +140,7 @@ typedef struct {
 
     /* heap types */
     PyObject *type_timelog;
-    PyObject *type_iter;
+    PyObject *type_timelog_iter;
     PyObject *type_pagespan;
     PyObject *type_pagespan_iter;
     PyObject *type_pagespan_objects_view;
@@ -150,7 +151,7 @@ typedef struct {
 ```c
 static struct PyModuleDef_Slot timelog_slots[] = {
     {Py_mod_exec, timelog_exec},
-#if defined(TIMELOG_ENABLE_PER_INTERPRETER_SUPPORT) && PY_VERSION_HEX >= 0x030C0000
+#if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
 #endif
 #if defined(TIMELOG_ENABLE_FREE_THREADED_SUPPORT) && PY_VERSION_HEX >= 0x030D0000
@@ -176,11 +177,12 @@ static struct PyModuleDef timelog_module = {
 
 1. import machinery allocates module object + zeroed module state;
 2. `timelog_exec(module)` does:
-   - if `st->initialized != 0`, return success immediately;
+   - classify state as empty, complete, or invalid;
+   - if state is complete, transactionally re-export the existing module-owned exceptions and public types, then return success;
    - exceptions;
    - heap types via `PyType_FromModuleAndSpec()`;
-   - module exports;
-3. if initialization fails partway through, unwind partial state, leave `initialized = 0`, and return failure;
+   - transactional module exports;
+3. if initialization fails partway through, unwind partial state explicitly, leave `initialized = 0`, and return failure;
 4. set `initialized = 1` only after the module object is fully ready;
 5. module methods and type methods recover state from the module/type, never from globals.
 
@@ -192,16 +194,16 @@ static struct PyModuleDef timelog_module = {
 - the module slots carry subinterpreter / free-threaded declarations.
 
 Important staging rule:
-- do not advertise `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` until heap types are in place and no process-global Python objects remain;
+- after Layer A/Step 4, advertise `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` on CPython 3.12+;
 - do not advertise `Py_MOD_GIL_NOT_USED` until Layer B locking and lifetime work is complete.
 
 Here `TIMELOG_ENABLE_*` is pseudocode for rollout gates, not a permanent public macro surface. The real implementation can spell those gates differently, but the declarations themselves must remain phase-gated.
 
 ## 5.2 Type architecture
 
-All exported types are converted from static types to **heap types** created per-module.
+All reachable binding types are converted from static types to **heap types** created per-module.
 
-Completing this conversion is part of Layer A, not a later optional polish pass. Until the exported types are heap types and wired to module state, interpreter isolation is not complete and the module must not declare per-interpreter support.
+Completing this conversion is part of Layer A, not a later optional polish pass. Until every reachable type is a module-owned heap type wired to module state, interpreter isolation is not complete.
 
 ### Types affected
 
@@ -254,11 +256,11 @@ timelog_module_state *st = PyModule_GetState(module);
 
 #### Type-check / allocation helpers
 
-For C paths that currently do:
+For C paths that historically used static type globals:
 
 ```c
-PyObject_TypeCheck(op, &PyTimelog_Type)
-PyObject_GC_New(PyTimelogIter, &PyTimelogIter_Type)
+PyObject_TypeCheck(op, &SomeTimelogType)
+PyObject_GC_New(SomeObject, &SomeTimelogType)
 ```
 
 replace them with helpers that recover the module-local heap type first and then:
@@ -279,13 +281,17 @@ No code path may reference a global exception singleton. All raising helpers acc
 ```c
 int TlPy_InitErrors(PyObject *module, timelog_module_state *st);
 void TlPy_ClearErrors(timelog_module_state *st);
-int TlPy_ExcContext_InitFromModuleState(tl_py_exc_ctx_t *out,
-                                        const timelog_module_state *st);
-PyObject *TlPy_RaiseFromExcContext(const tl_py_exc_ctx_t *ctx,
-                                   tl_status_t status);
-PyObject *TlPy_RaiseFromExcContextFmt(const tl_py_exc_ctx_t *ctx,
-                                      tl_status_t status,
-                                      const char *fmt, ...);
+int TlPy_StateHasCompleteErrors(const timelog_module_state *st);
+PyObject *TlPy_RaiseFromState(timelog_module_state *st,
+                              tl_status_t status);
+PyObject *TlPy_RaiseFromStateFmt(timelog_module_state *st,
+                                 tl_status_t status,
+                                 const char *fmt, ...);
+PyObject *TlPy_RaiseFromObject(PyObject *obj,
+                               tl_status_t status);
+PyObject *TlPy_RaiseFromObjectFmt(PyObject *obj,
+                                  tl_status_t status,
+                                  const char *fmt, ...);
 ```
 
 ### Mapping table
@@ -301,8 +307,8 @@ PyObject *TlPy_RaiseFromExcContextFmt(const tl_py_exc_ctx_t *ctx,
 
 ### Design note
 
-Custom exception identity will be module-local. That is correct under isolation and must be accepted.
-During Step 3, live `Timelog` instances cache their exception context. Holding live objects across a manual `del sys.modules["timelog._timelog"]` / reload cycle is therefore unsupported until Step 4 replaces the temporary binding scaffold with defining-class module recovery.
+Custom exception identity is module-local. That is correct under isolation and must be accepted.
+After Step 4, live objects recover their originating module state through heap type APIs, so manual reload/reimport creates a new module identity without corrupting existing objects.
 
 ## 5.4 Internal synchronization model
 
@@ -509,8 +515,8 @@ The pure Python `timelog` package is a contract surface and must be updated.
 
 ### Changes
 
-1. Remove stale blanket statements that the extension categorically requires the CPython GIL or can never support free-threaded builds.
-   - this includes binding headers, facade docstrings, top-level docs, and any runtime warnings that still claim “requires the CPython GIL”.
+1. Remove stale blanket statements that present the extension as tied only to the process-wide CPython lock or permanently unable to support free-threaded builds.
+   - this includes binding headers, facade docstrings, top-level docs, and any runtime warnings that still make CPython-GIL-required claims.
    - blanket GIL-required language is stale once subinterpreter isolation and free-threaded support work begins landing.
 2. Replace them with phase-accurate concurrency guarantees:
    - single-writer remains required;
@@ -594,7 +600,7 @@ Build distinct wheels with explicit support tiers:
 
 ### Change set
 
-- convert `PyTimelog_Type` from static type to `PyType_Spec`;
+- convert the `Timelog` binding type from static `PyTypeObject` storage to `PyType_Spec`;
 - use heap type flags and GC hooks where needed;
 - route all module-state access through `PyType_GetModuleState()` or `PyType_GetModuleByDef()`;
 - replace global-type check / allocation helpers with module-local heap-type lookup;
@@ -605,14 +611,14 @@ Build distinct wheels with explicit support tiers:
 ### Acceptance criteria
 
 - `Timelog` can be imported in more than one interpreter in the same process;
-- no static type objects remain for exported classes;
+- no static type objects remain for reachable binding classes;
 - all methods compile and function with the heap-type access pattern.
 
 ## 6.4 `bindings/cpython/src/py_iter.c`
 
 ### Change set
 
-- convert `PyTimelogIter_Type` to heap type;
+- convert the `TimelogIter` binding type to a heap type;
 - ensure iterator holds strong references required for snapshot/module/type lifetime;
 - route errors through module state;
 - protect iterator-local mutable fields according to the synchronization matrix;
@@ -657,7 +663,7 @@ Build distinct wheels with explicit support tiers:
 
 ### Change set
 
-- replace “requires GIL” assertions with “requires attached thread state” checks or documented preconditions;
+- replace old lock-presence assertions with attached-thread-state checks or documented preconditions;
 - introduce `live_lock` for live-entry hash table;
 - audit retired/drain queue memory ordering but keep lock-free queue design;
 - ensure drain paths only execute under attached Python threads;
@@ -678,7 +684,7 @@ Build distinct wheels with explicit support tiers:
 
 - add module-state struct definitions and access helpers;
 - expose heap-type creation helpers instead of static `PyTypeObject` symbols where possible;
-- update public comments from “requires GIL” to the new attached-thread-state and locking contract.
+- update public comments to the new attached-thread-state and locking contract.
 
 ## 6.9 `python/timelog/__init__.py` and `_api.py`
 
@@ -686,7 +692,7 @@ Build distinct wheels with explicit support tiers:
 
 - update top-level docstrings and warnings;
 - add feature-detection helpers and test support utilities;
-- remove user-visible claims that the extension requires the CPython GIL;
+- remove user-visible CPython-GIL-required claims;
 - preserve user API surface.
 
 ### Acceptance criteria
@@ -857,7 +863,7 @@ Deliverables:
 - module-local exceptions
 - `state->initialized`
 - same-module `timelog_exec()` idempotence and partial-init unwind
-- explicit `Py_mod_multiple_interpreters = Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED` until true Layer A isolation lands
+- explicit refusal to declare per-interpreter support until true Layer A isolation lands
 
 Exit criteria:
 - regular-build import/use remains green;
@@ -868,7 +874,7 @@ Exit criteria:
 ## Phase C — true Layer A interpreter isolation
 
 Deliverables:
-- all exported static types converted to heap types
+- all reachable static binding types converted to heap types
 - module-state access re-plumbed
 - type-check / allocation helpers re-plumbed away from process-global `PyTypeObject` symbols
 - no process-global Python objects remain
@@ -878,7 +884,7 @@ Deliverables:
 Exit criteria:
 - all existing tests pass under regular 3.14 and subinterpreters;
 - multi-interpreter identity/isolation tests pass;
-- no static exported `PyTypeObject` remains;
+- no reachable production static binding `PyTypeObject` remains;
 - no process-global Python object state remains.
 
 ## Phase D — free-threaded correctness / true Layer B
@@ -983,8 +989,8 @@ The task is complete only when all are true:
 - [ ] same-module `timelog_exec()` is idempotent and partial-init failure unwinds to `initialized = 0`
 - [ ] no process-global Python objects remain
 - [ ] all exceptions are per-module, not global
-- [ ] all exported extension types are heap types
-- [ ] no exported static `PyTypeObject` remains
+- [ ] all reachable extension types are heap types
+- [ ] no reachable production static binding `PyTypeObject` remains
 - [ ] core `tl_pagespan_owner.refcnt` is atomic and no `views()` lifetime path relies on GIL-era serialization
 - [ ] no correctness-critical path relies on the GIL as a lock
 - [ ] no decref / warning / callback-capable work occurs under `core_lock`, `live_lock`, or object critical sections
@@ -995,7 +1001,7 @@ The task is complete only when all are true:
 - [ ] free-threaded import does not enable the GIL
 - [ ] subinterpreter smoke and independence tests pass
 - [ ] concurrent stress tests and PageSpan cross-thread release tests pass on free-threaded 3.14
-- [ ] public docs and Python facade no longer claim blanket “requires the CPython GIL” support
+- [ ] public docs and Python facade no longer make blanket CPython-GIL-required support claims
 - [ ] dual wheel families build in CI
 
 ## 11. High-level implementation plan
@@ -1046,37 +1052,29 @@ Why this is its own step:
 Checkpoint:
 - exception identity is module-local;
 - initialization and error paths no longer depend on process-global Python object storage.
-- holding live `Timelog` objects across manual reload/reimport is explicitly unsupported until Step 4 removes the temporary `sys.modules` binding scaffold.
+- any temporary reload caveat ends once Step 4 replaces cached context with heap-type module-state recovery.
 
-### Step 4. Convert exported static types to heap types and rewire access paths
+### Step 4. Complete Layer A interpreter isolation
 
 Focus:
-- migrate every exported type to a per-module heap type;
+- migrate every reachable binding type to a per-module heap type, including the internal objects-view iterator;
 - update method access, slot access, type checks, and allocation helpers to recover state through module/type APIs rather than static `PyTypeObject` symbols.
+- remove the temporary `sys.modules` binding scaffold and cached exception context.
+- enable `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` after the heap-type and module-state checks pass.
+- leave `Py_mod_gil` unset until Layer B.
+- update user-facing messaging to say subinterpreter support is available, without yet claiming free-threaded support.
 
 Why this is the Layer A turning point:
-- interpreter isolation is not real until the exported types stop being process-shared;
+- interpreter isolation is not real until all reachable binding types stop being process-shared;
 - this is the step that turns “module state exists” into “module identity is actually isolated.”
 
 Checkpoint:
-- no exported static `PyTypeObject` remains;
+- no reachable production static binding `PyTypeObject` remains;
 - module-local types, methods, and exceptions all work across multiple interpreters.
-
-### Step 5. Declare subinterpreter support only after the isolation checkpoint is real
-
-Focus:
-- enable `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` only after Step 4 is complete;
-- update user-facing messaging to say subinterpreter support is available, without yet claiming free-threaded support.
-
-Why this deserves an explicit step:
-- the declaration is a compatibility promise, not a migration milestone marker;
-- it should be switched on only once the isolation tests pass and the design constraints are actually satisfied.
-
-Checkpoint:
 - subinterpreter smoke and independence tests pass;
 - the public contract matches the implementation state.
 
-### Step 6. Make lifetime and shared-state mechanics free-thread-safe
+### Step 5. Make lifetime and shared-state mechanics free-thread-safe
 
 Focus:
 - land the core `tl_pagespan_owner` atomic refcount change;
@@ -1091,7 +1089,7 @@ Checkpoint:
 - `views()` / `PageSpan` lifetime no longer depends on caller serialization by the GIL;
 - cleanup, finalizers, and mutable object state are governed by explicit synchronization rules.
 
-### Step 7. Finish free-threaded readiness and only then declare no-GIL support
+### Step 6. Finish free-threaded readiness and only then declare no-GIL support
 
 Focus:
 - complete attached-thread-state and finalization audits;
