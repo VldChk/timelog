@@ -56,6 +56,13 @@ TIMELOG_BUILD_SHARED = false
 build = "cp312-* cp313-* cp314-* cp314t-*"
 skip = "*-musllinux_*"
 test-command = "pytest {project}/python/tests -q"
+# Bound the free-threaded stress/freethreading harnesses during the
+# per-wheel test phase. Full-depth soak runs in the dedicated sanitizer
+# and compat-baseline CI legs; the cp314t wheel test only needs to confirm
+# the free-threaded ABI imports and exercises the race windows briefly.
+# TIMELOG_SHORT_STRESS=1 switches _iters() to its quick counts so the test
+# phase stays bounded on every platform (incl. Windows/macOS cp314t).
+test-environment = { TIMELOG_SHORT_STRESS = "1" }
 test-extras = ["test"]
 
 [tool.cibuildwheel.linux]

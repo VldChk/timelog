@@ -70,23 +70,37 @@ Validated on free-threaded CPython 3.14t (`Py_GIL_DISABLED=1`, Release build wit
 
 - `python/tests/test_free_threading.py`: import does not re-enable the GIL (hard-asserted, no xfail).
 - `python/tests/test_freethreaded_stress.py` (7 stress scenarios spanning LLD §7.5 concurrent reads, §7.6 PageSpan cross-thread release, §7.7 mutable-state overlap, §7.8 drop/drain with reentrant `__del__`, §7.9 close/reopen):
-  - **`TIMELOG_SHORT_STRESS=1` (CI-bounded)**: 7/7 passed in 0.09s. This is the
-    mode the `freethreading-3.14t-ubuntu` compat-baseline leg runs.
-  - **Full-iteration (no short-stress)** on 3.14t Release, 600s per-test
-    pytest-timeout: 6/7 passed in 604s. The failing test was
-    `TestConcurrentReadStress::test_readers_against_serialized_writer`
-    which exceeded the 600s deadline at the full 2000-iter-per-reader
-    setting. pytest killed reader threads mid-iteration, leaving 4
-    snapshots pinned; the test's `finally: log.close()` then correctly
-    raised `TimelogError: Cannot close: 4 active snapshots/iterators` —
-    which is **exactly the Layer B safety**: the close path refuses to
-    drop the engine while snapshots are live, preventing the UAF the
-    refcounted engine context was designed to prevent. The test's
-    iteration count is a budget issue, not a correctness issue.
-  - All other tests (§7.6 cross-thread span release, §7.7 close/buffer
-    overlap, §7.7 iter close-vs-iternext, §7.8 drop/drain with reentrant
-    `__del__`, §7.9 close+reopen, §7.9 GC finalization) passed full-strength
-    under genuine `Py_GIL_DISABLED` parallelism.
+  - **`TIMELOG_SHORT_STRESS=1` (CI-bounded)**: 7/7 passed in ~0.08s. This is the
+    mode the `freethreading-3.14t-ubuntu` compat-baseline leg and the cp314t
+    packaging-wheel test phase run.
+  - **Full-iteration (no short-stress)** on 3.14.3t Release: 7/7 passed in
+    ~0.17s. All seven run full-strength under genuine `Py_GIL_DISABLED`
+    parallelism.
+
+  An earlier draft of this report recorded 6/7 here, with
+  `TestConcurrentReadStress::test_readers_against_serialized_writer` exceeding a
+  600s pytest-timeout. That was a *test-budget* defect, not an engine problem:
+  the readers' `all()` / `views()` / `page_spans()` operations re-scanned the
+  entire (continuously growing) log on every iteration, making per-op work
+  super-linear in the writer's append count. The test now scans a fixed
+  4096-row window, bounds the writer with an explicit budget, and materializes
+  its slice iterators, so total work is independent of thread scheduling —
+  full-iteration completes in well under a second with no pinned-snapshot
+  stragglers.
+
+  The §7.8 drop/drain scenario was likewise hardened to genuinely exercise its
+  contract. Each payload's `__del__` now re-enters a benign `log.max_ts()` read
+  (instead of merely bumping a counter), and the test forces the
+  tombstone-driven drop/drain path *while the log is open*, then asserts that
+  every payload is finalized (no leaked or un-DECREF'd handle). A binding that
+  held an internal lock across the `Py_DECREF` that fires `__del__` would
+  deadlock inside that drain — the collect-under-lock / execute-outside-lock
+  discipline (LLD §5.4) is exactly what keeps the re-entrant call safe.
+
+  The Layer B close path remains strict: `close()` refuses to drop the engine
+  while any snapshot or iterator is still live (`TimelogError: Cannot close: N
+  active snapshots/iterators`). That refusal is the backstop preventing the
+  use-after-free the refcounted engine context was designed to eliminate.
 
 ## Conclusion
 

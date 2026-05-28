@@ -24,6 +24,7 @@ import gc
 import random
 import sysconfig
 import threading
+import time
 import weakref
 
 import pytest
@@ -356,10 +357,22 @@ class TestDropDrainStress:
 
         producers = 4
         per_producer = _iters(compat_runtime.short_stress, full=2_000, quick=200)
+        total = producers * per_producer
+        # __del__ may fire concurrently on multiple drain threads, so the
+        # counter increment must be serialized to count accurately.
+        finalize_lock = threading.Lock()
         finalize_counter = {"n": 0}
 
-        # Each payload re-enters a benign timelog API in __del__ so we
-        # exercise the collect/unlock/execute discipline.
+        log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
+
+        # Each payload RE-ENTERS a benign timelog read inside __del__. The
+        # finalizer runs inside the binding's retired-stack drain (when a
+        # tombstone physically drops the handle while the log is open) or the
+        # close-time live-set sweep. If the binding held an internal lock
+        # across Py_DECREF, this re-entrant max_ts() would deadlock — the
+        # collect-under-lock / execute-outside-lock discipline (LLD §5.4) is
+        # exactly what makes it safe. Closed-state errors are expected when
+        # the finalizer fires during/after close(), so they are tolerated.
         class ReentrantPayload:
             __slots__ = ("val",)
 
@@ -367,12 +380,13 @@ class TestDropDrainStress:
                 self.val = val
 
             def __del__(self):
-                finalize_counter["n"] += 1
-                # Touch a tiny bit of Python work so the finalizer
-                # actually executes inside the binding's drain path.
-                _ = ("payload", self.val)
+                with finalize_lock:
+                    finalize_counter["n"] += 1
+                try:
+                    log.max_ts()
+                except Exception:
+                    pass
 
-        log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
         errors: list[BaseException] = []
 
         def producer(start: int) -> None:
@@ -389,6 +403,7 @@ class TestDropDrainStress:
             ]
             for t in threads:
                 t.start()
+            # Concurrent flush cycles while producers append.
             for _ in range(5):
                 try:
                     log.flush()
@@ -397,12 +412,56 @@ class TestDropDrainStress:
             for t in threads:
                 t.join()
 
-            log.flush()
             assert not errors, f"producer errors: {errors!r}"
+
+            # Force the drop/drain path WHILE THE LOG IS OPEN. Tombstone the
+            # whole keyspace, then repeatedly flush + compact (so the covered
+            # handles are physically dropped onto the retired stack) and take
+            # read snapshots whose pins_exit drains the stack and fires the
+            # reentrant __del__. Background compaction is asynchronous and the
+            # concurrent flushes above may already have emptied the memtable,
+            # so a single cycle is not guaranteed to drop anything — poll with
+            # a bounded deadline instead. A lock-held-across-Py_DECREF bug
+            # would deadlock inside the drain here (caught by the suite's
+            # pytest-timeout) rather than ever reaching the assertion; the
+            # close path can't surface it because it short-circuits on the
+            # atomic closed flag before taking any lock.
+            log.delete(0, producers * 1_000_000 + per_producer)
+            deadline = time.monotonic() + 10.0
+            while finalize_counter["n"] == 0 and time.monotonic() < deadline:
+                try:
+                    log.flush()
+                except Exception:
+                    pass
+                try:
+                    log.compact()
+                except Exception:
+                    pass
+                try:
+                    log.max_ts()
+                except Exception:
+                    pass
+                time.sleep(0.002)
+
+            opened_finalized = finalize_counter["n"]
+            assert opened_finalized > 0, (
+                "no payloads were finalized via the drop/drain path while the "
+                "log was open — the reentrant __del__ contract was not "
+                "exercised (a lock held across Py_DECREF would have deadlocked "
+                "here instead)"
+            )
         finally:
             log.close()
             gc.collect()
             gc.collect()
+
+        # Every payload is eventually finalized: dropped via tombstone while
+        # the log was open, or DECREF'd by close()'s live-set sweep.
+        # Refcounting makes this deterministic once gc flushes any stragglers.
+        assert finalize_counter["n"] == total, (
+            f"expected all {total} payloads finalized, got "
+            f"{finalize_counter['n']} — a leaked/undecref'd handle"
+        )
 
 
 # ---------------------------------------------------------------------------

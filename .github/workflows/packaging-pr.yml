@@ -27,7 +27,12 @@ jobs:
           - python: "3.13"
             cibw_build: "cp313-manylinux_x86_64"
             wheel_tag: "cp313"
-          - python: "3.14"
+          # The cp314t leg MUST set up the free-threaded interpreter ("3.14t"):
+          # the host Python becomes the smoke-test venv base, and a cp314t ABI
+          # wheel only installs on a Py_GIL_DISABLED interpreter. Using plain
+          # "3.14" here would make the smoke + Py_mod_gil check run on a regular
+          # GIL build (and the cp314t wheel would fail to install).
+          - python: "3.14t"
             cibw_build: "cp314t-manylinux_x86_64"
             wheel_tag: "cp314t"
     runs-on: ubuntu-latest
@@ -70,9 +75,26 @@ jobs:
 
       - name: Wheel install + smoke tests
         shell: bash
+        env:
+          # Bound the free-threaded stress/freethreading harnesses so the
+          # smoke run stays fast; full-depth soak lives in the sanitizer legs.
+          TIMELOG_SHORT_STRESS: "1"
         run: |
           python -m venv .venv-wheel
           source .venv-wheel/bin/activate
+          # For the cp314t leg the smoke venv MUST be a Py_GIL_DISABLED
+          # interpreter: otherwise the cp314t ABI wheel cannot install and the
+          # Py_mod_gil check below would run on a regular GIL build (no signal).
+          if [ "${{ matrix.wheel_tag }}" = "cp314t" ]; then
+            python - <<'PY'
+          import sys, sysconfig
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, (
+              "cp314t smoke must run on a free-threaded interpreter; got a "
+              f"regular GIL build: {sys.version}"
+          )
+          print("Smoke venv is free-threaded (Py_GIL_DISABLED=1). OK.")
+          PY
+          fi
           python -m pip install --upgrade pip
           wheel_path="$(ls dist/timelog_lib-*${{ matrix.wheel_tag }}*.whl)"
           python -m pip install "${wheel_path}[test]"
