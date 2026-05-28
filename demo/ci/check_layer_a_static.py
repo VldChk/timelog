@@ -115,9 +115,14 @@ def iter_text_files() -> list[Path]:
     }
     docs_root = ROOT / "docs"
     if docs_root.is_dir():
+        # Scan user-facing docs only. Internal planning/acceptance artifacts
+        # under docs/superpowers/ legitimately quote historical "GIL-required"
+        # criterion names and migration-blocker descriptions, so they would
+        # produce false positives against the stale-claim text rules.
+        plans_root = docs_root / "superpowers"
         files.update(
             path for path in docs_root.rglob("*.md")
-            if path.is_file()
+            if path.is_file() and plans_root not in path.parents
         )
     return sorted(files)
 

@@ -184,7 +184,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     env:
-      TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0
+      # log_path routes TSan reports to files (pytest's capture swallows the
+      # inline report). suppressions filters known CPython-internal BRC noise
+      # so only timelog-frame races surface.
+      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0:suppressions=${{ github.workspace }}/.tsan-suppressions:log_path=${{ runner.temp }}/tsan-report"
 
     steps:
       - name: Checkout
@@ -230,19 +233,28 @@ jobs:
           TIMELOG_SHORT_STRESS: "1"
         run: |
           set +e
-          cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+          # setarch -R disables ASLR: TSan otherwise fails with
+          # "unexpected memory mapping" on recent kernels.
+          setarch -R cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
             python demo/ci/run_compat_baseline.py \
               --legs freethreading \
               --summary-json "${RUNNER_TEMP}/tsan-freethreaded.json" \
               --summary-md "${RUNNER_TEMP}/tsan-freethreaded.md" \
             2>&1 | tee "${RUNNER_TEMP}/tsan-freethreaded.log"
           exit_code=${PIPESTATUS[0]}
-          # Count TSan reports independently of pytest exit code so we
-          # surface races even when individual tests recover.
-          tsan_reports=$(grep -cE "^(WARNING|ERROR): ThreadSanitizer" \
-            "${RUNNER_TEMP}/tsan-freethreaded.log" || true)
-          if [ "${tsan_reports}" -gt 0 ]; then
-            echo "::error::ThreadSanitizer reported ${tsan_reports} races"
+          # TSan writes unsuppressed reports to ${RUNNER_TEMP}/tsan-report.<pid>.
+          # Count actual data races there (not pytest stdout, which swallows
+          # the inline report). Suppressed CPython-BRC noise is excluded by
+          # the suppressions file, so any match here is a timelog race.
+          tsan_races=0
+          for f in "${RUNNER_TEMP}"/tsan-report.*; do
+            [ -e "${f}" ] || continue
+            n=$(grep -cE "data race" "${f}" || true)
+            tsan_races=$((tsan_races + n))
+          done
+          if [ "${tsan_races}" -gt 0 ]; then
+            echo "::error::ThreadSanitizer reported ${tsan_races} unsuppressed races"
+            cat "${RUNNER_TEMP}"/tsan-report.* 2>/dev/null || true
             exit 1
           fi
           exit $exit_code
