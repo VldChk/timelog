@@ -125,8 +125,16 @@ typedef struct {
      * Refcounted handle/lifetime context.
      * Iterators and PageSpan owner hooks hold independent references so GC
      * clearing a Timelog cannot invalidate active snapshot pins.
+     *
+     * Atomic, and mutated (set to NULL) only under core_lock: a mutation or
+     * maintenance path captures an OWNED reference under core_lock before it
+     * performs post-commit bookkeeping (live-tracking / retired drain) off the
+     * lock, so a concurrent close() can neither null the field from under it
+     * nor free the context while that bookkeeping is in flight. close() defers
+     * the live-table teardown to the refcount destructor (refcnt -> 0), which
+     * by definition runs with no other reference outstanding.
      */
-    tl_py_handle_ctx_t* handle_ctx;
+    _Atomic(tl_py_handle_ctx_t*) handle_ctx;
 
     /**
      * Refcounted engine lifetime context.
