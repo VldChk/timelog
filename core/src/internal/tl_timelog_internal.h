@@ -2,16 +2,12 @@
 #define TL_TIMELOG_INTERNAL_H
 
 /*===========================================================================
- * Internal Timelog Structure Definition
+ * Internal Timelog Structure
  *
- * This header contains the SINGLE authoritative definition of struct tl_timelog.
- * It is included by:
- * - tl_timelog.c (main implementation)
- * - tl_snapshot.c (snapshot acquisition needs field access)
- * - Any future internal module that needs field access
- *
- * IMPORTANT: This is an INTERNAL header. External code must only use the
- * opaque tl_timelog_t pointer from timelog.h.
+ * Sole authoritative definition of struct tl_timelog. External callers see
+ * only the opaque tl_timelog_t pointer from timelog.h; this header is
+ * shared between internal translation units (the main implementation, the
+ * snapshot module, and any other internal module that needs field access).
  *===========================================================================*/
 
 #include "tl_defs.h"
@@ -30,28 +26,30 @@ typedef struct tl_memview_shared tl_memview_shared_t;
 /*===========================================================================
  * Maintenance Worker State Machine
  *
- * Protected by maint_mu. State transitions:
- *   STOPPED  -> RUNNING  (tl_maint_start)
- *   RUNNING  -> STOPPING (tl_maint_stop initiated)
- *   STOPPING -> STOPPED  (tl_maint_stop completed)
+ * Three states under maint_mu. Transitions:
+ *   STOPPED  -> RUNNING  via tl_maint_start
+ *   RUNNING  -> STOPPING via tl_maint_stop
+ *   STOPPING -> STOPPED  on successful join
  *
- * The 3-state machine prevents:
- * - Double-spawn: start during RUNNING returns TL_OK (idempotent)
- * - Double-join: start/stop during STOPPING returns TL_EBUSY/TL_OK
+ * The intermediate STOPPING state prevents two dangerous races:
+ *   - Double-spawn: tl_maint_start during RUNNING is idempotent (TL_OK).
+ *   - Double-join: start/stop while STOPPING returns TL_EBUSY so we never
+ *     pthread_join the same handle twice and never report TL_OK before the
+ *     worker is quiesced.
  *===========================================================================*/
 typedef enum tl_worker_state {
-    TL_WORKER_STOPPED  = 0,  /* No worker thread */
-    TL_WORKER_RUNNING  = 1,  /* Worker thread active */
-    TL_WORKER_STOPPING = 2   /* Stop requested, join in progress */
+    TL_WORKER_STOPPED  = 0,
+    TL_WORKER_RUNNING  = 1,
+    TL_WORKER_STOPPING = 2
 } tl_worker_state_t;
 
 /**
- * Core timelog instance structure.
+ * Core engine instance.
  *
- * Design notes:
- * - Cache-aligned to prevent false sharing in concurrent access
- * - Frequently accessed fields grouped together
- * - Immutable config stored inline (no indirection)
+ * Field ordering groups frequently-accessed members to reduce cache-line
+ * bouncing; config is stored inline so the hot path does not pay for a
+ * pointer chase. Mutability and lock ownership are documented per field
+ * below.
  */
 struct tl_timelog {
     /*-----------------------------------------------------------------------
@@ -60,15 +58,12 @@ struct tl_timelog {
     tl_config_t     config;
 
     /*-----------------------------------------------------------------------
-     * Effective Values (initialized from config at open)
+     * Effective Values
      *
-     * effective_ooo_budget: Derived once at init, immutable thereafter.
-     *                       Computed from config.ooo_budget_bytes or default.
-     *
-     * effective_window_size: Runtime state. Initial value from config,
-     *                        but MUTATED by adaptive segmentation during
-     *                        compaction. See tl_adaptive.h for details.
-     *                        Protected by maint_mu during updates.
+     * Both fields are derived from config at open. effective_ooo_budget is
+     * immutable for the lifetime of the instance. effective_window_size is
+     * mutable: adaptive segmentation may resize it during compaction
+     * (under maint_mu) until window_grid_frozen latches it in place.
      *-----------------------------------------------------------------------*/
     tl_ts_t         effective_window_size;
     size_t          effective_ooo_budget;
@@ -80,78 +75,80 @@ struct tl_timelog {
     tl_log_ctx_t    log;
 
     /*-----------------------------------------------------------------------
-     * Synchronization
+     * Synchronisation
      *
-     * Lock ordering: maint_mu -> flush_mu -> writer_mu -> memtable_mu
+     * Strict lock order, leftmost acquired first:
+     *   maint_mu -> flush_mu -> writer_mu -> memtable_mu
+     *
+     * Acquiring a lock to the left of one you already hold is forbidden
+     * and would deadlock against the worker thread.
      *-----------------------------------------------------------------------*/
 
-    /* Writer mutex: serializes manifest publication and snapshot capture.
-     * Held briefly during the publish phase of flush/compaction. */
+    /* Serialises manifest publication and snapshot capture. The critical
+     * section is intentionally short — all expensive work happens
+     * off-lock and only the final pointer swap is performed here. */
     tl_mutex_t      writer_mu;
 
-    /* Flush mutex: serializes flush build + publish (single flusher). */
+    /* Serialises flush build+publish so there is only ever one flusher. */
     tl_mutex_t      flush_mu;
 
-    /* Maintenance mutex: protects maint state flags and thread lifecycle. */
+    /* Protects the maintenance state machine and the pending-work flags. */
     tl_mutex_t      maint_mu;
     tl_cond_t       maint_cond;
 
-    /* Memtable mutex: protects sealed memrun queue. */
+    /* Protects the memtable's sealed-memrun ring buffer. */
     tl_mutex_t      memtable_mu;
-    tl_cond_t       memtable_cond;  /* Backpressure: sealed queue has space */
+    tl_cond_t       memtable_cond;  /* Signalled when sealed queue gains space. */
 
-    /* Seqlock for snapshot consistency. Even = idle, odd = publish in progress. */
+    /* Seqlock published with even/odd parity around manifest swaps so
+     * snapshot readers can detect torn captures and retry. */
     tl_seqlock_t    view_seq;
 
     /*-----------------------------------------------------------------------
      * Lifecycle Flag
      *
-     * is_open is only modified at open/close boundaries when no other
-     * threads should be accessing the instance.
+     * Mutated only on the open/close boundary, when no other thread can
+     * be touching the instance.
      *-----------------------------------------------------------------------*/
     bool            is_open;
 
     /*-----------------------------------------------------------------------
      * Maintenance State
      *
-     * CRITICAL: All fields in this section are protected by maint_mu.
-     * NO atomics are used. This eliminates the lost-work race condition
-     * that exists with load-then-store patterns on atomic flags.
+     * Every field in this block is protected by maint_mu and stored as a
+     * plain bool, never an atomic. The mutex doubles as the predicate
+     * barrier for maint_cond, which closes the classic lost-wakeup race
+     * that arises with naked atomic flags: a writer can set the flag while
+     * the worker is between predicate check and wait.
      *
-     * The state machine + plain bools pattern from plan_phase7.md:
-     * - State machine prevents double-spawn/double-join races
-     * - Mutex-protected flags ensure work is never lost
-     * - Flag set always happens (even if worker not RUNNING)
-     * - Signal gated on state (only when RUNNING)
+     * Signalling rule: always set the flag, but only signal the condvar
+     * when the worker is RUNNING. A flag set before tl_maint_start() is
+     * picked up automatically once the worker enters its loop.
      *-----------------------------------------------------------------------*/
-    tl_worker_state_t maint_state;      /* State machine: STOPPED/RUNNING/STOPPING */
-    bool              maint_shutdown;   /* Signal worker to exit */
-    bool              flush_pending;    /* Sealed memruns exist */
-    bool              compact_pending;  /* Compaction requested */
-    tl_thread_t       maint_thread;     /* Worker thread handle (valid when RUNNING) */
+    tl_worker_state_t maint_state;
+    bool              maint_shutdown;   /* Request the worker to exit. */
+    bool              flush_pending;    /* Sealed memrun(s) await flushing. */
+    bool              compact_pending;  /* Explicit compaction was requested. */
+    tl_thread_t       maint_thread;     /* Valid while maint_state == RUNNING. */
 
     /*-----------------------------------------------------------------------
-     * Adaptive Segmentation State (V-Next)
+     * Adaptive Segmentation State
      *
-     * Protected by maint_mu. Single writer: maintenance thread only.
-     * Tracks EWMA density and failure counters for window adaptation.
-     * The authoritative window is `effective_window_size` (above).
+     * Tracks the EWMA of segment density plus a consecutive-failure counter
+     * that the adaptive sizer uses to retune effective_window_size. Owned
+     * solely by the maintenance thread; readers acquire maint_mu.
      *-----------------------------------------------------------------------*/
     tl_adaptive_state_t adaptive;
 
     /*-----------------------------------------------------------------------
-     * Window Grid Freeze Flag (C-10)
+     * Window Grid Freeze
      *
-     * Protected by maint_mu. Once L1 segments exist, the window grid is
-     * frozen and adaptive segmentation cannot change effective_window_size.
-     * This prevents L1 overlap violations from window size changes.
-     *
-     * Set to true:
-     * - During tl_open() if manifest already has L1 segments
-     * - After first successful L1 creation in tl_compact_one()
-     *
-     * Checked in tl_compact_one() before computing adaptive candidate.
-     * Once frozen, remains frozen for the lifetime of the instance.
+     * Once any L1 segment exists, the partitioning of the time domain into
+     * non-overlapping windows is fixed for that L1's bounds; resizing the
+     * window after that point would let new L1 segments overlap their
+     * predecessors. This flag latches that condition: set true either at
+     * open (if the manifest already contains L1 segments) or the first
+     * time compaction promotes a segment to L1. Once true it remains true.
      *-----------------------------------------------------------------------*/
     bool window_grid_frozen;
 
@@ -159,53 +156,59 @@ struct tl_timelog {
      * Delta Layer
      *-----------------------------------------------------------------------*/
 
-    /* Memtable: mutable write buffer for inserts and tombstones */
+    /* Mutable write buffer that absorbs inserts and tombstones until the
+     * active run is sealed and handed off to the flusher. */
     tl_memtable_t   memtable;
 
-    /* Monotonic operation sequence (writer_mu protected) */
+    /* Monotonic operation sequence, written under writer_mu. Drives the
+     * sequence numbers stamped onto records and tombstones. */
     tl_seq_t        op_seq;
 
-    /* Snapshot memview cache (for reuse when memtable epoch unchanged) */
+    /* Shared cached memview reused across snapshot acquisitions when the
+     * memtable epoch has not changed; saves a deep copy on the hot path. */
     tl_memview_shared_t* memview_cache;
     uint64_t             memview_cache_epoch;
 
     /*-----------------------------------------------------------------------
      * Storage Layer
      *
-     * The manifest is the atomic publication root for storage.
-     * Swapped atomically under writer_mu + seqlock during flush/compaction.
+     * The manifest pointer is the engine's atomic publication root.
+     * Every flush and compaction swaps it under writer_mu and inside a
+     * seqlock write window so readers see either the pre-publish or
+     * post-publish state, never an intermediate.
      *-----------------------------------------------------------------------*/
-    tl_manifest_t*  manifest;       /* Current manifest (atomic publication root) */
-    uint32_t        next_gen;       /* Monotonic generation for new segments */
+    tl_manifest_t*  manifest;
+    uint32_t        next_gen;       /* Monotonic generation handed to new segments. */
 
     /*-----------------------------------------------------------------------
-     * Operational Counters (cumulative since open)
+     * Operational Counters
      *
-     * These are atomic because they may be incremented by the writer thread
-     * (seals, ooo_budget_hits, backpressure) or the maintenance thread
-     * (flushes, compactions) while being read by stats queries.
+     * Cumulative since open. Stored as atomics because the writer thread
+     * updates the ingest-side counters concurrently with the maintenance
+     * thread updating the flush/compact counters, and tl_stats() may
+     * sample any of them at any time. Relaxed loads are sufficient since
+     * each counter is independent of the others.
      *-----------------------------------------------------------------------*/
-    tl_atomic_u64   seals_total;        /* Memtable seals performed */
-    tl_atomic_u64   ooo_budget_hits;    /* OOO budget exceeded (forced sort) */
-    tl_atomic_u64   backpressure_waits; /* Writer blocked on sealed queue */
-    tl_atomic_u64   flushes_total;      /* Flush operations completed */
-    tl_atomic_u64   compactions_total;  /* Compaction operations completed */
-    tl_atomic_u64   compaction_retries;       /* Compaction publish retries */
-    tl_atomic_u64   compaction_publish_ebusy; /* Publish EBUSY returns */
-    /* Compaction selection observability */
-    tl_atomic_u64   compaction_select_calls;   /* Selection attempts */
-    tl_atomic_u64   compaction_select_l0_inputs; /* Total L0 inputs selected */
-    tl_atomic_u64   compaction_select_l1_inputs; /* Total L1 inputs selected */
-    tl_atomic_u64   compaction_select_no_work; /* Selections with no L0s */
+    tl_atomic_u64   seals_total;
+    tl_atomic_u64   ooo_budget_hits;            /* OOO budget exceeded (forced sort). */
+    tl_atomic_u64   backpressure_waits;         /* Writer waited on the sealed queue. */
+    tl_atomic_u64   flushes_total;
+    tl_atomic_u64   compactions_total;
+    tl_atomic_u64   compaction_retries;         /* Interim publish retries. */
+    tl_atomic_u64   compaction_publish_ebusy;   /* Publish gave up with EBUSY. */
+    tl_atomic_u64   compaction_select_calls;
+    tl_atomic_u64   compaction_select_l0_inputs;
+    tl_atomic_u64   compaction_select_l1_inputs;
+    tl_atomic_u64   compaction_select_no_work;
 
 #ifdef TL_DEBUG
     /*-----------------------------------------------------------------------
-     * Debug-Only Snapshot Tracking
-     *
-     * Counts outstanding snapshots to detect leaks at close time.
-     * Atomic because snapshots can be acquired/released from multiple threads.
+     * Debug-only outstanding snapshot count, used by tl_close() to fire
+     * an assertion when callers forget to release their snapshots before
+     * tearing the engine down. Atomic because snapshots can be acquired
+     * and released from arbitrary threads.
      *-----------------------------------------------------------------------*/
-    tl_atomic_u32   snapshot_count; /* Outstanding snapshot count */
+    tl_atomic_u32   snapshot_count;
 #endif
 };
 

@@ -1,16 +1,11 @@
 /*===========================================================================
  * test_adaptive_internal.c - Adaptive Segmentation Internal Tests
  *
- * These tests verify LLD-level invariants and internal API behavior for
- * the adaptive segmentation subsystem: density tracking, window computation,
- * and hysteresis/quantum policies.
+ * These tests verify invariants and internal API behavior for the adaptive
+ * segmentation subsystem: density tracking, window computation, and
+ * hysteresis/quantum policies.
  *
- * CLASSIFICATION: Internal (LLD-Driven)
- * These are IMPLEMENTATION tests, not SPEC tests.
- *
- * TDD Approach: Tests written FIRST to define expected behavior.
- *
- * Reference: docs/timelog_adaptive_segmentation_lld_c17.md (draft-5)
+ * CLASSIFICATION: Implementation tests, not public API contract tests.
  *===========================================================================*/
 
 #include "test_harness.h"
@@ -69,8 +64,17 @@ static bool approx_eq(double a, double b, double tol) {
     return fabs(a - b) <= tol;
 }
 
+static void init_advisory_timelog(tl_timelog_t* tl) {
+    memset(tl, 0, sizeof(*tl));
+    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&tl->maint_mu));
+}
+
+static void destroy_advisory_timelog(tl_timelog_t* tl) {
+    tl_mutex_destroy(&tl->maint_mu);
+}
+
 /*===========================================================================
- * Phase 1: Configuration Validation Tests
+ * Configuration Validation Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_config_valid) {
@@ -148,7 +152,7 @@ TEST_DECLARE(adapt_config_invalid_negative_quantum) {
 }
 
 /*===========================================================================
- * Phase 1: Candidate Computation Tests
+ * Candidate Computation Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_candidate_basic) {
@@ -182,7 +186,7 @@ TEST_DECLARE(adapt_candidate_very_low_density) {
 }
 
 /*===========================================================================
- * Phase 1: Guardrails Tests
+ * Guardrails Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_guardrails_clamp_min) {
@@ -228,7 +232,7 @@ TEST_DECLARE(adapt_guardrails_zero_max) {
 }
 
 /*===========================================================================
- * Phase 1: Hysteresis Tests
+ * Hysteresis Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_hysteresis_skip_small) {
@@ -269,7 +273,7 @@ TEST_DECLARE(adapt_hysteresis_zero_current) {
 }
 
 /*===========================================================================
- * Phase 1: Quantum Snapping Tests (NEAREST-quantum, not floor!)
+ * Quantum Snapping Tests (NEAREST-quantum, not floor!)
  *===========================================================================*/
 
 TEST_DECLARE(adapt_quantum_round_down) {
@@ -366,7 +370,7 @@ TEST_DECLARE(adapt_quantum_odd_larger) {
 }
 
 /*===========================================================================
- * Phase 2: State Initialization Tests
+ * State Initialization Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_state_init_zeros) {
@@ -386,7 +390,7 @@ TEST_DECLARE(adapt_state_init_zeros) {
 }
 
 /*===========================================================================
- * Phase 2: Density Update Tests
+ * Density Update Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_density_first_sample) {
@@ -490,7 +494,7 @@ TEST_DECLARE(adapt_density_overflow_span) {
 }
 
 /*===========================================================================
- * Phase 2: Span Computation Tests
+ * Span Computation Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_span_basic) {
@@ -522,7 +526,7 @@ TEST_DECLARE(adapt_span_large_valid) {
 }
 
 /*===========================================================================
- * Phase 3: Full Computation - Fallback Tests (Control-Loop Stability)
+ * Full Computation - Fallback Tests (Control-Loop Stability)
  *
  * CRITICAL: All fallback paths must return current_window, NOT base_window.
  *===========================================================================*/
@@ -615,7 +619,7 @@ TEST_DECLARE(adapt_fallback_candidate_zero) {
 
 TEST_DECLARE(adapt_wants_resize_disabled) {
     tl_timelog_t tl;
-    memset(&tl, 0, sizeof(tl));
+    init_advisory_timelog(&tl);
 
     tl.window_grid_frozen = false;
     tl.config.adaptive.target_records = 0;  /* disabled */
@@ -623,11 +627,12 @@ TEST_DECLARE(adapt_wants_resize_disabled) {
     tl.adaptive.flush_count = 100;
 
     TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+    destroy_advisory_timelog(&tl);
 }
 
 TEST_DECLARE(adapt_wants_resize_grid_frozen) {
     tl_timelog_t tl;
-    memset(&tl, 0, sizeof(tl));
+    init_advisory_timelog(&tl);
 
     tl.window_grid_frozen = true;
     tl.config.adaptive.target_records = 1000;
@@ -635,11 +640,12 @@ TEST_DECLARE(adapt_wants_resize_grid_frozen) {
     tl.adaptive.flush_count = 100;
 
     TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+    destroy_advisory_timelog(&tl);
 }
 
 TEST_DECLARE(adapt_wants_resize_warmup_not_met) {
     tl_timelog_t tl;
-    memset(&tl, 0, sizeof(tl));
+    init_advisory_timelog(&tl);
 
     tl.window_grid_frozen = false;
     tl.config.adaptive.target_records = 1000;
@@ -647,11 +653,12 @@ TEST_DECLARE(adapt_wants_resize_warmup_not_met) {
     tl.adaptive.flush_count = 3;
 
     TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
+    destroy_advisory_timelog(&tl);
 }
 
 TEST_DECLARE(adapt_wants_resize_warmup_met) {
     tl_timelog_t tl;
-    memset(&tl, 0, sizeof(tl));
+    init_advisory_timelog(&tl);
 
     tl.window_grid_frozen = false;
     tl.config.adaptive.target_records = 1000;
@@ -659,11 +666,12 @@ TEST_DECLARE(adapt_wants_resize_warmup_met) {
     tl.adaptive.flush_count = 4;
 
     TEST_ASSERT(tl_adaptive_wants_resize(&tl));
+    destroy_advisory_timelog(&tl);
 }
 
 TEST_DECLARE(adapt_wants_resize_zero_warmup) {
     tl_timelog_t tl;
-    memset(&tl, 0, sizeof(tl));
+    init_advisory_timelog(&tl);
 
     tl.window_grid_frozen = false;
     tl.config.adaptive.target_records = 1000;
@@ -671,10 +679,11 @@ TEST_DECLARE(adapt_wants_resize_zero_warmup) {
     tl.adaptive.flush_count = 0;
 
     TEST_ASSERT(tl_adaptive_wants_resize(&tl));
+    destroy_advisory_timelog(&tl);
 }
 
 /*===========================================================================
- * Phase 3: Full Computation - Basic Tests
+ * Full Computation - Basic Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_compute_basic) {
@@ -756,7 +765,7 @@ TEST_DECLARE(adapt_compute_full_pipeline) {
 }
 
 /*===========================================================================
- * Phase 3: Failure Tracking Tests
+ * Failure Tracking Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_failure_backoff_trigger) {
@@ -809,7 +818,7 @@ TEST_DECLARE(adapt_failure_increment) {
 }
 
 /*===========================================================================
- * Phase 9: Property Tests
+ * Property Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_prop_monotonicity) {
@@ -862,7 +871,7 @@ TEST_DECLARE(adapt_inv_within_guardrails) {
 }
 
 /*===========================================================================
- * Phase 9: Edge Case Tests
+ * Edge Case Tests
  *===========================================================================*/
 
 TEST_DECLARE(adapt_edge_ts_extremes) {
@@ -901,7 +910,7 @@ TEST_DECLARE(adapt_edge_inf_density) {
 }
 
 /*===========================================================================
- * Phase 9: E2E Configuration Tests
+ * E2E Configuration Tests
  *
  * These tests verify that adaptive configuration is properly validated
  * and integrated at tl_open() time.
@@ -1109,7 +1118,7 @@ TEST_DECLARE(adapt_e2e_compaction_commits_window) {
  *===========================================================================*/
 
 void run_adaptive_internal_tests(void) {
-    /* Phase 1: Configuration Validation */
+    /* Configuration Validation */
     RUN_TEST(adapt_config_valid);
     RUN_TEST(adapt_config_disabled_valid);
     RUN_TEST(adapt_config_invalid_min_max);
@@ -1123,14 +1132,14 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_config_invalid_negative_max_window);
     RUN_TEST(adapt_config_invalid_negative_quantum);
 
-    /* Phase 1: Candidate Computation */
+    /* Candidate Computation */
     RUN_TEST(adapt_candidate_basic);
     RUN_TEST(adapt_candidate_zero_density);
     RUN_TEST(adapt_candidate_negative_density);
     RUN_TEST(adapt_candidate_very_high_density);
     RUN_TEST(adapt_candidate_very_low_density);
 
-    /* Phase 1: Guardrails */
+    /* Guardrails */
     RUN_TEST(adapt_guardrails_clamp_min);
     RUN_TEST(adapt_guardrails_clamp_max);
     RUN_TEST(adapt_guardrails_within_range);
@@ -1139,7 +1148,7 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_guardrails_zero_min);
     RUN_TEST(adapt_guardrails_zero_max);
 
-    /* Phase 1: Hysteresis */
+    /* Hysteresis */
     RUN_TEST(adapt_hysteresis_skip_small);
     RUN_TEST(adapt_hysteresis_apply_large);
     RUN_TEST(adapt_hysteresis_at_threshold);
@@ -1147,7 +1156,7 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_hysteresis_zero_threshold);
     RUN_TEST(adapt_hysteresis_zero_current);
 
-    /* Phase 1: Quantum Snapping */
+    /* Quantum Snapping */
     RUN_TEST(adapt_quantum_round_down);
     RUN_TEST(adapt_quantum_round_up);
     RUN_TEST(adapt_quantum_round_up_600);
@@ -1157,30 +1166,30 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_quantum_overflow_guard);
     RUN_TEST(adapt_quantum_small_value);
 
-    /* Phase 1: Odd Quantum Values (uses (q+1)/2 threshold) */
+    /* Odd Quantum Values (uses (q+1)/2 threshold) */
     RUN_TEST(adapt_quantum_odd_round_down);
     RUN_TEST(adapt_quantum_odd_round_up);
     RUN_TEST(adapt_quantum_odd_boundary);
     RUN_TEST(adapt_quantum_odd_larger);
 
-    /* Phase 2: State Initialization */
+    /* State Initialization */
     RUN_TEST(adapt_state_init_zeros);
 
-    /* Phase 2: Density Updates */
+    /* Density Updates */
     RUN_TEST(adapt_density_first_sample);
     RUN_TEST(adapt_density_ewma_smoothing);
     RUN_TEST(adapt_density_empty_ignored);
     RUN_TEST(adapt_density_negative_span);
     RUN_TEST(adapt_density_overflow_span);
 
-    /* Phase 2: Span Computation */
+    /* Span Computation */
     RUN_TEST(adapt_span_basic);
     RUN_TEST(adapt_span_single_point);
     RUN_TEST(adapt_span_negative);
     RUN_TEST(adapt_span_overflow);
     RUN_TEST(adapt_span_large_valid);
 
-    /* Phase 3: Fallback Tests (Control-Loop Stability) */
+    /* Fallback Tests (Control-Loop Stability) */
     RUN_TEST(adapt_fallback_disabled);
     RUN_TEST(adapt_fallback_warmup);
     RUN_TEST(adapt_fallback_no_ewma);
@@ -1189,37 +1198,37 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_fallback_stale_zero);
     RUN_TEST(adapt_fallback_candidate_zero);
 
-    /* Phase 3: Advisory Resize Query */
+    /* Advisory Resize Query */
     RUN_TEST(adapt_wants_resize_disabled);
     RUN_TEST(adapt_wants_resize_grid_frozen);
     RUN_TEST(adapt_wants_resize_warmup_not_met);
     RUN_TEST(adapt_wants_resize_warmup_met);
     RUN_TEST(adapt_wants_resize_zero_warmup);
 
-    /* Phase 3: Full Computation */
+    /* Full Computation */
     RUN_TEST(adapt_compute_basic);
     RUN_TEST(adapt_compute_with_guardrails);
     RUN_TEST(adapt_compute_with_quantum);
     RUN_TEST(adapt_compute_hysteresis_blocks);
     RUN_TEST(adapt_compute_full_pipeline);
 
-    /* Phase 3: Failure Tracking */
+    /* Failure Tracking */
     RUN_TEST(adapt_failure_backoff_trigger);
     RUN_TEST(adapt_failure_backoff_clamp);
     RUN_TEST(adapt_failure_reset_on_success);
     RUN_TEST(adapt_failure_increment);
 
-    /* Phase 9: Property Tests */
+    /* Property Tests */
     RUN_TEST(adapt_prop_monotonicity);
     RUN_TEST(adapt_inv_window_positive);
     RUN_TEST(adapt_inv_within_guardrails);
 
-    /* Phase 9: Edge Cases */
+    /* Edge Cases */
     RUN_TEST(adapt_edge_ts_extremes);
     RUN_TEST(adapt_edge_nan_density);
     RUN_TEST(adapt_edge_inf_density);
 
-    /* Phase 9: E2E Configuration Tests */
+    /* E2E Configuration Tests */
     RUN_TEST(adapt_e2e_config_defaults_zeros);
     RUN_TEST(adapt_e2e_open_invalid_rejected);
     RUN_TEST(adapt_e2e_open_valid_accepted);

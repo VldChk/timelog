@@ -93,11 +93,11 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
 /*===========================================================================
  * Critical-section compat — Py_BEGIN_CRITICAL_SECTION (3.13+)
  *
- * Use these around mutable extension-object field accesses that the GIL
- * used to serialize. On 3.12 the macros are no-ops because the GIL
- * serializes all object access; the Layer A heap-type discipline keeps
- * a single PyTimelog instance bound to one interpreter so cross-interpreter
- * concurrency cannot happen either.
+ * Use these around mutable extension-object field accesses that need to be
+ * serialized when multiple Python threads may touch the same object. On
+ * 3.12 the macros are no-ops because the GIL serializes all object access;
+ * heap-type registration keeps a single PyTimelog instance bound to one
+ * interpreter, so cross-interpreter concurrency cannot occur there either.
  *
  * INVARIANT (PEP 703):
  *   Critical sections do NOT pin their target via refcount. They take an
@@ -112,9 +112,9 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
  *
  * SCOPE:
  *   Critical sections are leaf scopes. Do NOT hold them across Py_DECREF,
- *   allocations that can run Python, warnings, finalizers, or any code that
- *   may re-enter Python and try to take a lock (LLD §5.4 "no Python work
- *   under internal locks").
+ *   allocations that can run Python, warnings, finalizers, or any code
+ *   that may re-enter Python and try to take a lock; doing so risks
+ *   deadlock or lock-order violations.
  *
  *   Permitted under a single-object critical section:
  *     - A lone Py_INCREF / Py_NewRef of a DISTINCT object (e.g. capturing a

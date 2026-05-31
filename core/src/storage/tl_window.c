@@ -5,7 +5,8 @@
  *===========================================================================*/
 
 tl_ts_t tl_window_default_size(tl_time_unit_t unit) {
-    /* Unknown enum values get safe default (1 hour in seconds) */
+    /* Unknown values fall through to 1 hour in seconds so that a misconfigured
+     * time unit cannot return 0 and trigger division-by-zero downstream. */
     switch (unit) {
     case TL_TIME_S:  return TL_WINDOW_1H_S;
     case TL_TIME_MS: return TL_WINDOW_1H_MS;
@@ -24,17 +25,19 @@ tl_status_t tl_window_id_for_ts(tl_ts_t ts, tl_ts_t window_size,
                                  tl_ts_t window_origin, int64_t* out_id) {
     TL_ASSERT(out_id != NULL);
 
-    /* Defensive: prevent division by zero in release builds */
+    /* Reject non-positive window sizes in release builds; the floor division
+     * would otherwise hit UB. */
     if (window_size <= 0) {
         return TL_EINVAL;
     }
 
-    /* Floor division needed because C truncates toward zero for negatives */
     int64_t diff;
     if (tl_sub_overflow_i64(ts, window_origin, &diff)) {
         return TL_EOVERFLOW;
     }
 
+    /* tl_floor_div_i64 rounds toward -infinity so windows align consistently
+     * for timestamps on both sides of window_origin. */
     *out_id = tl_floor_div_i64(diff, window_size);
     return TL_OK;
 }
@@ -49,7 +52,8 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
     TL_ASSERT(out_end != NULL);
     TL_ASSERT(end_unbounded != NULL);
 
-    /* Defensive: return empty window on invalid size */
+    /* A non-positive window size cannot describe a real window; collapse to
+     * an empty range at the origin instead of taking division-by-zero UB. */
     if (window_size <= 0) {
         *out_start = window_origin;
         *out_end = window_origin;
@@ -57,7 +61,10 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
         return;
     }
 
-    /* Compute start = origin + id*size, end = start + size; saturate on overflow */
+    /* start = origin + id*size, end = start + size. Every step is overflow-
+     * checked; on overflow we either saturate to TL_TS_MAX/MIN or, if only
+     * end overflows, mark the window as unbounded so callers know the window
+     * has no finite upper bound. */
     int64_t product;
     int64_t start;
     int64_t end;
@@ -88,7 +95,8 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
         return;
     }
 
-    /* End overflow means "last window": [start, +inf) */
+    /* Only the end overflows: this is the trailing window that extends to
+     * +infinity. Encode it as (start, TL_TS_MAX, end_unbounded=true). */
     if (tl_add_overflow_i64(start, window_size, &end)) {
         *out_start = start;
         *out_end = TL_TS_MAX;

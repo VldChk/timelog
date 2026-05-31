@@ -7,35 +7,32 @@
 /*===========================================================================
  * Min-Heap
  *
- * Provides efficient K-way merge for the read path. Stores
- * (timestamp, tie_break_key) pairs and supports:
- * - Push/pop/peek in O(log K)
- * - Initial heapify in O(K)
+ * Backs the K-way merge used on the read path. Entries are ordered by
+ * (timestamp, tie_break_key); equal timestamps are broken by tie_break_key
+ * so the merge output remains deterministic. Push, pop, and peek run in
+ * O(log K); bulk construction via heapify is O(K).
  *
- * Used by:
- * - Merge iterator
- * - Memview iterator (K-way merge of memruns)
+ * Used by the segment merge iterator and the memview iterator (the latter
+ * merges the active run, OOO runs, and sealed memruns).
  *
- * Thread Safety:
- * - Not thread-safe. Caller must provide synchronization.
+ * Not thread-safe; callers serialise access externally.
  *===========================================================================*/
 
 /**
- * Heap entry for K-way merge.
- * Contains the current record from a component iterator.
+ * One slot per active component iterator. The fields hold the iterator's
+ * current record so the heap can order without dereferencing iter on every
+ * comparison; iter is followed only when the entry is popped to advance the
+ * source.
  */
 typedef struct tl_heap_entry {
-    tl_ts_t       ts;            /* Sort key (timestamp) */
-    uint32_t      tie_break_key; /* Secondary sort key for equal timestamps */
-    tl_handle_t   handle;        /* Current record handle */
-    tl_seq_t      watermark;     /* Per-record/source tombstone watermark */
-    void*         iter;          /* Opaque pointer to component iterator */
+    tl_ts_t       ts;            /* Primary sort key. */
+    uint32_t      tie_break_key; /* Disambiguates equal timestamps. */
+    tl_handle_t   handle;
+    tl_seq_t      watermark;     /* Tombstone watermark of the source. */
+    void*         iter;          /* Opaque component iterator. */
 } tl_heap_entry_t;
 
-/**
- * Min-heap for K-way merge.
- * Entries are ordered by (ts, tie_break_key).
- */
+/** Min-heap ordered by (ts, tie_break_key). */
 typedef struct tl_heap {
     tl_heap_entry_t* data;
     size_t           len;
@@ -50,17 +47,15 @@ typedef struct tl_heap {
 void tl_heap_init(tl_heap_t* h, tl_alloc_ctx_t* alloc);
 
 /**
- * Destroy heap and free memory.
- * Idempotent: safe to call on already-destroyed or zero-initialized heaps.
- * After this call, h is in a valid empty state.
+ * Release heap storage and reset to a valid empty state. Idempotent on
+ * already-destroyed or zero-initialised heaps so it can be used in cleanup
+ * paths regardless of how far initialisation progressed.
  */
 void tl_heap_destroy(tl_heap_t* h);
 
 void tl_heap_clear(tl_heap_t* h);
 
-/**
- * Reserve capacity for at least min_cap entries.
- */
+/** Grow the backing array so it can hold at least min_cap entries. */
 tl_status_t tl_heap_reserve(tl_heap_t* h, size_t min_cap);
 
 /*---------------------------------------------------------------------------
@@ -68,38 +63,33 @@ tl_status_t tl_heap_reserve(tl_heap_t* h, size_t min_cap);
  *---------------------------------------------------------------------------*/
 
 /**
- * Push an entry onto the heap.
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * @return TL_OK on success, TL_ENOMEM on allocation failure.
  */
 tl_status_t tl_heap_push(tl_heap_t* h, const tl_heap_entry_t* entry);
 
 /**
- * Pop the minimum entry from the heap.
- * @param out Output for the popped entry
- * @return TL_OK on success, TL_EOF if heap is empty
+ * @param out Receives the popped minimum entry.
+ * @return TL_OK on success, TL_EOF if the heap is empty.
  */
 tl_status_t tl_heap_pop(tl_heap_t* h, tl_heap_entry_t* out);
 
-/**
- * Peek at the minimum entry without removing it.
- * @return Pointer to minimum entry, or NULL if empty
- */
+/** @return Pointer to the minimum entry, or NULL when empty. */
 const tl_heap_entry_t* tl_heap_peek(const tl_heap_t* h);
 
 /**
- * Build heap from array of entries (heapify).
- * More efficient than repeated push for initial construction.
- * @param entries Array of entries (copied into heap)
- * @param n       Number of entries
- * @return TL_OK on success, TL_ENOMEM on allocation failure
+ * Bulk-build a heap from an array of entries using Floyd's O(K) heapify
+ * rather than the O(K log K) cost of repeated push.
+ *
+ * @param entries Source entries; copied into the heap.
+ * @param n       Number of entries.
+ * @return TL_OK on success, TL_ENOMEM on allocation failure.
  */
 tl_status_t tl_heap_build(tl_heap_t* h, const tl_heap_entry_t* entries, size_t n);
 
 /**
- * Replace the top entry and restore heap property.
- * Equivalent to pop + push but more efficient.
- * @param new_entry New entry to replace top
- * Precondition: heap is not empty
+ * Replace the top entry with new_entry and sift down. Equivalent to
+ * pop+push without the extra log K work of restoring the heap twice.
+ * Precondition: the heap is not empty.
  */
 void tl_heap_replace_top(tl_heap_t* h, const tl_heap_entry_t* new_entry);
 

@@ -1,11 +1,10 @@
 """Compatibility-baseline tests for free-threaded import behavior.
 
-Layer B contract:
-    Importing the timelog C extension on a free-threaded CPython build
-    (Py_GIL_DISABLED=1) must NOT cause the runtime to re-enable the
-    GIL. The module's PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED,
-    which the runtime honors only when the extension is correctly
-    synchronized for genuine parallelism.
+Importing the timelog C extension on a free-threaded CPython build
+(Py_GIL_DISABLED=1) must NOT cause the runtime to re-enable the GIL.
+The module's PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED,
+which the runtime honors only when the extension is correctly
+synchronized for genuine parallelism.
 """
 
 from __future__ import annotations

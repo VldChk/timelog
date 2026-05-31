@@ -57,7 +57,7 @@ static tl_status_t tl_py_core_call_best_effort(PyTimelog* self,
                                                 tl_py_core_call_fn fn);
 
 /* Internal non-throwing close helper */
-static void pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
+static uint64_t pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
 static void tl_py_timelog_drop_handle_ctx(PyTimelog* self);
 static void tl_py_timelog_drop_engine_ctx(PyTimelog* self);
 
@@ -400,9 +400,11 @@ tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
 
 /*
  * Acquire a consistent snapshot with all lifetime guards taken atomically
- * under core_lock, closing the pin-before-own TOCTOU.
+ * under core_lock — without the lock, a concurrent close() could free
+ * handle_ctx or engine_ctx in the window between checking the open state
+ * and pinning them.
  *
- * Under the lock (where a concurrent close() cannot interleave) we:
+ * Under the lock we:
  *   - own a reference on handle_ctx (so drain bookkeeping survives the
  *     unlock even if close() nulls self->handle_ctx);
  *   - own a reference on engine_ctx (so the core tl_timelog_t cannot be
@@ -429,7 +431,8 @@ static int tl_py_acquire_snapshot_pinned(PyTimelog* self,
     }
 
     /* Under core_lock: self->handle_ctx / engine_ctx / tl are all stable. */
-    tl_py_handle_ctx_t* hctx = self->handle_ctx;
+    tl_py_handle_ctx_t* hctx =
+        atomic_load_explicit(&self->handle_ctx, memory_order_acquire);
     tl_py_engine_ctx_t* ectx = self->engine_ctx;
     tl_py_handle_ctx_incref(hctx);
     tl_py_engine_ctx_incref(ectx);
@@ -559,17 +562,35 @@ static int
 PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 {
     /* Re-init not allowed. */
-    if (self->tl != NULL) {
+    if (atomic_load_explicit(&self->tl, memory_order_acquire) != NULL) {
         PyErr_SetString(PyExc_TypeError, "Timelog already initialized");
         return -1;
     }
 
-    self->core_lock = NULL;
-    self->handle_ctx = NULL;
+    /* Keep partially initialized and facade-reopened instances observably
+     * closed until every lifetime guard (handle_ctx, engine_ctx, core_lock)
+     * has been installed. A subclass can leak `self` from __new__ under a
+     * free-threaded build; methods seeing this object during __init__ must
+     * fail closed rather than running with a half-published core pointer. */
+    atomic_store_explicit(&self->closed, 1, memory_order_release);
+
+    /* core_lock is per-PyObject, not per-engine. A closed instance may be
+     * reopened by the Python facade, so preserve an existing lock instead of
+     * losing its pointer and leaking it. Fresh tp_alloc memory is already
+     * zeroed, so new instances still start with core_lock == NULL. */
+    atomic_store_explicit(&self->handle_ctx, NULL, memory_order_release);
     self->engine_ctx = NULL;
 
     if (TlPy_StateFromObject((PyObject*)self) == NULL) {
         return -1;
+    }
+
+    if (self->core_lock == NULL) {
+        self->core_lock = PyThread_allocate_lock();
+        if (self->core_lock == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
     }
 
     enum {
@@ -841,10 +862,11 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         : (uint32_t)drain_batch_limit;
 
     /* Initialize handle context first. */
-    self->handle_ctx = tl_py_handle_ctx_new(drain_limit);
-    if (self->handle_ctx == NULL) {
+    tl_py_handle_ctx_t* hctx = tl_py_handle_ctx_new(drain_limit);
+    if (hctx == NULL) {
         return -1;
     }
+    atomic_store_explicit(&self->handle_ctx, hctx, memory_order_release);
 
     /* Build tl_config_t */
     tl_config_t cfg;
@@ -1153,7 +1175,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     /* Wire up drop callback */
     cfg.on_drop_handle = tl_py_on_drop_handle;
-    cfg.on_drop_ctx = self->handle_ctx;
+    cfg.on_drop_ctx = hctx;
 
     /* Open the timelog. tl_open writes its result through a plain
      * tl_timelog_t** out-parameter; self->tl is _Atomic so we can't take
@@ -1168,7 +1190,6 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         TL_PY_RAISE_STATUS(self, st);
         return -1;
     }
-    atomic_store_explicit(&self->tl, tl_local, memory_order_release);
 
     self->engine_ctx = tl_py_engine_ctx_new(tl_local);
     if (self->engine_ctx == NULL) {
@@ -1179,20 +1200,8 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         return -1;
     }
 
-    /* Allocate per-instance core lock */
-    self->core_lock = PyThread_allocate_lock();
-    if (self->core_lock == NULL) {
-        /* Best-effort shutdown on allocation failure */
-        tl_py_engine_ctx_close(self->engine_ctx, 0);
-        atomic_store_explicit(&self->tl, NULL, memory_order_release);
-        atomic_store_explicit(&self->closed, 1, memory_order_release);
-        tl_py_timelog_drop_engine_ctx(self);
-        tl_py_timelog_drop_handle_ctx(self);
-        PyErr_NoMemory();
-        return -1;
-    }
-
     /* Success - store introspection fields */
+    atomic_store_explicit(&self->tl, tl_local, memory_order_release);
     atomic_store_explicit(&self->closed, 0, memory_order_release);
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
@@ -1210,11 +1219,11 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
  * Non-throwing close helper (close, finalizer, dealloc).
  * Skips Python handle drain during interpreter finalization.
  */
-static void
+static uint64_t
 pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
 {
     if (self == NULL) {
-        return;
+        return 0;
     }
 
     /* Idempotence guard (unlocked fast path). Gate only on the atomic
@@ -1225,7 +1234,7 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
      * re-check below runs under the lock. */
     if (atomic_load_explicit(&self->closed, memory_order_acquire) ||
         atomic_load_explicit(&self->tl, memory_order_acquire) == NULL) {
-        return;
+        return 0;
     }
     int finalizing = TL_PY_IS_FINALIZING();
     int allow_threads = (!finalizing && !from_finalizer);
@@ -1237,7 +1246,7 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
     TL_PY_LOCK(self);
     if (self->closed || self->tl == NULL || self->engine_ctx == NULL) {
         TL_PY_UNLOCK(self);
-        return;
+        return 0;
     }
     handle_ctx = atomic_load_explicit(&self->handle_ctx, memory_order_acquire);
     pins = handle_ctx != NULL ? tl_py_pins_count(handle_ctx) : 0;
@@ -1247,8 +1256,13 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
      * cannot acquire a snapshot between the sample and close detach.
      * Iterators/PageSpan owners hold engine_ctx refs and will close the
      * engine after releasing their snapshots. Explicit close() rejects pins
-     * before reaching this helper and is rechecked here for race safety.
+     * here while holding the same lock used by snapshot acquisition, so it
+     * cannot accidentally detach the contexts after a stale unlocked sample.
      */
+    if (!from_finalizer && pins != 0) {
+        TL_PY_UNLOCK(self);
+        return pins;
+    }
     defer_engine_close = (pins != 0);
     atomic_store_explicit(&self->closed, 1, memory_order_release);
     atomic_store_explicit(&self->tl, NULL, memory_order_release);
@@ -1322,6 +1336,7 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
      * can reach the object. After close, methods still acquire the live
      * lock and bail on the atomic closed flag.
      */
+    return 0;
 }
 
 static PyObject*
@@ -1339,15 +1354,15 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
         Py_RETURN_NONE;
     }
 
-    /* Reject close with active pins to avoid inconsistent state. */
-    uint64_t pins = self->handle_ctx != NULL ? tl_py_pins_count(self->handle_ctx) : 0;
+    /* Reject close with active pins to avoid inconsistent state. The helper
+     * performs this check under core_lock so the handle context cannot be
+     * detached between loading it and counting pins. */
+    uint64_t pins = pytimelog_close_no_raise(self, 0);
     if (pins != 0) {
         return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE,
             "Cannot close: %llu active snapshots/iterators",
             (unsigned long long)pins);
     }
-
-    pytimelog_close_no_raise(self, 0);
 
     Py_RETURN_NONE;
 }
@@ -1415,8 +1430,15 @@ static int
 PyTimelog_traverse(PyTimelog* self, visitproc visit, void* arg)
 {
     Py_VISIT(Py_TYPE(self));
-    return self->handle_ctx != NULL ?
-        tl_py_handle_ctx_traverse(self->handle_ctx, visit, arg) : 0;
+
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    if (hctx == NULL) {
+        return 0;
+    }
+
+    int rc = tl_py_handle_ctx_traverse(hctx, visit, arg);
+    tl_py_handle_ctx_decref(hctx);
+    return rc;
 }
 
 static int
@@ -2465,8 +2487,9 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
     }
 
     /* Acquire snapshot + pin + owned handle_ctx/engine_ctx refs atomically
-     * under core_lock (closes the pin-before-own TOCTOU). On success these
-     * owned refs and the pin are TRANSFERRED to the iterator below — no
+     * under core_lock so a concurrent close() cannot free the contexts
+     * between pin entry and snapshot acquisition. On success these owned
+     * refs and the pin are TRANSFERRED to the iterator below — no
      * additional incref — so the iterator's cleanup releases them exactly
      * once. */
     tl_snapshot_t* snap = NULL;
@@ -2801,13 +2824,21 @@ static PyObject* PyTimelog_get_busy_policy(PyTimelog* self, void* Py_UNUSED(clos
 
 static PyObject* PyTimelog_get_retired_queue_len(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    uint64_t len = self->handle_ctx != NULL ? tl_py_retired_queue_len(self->handle_ctx) : 0;
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    uint64_t len = hctx != NULL ? tl_py_retired_queue_len(hctx) : 0;
+    if (hctx != NULL) {
+        tl_py_handle_ctx_decref(hctx);
+    }
     return PyLong_FromUnsignedLongLong(len);
 }
 
 static PyObject* PyTimelog_get_alloc_failures(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    uint64_t failures = self->handle_ctx != NULL ? tl_py_alloc_failures(self->handle_ctx) : 0;
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    uint64_t failures = hctx != NULL ? tl_py_alloc_failures(hctx) : 0;
+    if (hctx != NULL) {
+        tl_py_handle_ctx_decref(hctx);
+    }
     return PyLong_FromUnsignedLongLong(failures);
 }
 

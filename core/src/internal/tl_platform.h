@@ -71,34 +71,31 @@
 /*===========================================================================
  * Debug Assertions
  *
- * WARNING: TL_ASSERT maps to TL_ASSUME in release builds, which tells the
- * compiler the condition is always true. This is an optimization hint.
+ * TL_ASSERT collapses to TL_ASSUME in release builds, so a violated
+ * condition produces undefined behaviour rather than a crash. Use it only
+ * for invariants that are true by construction inside timelog itself.
  *
- * NEVER use TL_ASSERT for:
- * - User input validation (use explicit checks + return TL_EINVAL)
- * - API contract enforcement on external data
- * - Anything that could be false due to caller error
- *
- * ONLY use TL_ASSERT for:
- * - Internal invariants provably true by construction
- * - Programmer errors that indicate bugs in timelog itself
+ * Caller-supplied data (API inputs, external state) MUST be validated with
+ * explicit branches returning TL_EINVAL — never with TL_ASSERT, because the
+ * release-build TL_ASSUME would let the compiler optimise the check away
+ * and miscompile downstream code on bad input.
  *===========================================================================*/
 
 #ifdef TL_DEBUG
     #include <assert.h>
     #include <stdio.h>
-    #include <stdlib.h>  /* for abort() */
+    #include <stdlib.h>
 
     #ifdef TL_TEST_HOOKS
         /*
-         * Test hook for intercepting assertions without aborting.
-         * When tl__test_assert_hook is set, TL_ASSERT calls the hook
-         * instead of aborting, allowing tests to verify assertion conditions.
+         * Pluggable assertion handler used by the test harness to verify
+         * that specific code paths assert without crashing the test runner.
+         * When tl__test_assert_hook is non-NULL it is invoked in place of
+         * the usual abort(). Typical usage:
          *
-         * Usage in tests:
-         *   tl__test_set_assert_hook(my_hook);
-         *   // ... code that should trigger assertion ...
-         *   tl__test_set_assert_hook(NULL);
+         *     tl__test_set_assert_hook(my_hook);
+         *     // run code expected to assert
+         *     tl__test_set_assert_hook(NULL);
          */
         typedef void (*tl_assert_hook_fn)(const char* file, int line, const char* expr);
         extern tl_assert_hook_fn tl__test_assert_hook;
@@ -139,18 +136,14 @@
 #endif
 
 /*===========================================================================
- * TL_VERIFY: Runtime verification for OS primitives
+ * TL_VERIFY: always-on runtime verification.
  *
- * Unlike TL_ASSERT (which becomes TL_ASSUME in release, potentially causing UB),
- * TL_VERIFY always performs the check and aborts on failure.
- *
- * Use TL_VERIFY for:
- * - OS primitive return values (pthread_mutex_lock, etc.)
- * - Conditions where failure indicates system corruption
- * - Situations where TL_ASSUME would cause UB if violated
- *
- * In debug: Uses TL_ASSERT for file/line info in error messages
- * In release: Explicit abort() - deterministic crash, no UB
+ * Behaves like TL_ASSERT in debug builds, but in release builds it still
+ * evaluates the condition and calls abort() on failure rather than
+ * collapsing to TL_ASSUME. Use it for conditions where treating failure as
+ * unreachable would be unsafe — typically OS primitive return values
+ * (pthread_mutex_lock and friends) and any check whose violation implies
+ * system or kernel corruption.
  *===========================================================================*/
 
 #ifdef TL_DEBUG

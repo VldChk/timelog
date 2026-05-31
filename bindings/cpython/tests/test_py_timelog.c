@@ -3,7 +3,7 @@
  * @brief Unit tests for PyTimelog CPython extension
  *
  * TDD-driven tests for the PyTimelog wrapper type.
- * Tests run with Python initialized and GIL held.
+ * Tests run with Python initialized on an attached Python thread state.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -480,6 +480,49 @@ TEST(close_idempotent)
 
     Py_DECREF(close_method);
     Py_DECREF(tl);
+}
+
+TEST(reopen_reuses_core_lock)
+{
+    /* Reopen is implemented as __init__ on a closed instance. The per-object
+     * core_lock must be preserved across that transition; losing the pointer
+     * leaks a PyThread lock and breaks the "lock freed only in dealloc"
+     * contract. */
+    PyTimelog* tl = create_timelog_custom("disabled", "raise");
+    ASSERT_NOT_NULL(tl);
+    ASSERT_NOT_NULL(tl->core_lock);
+    PyThread_type_lock first_lock = tl->core_lock;
+
+    PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
+    ASSERT_NOT_NULL(close_method);
+    PyObject* result = PyObject_CallNoArgs(close_method);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+    Py_DECREF(close_method);
+
+    ASSERT_NULL(tl->tl);
+    ASSERT_EQ(tl->closed, 1);
+    ASSERT(tl->core_lock == first_lock);
+
+    PyObject* args = PyTuple_New(0);
+    PyObject* kwargs = PyDict_New();
+    ASSERT_NOT_NULL(args);
+    ASSERT_NOT_NULL(kwargs);
+
+    PyObject* maint = PyUnicode_FromString("disabled");
+    ASSERT_NOT_NULL(maint);
+    ASSERT(PyDict_SetItemString(kwargs, "maintenance", maint) == 0);
+    Py_DECREF(maint);
+
+    int init_result = Py_TYPE(tl)->tp_init((PyObject*)tl, args, kwargs);
+    ASSERT_EQ(init_result, 0);
+    ASSERT_NOT_NULL(tl->tl);
+    ASSERT_EQ(tl->closed, 0);
+    ASSERT(tl->core_lock == first_lock);
+
+    Py_DECREF(kwargs);
+    Py_DECREF(args);
+    close_and_dealloc(tl);
 }
 
 TEST(close_sets_state)
@@ -1597,6 +1640,7 @@ int main(int argc, char* argv[])
     run_reinit_fails();
     run_init_ignores_shadowed_sys_modules_entry();
     run_close_idempotent();
+    run_reopen_reuses_core_lock();
     run_close_releases_tracked_objects();
     run_close_sets_state();
     run_close_refuses_with_pins();

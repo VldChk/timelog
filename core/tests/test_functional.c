@@ -10,12 +10,10 @@
  * - Maintenance: tl_flush, tl_compact, tl_maint_step
  * - Failure handling: ENOMEM recovery, error logging
  *
- * Internal implementation tests have been moved to:
+ * Internal implementation tests live in:
  * - test_storage_internal.c: window, page, segment, manifest
  * - test_delta_internal.c: memrun, memtable, flush builder
  * - test_compaction_internal.c: selection, merge, publish
- *
- * Part of Phase 10: Integration Testing and Hardening
  *
  * Note: test scaffolding uses internal sync primitives for threads/conds,
  * but core behaviors are exercised through the public API surface.
@@ -78,7 +76,7 @@ TEST_DECLARE(func_snapshot_acquire_with_data) {
 }
 
 /*===========================================================================
- * Iterator Range Tests (migrated from test_phase5.c)
+ * Iterator Range Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_range_basic) {
@@ -163,7 +161,7 @@ TEST_DECLARE(func_iter_range_invalid) {
 }
 
 /*===========================================================================
- * Iterator Since/Until Tests (migrated from test_phase5.c)
+ * Iterator Since/Until Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_since_basic) {
@@ -225,7 +223,7 @@ TEST_DECLARE(func_iter_until_basic) {
 }
 
 /*===========================================================================
- * Point/Equal Lookup Tests (migrated from test_phase5.c)
+ * Point/Equal Lookup Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_equal_basic) {
@@ -423,7 +421,7 @@ TEST_DECLARE(func_iter_point_at_ts_max) {
 }
 
 /*===========================================================================
- * Tombstone (Delete) Tests (migrated from test_phase5.c)
+ * Tombstone (Delete) Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_with_tombstone) {
@@ -489,7 +487,7 @@ TEST_DECLARE(func_iter_delete_before) {
 }
 
 /*===========================================================================
- * Scan API Tests (migrated from test_phase5.c)
+ * Scan API Tests
  *===========================================================================*/
 
 typedef struct {
@@ -645,13 +643,13 @@ TEST_DECLARE(func_count_range_mixed_sources) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(NULL, &tl));
 
-    /* Phase 1: records that will be flushed to L0 */
+    /* Records that will be flushed to L0. */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 1));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 2));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 3));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
-    /* Phase 2: records in memtable */
+    /* Records that remain in the memtable. */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 4));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 50, 5));
 
@@ -989,7 +987,7 @@ TEST_DECLARE(func_stats_active_memtable_filtered) {
 }
 
 /*===========================================================================
- * Timestamp Navigation Tests (migrated from test_phase5.c)
+ * Timestamp Navigation Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_min_max_ts_basic) {
@@ -1081,7 +1079,7 @@ TEST_DECLARE(func_next_ts_at_ts_max_eof) {
 }
 
 /*===========================================================================
- * Post-Flush Read Tests (migrated from test_phase5.c)
+ * Post-Flush Read Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_after_flush) {
@@ -1220,7 +1218,7 @@ TEST_DECLARE(func_iter_tombstone_multi_segment) {
 }
 
 /*===========================================================================
- * Edge Case Tests (migrated from test_phase5.c)
+ * Edge Case Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_iter_at_ts_max) {
@@ -1370,7 +1368,7 @@ TEST_DECLARE(func_tombstone_coalescing) {
 }
 
 /*===========================================================================
- * Statistics Tests (migrated from test_phase6.c)
+ * Statistics Tests
  *===========================================================================*/
 
 TEST_DECLARE(func_stats_empty_timelog) {
@@ -2104,24 +2102,21 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    /* Phase 1: Create first L1 segment */
-    /* Insert records in window 0 [0, 100) */
+    /* Build the first L1 segment from window 0 [0, 100). */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 10, 10));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 20, 20));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
-    /* Insert more in same window */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 30, 30));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 40, 40));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
-    /* Compact - should create L1 segment for window 0 */
-    /* After this, window_grid_frozen should be true. */
+    /* Compact creates the L1 segment and freezes the window grid. */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     while (tl_maint_step(tl) == TL_OK) {}
 
-    /* Phase 2: Add more data in different window and compact again */
-    /* Insert records in window 1 [100, 200) */
+    /* Build a second L1 segment from window 1 [100, 200). The frozen
+     * grid keeps window boundaries stable and preserves non-overlap. */
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 110, 110));
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 120, 120));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
@@ -2130,12 +2125,10 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     TEST_ASSERT_STATUS(TL_OK, tl_append(tl, 140, 140));
     TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
 
-    /* Compact again - should create L1 segment for window 1 */
-    /* Frozen grid keeps window boundaries stable and preserves non-overlap. */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     while (tl_maint_step(tl) == TL_OK) {}
 
-    /* Phase 3: Verify all data is queryable (L1 non-overlap maintained) */
+    /* All data remains queryable across both L1 windows. */
     tl_snapshot_t* snap = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
     tl_iter_t* it = NULL;
@@ -2153,7 +2146,7 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
     }
     TEST_ASSERT_STATUS(TL_EOF, tl_iter_next(it, &rec));
 
-    /* Phase 4: Verify validation passes (L1 non-overlap invariant) */
+    /* Validation confirms the L1 non-overlap invariant holds. */
 #ifdef TL_DEBUG
     TEST_ASSERT_STATUS(TL_OK, tl_validate(snap));
 #endif
@@ -2164,7 +2157,7 @@ TEST_DECLARE(func_compact_c10_l1_nonoverlap_preserved) {
 }
 
 /*===========================================================================
- * Failure Handling Tests (migrated from test_phase9.c)
+ * Failure Handling Tests
  *===========================================================================*/
 
 #include "internal/tl_atomic.h"  /* tl_atomic_u32, tl_atomic_fetch_add_u32 */
@@ -2291,7 +2284,7 @@ TEST_DECLARE(func_flush_build_survives_enomem) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    /* Phase 1: Create and flush first memrun (calibration run) */
+    /* Calibration run: flush once to learn the allocation budget. */
     fail_ctx.alloc_count = 0;
     for (int i = 0; i < 5; i++) {
         tl_append(tl, 1000 + i, (tl_handle_t)(uintptr_t)(i + 1));
@@ -2304,14 +2297,13 @@ TEST_DECLARE(func_flush_build_survives_enomem) {
     /* Sanity check: flush should have done some allocations */
     TEST_ASSERT(flush_allocs > 0);
 
-    /* Phase 2: Create another memrun */
+    /* Stage a second batch and trigger ENOMEM partway through its flush. */
     fail_ctx.alloc_count = 0;
     fail_ctx.failed = false;
     for (int i = 0; i < 5; i++) {
         tl_append(tl, 2000 + i, (tl_handle_t)(uintptr_t)(i + 100));
     }
 
-    /* Phase 3: Inject ENOMEM at midpoint of flush allocations. */
     fail_ctx.fail_after_n = (flush_allocs > 2) ? flush_allocs / 2 : 1;
     fail_ctx.alloc_count = 0;
 
@@ -2319,7 +2311,7 @@ TEST_DECLARE(func_flush_build_survives_enomem) {
     TEST_ASSERT_STATUS(TL_ENOMEM, st);
     TEST_ASSERT(fail_ctx.failed);  /* Verify injection triggered */
 
-    /* Phase 4: Verify records still visible via snapshot iteration. */
+    /* Despite the failed flush the records must still be visible. */
     tl_snapshot_t* snap = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
 
@@ -2336,18 +2328,18 @@ TEST_DECLARE(func_flush_build_survives_enomem) {
     tl_iter_destroy(it);
     tl_snapshot_release(snap);
 
-    /* Phase 5: Retry without fault, verify success */
-    fail_ctx.fail_after_n = 0;  /* Disable injection */
+    /* Retry without injection: the flush should now succeed. */
+    fail_ctx.fail_after_n = 0;
     fail_ctx.alloc_count = 0;
 
     st = tl_flush(tl);
     TEST_ASSERT_STATUS(TL_OK, st);
 
-    /* Phase 6: Verify data now in L0 segment */
+    /* The retried flush produced at least one L0 segment. */
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
     tl_stats_t stats;
     tl_stats(snap, &stats);
-    TEST_ASSERT(stats.segments_l0 >= 1);  /* At least one L0 from retry */
+    TEST_ASSERT(stats.segments_l0 >= 1);
     tl_snapshot_release(snap);
 
     tl_close(tl);
@@ -2383,27 +2375,27 @@ TEST_DECLARE(func_publish_phase_enomem) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    /* Phase 1: Create L0 segments (injection disabled during setup) */
+    /* Create L0 segments with injection disabled during setup. */
     TEST_ASSERT(func_flush_n_times_checked(tl, 2, 1000, 5));
 
-    /* Phase 2: Calibrate - count allocations during successful compaction. */
+    /* Calibrate: count allocations during one successful compaction. */
     fail_ctx.alloc_count = 0;
     TEST_ASSERT_STATUS(TL_EOF, func_compact_to_quiescence(tl));
     size_t compact_allocs = fail_ctx.alloc_count;
 
-    tl_status_t st;  /* Declare here for use in Phase 3 */
+    tl_status_t st;
 
-    /* Create more L0 segments for second compaction attempt (still no injection) */
+    /* Create more L0 segments for the second compaction attempt. */
     TEST_ASSERT(func_flush_n_times_checked(tl, 2, 3000, 5));
 
-    /* Get stats before injection */
+    /* Snapshot stats before injecting the failure. */
     tl_snapshot_t* snap = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
     tl_stats_t stats_before;
     tl_stats(snap, &stats_before);
     tl_snapshot_release(snap);
 
-    /* Phase 3: Inject ENOMEM late in compaction (targeting manifest build) */
+    /* Inject ENOMEM late in compaction, targeting the manifest build. */
     if (compact_allocs > 4) {
         /* Target the last quarter of allocations (more likely to hit publish) */
         fail_ctx.fail_after_n = compact_allocs * 3 / 4;
@@ -2878,7 +2870,7 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
     tl_timelog_t* tl = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
 
-    /* Phase 1: Append records across multiple flushes */
+    /* Append records across multiple flushes to create L0 segments. */
     for (int batch = 0; batch < 3; batch++) {
         for (int i = 0; i < 10; i++) {
             tl_ts_t ts = (tl_ts_t)(batch * 1000 + i * 10);
@@ -2887,7 +2879,7 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
         TEST_ASSERT_STATUS(TL_OK, tl_flush(tl));
     }
 
-    /* Phase 2: Take snapshot, verify data */
+    /* Confirm the three L0 segments and their record budget. */
     tl_snapshot_t* snap = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
 
@@ -2898,14 +2890,14 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
 
     tl_snapshot_release(snap);
 
-    /* Phase 3: Compact L0 -> L1 */
+    /* Compact L0 into L1. */
     TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
     tl_status_t st;
     do {
         st = tl_maint_step(tl);
     } while (st == TL_OK);
 
-    /* Phase 4: Verify L1 exists, L0 consumed */
+    /* L0 segments were consumed and L1 segments now exist. */
     TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
     tl_stats(snap, &stats);
     TEST_ASSERT_EQ(0, stats.segments_l0);
@@ -2924,7 +2916,7 @@ TEST_DECLARE(func_lifecycle_no_segment_refcount_leak) {
     tl_iter_destroy(it);
     tl_snapshot_release(snap);
 
-    /* Phase 5: Close - ASan will catch any refcount leaks */
+    /* Close — ASan catches any refcount leaks. */
     tl_close(tl);
 }
 
@@ -3095,20 +3087,20 @@ void run_functional_tests(void) {
      * - test_compaction_internal.c
      *=======================================================================*/
 
-    /* Snapshot tests (2 tests) - migrated from test_phase5.c */
+    /* Snapshot tests (2 tests) */
     RUN_TEST(func_snapshot_acquire_release_empty);
     RUN_TEST(func_snapshot_acquire_with_data);
 
-    /* Iterator range tests (3 tests) - migrated from test_phase5.c */
+    /* Iterator range tests (3 tests) */
     RUN_TEST(func_iter_range_basic);
     RUN_TEST(func_iter_range_empty);
     RUN_TEST(func_iter_range_invalid);
 
-    /* Since/Until tests (2 tests) - migrated from test_phase5.c */
+    /* Since/Until tests (2 tests) */
     RUN_TEST(func_iter_since_basic);
     RUN_TEST(func_iter_until_basic);
 
-    /* Point lookup tests (6 tests) - migrated from test_phase5.c */
+    /* Point lookup tests (6 tests) */
     RUN_TEST(func_iter_equal_basic);
     RUN_TEST(func_iter_point_not_found);
     RUN_TEST(func_iter_point_fast_path);
@@ -3116,11 +3108,11 @@ void run_functional_tests(void) {
     RUN_TEST(func_reinsert_visible_after_delete);
     RUN_TEST(func_iter_point_at_ts_max);
 
-    /* Tombstone tests (2 tests) - migrated from test_phase5.c */
+    /* Tombstone tests (2 tests) */
     RUN_TEST(func_iter_with_tombstone);
     RUN_TEST(func_iter_delete_before);
 
-    /* Scan tests (2 tests) - migrated from test_phase5.c */
+    /* Scan tests (2 tests) */
     RUN_TEST(func_scan_range_basic);
     RUN_TEST(func_scan_range_early_stop);
     RUN_TEST(func_count_range_basic);
@@ -3137,18 +3129,18 @@ void run_functional_tests(void) {
     RUN_TEST(func_count_ooo_runs_with_tombstones);
     RUN_TEST(func_stats_active_memtable_filtered);
 
-    /* Timestamp navigation tests (3 tests) - migrated from test_phase5.c */
+    /* Timestamp navigation tests (3 tests) */
     RUN_TEST(func_min_max_ts_basic);
     RUN_TEST(func_min_max_ts_empty);
     RUN_TEST(func_next_prev_ts_basic);
     RUN_TEST(func_next_ts_at_ts_max_eof);
 
-    /* Post-flush tests (2 tests) - migrated from test_phase5.c */
+    /* Post-flush tests (2 tests) */
     RUN_TEST(func_iter_after_flush);
     RUN_TEST(func_iter_tombstone_after_flush);
     RUN_TEST(func_iter_tombstone_multi_segment);
 
-    /* Edge case tests (5 tests) - migrated from test_phase5.c */
+    /* Edge case tests (5 tests) */
     RUN_TEST(func_iter_at_ts_max);
     RUN_TEST(func_min_max_with_tombstones);
     RUN_TEST(func_min_max_all_deleted);

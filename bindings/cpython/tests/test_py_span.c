@@ -3,7 +3,7 @@
  * @brief Unit tests for PyPageSpan and related types
  *
  * TDD-driven tests for the PageSpan, PageSpanIter, and PageSpanObjectsView types.
- * Tests run with Python initialized and GIL held.
+ * Tests run with Python initialized on an attached Python thread state.
  */
 
 #define PY_SSIZE_T_CLEAN

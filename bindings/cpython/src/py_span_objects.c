@@ -1,6 +1,6 @@
 /**
  * @file py_span_objects.c
- * @brief PyPageSpanObjectsView CPython extension type implementation (Core API Integration)
+ * @brief PyPageSpanObjectsView CPython extension type implementation
  *
  * Implements lazy access to decoded Python objects from a PageSpan.
  * Uses span->h[] pointer directly (borrowed from core owner's snapshot).

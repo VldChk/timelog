@@ -12,7 +12,7 @@
  *   serialization. Snapshot-based iterators are safe for concurrent reads
  *   from independent threads.
  *
- *   The binding's internal synchronization (LLD §5.4) is:
+ *   The binding's internal synchronization layers:
  *     - per-instance core_lock (PyThread_type_lock)
  *     - atomic mirrors for the hot-path closed/tl fields
  *     - per-object Py_BEGIN_CRITICAL_SECTION on mutable extension fields
@@ -114,10 +114,10 @@ typedef struct {
      * 0 = open, 1 = closed.
      * Set early in close() to prevent reentrancy.
      *
-     * Atomic mirror of the lifecycle state (LLD §5.4 invariant L1): any
-     * fast-path unlocked closed check must be atomically synchronized,
-     * not racy. Writers hold core_lock and use memory_order_release;
-     * readers may use memory_order_acquire without the lock.
+     * Atomic mirror of the lifecycle state so the fast-path unlocked
+     * closed check is synchronized, not racy. Writers hold core_lock and
+     * use memory_order_release; readers may use memory_order_acquire
+     * without the lock.
      */
     _Atomic(uint8_t) closed;
 

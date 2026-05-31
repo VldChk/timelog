@@ -6,7 +6,8 @@
  * Internal Helpers
  *===========================================================================*/
 
-/** Minimum initial capacity for record vector (larger - batches can be big) */
+/* Initial capacity sized for typical batch inserts; large enough that the
+ * first push avoids an immediate reallocation for batch ingestion paths. */
 static const size_t RECVEC_MIN_CAPACITY = 16;
 
 /*===========================================================================
@@ -32,11 +33,11 @@ void tl_recvec_destroy(tl_recvec_t* rv) {
         tl__free(rv->alloc, rv->data);
     }
 
-    /* Leave in valid empty state for idempotent destroy */
+    /* Reset to the canonical empty state so destroy is idempotent. The
+     * allocator pointer is borrowed and intentionally retained. */
     rv->data = NULL;
     rv->len = 0;
     rv->cap = 0;
-    /* Note: alloc pointer is borrowed, not cleared */
 }
 
 void tl_recvec_clear(tl_recvec_t* rv) {
@@ -52,7 +53,7 @@ tl_status_t tl_recvec_reserve(tl_recvec_t* rv, size_t min_cap) {
     TL_ASSERT(rv != NULL);
 
     if (min_cap <= rv->cap) {
-        return TL_OK; /* Already have enough capacity */
+        return TL_OK;
     }
 
     size_t new_cap = tl__grow_capacity(rv->cap, min_cap, RECVEC_MIN_CAPACITY);
@@ -75,11 +76,10 @@ tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* rv) {
     TL_ASSERT(rv != NULL);
 
     if (rv->len == rv->cap) {
-        return TL_OK; /* Already exact fit */
+        return TL_OK;
     }
 
     if (rv->len == 0) {
-        /* Free backing storage entirely */
         if (rv->data != NULL) {
             tl__free(rv->alloc, rv->data);
             rv->data = NULL;
@@ -88,11 +88,11 @@ tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* rv) {
         return TL_OK;
     }
 
-    /* Reallocate to exact size */
     tl_record_t* new_data = tl__realloc(rv->alloc, rv->data,
                                          rv->len * sizeof(tl_record_t));
     if (new_data == NULL) {
-        /* Realloc failed, capacity unchanged (data is still valid) */
+        /* The original allocation is still valid; leave capacity unchanged
+         * so the caller can continue to use the vector. */
         return TL_ENOMEM;
     }
 
@@ -108,7 +108,6 @@ tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* rv) {
 tl_status_t tl_recvec_push(tl_recvec_t* rv, tl_ts_t ts, tl_handle_t handle) {
     TL_ASSERT(rv != NULL);
 
-    /* Check for len overflow */
     if (rv->len == SIZE_MAX) {
         return TL_ENOMEM;
     }
@@ -128,12 +127,12 @@ tl_status_t tl_recvec_push_n(tl_recvec_t* rv, const tl_record_t* records, size_t
     TL_ASSERT(rv != NULL);
 
     if (n == 0) {
-        return TL_OK; /* No-op for n=0 */
+        return TL_OK;
     }
 
     TL_ASSERT(records != NULL);
 
-    /* Check for len + n overflow */
+    /* Overflow guard for the eventual rv->len + n addition. */
     if (n > SIZE_MAX - rv->len) {
         return TL_ENOMEM;
     }
@@ -155,7 +154,6 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
         return TL_EINVAL;
     }
 
-    /* Check for len overflow */
     if (rv->len == SIZE_MAX) {
         return TL_ENOMEM;
     }
@@ -165,7 +163,6 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
         return s;
     }
 
-    /* Shift elements to make room */
     if (idx < rv->len) {
         memmove(&rv->data[idx + 1], &rv->data[idx],
                 (rv->len - idx) * sizeof(tl_record_t));
@@ -182,16 +179,14 @@ tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_
  *===========================================================================*/
 
 /**
- * Comparison function for qsort.
- * Sorts records by (ts, handle) in non-decreasing order.
+ * Comparator that orders records by (ts, handle) ascending. Uses explicit
+ * comparisons rather than subtraction because tl_ts_t spans the full
+ * signed int64 range, so (a - b) would overflow for distant timestamps.
  */
 static int cmp_record_ts(const void* a, const void* b) {
     const tl_record_t* ra = (const tl_record_t*)a;
     const tl_record_t* rb = (const tl_record_t*)b;
 
-    /* Use explicit comparison to avoid integer overflow in subtraction.
-     * For signed int64_t, (ra->ts - rb->ts) could overflow if the values
-     * span a large range. Explicit comparison is safe. */
     if (ra->ts < rb->ts) return -1;
     if (ra->ts > rb->ts) return 1;
     if (ra->handle < rb->handle) return -1;
@@ -203,7 +198,7 @@ void tl_recvec_sort(tl_recvec_t* rv) {
     TL_ASSERT(rv != NULL);
 
     if (rv->len <= 1) {
-        return;  /* Already sorted */
+        return;
     }
 
     qsort(rv->data, rv->len, sizeof(tl_record_t), cmp_record_ts);
@@ -325,7 +320,6 @@ tl_record_t* tl_recvec_take(tl_recvec_t* rv, size_t* out_len) {
     tl_record_t* data = rv->data;
     *out_len = rv->len;
 
-    /* Reset vector to empty state */
     rv->data = NULL;
     rv->len = 0;
     rv->cap = 0;

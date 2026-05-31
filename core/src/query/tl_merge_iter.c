@@ -5,13 +5,15 @@
  * Internal Helpers
  *===========================================================================*/
 
-/* Test hook: force kmerge source_next to return TL_EINTERNAL */
+/* When > 0, source_next() decrements this counter and returns
+ * TL_EINTERNAL instead of advancing, used to exercise error
+ * propagation through the merge. Test-only. */
 #ifdef TL_TEST_HOOKS
 volatile int tl_test_kmerge_force_error_count = 0;
 #endif
 
-/* Disable C4702 (unreachable code) for defensive fallback code.
- * LTCG proves these are unreachable, but we keep them for safety. */
+/* MSVC C4702: LTCG proves the defensive enum fallbacks below are
+ * unreachable. They are kept for safety against future enum additions. */
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4702)
@@ -201,10 +203,8 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
         return TL_EOF;
     }
 
-    /*
-     * Peek + replace_top pattern: avoids the data-loss window of
-     * pop + push (where push failure would lose a record).
-     */
+    /* Peek + replace_top: a pop/push pair would risk losing a record
+     * if push failed after we had already dropped the heap entry. */
     const tl_heap_entry_t* peek = tl_heap_peek(&it->heap);
     if (peek == NULL) {
         it->done = true;
@@ -225,7 +225,6 @@ tl_status_t tl_kmerge_iter_next(tl_kmerge_iter_t* it, tl_record_t* out,
     tl_status_t st = source_next(src, &next_rec, &next_watermark);
 
     if (st == TL_OK) {
-        /* Replace top (no allocation needed) */
         tl_heap_entry_t new_entry = {
             .ts = next_rec.ts,
             .tie_break_key = tie_id,
@@ -266,18 +265,17 @@ void tl_kmerge_iter_seek(tl_kmerge_iter_t* it, tl_ts_t target) {
         return;
     }
 
-    /* Forward-only: no-op if target <= current min */
+    /* Forward-only: no-op if target is at or before current min. */
     const tl_ts_t* current_min = tl_kmerge_iter_peek_ts(it);
     if (current_min != NULL && target <= *current_min) {
         return;
     }
 
-    /*
-     * Pop entries with ts < target, re-seek those sources, push replacements.
-     * Entries with ts >= target are preserved (source already advanced past them,
-     * so they cannot be re-fetched). Min-heap property lets us stop when
-     * peek()->ts >= target.
-     */
+    /* Pop entries with ts < target, re-seek their sources, push the
+     * replacements. Entries with ts >= target stay in place: source
+     * iterators are forward-only and cannot re-yield a record they've
+     * already returned. The min-heap property lets us stop the scan
+     * once peek()->ts >= target. */
     while (!tl_heap_is_empty(&it->heap)) {
         const tl_heap_entry_t* min = tl_heap_peek(&it->heap);
         if (min->ts >= target) {

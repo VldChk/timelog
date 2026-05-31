@@ -29,7 +29,7 @@
 #include <stdint.h>
 
 /*===========================================================================
- * tl_validate() Tests (migrated from test_phase6.c)
+ * tl_validate() Tests
  *===========================================================================*/
 
 TEST_DECLARE(inv_validate_empty_timelog) {
@@ -175,7 +175,7 @@ TEST_DECLARE(inv_validate_multiple_flushes) {
 }
 
 /*===========================================================================
- * TL_TS_MAX Edge Case Tests (migrated from test_phase6.c)
+ * TL_TS_MAX Edge Case Tests
  *
  * These tests verify that validation handles TL_TS_MAX correctly. The
  * validator must use explicit has_content flags rather than sentinel checks.
@@ -300,7 +300,7 @@ TEST_DECLARE(inv_l0_generation_ordering_after_flush) {
  *===========================================================================*/
 
 void run_invariants_tests(void) {
-    /* tl_validate() tests (8 tests) - migrated from test_phase6.c */
+    /* tl_validate() tests (8 tests) */
     RUN_TEST(inv_validate_empty_timelog);
     RUN_TEST(inv_validate_with_records);
     RUN_TEST(inv_validate_with_ooo_records);
@@ -310,7 +310,7 @@ void run_invariants_tests(void) {
     RUN_TEST(inv_validate_null_snapshot);
     RUN_TEST(inv_validate_multiple_flushes);
 
-    /* TL_TS_MAX edge case tests (2 tests) - migrated from test_phase6.c */
+    /* TL_TS_MAX edge case tests (2 tests) */
     RUN_TEST(inv_validate_record_at_ts_max);
     RUN_TEST(inv_validate_tombstone_ending_at_ts_max);
 

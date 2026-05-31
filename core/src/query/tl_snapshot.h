@@ -9,30 +9,27 @@
 /*===========================================================================
  * Snapshot: Complete Point-in-Time View
  *
- * A snapshot captures a consistent view of the timelog at a point in time.
- * It contains:
- * - Manifest (pinned via acquire, released on destroy)
- * - Memview (owned, captured at acquisition time)
+ * A snapshot captures a consistent view of the timelog at a moment in
+ * time:
+ *   - the manifest (pinned via acquire, released on destroy)
+ *   - the memview (owned, captured at acquisition time)
  *
- * The snapshot is completely immutable after acquisition and can be used
- * for queries without holding any locks.
+ * Once acquired, the snapshot is fully immutable; queries run against
+ * it without holding any timelog locks.
  *
- * Acquisition Protocol:
- * 1. Lock writer_mu
- * 2. Acquire manifest reference
- * 3. Capture or reuse memview snapshot (captures under memtable_mu as needed)
- * 4. Capture op_seq watermark
- * 5. Unlock writer_mu
- * 6. Sort fresh OOO head outside writer_mu, then cache if epoch still matches
- *
- * Consistency model:
- * - writer_mu serializes publish and snapshot capture
- * - no seqlock retry loop is required in the current implementation
+ * Acquisition holds writer_mu, which also serialises every publisher.
+ * That mutual exclusion is what makes the captured manifest and
+ * memview a single consistent state, so no seqlock retry loop is
+ * needed. The OOO head sort is performed after writer_mu is released,
+ * then cached only if the memtable epoch is still unchanged.
  *
  * Thread Safety:
- * - Acquisition requires internal locking (handled automatically)
- * - After acquisition, fully immutable - no synchronization needed
- * - Release is thread-safe (reference counting)
+ * - Acquisition handles its own internal locking.
+ * - After acquisition, fully immutable; no synchronisation needed.
+ * - The snapshot object itself is single-owner. Do not call release twice or
+ *   race release with readers; share by creating independent snapshots or by
+ *   serialising ownership externally. The manifest/memview objects referenced
+ *   by a snapshot are internally refcounted.
  *===========================================================================*/
 
 /* Forward declaration (opaque). */
@@ -115,11 +112,11 @@ void tl_snapshot_iter_destroyed(tl_snapshot_t* snap);
 #endif
 
 /*===========================================================================
- * Internal Acquisition (called from tl_timelog.c)
+ * Internal Acquisition
  *
- * The public API (tl_snapshot_acquire, tl_snapshot_release) is declared in
- * timelog.h. The implementation is in tl_snapshot.c but is called from
- * tl_timelog.c wrapper functions.
+ * The public entry points tl_snapshot_acquire / tl_snapshot_release are
+ * declared in timelog.h and implemented as thin wrappers around the
+ * internal functions below.
  *===========================================================================*/
 
 /**

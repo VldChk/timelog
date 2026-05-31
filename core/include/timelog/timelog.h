@@ -188,7 +188,15 @@ typedef enum tl_log_level {
     TL_LOG_NONE  = -1   /* Disable all logging */
 } tl_log_level_t;
 
-/** Custom allocator interface */
+/**
+ * Custom allocator interface.
+ *
+ * Allocator callbacks may run on writer, reader, or maintenance threads and
+ * some internal paths call them while holding timelog mutexes. Implementations
+ * must therefore be thread-safe, non-reentrant, bounded, and C-only: they must
+ * not call back into timelog APIs, acquire application locks that can call
+ * timelog, or execute Python/runtime callbacks from language bindings.
+ */
 typedef struct tl_allocator {
     void* ctx;
     void* (*malloc_fn)(void* ctx, size_t size);
@@ -331,8 +339,8 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  *   while tl_close() is executing.
  * - This is consistent with the single-writer model: external coordination
  *   is required for lifecycle transitions.
- * - If worker join fails (TL_EINTERNAL from internal tl_maint_stop), close
- *   will abort in debug builds to prevent memory corruption.
+ * - If internal worker stop does not return TL_OK, close aborts rather than
+ *   tearing down state before maintenance quiescence.
  */
 TL_API void tl_close(tl_timelog_t* tl);
 
@@ -409,7 +417,11 @@ TL_API tl_status_t tl_compact(tl_timelog_t* tl);
 /** Acquire a consistent read snapshot. Thread-safe (multiple concurrent readers). */
 TL_API tl_status_t tl_snapshot_acquire(const tl_timelog_t* tl, tl_snapshot_t** out);
 
-/** Release snapshot. All iterators derived from it must be destroyed first. */
+/**
+ * Release a snapshot. All iterators derived from it must be destroyed first.
+ * The snapshot pointer is single-owner; callers must not release the same
+ * snapshot concurrently or more than once.
+ */
 TL_API void tl_snapshot_release(tl_snapshot_t* s);
 
 /*===========================================================================
@@ -602,14 +614,15 @@ TL_API tl_status_t tl_maint_start(tl_timelog_t* tl);
  * Safe to call regardless of mode (allows cleanup in tl_close).
  *
  * @param tl Timelog instance
- * @return TL_OK       Worker stopped (or already stopped, or stop in progress)
+ * @return TL_OK       Worker stopped or already stopped
  *         TL_EINVAL   tl is NULL
+ *         TL_EBUSY    Another thread is already stopping the worker; retry later
  *         TL_EINTERNAL Thread join failed (severe error)
  *
  * Thread Safety: Safe to call from any thread.
- * Idempotency: Returns TL_OK if already stopped or if another thread is
- *              stopping. In the latter case, TL_OK does NOT guarantee the
- *              worker has fully exited - only that a stop is in progress.
+ * Idempotency: Returns TL_OK if already stopped. If another thread is already
+ *              stopping the worker, returns TL_EBUSY so callers do not mistake
+ *              an in-flight stop for completed quiescence.
  *
  * @warning Do not call from the worker thread itself (deadlock on join).
  */

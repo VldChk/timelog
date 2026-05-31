@@ -29,19 +29,11 @@ void tl_page_builder_init(tl_page_builder_t* pb, tl_alloc_ctx_t* alloc,
     pb->records_per_page = tl_page_builder_compute_capacity(target_page_bytes);
 }
 
-/*---------------------------------------------------------------------------
- * Single-Allocation Page Layout
- *
- * We allocate one block containing:
- * - tl_page_t header
- * - padding for ts[] alignment
- * - ts[] array
- * - padding for h[] alignment
- * - h[] array
- *
- * This minimizes allocations and improves cache locality.
- *---------------------------------------------------------------------------*/
-
+/*
+ * The page header, the ts[] array, and the h[] array all live inside a single
+ * backing allocation so that destruction is a single free() and so the SoA
+ * data sits next to its metadata in cache.
+ */
 tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
                                    const tl_record_t* records, size_t count,
                                    tl_page_t** out) {
@@ -66,7 +58,9 @@ tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
     }
 #endif
 
-    /* Compute single-allocation layout with overflow checks */
+    /* Lay out [header][ts[]][h[]] inside one allocation with explicit
+     * alignment for each array. Every size computation is overflow-checked
+     * because count is caller-supplied. */
     const size_t ts_align = _Alignof(tl_ts_t);
     const size_t h_align = _Alignof(tl_handle_t);
 
@@ -134,7 +128,7 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc) {
         return;
     }
 
-    /* Page struct is part of backing, so a single free covers both */
+    /* Header, ts[], and h[] share a single allocation rooted at backing. */
     if (page->backing != NULL) {
         tl__free(alloc, page->backing);
     }
@@ -196,7 +190,6 @@ size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target) {
 
 #ifdef TL_DEBUG
 
-/** Validate page invariants (bounds, sortedness, flags). */
 bool tl_page_validate(const tl_page_t* page) {
     if (page == NULL) {
         return false;
@@ -219,13 +212,14 @@ bool tl_page_validate(const tl_page_t* page) {
         }
     }
 
-    /* Both delete bits set simultaneously is invalid */
+    /* FULLY_DELETED and PARTIAL_DELETED are mutually exclusive by design. */
     uint32_t del_bits = page->flags & (TL_PAGE_FULLY_DELETED | TL_PAGE_PARTIAL_DELETED);
     if (del_bits == (TL_PAGE_FULLY_DELETED | TL_PAGE_PARTIAL_DELETED)) {
         return false;
     }
 
-    /* Only FULLY_LIVE pages are valid in the current on-disk format. */
+    /* The current builder only emits live pages; row-level delete metadata
+     * is reserved for a future format. */
     if (page->flags != TL_PAGE_FULLY_LIVE) {
         return false;
     }
@@ -266,7 +260,8 @@ void tl_page_catalog_destroy(tl_page_catalog_t* cat) {
     cat->capacity = 0;
 }
 
-/* On error, catalog state is unchanged (safe to retry or destroy). */
+/* On error, the catalog is left untouched so callers can retry or destroy
+ * it without leaking. */
 tl_status_t tl_page_catalog_reserve(tl_page_catalog_t* cat, size_t n) {
     TL_ASSERT(cat != NULL);
 
@@ -335,7 +330,9 @@ size_t tl_page_catalog_find_first_ge(const tl_page_catalog_t* cat, tl_ts_t ts) {
         return 0;
     }
 
-    /* Lower-bound on max_ts (monotonically non-decreasing) */
+    /* max_ts is monotonically non-decreasing across pages (pages within a
+     * segment come from a single sorted record stream), so a plain
+     * lower_bound on max_ts gives the first page that may contain ts. */
     size_t lo = 0;
     size_t hi = cat->n_pages;
 
@@ -358,7 +355,6 @@ size_t tl_page_catalog_find_start_ge(const tl_page_catalog_t* cat, tl_ts_t ts) {
         return 0;
     }
 
-    /* Lower-bound on min_ts */
     size_t lo = 0;
     size_t hi = cat->n_pages;
 
@@ -380,7 +376,6 @@ size_t tl_page_catalog_find_start_ge(const tl_page_catalog_t* cat, tl_ts_t ts) {
 
 #ifdef TL_DEBUG
 
-/** Validate catalog invariants (sort order, metadata consistency, page validity). */
 bool tl_page_catalog_validate(const tl_page_catalog_t* cat) {
     if (cat == NULL) {
         return false;
@@ -406,7 +401,9 @@ bool tl_page_catalog_validate(const tl_page_catalog_t* cat) {
             return false;
         }
 
-        /* Metadata must match actual page values */
+        /* Catalog metadata is a cache of the page header; mismatch means
+         * either the page mutated (impossible — pages are immutable) or the
+         * catalog was populated incorrectly. */
         if (m->min_ts != m->page->min_ts) {
             return false;
         }

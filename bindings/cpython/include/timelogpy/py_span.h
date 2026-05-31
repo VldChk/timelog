@@ -1,14 +1,14 @@
 /**
  * @file py_span.h
- * @brief PyPageSpan CPython extension type declaration (Core API Integration)
+ * @brief PyPageSpan CPython extension type declaration
  *
  * This module provides the PyPageSpan type which exposes a contiguous
  * slice of page memory (timestamps) via the CPython buffer protocol.
  *
- * Architecture (Post-Migration):
- *   PageSpan now wraps the core tl_pagespan_view_t, storing ts/h/len
- *   pointers directly instead of page pointer + row indices. The core
- *   tl_pagespan_owner_t manages snapshot lifetime via hooks.
+ * Architecture:
+ *   PageSpan wraps the core tl_pagespan_view_t, storing ts/h/len pointers
+ *   directly. The core tl_pagespan_owner_t manages snapshot lifetime via
+ *   hooks invoked when the owner refcount reaches zero.
  *
  * Zero-Copy Promise:
  *   The .timestamps property returns a memoryview directly backed by
@@ -49,7 +49,7 @@ extern "C" {
  * Zero-copy view of timestamps from a single span slice.
  * Implements the buffer protocol for memoryview exposure.
  *
- * Data Layout (Core API Integration):
+ * Data layout:
  *   The span stores pointers from tl_pagespan_view_t directly:
  *   - ts: pointer to timestamp array (borrowed from owner's snapshot)
  *   - h:  pointer to handle array (borrowed from owner's snapshot)

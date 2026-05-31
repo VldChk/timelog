@@ -8,15 +8,16 @@
 /*===========================================================================
  * Memrun Iterator
  *
- * Internal K-way merge over run[] and OOO runs within a memrun.
+ * Internal K-way merge over a memrun's sorted run plus its OOO runs.
  *
- * UNBOUNDED QUERY DESIGN:
- * - If t2_unbounded == true, the query is [t1, +inf)
- * - When t2_unbounded is true, the 't2' field is ignored (pass 0 for clarity)
+ * Range semantics:
+ * - When t2_unbounded == true the query is [t1, +inf) and the t2 field
+ *   is ignored (pass 0 for clarity).
+ * - Otherwise the query is the half-open interval [t1, t2).
  *
  * Thread Safety:
- * - Not thread-safe (each thread needs its own iterator)
- * - Memrun must remain valid for the lifetime of the iterator
+ * - Not thread-safe (each thread needs its own iterator).
+ * - Memrun must remain valid for the lifetime of the iterator.
  *===========================================================================*/
 
 typedef struct tl_memrun_iter {

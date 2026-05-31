@@ -82,11 +82,7 @@ class Timelog(_CTimelog):
         Supported builds:
             * Regular CPython 3.12-3.14 (single interpreter).
             * Isolated subinterpreters with per-interpreter GIL (3.12+).
-            * Free-threaded CPython 3.14t (Py_GIL_DISABLED=1) — the
-              module declares Py_mod_gil = Py_MOD_GIL_NOT_USED and
-              synchronizes all mutable extension state with per-object
-              critical sections, an explicit live_lock, and atomic
-              context refcounts.
+            * Free-threaded CPython 3.14t (Py_GIL_DISABLED=1).
 
     Warning:
         ``close()`` drops unflushed records. Call ``flush()`` first to

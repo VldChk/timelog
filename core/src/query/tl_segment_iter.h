@@ -7,28 +7,23 @@
 /*===========================================================================
  * Segment Iterator
  *
- * Iterates over records within a segment for a given range [t1, t2) or
- * [t1, +inf). Uses page catalog for pruning and within-page binary search
- * for efficient navigation.
- *
- * Algorithm:
- * 1. Initialize: find first and last pages that might overlap the range
- * 2. For each page: use binary search to find row boundaries
- * 3. Iterate through rows, checking range bounds
+ * Walks the records of a segment that fall in [t1, t2) or [t1, +inf).
+ * The page catalog prunes to the relevant page range, then a binary
+ * search inside each page positions the cursor at the first matching
+ * row.
  *
  * API contract:
- * - This iterator is pull-based (next-only).
- * - It does not expose a persistent "current row" or peek operation.
- * - Callers that need non-advancing inspection should cache the last row.
+ * - Pull-based: next() is the only way to advance.
+ * - No persistent "current row" and no peek; callers that need
+ *   non-advancing inspection must cache the last returned record.
  *
- * UNBOUNDED QUERY DESIGN:
- * - If t2_unbounded == true, the query is [t1, +inf)
- * - When t2_unbounded is true, the 't2' field is ignored (pass 0 for clarity)
- * - All comparisons must check t2_unbounded FIRST before using t2
+ * Range semantics:
+ * - t2_unbounded == true means [t1, +inf); the t2 field is ignored.
+ *   All comparisons MUST check t2_unbounded before reading t2.
  *
  * Thread Safety:
- * - Not thread-safe (each thread needs its own iterator)
- * - Segment must remain valid for the lifetime of the iterator
+ * - Not thread-safe (each thread needs its own iterator).
+ * - Segment must remain valid for the lifetime of the iterator.
  *===========================================================================*/
 
 typedef struct tl_segment_iter {
@@ -56,20 +51,17 @@ typedef struct tl_segment_iter {
  *===========================================================================*/
 
 /**
- * Initialize segment iterator for range [t1, t2) or [t1, +inf).
+ * Initialise the iterator for range [t1, t2) or [t1, +inf).
  *
- * UNBOUNDED QUERIES:
- * - If t2_unbounded == true, the query is [t1, +inf)
- * - When t2_unbounded is true, t2 is IGNORED (pass 0 or any value)
+ * After init, call tl_segment_iter_next() to fetch the first record.
+ * If the segment does not overlap the requested range, the iterator
+ * starts already exhausted.
  *
- * After init, call tl_segment_iter_next() to get the first record.
- * If the segment doesn't overlap the range, the iterator starts exhausted.
- *
- * @param it           Iterator to initialize
+ * @param it           Iterator to initialise
  * @param seg          Segment to iterate (must remain valid)
  * @param t1           Range start (inclusive)
- * @param t2           Range end (exclusive) - ONLY used if !t2_unbounded
- * @param t2_unbounded True => [t1, +inf), t2 is ignored
+ * @param t2           Range end (exclusive); ignored when t2_unbounded
+ * @param t2_unbounded When true, range is [t1, +inf)
  */
 void tl_segment_iter_init(tl_segment_iter_t* it,
                            const tl_segment_t* seg,

@@ -79,22 +79,25 @@ typedef struct tl_segment {
     uint32_t  level;            /* tl_segment_level_t */
     uint32_t  generation;       /* Monotonic generation counter (diagnostics) */
     /*
-     * Tombstone watermark applied to this segment.
+     * Tombstone watermark for this segment.
      *
-     * CONTRACT: For immutable source S with S.applied_seq = X, all
-     * tombstones with seq <= X were physically applied to S's records
-     * at build time. Surviving records have either:
-     *   - tomb_seq <= X: tombstone already applied, record survived
-     *   - tomb_seq > X:  tombstone newer, must be checked at query time
+     * Contract: for an immutable source with applied_seq = X, every tombstone
+     * with seq <= X was already physically applied to that source's records
+     * at build time. A surviving record therefore falls into one of:
+     *   - tomb_seq <= X: a tombstone visible at build time did not cover it,
+     *     so the record is permanently live for that tombstone set.
+     *   - tomb_seq > X:  a newer tombstone exists and the read path must
+     *     re-check it at query time.
      *
-     * INVARIANT: applied_seq >= max(tombstones[i].max_seq) for all
-     * tombstones stored in this segment.
+     * Invariants:
+     *   - applied_seq >= max(tombstones[i].max_seq) for every tombstone
+     *     stored in this segment.
+     *   - For L0 segments emitted in flush order, applied_seq is
+     *     non-decreasing with generation because the flush assigns op_seq
+     *     at seal time.
      *
-     * INVARIANT: For L0 segments produced in order, applied_seq is
-     * non-decreasing with generation (flush assigns op_seq at seal time).
-     *
-     * CRITICAL: During flush, applied_seq and the tombstone set MUST come
-     * from the same snapshot to preserve the watermark guarantee.
+     * During flush, applied_seq and the tombstone set must originate from
+     * the same snapshot or the watermark guarantee above breaks.
      */
     tl_seq_t  applied_seq;
 

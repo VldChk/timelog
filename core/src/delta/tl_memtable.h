@@ -242,16 +242,11 @@ bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt);
 /**
  * Seal active state into a memrun and push to sealed queue.
  *
- * CRITICAL: This function PRESERVES active state on failure.
- *
- * Algorithm (failure-safe):
- * 1. If active empty: return TL_OK (no-op)
- * 2. Check queue capacity (under memtable_mu): if full, return TL_EBUSY
- * 3. Allocate memrun struct: if fails, return TL_ENOMEM (active preserved)
- * 4. Take ownership of active arrays (tl_recvec_take, tl_intervals_take)
- * 5. Initialize memrun fields, compute bounds (including tombstones)
- * 6. Push to sealed queue (under memtable_mu)
- * 7. Reset active metadata (last_inorder_ts, active_bytes_est)
+ * Failure-safe: every error path that runs before the memrun is published
+ * leaves the active buffers untouched, so the caller may retry without losing
+ * data. The queue-full check is performed twice (before any allocation and
+ * again at publish time) to translate contention into TL_EBUSY without
+ * wasting work.
  *
  * Requires: writer_mu held externally, memtable_mu acquired internally
  *

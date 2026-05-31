@@ -3,7 +3,7 @@
  * @brief Unit tests for PyTimelogIter CPython extension
  *
  * TDD-driven tests for the PyTimelogIter iterator type.
- * Tests run with Python initialized and GIL held.
+ * Tests run with Python initialized on an attached Python thread state.
  */
 
 #define PY_SSIZE_T_CLEAN

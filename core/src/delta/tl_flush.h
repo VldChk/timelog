@@ -11,11 +11,9 @@
  *
  * Builds L0 segments from sealed memruns. Serialized by flush_mu in tl_timelog.
  *
- * The flush builder:
- * 1. Merges run + OOO runs into a single sorted stream (K-way merge)
- * 2. Passes merged records + tombstones to tl_segment_build_l0
- * 3. Returns the built L0 segment
- *
+ * The flush builder merges the in-order run and every OOO run into a single
+ * sorted stream via a k-way merge, then hands the merged records plus the
+ * memrun's tombstones to tl_segment_build_l0 to produce an L0 segment.
  *===========================================================================*/
 
 /*===========================================================================
@@ -124,14 +122,11 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
 /**
  * Build an L0 segment from a memrun.
  *
- * Algorithm:
- * 1. Check for addition overflow: run_len + ooo_total_len
- * 2. If both run and OOO empty but tombs non-empty: build tombstone-only segment
- * 3. Check for multiplication overflow: total_records * sizeof(tl_record_t)
- * 4. Allocate merged[] buffer
- * 5. Merge run + OOO runs into merged[] using K-way merge
- * 6. Call tl_segment_build_l0(merged, tombstones)
- * 7. Free merged[] buffer
+ * Performs a stable k-way merge of the in-order run and every OOO run, applies
+ * the snapshot-visible tombstones to drop records the merge would otherwise
+ * keep, and hands the surviving records (plus the memrun's persisted
+ * tombstones) to tl_segment_build_l0. If no records survive but tombstones
+ * exist, a tombstone-only segment is produced.
  *
  * @param ctx              Flush context with configuration
  * @param mr               Pinned memrun (caller holds reference)

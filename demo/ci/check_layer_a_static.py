@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Production-source regression checks for Layer A interpreter isolation."""
+"""Production-source regression checks for per-interpreter isolation.
+
+Scans the CPython binding sources for patterns that would break heap-type
+isolation across subinterpreters (static type objects, cached module
+globals, GIL-only claims in docs, etc.).
+"""
 
 from __future__ import annotations
 
@@ -87,8 +92,12 @@ TEXT_RULES = (
         "stale GIL-only claim",
         re.compile(
             r"(?:"
-            r"\b(?:requires|needs|must\s+hold|depends\s+on)\s+"
+            r"\b(?:requires|needs|depends\s+on)\s+"
             r"(?:the\s+)?(?:CPython\s+)?GIL\b"
+            r"|\bmust\s+(?:hold|be\s+held)\s+(?:the\s+)?(?:CPython\s+)?GIL\b"
+            r"|\b(?:called|run|runs|running)\s+with\s+"
+            r"(?:the\s+)?(?:CPython\s+)?GIL\s+held\b"
+            r"|\bwith\s+(?:the\s+)?(?:CPython\s+)?GIL\s+held\b"
             r"|\bGIL[- ](?:only|based)\b"
             r")",
             re.IGNORECASE,
@@ -113,6 +122,7 @@ def iter_text_files() -> list[Path]:
         path for path in EXTRA_TEXT_SCAN_FILES
         if path.is_file()
     }
+    files.update(iter_source_files())
     docs_root = ROOT / "docs"
     if docs_root.is_dir():
         # Scan user-facing docs only. Internal planning/acceptance artifacts

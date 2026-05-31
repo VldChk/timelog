@@ -1,6 +1,6 @@
 /**
  * @file py_span_iter.c
- * @brief PyPageSpanIter CPython extension type implementation (Core API Integration)
+ * @brief PyPageSpanIter CPython extension type implementation
  *
  * Implements streaming iteration over page spans using core tl_pagespan_iter_*.
  * Delegates span enumeration and ownership management to core.
@@ -49,7 +49,8 @@ typedef struct tl_py_pagespan_hook_ctx {
 
 /**
  * Release hook: called by core when owner refcount reaches 0.
- * GIL must be held. Preserves exception state (may run during GC).
+ * Must run on the owning interpreter with an attached Python thread state.
+ * Preserves exception state (may run during GC).
  */
 static void tl_py_pagespan_on_release(void* user)
 {
@@ -129,11 +130,11 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     /*
      * Acquire all lifetime guards under core_lock so a concurrent close()
      * cannot free handle_ctx/engine_ctx in the window between the open-state
-     * check and the pin/incref (the pin-before-own TOCTOU). Under the lock:
-     * recheck open (tl_py_lock_checked), own a handle_ctx + engine_ctx ref,
-     * enter the pin, then open the core iterator. The owned refs + pin are
-     * transferred to the hook context (released by tl_py_pagespan_on_release
-     * when the owner refcount reaches zero).
+     * check and the pin/incref. Under the lock: recheck open
+     * (tl_py_lock_checked), own a handle_ctx + engine_ctx ref, enter the
+     * pin, then open the core iterator. The owned refs + pin are
+     * transferred to the hook context, which releases them when
+     * tl_py_pagespan_on_release fires (the owner refcount reaches zero).
      */
     if (tl_py_lock_checked(tl_obj) < 0) {
         PyMem_Free(hook_ctx);
@@ -282,7 +283,7 @@ static void PyPageSpanIter_dealloc(PyPageSpanIter* self)
  * Iterator Protocol
  *
  * Each __next__ call invokes core iter_next to get the next span on-demand.
- * This is streaming - no pre-collection of spans.
+ * No pre-collection of spans.
  *===========================================================================*/
 
 static PyObject* PyPageSpanIter_iternext(PyPageSpanIter* self)

@@ -101,8 +101,10 @@ static int tl_py_iter_test_should_fail_next_batch(void)
  * the critical section with the returned values.
  *
  * Splitting cleanup this way lets iternext / next_batch hold the CS through
- * the engine call (preventing close-vs-engine-call UAF) while still honoring
- * spec §5.4: no Py_DECREF / hook / __del__ work under any internal lock.
+ * the engine call (which prevents a concurrent close from freeing self->iter
+ * mid-call) while keeping the hard rule "no Py_DECREF, hook or __del__ work
+ * under any internal lock" — that work runs only after the release helper
+ * has been invoked outside the CS.
  */
 static int pytimelogiter_detach_locked(
     PyTimelogIter* self,
@@ -230,11 +232,10 @@ static void PyTimelogIter_dealloc(PyTimelogIter* self)
 static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 {
     /*
-     * Hold the iter's CS during tl_iter_next. The engine call is pure C
-     * (does not execute Python), so the spec hard invariant ("no Python
-     * work under internal locks") is honored. The CS prevents a concurrent
-     * close() from running tl_iter_destroy(self->iter) while the engine
-     * call is in flight (which would be UAF).
+     * Hold the iter's CS across tl_iter_next so a concurrent close() cannot
+     * tl_iter_destroy(self->iter) mid-call (which would be UAF). The engine
+     * call is pure C and executes no Python, so the "no Python work under
+     * any internal lock" rule is preserved.
      *
      * Py_BEGIN_CRITICAL_SECTION introduces a scope; structure the function
      * as a single LOCK/UNLOCK pair so locally-declared inner state cannot

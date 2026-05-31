@@ -1,14 +1,14 @@
 /**
  * @file py_span_iter.h
- * @brief PyPageSpanIter CPython extension type declaration (Core API Integration)
+ * @brief PyPageSpanIter CPython extension type declaration
  *
  * This module provides the PyPageSpanIter type which wraps the core
  * tl_pagespan_iter_t for streaming iteration over page spans.
  *
- * Architecture (Post-Migration):
- *   The iterator delegates to the core tl_pagespan_iter_* API instead of
- *   pre-collecting span descriptors. This eliminates algorithm duplication
- *   and reduces memory usage for large result sets.
+ * Architecture:
+ *   The iterator delegates to the core tl_pagespan_iter_* API rather than
+ *   pre-collecting span descriptors, so memory usage stays bounded
+ *   regardless of result-set size.
  *
  * Streaming Behavior:
  *   Each call to __next__ invokes tl_pagespan_iter_next() which returns

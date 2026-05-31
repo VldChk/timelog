@@ -51,7 +51,6 @@ typedef struct {
     /**
      * Strong reference to owner PyTimelog.
      * Prevents UAF if user drops PyTimelog ref while iterator exists.
-     * Pin tracking replaces HLD's open-iterator counter.
      */
     PyObject* owner;
 

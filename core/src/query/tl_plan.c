@@ -172,12 +172,13 @@ static tl_status_t add_active_tombstones(tl_intervals_t* accum,
  * Lifecycle
  *
  * Allocation and cleanup semantics:
- * - tl_plan_build() initializes plan with memset(0) first, so partial
- *   allocations on failure leave plan in a safe state (NULL pointers)
- * - On any allocation failure, build() calls tl_plan_destroy() internally
- *   before returning error, so caller does NOT need to clean up on failure
- * - tl_plan_destroy() safely handles NULL arrays (checks before free)
- * - Caller MUST call tl_plan_destroy() on success to free sources/tombstones
+ * - tl_plan_build() begins with memset(0), so partial allocations on
+ *   failure leave the plan in a safe NULL-pointer state.
+ * - On any allocation failure, build() calls tl_plan_destroy() before
+ *   returning the error; callers do not need to clean up on failure.
+ * - tl_plan_destroy() tolerates NULL arrays (checked before free).
+ * - On success the caller MUST call tl_plan_destroy() to release the
+ *   sources and tombstone arrays.
  *===========================================================================*/
 
 tl_status_t tl_plan_build(tl_plan_t* plan,
@@ -202,12 +203,14 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
     tl_intervals_init(&tombs, alloc);
     tl_status_t st;
 
-    /* Empty range short-circuit (unbounded ranges are never empty) */
+    /* Empty range short-circuit (unbounded ranges are never empty). */
     if (tl_range_is_empty(t1, t2, t2_unbounded)) {
         return TL_OK;
     }
 
-    /* Step 1: L1 segments (binary search to first overlap) */
+    /* L1: non-overlapping, sorted by window_start. Binary-search to
+     * the first window that can overlap [t1, ...), then linear-scan
+     * forward until past t2. */
     size_t l1_start = tl_manifest_l1_find_first_overlap(manifest, t1);
     for (size_t i = l1_start; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
@@ -225,15 +228,17 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
-        /* Defensive: include any L1 tombstones if present. */
+        /* L1 segments are tombstone-free by invariant; collect
+         * defensively to remain correct if that ever changes. */
         st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
-    /* Count pruned segments from before l1_start */
+    /* Account for everything skipped by the binary search. */
     plan->segments_pruned += l1_start;
 
-    /* Step 2: L0 segments (may overlap; priority by generation) */
+    /* L0: segments may overlap each other; merge priority comes from
+     * generation (newer flushes have higher generation). */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
@@ -251,7 +256,6 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             continue;
         }
 
-        /* L0 priority: use generation (newer flushes have higher gen) */
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
@@ -259,7 +263,8 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /* Step 3: Sealed memruns (FIFO; higher index = newer = higher priority) */
+    /* Sealed memruns: held in FIFO order, so a higher index means a
+     * newer memrun, which gets higher merge priority. */
     size_t sealed_len = tl_memview_sealed_len(mv);
     for (size_t i = 0; i < sealed_len; i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
@@ -275,7 +280,9 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             continue;
         }
 
-        /* Priority for memruns: base at segment max gen + index */
+        /* Memruns rank above any L0 segment by starting from one past
+         * the newest L0 generation, then ordering memruns among
+         * themselves by FIFO index. */
         uint32_t base_priority = 0;
         if (tl_manifest_l0_count(manifest) > 0) {
             uint32_t newest_gen = tl_manifest_l0_get(
@@ -283,16 +290,13 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             base_priority = (newest_gen == UINT32_MAX) ? UINT32_MAX : (newest_gen + 1);
         }
 
-        /*
-         * Overflow-safe priority assignment with saturation.
-         * If base_priority + i would exceed UINT32_MAX, saturate to UINT32_MAX.
-         * This preserves relative ordering within the valid range.
-         */
+        /* Saturating addition keeps relative ordering correct even at
+         * the extreme upper end of the priority space. */
         uint32_t priority;
         if (i > UINT32_MAX) {
             priority = UINT32_MAX;
         } else if (base_priority > UINT32_MAX - (uint32_t)i) {
-            priority = UINT32_MAX;  /* Saturate on overflow */
+            priority = UINT32_MAX;
         } else {
             priority = base_priority + (uint32_t)i;
         }
@@ -304,7 +308,7 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /* Step 4: Active memview (highest priority) */
+    /* Active memview holds the most recent writes; always max priority. */
     if (mv->has_data && tl_memview_overlaps(mv, t1, t2, t2_unbounded)) {
         size_t active_run_len = tl_memview_run_len(mv);
         size_t active_ooo_len = tl_memview_ooo_total_len(mv);
@@ -318,7 +322,8 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         if (st != TL_OK) goto fail;
     }
 
-    /* Step 5: Clip tombstones to query range */
+    /* Clip the accumulated tombstones to the query range so the
+     * filter pass never visits intervals that cannot affect output. */
     if (!tl_intervals_is_empty(&tombs)) {
         if (t2_unbounded) {
             tl_intervals_clip_lower(&tombs, t1);

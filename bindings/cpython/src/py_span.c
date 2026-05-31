@@ -1,6 +1,6 @@
 /**
  * @file py_span.c
- * @brief PyPageSpan CPython extension type implementation (Core API Integration)
+ * @brief PyPageSpan CPython extension type implementation
  *
  * Implements zero-copy timestamp exposure via the CPython buffer protocol.
  * Delegates ownership management to core tl_pagespan_owner_t.
@@ -74,9 +74,11 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
     self->first_ts = view->first_ts;
     self->last_ts = view->last_ts;
 
-    /* Buffer protocol state. */
-    self->shape[0] = 0;
-    self->strides[0] = 0;
+    /* Buffer protocol metadata is immutable after creation. Existing
+     * memoryviews may read these arrays without taking our critical section, so
+     * getbuffer() must not rewrite them under free-threaded CPython. */
+    self->shape[0] = (Py_ssize_t)view->len;
+    self->strides[0] = (Py_ssize_t)sizeof(tl_ts_t);
     self->exports = 0;
     self->closed = 0;
 
@@ -95,7 +97,8 @@ PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
  * Detach the span's owned resources in ONE critical section, making the
  * "check exports + mark closed + detach owner" sequence atomic with respect
  * to a concurrent getbuffer (which checks closed + increments exports under
- * the same CS). This closes the close-vs-buffer-export TOCTOU.
+ * the same CS). Without this, getbuffer could export a buffer in the gap
+ * between an exports==0 read and the mark-closed store.
  *
  * Returns:
  *   1  detached — caller MUST release (*out_owner, *out_timelog) outside CS
@@ -134,9 +137,9 @@ static int pagespan_detach_locked(PyPageSpan* self, int force,
     return result;
 }
 
-/* Release detached resources OUTSIDE any critical section (the owner hook
- * may drain; Py_DECREF may run __del__). Spec §5.4: no such work under a
- * lock. */
+/* Release detached resources OUTSIDE any critical section: the owner
+ * release hook may drain retired objects and Py_DECREF may run __del__,
+ * neither of which is permitted while an internal lock is held. */
 static void pagespan_release_detached(tl_pagespan_owner_t* owner,
                                       PyObject* timelog)
 {
@@ -222,10 +225,10 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
     view->obj = NULL;
 
     /* err codes: 0 ok, 1 closed, 2 overflow, 3 writable-rejected.
-     * The closed check is evaluated BEFORE the writable rejection to
-     * preserve the historical exception precedence (a closed span raises
-     * ValueError, not BufferError, even when a writable buffer was
-     * requested). */
+     * The closed check runs BEFORE the writable check so a closed span
+     * always raises ValueError, even when the caller asked for a writable
+     * buffer (which would otherwise mask the closed state with
+     * BufferError). */
     int err = 0;
     void* ts_local = NULL;
     Py_ssize_t n_local = 0;
@@ -251,13 +254,11 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
         view->ndim = 1;
         view->format = (flags & PyBUF_FORMAT) ? (char*)PAGESPAN_TS_FORMAT : NULL;
         if (flags & PyBUF_ND) {
-            self->shape[0] = n_local;
             view->shape = self->shape;
         } else {
             view->shape = NULL;
         }
         if (flags & PyBUF_STRIDES) {
-            self->strides[0] = (Py_ssize_t)sizeof(tl_ts_t);
             view->strides = self->strides;
         } else {
             view->strides = NULL;

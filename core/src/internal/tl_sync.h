@@ -21,8 +21,9 @@
 /*===========================================================================
  * Mutex
  *
- * Design: Use SRWLock on Windows (fast, slim) and pthread_mutex on POSIX.
- * Both are non-recursive by default, which matches our usage.
+ * Backed by SRWLock on Windows (slim, fast, non-recursive) and
+ * pthread_mutex on POSIX. Both implementations are non-recursive by
+ * design — the engine never re-enters a mutex it already holds.
  *===========================================================================*/
 
 #if defined(TL_PLATFORM_WINDOWS)
@@ -30,7 +31,7 @@
 typedef struct tl_mutex {
     SRWLOCK lock;
 #ifdef TL_DEBUG
-    volatile DWORD owner;  /* Thread ID of owner, 0 if unlocked */
+    volatile DWORD owner;  /* Thread ID of owner; 0 means unlocked. */
 #endif
 } tl_mutex_t;
 
@@ -40,57 +41,40 @@ typedef struct tl_mutex {
     pthread_mutex_t lock;
 #ifdef TL_DEBUG
     /*
-     * IMPORTANT: pthread_t is an opaque type - we cannot assign 0 to it.
-     * We use 'locked' as the primary indicator and only read 'owner' when
-     * 'locked' is true. The owner field is only valid when locked == 1.
+     * pthread_t is opaque, so we cannot use a sentinel value to mean
+     * "unlocked". The companion 'locked' flag carries that information,
+     * and owner is only meaningful while locked == 1.
      */
-    pthread_t owner;    /* Valid only when locked == 1 */
-    int locked;         /* 0 = unlocked, 1 = locked */
+    pthread_t owner;
+    int locked;
 #endif
 } tl_mutex_t;
 
 #endif
 
-/**
- * Initialize a mutex.
- * @return TL_OK on success, TL_EINTERNAL on failure
- */
+/** @return TL_OK on success, TL_EINTERNAL on platform failure. */
 tl_status_t tl_mutex_init(tl_mutex_t* mu);
 
-/**
- * Destroy a mutex.
- * Mutex must be unlocked. Behavior undefined if locked.
- */
+/** Destroy an unlocked mutex. Destroying a held mutex is undefined behaviour. */
 void tl_mutex_destroy(tl_mutex_t* mu);
 
-/**
- * Acquire mutex (blocking).
- */
 void tl_mutex_lock(tl_mutex_t* mu);
 
-/**
- * Release mutex.
- * Must be called by the thread that locked it.
- */
+/** Must be called by the same thread that called tl_mutex_lock(). */
 void tl_mutex_unlock(tl_mutex_t* mu);
 
-/**
- * Try to acquire mutex (non-blocking).
- * @return true if acquired, false if already locked
- */
+/** @return true if the mutex was acquired, false if already held. */
 bool tl_mutex_trylock(tl_mutex_t* mu);
 
 #ifdef TL_DEBUG
-/**
- * Check if current thread holds the mutex (debug only).
- */
+/** Debug-only ownership query, used to assert lock-order invariants. */
 bool tl_mutex_is_held(const tl_mutex_t* mu);
 #endif
 
 /*===========================================================================
  * Condition Variable
  *
- * Design: Use CONDITION_VARIABLE on Windows, pthread_cond on POSIX.
+ * Backed by CONDITION_VARIABLE on Windows and pthread_cond on POSIX.
  *===========================================================================*/
 
 #if defined(TL_PLATFORM_WINDOWS)
@@ -103,49 +87,39 @@ typedef struct tl_cond {
 
 typedef struct tl_cond {
     pthread_cond_t cond;
-    bool use_monotonic;  /* true if using CLOCK_MONOTONIC, false for CLOCK_REALTIME */
+    /* Prefer CLOCK_MONOTONIC so timed waits are immune to wall-clock
+     * jumps; fall back to CLOCK_REALTIME on platforms that don't support
+     * setting the condvar clock attribute. */
+    bool use_monotonic;
 } tl_cond_t;
 
 #endif
 
-/**
- * Initialize a condition variable.
- * @return TL_OK on success, TL_EINTERNAL on failure
- */
+/** @return TL_OK on success, TL_EINTERNAL on platform failure. */
 tl_status_t tl_cond_init(tl_cond_t* cv);
 
-/**
- * Destroy a condition variable.
- */
 void tl_cond_destroy(tl_cond_t* cv);
 
 /**
- * Wait on condition variable.
- * Mutex must be held; it is released during wait and reacquired before return.
+ * Wait on the condvar with the associated mutex held. The mutex is
+ * released for the duration of the wait and re-acquired before return.
  */
 void tl_cond_wait(tl_cond_t* cv, tl_mutex_t* mu);
 
 /**
- * Wait on condition variable with timeout.
- * @param timeout_ms Maximum wait time in milliseconds
- * @return true if signaled, false if timed out
+ * Bounded wait. @return true on a wake-up, false on timeout. Spurious
+ * wake-ups are possible — callers must re-check their predicate.
  */
 bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms);
 
-/**
- * Signal one waiting thread.
- */
 void tl_cond_signal(tl_cond_t* cv);
-
-/**
- * Signal all waiting threads.
- */
 void tl_cond_broadcast(tl_cond_t* cv);
 
 /*===========================================================================
  * Thread
  *
- * Design: Simple wrapper for background maintenance thread.
+ * Minimal wrapper around the platform thread API, used for the background
+ * maintenance worker.
  *===========================================================================*/
 
 typedef void* (*tl_thread_fn)(void* arg);
@@ -168,41 +142,23 @@ typedef struct tl_thread {
 
 #endif
 
-/**
- * Create and start a new thread.
- * @param thread Output thread handle
- * @param fn Thread function
- * @param arg Argument passed to fn
- * @return TL_OK on success, TL_EINTERNAL on failure
- */
+/** @return TL_OK on success, TL_EINTERNAL on platform failure. */
 tl_status_t tl_thread_create(tl_thread_t* thread, tl_thread_fn fn, void* arg);
 
-/**
- * Wait for thread to complete and retrieve result.
- * @param thread Thread to join
- * @param result Optional output for thread return value
- * @return TL_OK on success
- */
+/** Block until the thread exits, optionally returning its result. */
 tl_status_t tl_thread_join(tl_thread_t* thread, void** result);
 
-/**
- * Get current thread ID (for debugging).
- */
+/** Opaque identifier for the calling thread; debug/diagnostic use only. */
 uint64_t tl_thread_self_id(void);
 
 #ifdef TL_DEBUG
 /**
- * Set name for the current thread (debug only, for profilers/debuggers).
- *
- * Thread names appear in debuggers, profilers, and tools like htop.
- * This is useful for identifying maintenance worker threads.
- *
- * Platform support:
- * - Windows: SetThreadDescription (Windows 10 1607+, silently fails on older)
- * - Linux: pthread_setname_np (truncates to 15 chars)
- * - macOS: pthread_setname_np (truncates to 63 chars)
- *
- * @param name Thread name (null-terminated, may be truncated by platform)
+ * Tag the current thread with a human-readable name so it shows up in
+ * debuggers, profilers, and tools like htop. Each platform imposes its
+ * own length limit and the name will be silently truncated to fit:
+ * Linux pthread_setname_np caps at 15 chars, macOS at 63, Windows
+ * (SetThreadDescription) requires Windows 10 1607 or newer and is a
+ * no-op on older releases.
  */
 void tl_thread_set_name(const char* name);
 #endif
@@ -211,14 +167,8 @@ void tl_thread_set_name(const char* name);
  * Yield and Sleep
  *===========================================================================*/
 
-/**
- * Yield to other threads.
- */
 void tl_thread_yield(void);
 
-/**
- * Sleep for specified milliseconds.
- */
 void tl_sleep_ms(uint32_t ms);
 
 /*===========================================================================
@@ -226,9 +176,9 @@ void tl_sleep_ms(uint32_t ms);
  *===========================================================================*/
 
 /**
- * Get current monotonic time in milliseconds.
- * Used for computing elapsed time in bounded waits.
- * The absolute value is meaningless; only differences are useful.
+ * Monotonic millisecond clock. The absolute value is implementation-
+ * defined; only differences between two calls are meaningful. Used for
+ * bounded-wait elapsed-time computations.
  */
 uint64_t tl_monotonic_ms(void);
 

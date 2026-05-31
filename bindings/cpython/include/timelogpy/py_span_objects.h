@@ -1,6 +1,6 @@
 /**
  * @file py_span_objects.h
- * @brief PyPageSpanObjectsView CPython extension type declaration (Core API Integration)
+ * @brief PyPageSpanObjectsView CPython extension type declaration
  *
  * This module provides the PyPageSpanObjectsView type which provides
  * lazy access to decoded Python objects from a PageSpan.

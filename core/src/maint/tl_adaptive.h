@@ -4,26 +4,23 @@
 /*===========================================================================
  * Adaptive Segmentation Module
  *
- * Implements adaptive window size computation for L1 segmentation based on
- * data density. The feature dynamically adjusts compaction window sizes to
- * maintain approximately constant segment sizes (target_records per segment).
+ * Computes compaction window sizes from observed data density so that each
+ * window holds approximately target_records records, even as the input
+ * timestamp rate changes. Disabled by default (target_records == 0).
  *
- * Design principles:
- * 1. Backward compatible: Disabled by default (target_records == 0)
- * 2. Non-invasive: Pure policy module with clean integration points
- * 3. Safe: No allocation in policy loop, overflow-safe arithmetic
- * 4. Testable: Pure functions enable comprehensive unit testing
- * 5. Stable: All fallback paths return current_window (not base) for stability
+ * Properties:
+ * - No allocation in the policy loop; overflow-safe arithmetic throughout
+ * - All fallback paths return the current window (never reset to a base),
+ *   which keeps the control loop stable on bad samples
  *
- * Single Source of Truth:
- * - tl->effective_window_size is THE authoritative window
- * - tl_adaptive_state_t tracks EWMA, counters, and density metrics only
+ * Single source of truth:
+ * - tl->effective_window_size is the authoritative window
+ * - tl_adaptive_state_t holds only EWMA, counters, and density metrics
  *
  * Thread Safety:
- * - All state updates happen under maint_mu (single writer: maintenance thread)
- * - Density updates occur ONLY when maintenance thread performs flush
- * - Manual tl_flush() does NOT update density (acceptable constraint)
- *
+ * - State updates run under maint_mu (single writer: maintenance thread)
+ * - Density updates fire only when the maintenance thread performs a flush;
+ *   manual tl_flush() does not update density
  *===========================================================================*/
 
 #include "timelog/timelog.h"  /* For tl_adaptive_config_t, tl_ts_t, tl_status_t */
@@ -70,20 +67,13 @@ typedef struct tl_adaptive_state {
 
     /* Failure tracking */
     uint32_t        consecutive_failures;
-    /* NOTE: last_compact_windows removed - not used in current implementation.
-     * Defined for the desired_segments_per_compact feature which is
-     * not yet implemented. Add back if/when that feature is added. */
 } tl_adaptive_state_t;
 
 /*===========================================================================
  * Flush Metrics
  *
- * Metrics captured during flush for adaptive policy.
- * Record-only bounds (excludes tombstones).
- *
- * Placed in tl_adaptive.h (not tl_flush.h) because:
- * - Only consumed by adaptive policy module
- * - Avoids cross-layer header dependencies
+ * Metrics captured during flush for the adaptive policy.
+ * Bounds cover records only (tombstones excluded).
  *===========================================================================*/
 
 typedef struct tl_flush_metrics {
@@ -153,27 +143,14 @@ void tl_adaptive_update_density(tl_adaptive_state_t* state,
 /*===========================================================================
  * Window Computation
  *
- * Computes candidate window size based on current state and config.
- * Called before compaction in the maintenance path.
+ * Compute the candidate window for the next compaction.
  *
- * CRITICAL SEMANTICS: Returns current_window in ALL fallback cases:
- * - Adaptive disabled (target_records == 0)
- * - Warmup not complete (flush_count < warmup_flushes)
- * - No valid EWMA density (ewma_density <= 0)
- * - Density stale (flush_count - last_update > stale_flushes)
- * - Arithmetic failure (overflow, NaN, candidate <= 0)
+ * The candidate is target_records / ewma_density, then adjusted by failure
+ * backoff, guardrails, hysteresis, and quantum snapping.
  *
- * This "keep current" rule is critical for control-loop stability.
- * Resetting to base_window causes oscillation.
- *
- * Algorithm:
- * 1. Check fallback conditions → return current_window
- * 2. candidate = target_records / ewma_density
- * 3. Apply failure backoff if triggered
- * 4. Clamp to [min_window, max_window]
- * 5. Apply hysteresis (skip small changes)
- * 6. Apply quantum snapping (nearest-quantum rounding)
- * 7. Return candidate or current_window on any failure
+ * Every "not ready" or "computation failed" path returns current_window
+ * (NOT a base_window). Resetting to a fixed base causes the control loop
+ * to oscillate; "keep current" is what gives the loop stability.
  *
  * @param state           Adaptive state (read-only)
  * @param cfg             Adaptive configuration
@@ -188,16 +165,15 @@ tl_ts_t tl_adaptive_compute_candidate(const tl_adaptive_state_t* state,
 /*===========================================================================
  * Success/Failure Tracking
  *
- * Called ONLY after compaction publish completes.
+ * Called by the caller ONLY after compaction publish completes.
  *
- * INTEGRATION (caller must):
- * After successful publish:
- *   1. tl->effective_window_size = candidate;  // Single source of truth
- *   2. tl_adaptive_record_success(&tl->adaptive);
+ * After a successful publish, the caller must commit the new window AND
+ * record success:
+ *     tl->effective_window_size = candidate;
+ *     tl_adaptive_record_success(&tl->adaptive);
  *
- * On failure (ENOMEM/EBUSY):
- *   1. tl_adaptive_record_failure(&tl->adaptive);
- *   2. DO NOT update tl->effective_window_size
+ * On publish failure (ENOMEM/EBUSY), record failure and leave
+ * tl->effective_window_size unchanged.
  *
  * @param state  Adaptive state (modified)
  *===========================================================================*/
@@ -215,9 +191,8 @@ void tl_adaptive_record_failure(tl_adaptive_state_t* state);
  * tl_adaptive_compute_candidate() which includes warmup checks, staleness,
  * hysteresis, etc.
  *
- * Thread Safety: This function reads fields without locking (intentionally).
- * Reads may be racy but are benign for advisory use. See implementation for
- * detailed rationale. Callers must NOT use this for correctness decisions.
+ * Thread Safety: Locks the timelog maintenance mutex while reading adaptive
+ * state. Callers must not already hold maint_mu.
  *
  * @param tl  Timelog instance (must not be NULL)
  * @return true if resize might be beneficial, false otherwise
@@ -257,16 +232,9 @@ bool tl__adaptive_hysteresis_skip(double candidate,
                                   uint32_t hysteresis_pct);
 
 /**
- * Apply nearest-quantum snapping.
- * Returns snapped value, or current_window if snapping fails.
- *
- * Algorithm:
- * 1. wi = llround(candidate)
- * 2. qid = floor_div(wi, quantum)
- * 3. snapped = qid * quantum
- * 4. remainder = wi - snapped
- * 5. if remainder >= quantum/2: round up (with overflow guard)
- * 6. return snapped if > 0, else current_window
+ * Snap a candidate window to the nearest multiple of window_quantum using
+ * half-up rounding. Returns current_window for any out-of-range or
+ * non-finite input.
  */
 tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
                                      tl_ts_t window_quantum,

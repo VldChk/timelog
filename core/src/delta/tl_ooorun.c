@@ -20,7 +20,6 @@ tl_status_t tl_ooorun_create(tl_alloc_ctx_t* alloc,
     }
 
 #ifdef TL_DEBUG
-    /* Verify records are sorted by (ts, handle) */
     for (size_t i = 1; i < len; i++) {
         TL_ASSERT(records[i - 1].ts < records[i].ts ||
                   (records[i - 1].ts == records[i].ts &&
@@ -53,7 +52,9 @@ tl_ooorun_t* tl_ooorun_acquire(tl_ooorun_t* run) {
         return NULL;
     }
 
-    tl_atomic_fetch_add_u32(&run->refcnt, 1, TL_MO_RELAXED);
+    TL_REFCOUNT_ACQUIRE(&run->refcnt,
+                        "ooorun acquire after final release",
+                        "ooorun refcount overflow");
     return run;
 }
 
@@ -102,7 +103,8 @@ tl_status_t tl_ooorunset_create(tl_alloc_ctx_t* alloc,
 
     for (size_t i = 0; i < count; i++) {
         if (runs[i] == NULL) {
-            /* NULL run in array - unwind and fail */
+            /* Release everything we already pinned before bailing so the
+             * partially built set leaves no dangling references. */
             for (size_t j = 0; j < i; j++) {
                 tl_ooorun_release(set->runs[j]);
             }
@@ -111,7 +113,6 @@ tl_status_t tl_ooorunset_create(tl_alloc_ctx_t* alloc,
         }
         set->runs[i] = tl_ooorun_acquire(runs[i]);
         if (runs[i]->len > SIZE_MAX - set->total_len) {
-            /* Overflow - unwind */
             for (size_t j = 0; j <= i; j++) {
                 tl_ooorun_release(set->runs[j]);
             }
@@ -154,7 +155,7 @@ tl_status_t tl_ooorunset_append(tl_alloc_ctx_t* alloc,
     set->total_len = 0;
 
     for (size_t i = 0; i < old_count; i++) {
-        TL_ASSERT(old_set->runs[i] != NULL);  /* Invariant: valid runsets have no NULL runs */
+        TL_ASSERT(old_set->runs[i] != NULL);
         set->runs[i] = tl_ooorun_acquire(old_set->runs[i]);
         if (old_set->runs[i]->len > SIZE_MAX - set->total_len) {
             for (size_t j = 0; j <= i; j++) {
@@ -185,7 +186,9 @@ tl_ooorunset_t* tl_ooorunset_acquire(tl_ooorunset_t* set) {
         return NULL;
     }
 
-    tl_atomic_fetch_add_u32(&set->refcnt, 1, TL_MO_RELAXED);
+    TL_REFCOUNT_ACQUIRE(&set->refcnt,
+                        "ooorunset acquire after final release",
+                        "ooorunset refcount overflow");
     return set;
 }
 

@@ -98,6 +98,8 @@ def test_subinterpreter_identities_are_isolated(compat_runtime, compat_package_r
                             objects_iter = iter(objects_view)
 
                             ids = (
+                                id(c_timelog.TimelogError),
+                                id(c_timelog.TimelogBusyError),
                                 id(c_timelog.Timelog),
                                 id(c_timelog.TimelogIter),
                                 id(c_timelog.PageSpan),
@@ -113,10 +115,18 @@ def test_subinterpreter_identities_are_isolated(compat_runtime, compat_package_r
                         finally:
                             log.close()
 
+                        try:
+                            log.flush()
+                        except c_timelog.TimelogError as exc:
+                            error_is_local = type(exc) is c_timelog.TimelogError
+                        else:
+                            error_is_local = False
+
                         result_queue.put(
                             (
                                 "ok",
                                 ids,
+                                error_is_local,
                             )
                         )
                     except Exception as exc:
@@ -134,8 +144,10 @@ def test_subinterpreter_identities_are_isolated(compat_runtime, compat_package_r
         left_ids = left_payload[1]
         right_ids = right_payload[1]
 
-        assert len(left_ids) == len(right_ids) == 6
+        assert len(left_ids) == len(right_ids) == 8
         assert all(left != right for left, right in zip(left_ids, right_ids, strict=True))
+        assert left_payload[2] is True
+        assert right_payload[2] is True
     finally:
         left_interp.close()
         right_interp.close()

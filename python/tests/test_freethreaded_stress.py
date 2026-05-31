@@ -1,17 +1,17 @@
-"""Layer B free-threaded concurrency stress tests.
+"""Free-threaded concurrency stress tests.
 
 These tests gate on Py_GIL_DISABLED=1 because they only meaningfully
-exercise the per-object critical sections and live_lock when CPython
+exercise the per-object critical sections and live-handle lock when CPython
 actually permits parallel execution. On regular GIL builds the GIL
 serializes all access — these tests would pass by coincidence with
 no signal value about the underlying synchronization.
 
-Each test exercises one section of the LLD §5.4 synchronization matrix:
-- §7.5 concurrent read stress (multiple readers + serialized writer)
-- §7.6 PageSpan owner cross-thread release
-- §7.7 mutable object-state overlap
-- §7.8 drop/drain stress with reentrant __del__
-- §7.9 finalization and reopen
+Covers:
+- Concurrent read stress (multiple readers + serialized writer)
+- PageSpan owner cross-thread release
+- Mutable object-state overlap
+- Drop/drain stress with reentrant __del__
+- Finalization and reopen
 
 Iteration counts honor the TIMELOG_SHORT_STRESS env var so CI legs can
 trade depth for runtime, while a full local run still exercises the
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import gc
 import random
+import sys
 import sysconfig
 import threading
 import time
@@ -34,11 +35,16 @@ pytestmark = [pytest.mark.freethreading]
 
 
 @pytest.fixture(autouse=True)
-def _require_freethreaded() -> None:
-    """Skip if not on a Py_GIL_DISABLED build — the only place these
-    tests have signal value."""
+def _require_freethreaded(compat_runtime) -> None:
+    """Require both a free-threaded build and a disabled GIL runtime."""
+    compat_runtime.require_free_threaded_build()
     if sysconfig.get_config_var("Py_GIL_DISABLED") != 1:
-        pytest.skip("Layer B stress requires Py_GIL_DISABLED=1 build")
+        pytest.skip("free-threaded stress requires Py_GIL_DISABLED=1 build")
+    if sys._is_gil_enabled():
+        pytest.fail("free-threaded stress must run with PYTHON_GIL=0")
+    import timelog  # noqa: F401
+    if sys._is_gil_enabled():
+        pytest.fail("importing timelog re-enabled the GIL")
 
 
 def _iters(short: bool, *, full: int, quick: int) -> int:
@@ -46,16 +52,15 @@ def _iters(short: bool, *, full: int, quick: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# §7.5 — concurrent read stress
+# Concurrent read stress
 # ---------------------------------------------------------------------------
 
 
 class TestConcurrentReadStress:
     """N readers + 1 writer (writer is externally serialized).
 
-    Spec line 783-786: "one writer thread externally serialized; N reader
-    threads repeatedly acquire snapshots/iterators/views; validate no
-    crashes, refcount corruption, or stale-pointer behavior."
+    Readers repeatedly acquire snapshots/iterators/views; validate
+    no crashes, refcount corruption, or stale-pointer behavior.
     """
 
     def test_readers_against_serialized_writer(self, compat_runtime) -> None:
@@ -152,15 +157,15 @@ class TestConcurrentReadStress:
 
 
 # ---------------------------------------------------------------------------
-# §7.6 — PageSpan owner cross-thread release
+# PageSpan owner cross-thread release
 # ---------------------------------------------------------------------------
 
 
 class TestPageSpanCrossThreadRelease:
     """Independent PageSpan objects handed to different threads. Each
     thread releases its span via memoryview acquire/release + close in
-    a randomized order. Validates that tl_pagespan_owner.refcnt is truly
-    atomic and that close-vs-buffer-release is race-safe.
+    a randomized order. Validates that the PageSpan owner refcount is
+    truly atomic and that close-vs-buffer-release is race-safe.
     """
 
     def test_independent_spans_released_concurrently(self, compat_runtime) -> None:
@@ -221,14 +226,14 @@ class TestPageSpanCrossThreadRelease:
 
 
 # ---------------------------------------------------------------------------
-# §7.7 — mutable object-state overlap
+# Mutable object-state overlap
 # ---------------------------------------------------------------------------
 
 
 class TestMutableObjectStateOverlap:
     """Overlap close, buffer export/release, property reads on the same
-    PageSpan. The contract is "no crash, no torn state" — the spec
-    permits errors from racing operations, but never UAF.
+    PageSpan. The contract is "no crash, no torn state" — racing
+    operations may surface errors, but never use-after-free.
     """
 
     def test_pagespan_close_overlapped_with_buffer_and_property_reads(
@@ -289,7 +294,7 @@ class TestMutableObjectStateOverlap:
     def test_iter_exhaustion_overlapped_with_close_no_crash(
         self, compat_runtime
     ) -> None:
-        """Same iter instance is non-thread-safe per spec; binding must
+        """A single iterator instance is not thread-safe; the binding must
         not crash on accidental overlap. Acceptable exceptions are
         StopIteration / ValueError / RuntimeError."""
         from timelog import Timelog
@@ -335,23 +340,22 @@ class TestMutableObjectStateOverlap:
 
 
 # ---------------------------------------------------------------------------
-# §7.8 — drop/drain stress with reentrant __del__
+# Drop/drain stress with reentrant __del__
 # ---------------------------------------------------------------------------
 
 
 class TestDropDrainStress:
     """Payloads with __del__ side-effects under flush/compact/close.
 
-    Spec line 821-824: "create many short-lived objects with __del__
-    side effects; include finalizers that log, warn, or re-enter
-    harmless timelog APIs so decref-under-lock bugs surface; force
-    flush/compact cycles."
+    Create many short-lived objects with __del__ side effects, including
+    finalizers that re-enter harmless timelog APIs so decref-under-lock
+    bugs would surface; force flush/compact cycles to drive drop/drain.
 
-    A bug where the live_lock is held across Py_DECREF would deadlock
-    here because the __del__ acquires the live_lock indirectly via
-    note_drop on the same ctx.
+    A bug where the live-handle lock is held across Py_DECREF would
+    deadlock here because the finalizer reacquires that lock indirectly.
     """
 
+    @pytest.mark.timeout(60)
     def test_reentrant_del_under_flush_compact(self, compat_runtime) -> None:
         from timelog import Timelog
 
@@ -362,17 +366,18 @@ class TestDropDrainStress:
         # counter increment must be serialized to count accurately.
         finalize_lock = threading.Lock()
         finalize_counter = {"n": 0}
+        writer_lock = threading.Lock()
 
-        log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
+        log = Timelog(maintenance="disabled", busy_policy="flush")
 
         # Each payload RE-ENTERS a benign timelog read inside __del__. The
         # finalizer runs inside the binding's retired-stack drain (when a
         # tombstone physically drops the handle while the log is open) or the
         # close-time live-set sweep. If the binding held an internal lock
         # across Py_DECREF, this re-entrant max_ts() would deadlock — the
-        # collect-under-lock / execute-outside-lock discipline (LLD §5.4) is
-        # exactly what makes it safe. Closed-state errors are expected when
-        # the finalizer fires during/after close(), so they are tolerated.
+        # collect-under-lock / execute-outside-lock discipline is exactly
+        # what makes it safe. Closed-state errors are expected when the
+        # finalizer fires during/after close(), so they are tolerated.
         class ReentrantPayload:
             __slots__ = ("val",)
 
@@ -392,7 +397,8 @@ class TestDropDrainStress:
         def producer(start: int) -> None:
             try:
                 for i in range(start, start + per_producer):
-                    log.append(i, ReentrantPayload(i))
+                    with writer_lock:
+                        log.append(i, ReentrantPayload(i))
             except BaseException as exc:
                 errors.append(exc)
 
@@ -404,44 +410,50 @@ class TestDropDrainStress:
             for t in threads:
                 t.start()
             # Concurrent flush cycles while producers append.
+            maintenance_errors: list[BaseException] = []
             for _ in range(5):
                 try:
-                    log.flush()
-                except Exception:
-                    pass
+                    with writer_lock:
+                        log.flush()
+                except BaseException as exc:
+                    maintenance_errors.append(exc)
+                    break
             for t in threads:
                 t.join()
 
             assert not errors, f"producer errors: {errors!r}"
+            assert not maintenance_errors, (
+                f"flush during producer phase failed: {maintenance_errors!r}"
+            )
 
             # Force the drop/drain path WHILE THE LOG IS OPEN. Tombstone the
-            # whole keyspace, then repeatedly flush + compact (so the covered
-            # handles are physically dropped onto the retired stack) and take
-            # read snapshots whose pins_exit drains the stack and fires the
-            # reentrant __del__. Background compaction is asynchronous and the
-            # concurrent flushes above may already have emptied the memtable,
-            # so a single cycle is not guaranteed to drop anything — poll with
-            # a bounded deadline instead. A lock-held-across-Py_DECREF bug
-            # would deadlock inside the drain here (caught by the suite's
-            # pytest-timeout) rather than ever reaching the assertion; the
-            # close path can't surface it because it short-circuits on the
-            # atomic closed flag before taking any lock.
-            log.delete(0, producers * 1_000_000 + per_producer)
+            # whole keyspace, flush the tombstone to storage, request compaction,
+            # then drive manual maintenance. In maintenance="disabled",
+            # compact() only arms compact_pending; maint_step() is what actually
+            # performs the merge, fires on_drop, and drains retired handles.
+            # A lock-held-across-Py_DECREF bug would deadlock inside the drain
+            # here (caught by pytest-timeout when installed) rather than ever
+            # reaching the assertion; the close path can't surface it because it
+            # short-circuits on the atomic closed flag before taking any lock.
+            with writer_lock:
+                log.delete(0, producers * 1_000_000 + per_producer)
+                log.flush()
+                log.compact()
             deadline = time.monotonic() + 10.0
             while finalize_counter["n"] == 0 and time.monotonic() < deadline:
                 try:
-                    log.flush()
-                except Exception:
-                    pass
-                try:
-                    log.compact()
-                except Exception:
-                    pass
-                try:
-                    log.max_ts()
-                except Exception:
-                    pass
+                    with writer_lock:
+                        did_work = log.maint_step()
+                    if not did_work:
+                        with writer_lock:
+                            log.compact()
+                except BaseException as exc:
+                    maintenance_errors.append(exc)
+                    break
                 time.sleep(0.002)
+            assert not maintenance_errors, (
+                f"drop/drain maintenance failed: {maintenance_errors!r}"
+            )
 
             opened_finalized = finalize_counter["n"]
             assert opened_finalized > 0, (
@@ -465,7 +477,7 @@ class TestDropDrainStress:
 
 
 # ---------------------------------------------------------------------------
-# §7.9 — finalization and reopen
+# Finalization and reopen
 # ---------------------------------------------------------------------------
 
 

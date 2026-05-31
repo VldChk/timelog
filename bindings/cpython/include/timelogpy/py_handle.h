@@ -15,8 +15,8 @@
  * Thread safety:
  * - on_drop callback: called from flush/maintenance publisher thread, NO GIL,
  *   NO Python C-API
- * - drain: called from Python thread with GIL held
- * - pins: atomic counter, safe from any thread
+ * - drain: called on the owning interpreter with an attached Python thread state
+ * - pins: atomic counter plus pin_lock for zero-transition/drain handoff
  *
  * See: docs/internals/components/python-binding-architecture.md
  *      docs/errors-and-retry-semantics.md
@@ -52,7 +52,7 @@ _Static_assert(sizeof(void*) <= sizeof(tl_handle_t),
                "Pointer size exceeds tl_handle_t width");
 
 /*===========================================================================
- * Handle Encoding/Decoding (Invariant I1)
+ * Handle Encoding/Decoding
  *
  * Guarantee: decode(encode(obj)) == obj for all valid PyObject* pointers.
  *===========================================================================*/
@@ -160,12 +160,23 @@ typedef struct tl_py_handle_ctx {
     atomic_flag drain_guard;
 
     /**
+     * Serializes active-pin transitions with retired-list claiming. The pin
+     * counter is still atomic for cheap diagnostics, but the transition from
+     * pins==0 to pins>0 must not race a drainer that has observed zero and is
+     * about to claim retired PyObjects. The drainer takes this lock only long
+     * enough to test pins and exchange the retired stack; Py_DECREF always runs
+     * after unlocking.
+     */
+    tl_py_mutex_t pin_lock;
+
+    /**
      * Live handle tracking (multiset by pointer identity).
      * Used to DECREF all remaining objects on close().
      *
-     * Mutation and scan are protected by `live_lock`. Per the
-     * collect/unlock/execute rule (LLD §5.4), callers must drop the
-     * lock before any Python decref happens.
+     * Mutation and scan are protected by `live_lock`. Callers must
+     * collect refs under the lock and then drop it before any
+     * Py_DECREF runs (a __del__ that touched the same context would
+     * otherwise deadlock).
      */
     struct tl_py_live_entry* live_entries;
     size_t                  live_cap;
@@ -232,7 +243,7 @@ void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx);
 void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx);
 
 /*===========================================================================
- * Pin Tracking API (Invariant I3)
+ * Pin Tracking API
  *
  * Used to track active snapshots/iterators. While pins > 0, retired
  * objects cannot be safely DECREF'd because a snapshot might still
@@ -268,7 +279,7 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx);
 uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx);
 
 /*===========================================================================
- * On-Drop Callback (Invariant I4)
+ * On-Drop Callback
  *
  * Called from flush/maintenance thread when records are physically reclaimed.
  * Does NOT acquire GIL or call Python C-API. Enqueues to lock-free stack.
@@ -316,7 +327,8 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force);
 
 /**
  * Record that a handle was inserted (increments count).
- * Must be called with GIL held.
+ * Must be called on the owning interpreter with an attached Python thread
+ * state.
  *
  * @return TL_OK on success, TL_ENOMEM on allocation failure.
  *         On failure, tracking is best-effort; caller should continue.
@@ -325,19 +337,22 @@ tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj);
 
 /**
  * Record that a handle was physically dropped (decrements count).
- * Must be called with GIL held.
+ * Must be called on the owning interpreter with an attached Python thread
+ * state.
  */
 void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj);
 
 /**
  * Release all remaining tracked objects (DECREF counts).
- * Must be called with GIL held. Clears tracking table.
+ * Must be called on the owning interpreter with an attached Python thread
+ * state. Clears tracking table.
  */
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
 
 /**
  * GC traversal helper: visit all Python objects currently referenced by ctx.
- * Must be called with GIL held.
+ * Must be called on the owning interpreter with an attached Python thread
+ * state.
  */
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg);
 
