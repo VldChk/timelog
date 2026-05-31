@@ -1,6 +1,10 @@
 # Timelog LLD: GIL-free support and independent subinterpreters
 
 Date: 2026-04-12
+Implementation status: Layer A and Layer B are complete on the
+`timelog-gil-free` branch. This document keeps the original blocker analysis
+for design context; the acceptance checklist records the implemented target
+state.
 Primary design target: CPython 3.14+
 Secondary compatibility targets:
 - regular GIL-enabled CPython 3.12-3.14 when validated
@@ -35,9 +39,9 @@ The following are **not** part of this migration:
 - preserving exact identity equality of module classes/exceptions across separate module objects/interpreters;
 - stable ABI / limited C API compatibility for free-threaded wheels.
 
-## 3. Current-state blockers in the repository
+## 3. Original-state blockers in the repository
 
-The current codebase has four hard blockers:
+The pre-migration codebase had these hard blockers:
 
 ### B1. Single-phase module init and no module state
 
@@ -79,9 +83,8 @@ Impact:
 
 ### B5. Public facade and docs must stay phase-accurate
 
-The binding headers and Python facade must distinguish regular CPython and
-per-interpreter-GIL support from the still-unsupported free-threaded/no-GIL
-target.
+The binding headers and Python facade must distinguish regular CPython,
+per-interpreter-GIL support, and the now-supported free-threaded/no-GIL target.
 
 Impact:
 - release notes, docs, and runtime claims can drift from the actual implementation state;
@@ -365,7 +368,7 @@ Use cases:
 - reading/writing internal Python-owned state that would previously have been implicitly protected by the GIL;
 - protecting dict iteration with `PyDict_Next` if the dict might be concurrently modified.
 
-Do **not** use critical sections as a replacement for the storage engine’s own locks. They are for Python-object-level protection and deadlock-aware interaction with CPython’s locking rules. Keep them as leaf scopes around object-local field access, not around engine calls or arbitrary cleanup.
+Do **not** use critical sections as a replacement for the storage engine’s own locks. They are for Python-object-level protection and deadlock-aware interaction with CPython’s locking rules. Keep them as leaf scopes around object-local field access and never hold them around arbitrary cleanup, Python callbacks, decrefs, warnings, or blocking maintenance/lifecycle calls. The only allowed engine-call exception is a same-object iterator cursor advance (`tl_iter_next` / `tl_pagespan_iter_next`) under that iterator object's critical section; those calls are pure C, non-blocking, and the lock is required so a concurrent Python-level `close()` cannot destroy the cursor mid-call.
 
 #### L5. Core `tl_pagespan_owner.refcnt` (new core requirement)
 
@@ -539,14 +542,17 @@ The Python facade should **not** attempt to emulate cross-interpreter object pas
 
 Build distinct wheels with explicit support tiers:
 - regular ABI: `cp312`, `cp313`, `cp314` when validated by CI
-- official free-threaded ABI: `cp314t`
+- official free-threaded ABI: `cp314t` on Linux while macOS/Windows
+  free-threaded runners remain outside the required matrix
 - optional experimental free-threaded ABI: `cp313t` only if explicitly tested and documented as experimental
 
 ### Important packaging constraints
 
 - free-threaded builds currently require separate wheels;
 - the free-threaded build does not support the limited C API / stable ABI;
-- Windows builds need `Py_GIL_DISABLED=1` defined explicitly when building extension sources.
+- Windows free-threaded wheels need `Py_GIL_DISABLED=1` defined explicitly
+  when building extension sources; publish them only after that path is gated
+  in CI.
 
 ### Suggested build policy
 
@@ -710,11 +716,12 @@ Build distinct wheels with explicit support tiers:
   - regular 3.14
   - free-threaded 3.14
   - subinterpreter suite on 3.14
-- on Windows, define `Py_GIL_DISABLED=1` for free-threaded builds.
+- before enabling Windows free-threaded wheels, define `Py_GIL_DISABLED=1`
+  for extension builds and add the matching CI leg.
 
 ### Acceptance criteria
 
-- wheels are produced for both ABI families;
+- wheels are produced for regular ABI and for the gated free-threaded ABI set;
 - free-threaded import test proves the GIL stays disabled;
 - subinterpreter test suite passes.
 
@@ -912,7 +919,7 @@ Deliverables:
 - release notes documenting concurrency guarantees and residual limits
 
 Exit criteria:
-- publish both wheel families;
+- publish regular wheels and the gated free-threaded wheel set;
 - user docs updated.
 
 ## 9. Risks and mitigations
@@ -984,25 +991,25 @@ Mitigation:
 
 The task is complete only when all are true:
 
-- [ ] no `m_size = -1` in the extension module definition
-- [ ] module uses multi-phase initialization
-- [ ] same-module `timelog_exec()` is idempotent and partial-init failure unwinds to `initialized = 0`
-- [ ] no process-global Python objects remain
-- [ ] all exceptions are per-module, not global
-- [ ] all reachable extension types are heap types
-- [ ] no reachable production static binding `PyTypeObject` remains
-- [ ] core `tl_pagespan_owner.refcnt` is atomic and no `views()` lifetime path relies on GIL-era serialization
-- [ ] no correctness-critical path relies on the GIL as a lock
-- [ ] no decref / warning / callback-capable work occurs under `core_lock`, `live_lock`, or object critical sections
-- [ ] live tracking and object-local mutable state are explicitly synchronized according to the synchronization matrix
-- [ ] maintenance thread never calls Python C API
-- [ ] `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
-- [ ] `Py_mod_gil = Py_MOD_GIL_NOT_USED`
-- [ ] free-threaded import does not enable the GIL
-- [ ] subinterpreter smoke and independence tests pass
-- [ ] concurrent stress tests and PageSpan cross-thread release tests pass on free-threaded 3.14
-- [ ] public docs and Python facade no longer make blanket CPython-GIL-required support claims
-- [ ] dual wheel families build in CI
+- [x] no `m_size = -1` in the extension module definition
+- [x] module uses multi-phase initialization
+- [x] same-module `timelog_exec()` is idempotent and partial-init failure unwinds to `initialized = 0`
+- [x] no process-global Python objects remain
+- [x] all exceptions are per-module, not global
+- [x] all reachable extension types are heap types
+- [x] no reachable production static binding `PyTypeObject` remains
+- [x] core `tl_pagespan_owner.refcnt` is atomic and no `views()` lifetime path relies on GIL-era serialization
+- [x] no correctness-critical path relies on the GIL as a lock
+- [x] no decref / warning / callback-capable work occurs under `core_lock`, `live_lock`, or object critical sections
+- [x] live tracking and object-local mutable state are explicitly synchronized according to the synchronization matrix
+- [x] maintenance thread never calls Python C API
+- [x] `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
+- [x] `Py_mod_gil = Py_MOD_GIL_NOT_USED`
+- [x] free-threaded import does not enable the GIL
+- [x] subinterpreter smoke and independence tests pass
+- [x] concurrent stress tests and PageSpan cross-thread release tests pass on free-threaded 3.14
+- [x] public docs and Python facade no longer make blanket CPython-GIL-required support claims
+- [x] dual wheel families build in CI
 
 ## 11. High-level implementation plan
 

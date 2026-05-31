@@ -32,12 +32,20 @@ jobs:
           languages: ${{ matrix.language }}
           queries: security-extended,security-and-quality
 
+      - name: Setup Python for CPython binding build
+        if: matrix.language == 'c-cpp'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Build C/C++ sources for CodeQL
         if: matrix.language == 'c-cpp'
         run: |
           cmake -S . -B build-codeql \
             -DCMAKE_BUILD_TYPE=Release \
-            -DTIMELOG_BUILD_PYTHON=OFF \
+            -DTIMELOG_BUILD_PYTHON=ON \
+            -DTIMELOG_BUILD_PY_TESTS=OFF \
+            -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF \
             -DTIMELOG_BUILD_CORE_TESTS=OFF \
             -DTIMELOG_BUILD_DEMOS=OFF
           cmake --build build-codeql -j2

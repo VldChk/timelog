@@ -81,7 +81,8 @@ python -c "import timelog; from timelog import Timelog; print('sdist-pass')"
 `packaging-pr.yml` runs on pull requests and performs:
 
 1. `python -m build --sdist`
-2. representative Linux wheel build via `cibuildwheel` (`cp313-manylinux_x86_64`)
+2. representative Linux wheel builds via `cibuildwheel` (`cp313-manylinux_x86_64`,
+   `cp314t-manylinux_x86_64`, and `cp314t-manylinux_aarch64`)
 3. `twine check dist/*`
 4. wheel install + `python/tests` + smoke script
 
@@ -108,11 +109,13 @@ Trigger `.github/workflows/release-testpypi.yml` manually (`workflow_dispatch`):
 
 Build matrix is defined in `pyproject.toml` under `[tool.cibuildwheel]`.
 
-1. Python: `cp312`, `cp313`, `cp314`
-2. Skip: `cp313t`, `cp314t`, `pp*`, `*-musllinux_*`
-3. Linux arches: `x86_64`, `aarch64`
-4. macOS arches: `x86_64`, `arm64`
-5. Windows arch: `AMD64`
+1. Regular CPython: `cp312`, `cp313`, `cp314` on Linux, macOS, and Windows.
+2. Free-threaded CPython: `cp314t` on Linux (`manylinux_x86_64`,
+   `manylinux_aarch64`) only until macOS/Windows cp314t runners are required CI.
+3. Skip: `cp313t`, `pp*`, `*-musllinux_*`
+4. Linux arches: `x86_64`, `aarch64`
+5. macOS arches: `x86_64`, `arm64`
+6. Windows arch: `AMD64`
 
 ## Trusted Publishing Checklist
 

@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pytest-timeout>=2.3"]
 
 [project.urls]
 Homepage = "https://github.com/VldChk/timelog"
@@ -51,9 +51,11 @@ TIMELOG_BUILD_DEMOS = false
 TIMELOG_BUILD_SHARED = false
 
 [tool.cibuildwheel]
-# Build for regular CPython 3.12-3.14 and free-threaded 3.14t.
+# Build for regular CPython 3.12-3.14 on all supported OSes. Free-threaded
+# cp314t wheels are limited to Linux until macOS/Windows cp314t hosts are part
+# of the required CI matrix.
 # 3.13t is intentionally omitted (spec §6.10: "explicitly tested only").
-build = "cp312-* cp313-* cp314-* cp314t-*"
+build = "cp312-* cp313-* cp314-* cp314t-manylinux_x86_64 cp314t-manylinux_aarch64"
 skip = "*-musllinux_*"
 test-command = "pytest {project}/python/tests -q"
 # Bound the free-threaded stress/freethreading harnesses during the
@@ -61,9 +63,13 @@ test-command = "pytest {project}/python/tests -q"
 # and compat-baseline CI legs; the cp314t wheel test only needs to confirm
 # the free-threaded ABI imports and exercises the race windows briefly.
 # TIMELOG_SHORT_STRESS=1 switches _iters() to its quick counts so the test
-# phase stays bounded on every platform (incl. Windows/macOS cp314t).
+# phase stays bounded on every configured wheel platform.
 test-environment = { TIMELOG_SHORT_STRESS = "1" }
 test-extras = ["test"]
+
+[[tool.cibuildwheel.overrides]]
+select = "cp314t-*"
+test-environment = { TIMELOG_SHORT_STRESS = "1", PYTHON_GIL = "0" }
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]
@@ -79,4 +85,5 @@ markers = [
     "subinterpreters: compatibility baseline tests for isolated interpreter support",
     "freethreading: compatibility baseline tests for free-threaded/no-GIL support",
     "stress: opt-in compatibility stress harnesses for lifetime and concurrency",
+    "timeout(timeout): fail a test when pytest-timeout is installed and runtime exceeds the bound",
 ]

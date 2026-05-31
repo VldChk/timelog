@@ -167,8 +167,12 @@ jobs:
           -DTIMELOG_BUILD_PY_TESTS=ON
           -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
-      - name: Build Python extension
-        run: cmake --build build --target _timelog --config Release -j 2
+      - name: Build e2e targets
+        run: cmake --build build --target timelog_e2e_build --config Release -j 2
+
+      - name: Run module exec isolation tests
+        shell: bash
+        run: ctest --test-dir build -C Release --output-on-failure -R '^py_module_exec_tests$'
 
       - name: Run required subinterpreter tests
         shell: bash

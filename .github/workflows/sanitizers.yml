@@ -200,10 +200,14 @@ jobs:
           allow-prereleases: true
 
       - name: Verify free-threaded build
+        env:
+          PYTHON_GIL: "0"
         run: |
-          python -c "import sysconfig; \
+          python -c "import sys, sysconfig; \
             assert sysconfig.get_config_var('Py_GIL_DISABLED') == 1, \
-            'expected Py_GIL_DISABLED=1 build but got regular interpreter'"
+            'expected Py_GIL_DISABLED=1 build but got regular interpreter'; \
+            assert sys._is_gil_enabled() is False, \
+            'expected PYTHON_GIL=0 to disable the runtime GIL'"
 
       - name: Install Python test dependencies
         run: python -m pip install --upgrade pip -r requirements-test.txt
@@ -236,6 +240,7 @@ jobs:
           # setarch -R disables ASLR: TSan otherwise fails with
           # "unexpected memory mapping" on recent kernels.
           setarch -R cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+            "PYTHON_GIL=0" \
             python demo/ci/run_compat_baseline.py \
               --legs freethreading \
               --summary-json "${RUNNER_TEMP}/tsan-freethreaded.json" \
@@ -243,17 +248,17 @@ jobs:
             2>&1 | tee "${RUNNER_TEMP}/tsan-freethreaded.log"
           exit_code=${PIPESTATUS[0]}
           # TSan writes unsuppressed reports to ${RUNNER_TEMP}/tsan-report.<pid>.
-          # Count actual data races there (not pytest stdout, which swallows
-          # the inline report). Suppressed CPython-BRC noise is excluded by
-          # the suppressions file, so any match here is a timelog race.
-          tsan_races=0
+          # Count any surviving TSan report there (not pytest stdout, which
+          # swallows the inline report). Suppressed CPython-BRC noise is excluded
+          # by the suppressions file, so any remaining report is actionable.
+          tsan_reports=0
           for f in "${RUNNER_TEMP}"/tsan-report.*; do
             [ -e "${f}" ] || continue
-            n=$(grep -cE "data race" "${f}" || true)
-            tsan_races=$((tsan_races + n))
+            n=$(grep -cE "(WARNING|ERROR): ThreadSanitizer" "${f}" || true)
+            tsan_reports=$((tsan_reports + n))
           done
-          if [ "${tsan_races}" -gt 0 ]; then
-            echo "::error::ThreadSanitizer reported ${tsan_races} unsuppressed races"
+          if [ "${tsan_reports}" -gt 0 ]; then
+            echo "::error::ThreadSanitizer reported ${tsan_reports} unsuppressed issues"
             cat "${RUNNER_TEMP}"/tsan-report.* 2>/dev/null || true
             exit 1
           fi

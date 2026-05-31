@@ -19,13 +19,13 @@ The repository also includes compatibility workflows at
 
 Purpose:
 1. Mirror Layer A subinterpreter behavior on additional compatibility hosts, including Windows CPython 3.14.
-2. Keep free-threaded compatibility visible without declaring no-GIL support.
-3. Preserve permanent baseline coverage so future support work turns `XFAIL` into `PASS` instead of adding new tests late.
+2. Gate Layer B free-threaded behavior on a genuine CPython 3.14t host with `Py_GIL_DISABLED=1`.
+3. Preserve permanent baseline coverage so future regressions fail against existing tests instead of adding new tests late.
 
 Current policy:
 1. Missing host capability is reported as `SKIP`, but a leg that collects no passing or expected-failing tests is a failure.
 2. Layer A subinterpreter tests are required to pass on hosts with `concurrent.interpreters`.
-3. Layer B free-threaded incompatibility remains advisory and is reported as `XFAIL`.
+3. Layer B free-threaded import and short-stress tests are required to pass on the `freethreading-3.14t-ubuntu` compatibility leg.
 4. `XPASS`, `FAIL`, `ERROR`, and all-skip capability legs fail the compatibility job.
 
 Compatibility markers:
@@ -77,15 +77,17 @@ Set these GitHub checks as required:
 3. `Tests (PR) / test (windows-latest, 3.12)`
 4. `Tests (PR) / test (windows-latest, 3.13)`
 5. `Tests (PR) / subinterpreters (ubuntu-latest, 3.14)`
-6. `Packaging (PR) / packaging-pr`
-7. `Dependency Review / dependency-review`
+6. `Packaging (PR) / packaging-pr (cp313)`
+7. `Packaging (PR) / packaging-pr (cp314t)`
+8. `Packaging (PR) / packaging-pr (cp314t-aarch64)`
+9. `Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-ubuntu)`
+10. `Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-windows)`
+11. `Compatibility Baseline (PR) / compatibility-baseline (freethreading-3.14t-ubuntu)`
+12. `Docs Check (PR) / docs-check`
+13. `Dependency Review / dependency-review`
 
-Repository settings should also require
-`Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-ubuntu)`
-and
-`Compatibility Baseline (PR) / compatibility-baseline (subinterpreters-3.14-windows)`
-once CPython 3.14 runner availability is stable for the project. Free-threaded
-compatibility remains informational until no-GIL support is explicitly declared.
+The dedicated TSan free-threaded job remains advisory until runner stability is
+characterized.
 
 ## Packaging and Release Workflows
 
@@ -124,8 +126,8 @@ cmake -E env PYTHONPATH="$PWD/python" TIMELOG_STRESS_TESTS=1 TIMELOG_SHORT_STRES
 Free-threaded `t` build host:
 
 ```bash
-cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests/test_free_threading.py -q -rA
-cmake -E env PYTHONPATH="$PWD/python" python demo/ci/run_compat_baseline.py --legs freethreading --summary-json demo/benchmark_runs/compat-ft.local.json --summary-md demo/benchmark_runs/compat-ft.local.md
+cmake -E env PYTHONPATH="$PWD/python" PYTHON_GIL=0 python -m pytest python/tests/test_free_threading.py -q -rA
+cmake -E env PYTHONPATH="$PWD/python" PYTHON_GIL=0 python demo/ci/run_compat_baseline.py --legs freethreading --summary-json demo/benchmark_runs/compat-ft.local.json --summary-md demo/benchmark_runs/compat-ft.local.md
 ```
 
 ## Local Packaging Dry-Run Commands

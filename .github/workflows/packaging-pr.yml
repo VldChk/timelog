@@ -3,13 +3,6 @@ name: Packaging (PR)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "core/**"
-      - "bindings/**"
-      - "python/**"
-      - "pyproject.toml"
-      - "CMakeLists.txt"
-      - ".github/workflows/packaging-pr.yml"
 
 concurrency:
   group: packaging-pr-${{ github.ref }}
@@ -27,6 +20,7 @@ jobs:
           - python: "3.13"
             cibw_build: "cp313-manylinux_x86_64"
             wheel_tag: "cp313"
+            arch: "x86_64"
           # The cp314t leg MUST set up the free-threaded interpreter ("3.14t"):
           # the host Python becomes the smoke-test venv base, and a cp314t ABI
           # wheel only installs on a Py_GIL_DISABLED interpreter. Using plain
@@ -35,6 +29,11 @@ jobs:
           - python: "3.14t"
             cibw_build: "cp314t-manylinux_x86_64"
             wheel_tag: "cp314t"
+            arch: "x86_64"
+          - python: "3.14t"
+            cibw_build: "cp314t-manylinux_aarch64"
+            wheel_tag: "cp314t-aarch64"
+            arch: "aarch64"
     runs-on: ubuntu-latest
     name: packaging-pr (${{ matrix.wheel_tag }})
 
@@ -51,6 +50,12 @@ jobs:
       - name: Install packaging tools
         run: python -m pip install --upgrade pip build twine cibuildwheel
 
+      - name: Setup QEMU (aarch64 wheel leg)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Build sdist
         if: matrix.wheel_tag == 'cp313'
         run: python -m build --sdist
@@ -58,7 +63,7 @@ jobs:
       - name: Build representative wheel (${{ matrix.cibw_build }})
         env:
           CIBW_BUILD: ${{ matrix.cibw_build }}
-          CIBW_ARCHS_LINUX: x86_64
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
           CIBW_CONFIG_SETTINGS: >-
             cmake.define.TIMELOG_BUILD_PYTHON=true
             cmake.define.TIMELOG_BUILD_PY_TESTS=false
@@ -74,12 +79,16 @@ jobs:
         run: python -m twine check dist/*
 
       - name: Wheel install + smoke tests
+        if: matrix.arch == 'x86_64'
         shell: bash
         env:
           # Bound the free-threaded stress/freethreading harnesses so the
           # smoke run stays fast; full-depth soak lives in the sanitizer legs.
           TIMELOG_SHORT_STRESS: "1"
         run: |
+          if [ "${{ matrix.wheel_tag }}" = "cp314t" ]; then
+            export PYTHON_GIL=0
+          fi
           python -m venv .venv-wheel
           source .venv-wheel/bin/activate
           # For the cp314t leg the smoke venv MUST be a Py_GIL_DISABLED
@@ -92,7 +101,8 @@ jobs:
               "cp314t smoke must run on a free-threaded interpreter; got a "
               f"regular GIL build: {sys.version}"
           )
-          print("Smoke venv is free-threaded (Py_GIL_DISABLED=1). OK.")
+          assert sys._is_gil_enabled() is False, "PYTHON_GIL=0 must disable the runtime GIL"
+          print("Smoke venv is free-threaded with GIL disabled. OK.")
           PY
           fi
           python -m pip install --upgrade pip
