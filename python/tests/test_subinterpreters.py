@@ -35,7 +35,8 @@ def test_subinterpreter_smoke_roundtrip(compat_runtime, compat_package_root):
                 """
                 import sys
 
-                sys.path.insert(0, package_root)
+                if package_root:
+                    sys.path.insert(0, package_root)
 
                 try:
                     from timelog import Timelog
@@ -82,7 +83,8 @@ def test_subinterpreter_identities_are_isolated(compat_runtime, compat_package_r
                     """
                     import sys
 
-                    sys.path.insert(0, package_root)
+                    if package_root:
+                        sys.path.insert(0, package_root)
 
                     try:
                         import timelog._timelog as c_timelog
@@ -172,7 +174,8 @@ def test_subinterpreter_factory_products_use_local_types(
                 """
                 import sys
 
-                sys.path.insert(0, package_root)
+                if package_root:
+                    sys.path.insert(0, package_root)
 
                 try:
                     import timelog._timelog as c_timelog
@@ -239,7 +242,8 @@ def test_subinterpreter_subclass_method_recovers_module_state(
                 """
                 import sys
 
-                sys.path.insert(0, package_root)
+                if package_root:
+                    sys.path.insert(0, package_root)
 
                 try:
                     import timelog
@@ -288,7 +292,8 @@ def test_subinterpreter_close_with_leaked_timelog(
                 """
                 import sys
 
-                sys.path.insert(0, package_root)
+                if package_root:
+                    sys.path.insert(0, package_root)
 
                 try:
                     from timelog import Timelog
@@ -332,7 +337,8 @@ def test_three_subinterpreters_can_import_and_use_concurrently(
                     """
                     import sys
 
-                    sys.path.insert(0, package_root)
+                    if package_root:
+                        sys.path.insert(0, package_root)
 
                     try:
                         from timelog import Timelog
@@ -390,7 +396,8 @@ def test_subinterpreter_maintenance_finalize_subprocess(
                 '''
                 import sys
 
-                sys.path.insert(0, package_root)
+                if package_root:
+                    sys.path.insert(0, package_root)
 
                 try:
                     from timelog import Timelog
@@ -416,10 +423,11 @@ def test_subinterpreter_maintenance_finalize_subprocess(
     )
 
     env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        compat_package_root if not existing else compat_package_root + os.pathsep + existing
-    )
+    if compat_package_root:
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            compat_package_root if not existing else compat_package_root + os.pathsep + existing
+        )
 
     completed = subprocess.run(
         [sys.executable, "-c", script, compat_package_root],

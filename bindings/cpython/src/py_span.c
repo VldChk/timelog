@@ -8,6 +8,7 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdint.h>  /* For SIZE_MAX */
 #include <string.h>  /* For memset */
 
 #include "timelogpy/py_compat.h"
@@ -231,24 +232,24 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
      * BufferError). */
     int err = 0;
     void* ts_local = NULL;
-    Py_ssize_t n_local = 0;
+    size_t byte_len_local = 0;
 
     TL_PY_OBJ_LOCK(self);
     if (self->closed || self->ts == NULL) {
         err = 1;
     } else if (flags & PyBUF_WRITABLE) {
         err = 3;
-    } else if (self->len > (size_t)PY_SSIZE_T_MAX ||
-               (Py_ssize_t)self->len >
-                   PY_SSIZE_T_MAX / (Py_ssize_t)sizeof(tl_ts_t)) {
+#if SIZE_MAX <= UINT32_MAX
+    } else if ((size_t)self->len > (size_t)PY_SSIZE_T_MAX / sizeof(tl_ts_t)) {
         err = 2;
+#endif
     } else {
-        n_local = (Py_ssize_t)self->len;
+        byte_len_local = (size_t)self->len * sizeof(tl_ts_t);
         ts_local = (void*)self->ts;
 
         /* Fill view (request-independent fields). */
         view->buf = ts_local;
-        view->len = n_local * (Py_ssize_t)sizeof(tl_ts_t);
+        view->len = (Py_ssize_t)byte_len_local;
         view->readonly = 1;
         view->itemsize = (Py_ssize_t)sizeof(tl_ts_t);
         view->ndim = 1;

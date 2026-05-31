@@ -18,6 +18,26 @@ def _env_flag(name: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _source_package_root_if_staged() -> str:
+    """Return the source package root only when its extension is staged.
+
+    Wheel tests run the repository's pytest files against an installed wheel.
+    In that mode, adding ``{project}/python`` to sys.path shadows the installed
+    wheel with source files that do not contain the built extension module.
+    """
+    if _env_flag("CIBUILDWHEEL"):
+        return ""
+
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    if ext_suffix is None:
+        return ""
+
+    package_root = Path(__file__).resolve().parents[1]
+    if (package_root / "timelog" / f"_timelog{ext_suffix}").is_file():
+        return str(package_root)
+    return ""
+
+
 @dataclass(frozen=True)
 class CompatRuntime:
     """Runtime capability probes shared by compatibility tests."""
@@ -75,7 +95,7 @@ def compat_runtime() -> CompatRuntime:
 
 @pytest.fixture(scope="session")
 def compat_package_root() -> str:
-    return str(Path(__file__).resolve().parents[1])
+    return _source_package_root_if_staged()
 
 
 @pytest.fixture(scope="session")
@@ -87,7 +107,7 @@ def compat_repo_root() -> str:
 def compat_env() -> dict[str, Any]:
     runtime = _COMPAT_RUNTIME
     return {
-        "package_root": str(Path(__file__).resolve().parents[1]),
+        "package_root": _source_package_root_if_staged(),
         "repo_root": str(Path(__file__).resolve().parents[2]),
         "python_version": runtime.python_version,
         "free_threaded_build": runtime.free_threaded_build,

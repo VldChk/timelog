@@ -17,14 +17,33 @@ Example::
 
 from __future__ import annotations
 
+from pathlib import Path as _Path
+import tomllib as _tomllib
+
 try:
     from importlib import metadata as _importlib_metadata
 except ImportError:
     _importlib_metadata = None
 
 
+def _resolve_local_version() -> str | None:
+    """Resolve version from the source tree when imported via PYTHONPATH."""
+    try:
+        project_root = _Path(__file__).resolve().parents[2]
+        pyproject = project_root / "pyproject.toml"
+        data = _tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        version = data.get("project", {}).get("version")
+    except (OSError, IndexError, TypeError, _tomllib.TOMLDecodeError):
+        return None
+    return version if isinstance(version, str) and version else None
+
+
 def _resolve_version() -> str:
     """Resolve package version across distribution name variants."""
+    local_version = _resolve_local_version()
+    if local_version is not None:
+        return local_version
+
     if _importlib_metadata is None:
         return "0+unknown"
 

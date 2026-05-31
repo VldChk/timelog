@@ -37,11 +37,12 @@ def test_import_does_not_enable_gil(compat_runtime, compat_package_root):
     )
 
     env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    if existing:
-        env["PYTHONPATH"] = compat_package_root + os.pathsep + existing
-    else:
-        env["PYTHONPATH"] = compat_package_root
+    if compat_package_root:
+        existing = env.get("PYTHONPATH", "")
+        if existing:
+            env["PYTHONPATH"] = compat_package_root + os.pathsep + existing
+        else:
+            env["PYTHONPATH"] = compat_package_root
     env["PYTHON_GIL"] = "0"
 
     completed = subprocess.run(

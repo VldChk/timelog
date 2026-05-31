@@ -1,7 +1,9 @@
 """Tests for the Python facade layer."""
 
 from importlib import metadata as importlib_metadata
+from pathlib import Path
 import gc
+import tomllib
 import weakref
 import pytest
 
@@ -71,6 +73,18 @@ class TestVersion:
 
         assert "__version__" in timelog.__all__
 
+    def test_resolve_version_prefers_source_tree_pyproject(self, monkeypatch):
+        """Source-tree imports must not report a stale installed distribution."""
+        import timelog
+
+        project_root = Path(__file__).resolve().parents[2]
+        pyproject_version = tomllib.loads(
+            (project_root / "pyproject.toml").read_text(encoding="utf-8")
+        )["project"]["version"]
+
+        monkeypatch.setattr(importlib_metadata, "version", lambda _dist_name: "0.0.1-stale")
+        assert timelog._resolve_version() == pyproject_version
+
     def test_resolve_version_prefers_timelog_lib(self, monkeypatch):
         """Version resolver should prefer timelog-lib distribution metadata."""
         import timelog
@@ -83,6 +97,7 @@ class TestVersion:
                 return "1.0.0"
             raise importlib_metadata.PackageNotFoundError(dist_name)
 
+        monkeypatch.setattr(timelog, "_resolve_local_version", lambda: None)
         monkeypatch.setattr(importlib_metadata, "version", _fake_version)
         assert timelog._resolve_version() == "1.0.0"
         assert calls == ["timelog-lib"]
@@ -101,6 +116,7 @@ class TestVersion:
                 return "0.9.9"
             raise AssertionError(f"unexpected distribution lookup: {dist_name}")
 
+        monkeypatch.setattr(timelog, "_resolve_local_version", lambda: None)
         monkeypatch.setattr(importlib_metadata, "version", _fake_version)
         assert timelog._resolve_version() == "0.9.9"
         assert calls == ["timelog-lib", "timelog"]
