@@ -272,11 +272,7 @@ static int PyPageSpanIter_clear(PyPageSpanIter* self)
 
 static void PyPageSpanIter_dealloc(PyPageSpanIter* self)
 {
-    PyTypeObject* tp = Py_TYPE(self);
-    PyObject_GC_UnTrack(self);
-    pagespaniter_cleanup(self);
-    tp->tp_free((PyObject*)self);
-    Py_DECREF(tp);
+    TL_PY_GC_DEALLOC(self, pagespaniter_cleanup(self));
 }
 
 /*===========================================================================
@@ -369,15 +365,7 @@ static PyObject* PyPageSpanIter_exit(PyPageSpanIter* self, PyObject* args)
  * Properties
  *===========================================================================*/
 
-static PyObject* PyPageSpanIter_get_closed(PyPageSpanIter* self, void* closure)
-{
-    (void)closure;
-    int closed;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    TL_PY_OBJ_UNLOCK();
-    return PyBool_FromLong(closed);
-}
+TL_PY_DEFINE_CLOSED_GETTER(PyPageSpanIter_get_closed, PyPageSpanIter)
 
 /*===========================================================================
  * Method/GetSet Tables
@@ -434,8 +422,4 @@ PyObject* TlPy_CreatePageSpanIterType(PyObject* module)
     return PyType_FromModuleAndSpec(module, &PyPageSpanIter_spec, NULL);
 }
 
-int TlPyPageSpanIter_Check(PyObject* op, const tl_py_module_state_t* st)
-{
-    return op != NULL && st != NULL && st->type_pagespan_iter != NULL &&
-           PyObject_TypeCheck(op, (PyTypeObject*)st->type_pagespan_iter);
-}
+TL_PY_DEFINE_CHECK(TlPyPageSpanIter_Check, type_pagespan_iter)

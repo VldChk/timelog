@@ -352,6 +352,21 @@ static tl_py_handle_ctx_t* tl_py_acquire_owned_handle_ctx(PyTimelog* self)
     return h;
 }
 
+/*
+ * Opportunistic post-core-call drain. Own a handle_ctx reference (so a
+ * concurrent close() cannot free it mid-drain), drain retired Python refs
+ * best-effort (force=0), then drop the reference. Runs with no lock held:
+ * the drain may Py_DECREF, so it must never be called under core_lock.
+ */
+static void tl_py_drain_owned(PyTimelog* self)
+{
+    tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
+    if (dctx != NULL) {
+        tl_py_drain_retired(dctx, 0);
+        tl_py_handle_ctx_decref(dctx);
+    }
+}
+
 static int
 tl_py_core_call_strict(PyTimelog* self, tl_py_core_call_fn fn, tl_status_t* out_status)
 {
@@ -1376,22 +1391,12 @@ static void
 PyTimelog_finalize(PyObject* self_obj)
 {
     PyTimelog* self = (PyTimelog*)self_obj;
-#if PY_VERSION_HEX >= 0x030C0000
-    PyObject* exc = PyErr_GetRaisedException();
+    TL_PY_PRESERVE_EXC_BEGIN;
     pytimelog_close_no_raise(self, 1);
     if (PyErr_Occurred()) {
         PyErr_WriteUnraisable(self_obj);
     }
-    PyErr_SetRaisedException(exc);
-#else
-    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-    pytimelog_close_no_raise(self, 1);
-    if (PyErr_Occurred()) {
-        PyErr_WriteUnraisable(self_obj);
-    }
-    PyErr_Restore(exc_type, exc_value, exc_tb);
-#endif
+    TL_PY_PRESERVE_EXC_END;
 }
 
 static void
@@ -1822,13 +1827,7 @@ error_seq:
     free(records);
     free(objs);
     Py_DECREF(it);
-    {
-        tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
-        if (dctx != NULL) {
-            tl_py_drain_retired(dctx, 0);
-            tl_py_handle_ctx_decref(dctx);
-        }
-    }
+    tl_py_drain_owned(self);
     Py_RETURN_NONE;
 
 error_stream:
@@ -1846,6 +1845,37 @@ error_stream:
  *
  * CRITICAL: Same TL_EBUSY semantics as append.
  *===========================================================================*/
+
+/*
+ * Finish a tombstone write (delete_range / delete_before) after the core call
+ * returned and core_lock was released. Consumes the owned hctx reference
+ * (always decrefs it). Mirrors the append EBUSY contract: on TL_EBUSY the
+ * tombstone IS already in the log, so the busy policy is applied and the write
+ * is never rolled back. On success (TL_OK or backpressure-handled EBUSY) the
+ * retired refs are drained and None is returned; otherwise NULL is returned
+ * with a Python exception set.
+ */
+static PyObject*
+tl_py_finish_tombstone_write(PyTimelog* self, tl_py_handle_ctx_t* hctx,
+                             tl_status_t st)
+{
+    if (st != TL_OK) {
+        if (st != TL_EBUSY) {
+            tl_py_handle_ctx_decref(hctx);
+            return TL_PY_RAISE_STATUS(self, st);
+        }
+        if (tl_py_handle_write_ebusy(self,
+                "Tombstone inserted but backpressure occurred. "
+                "Call flush() or wait for background maintenance to relieve.") < 0) {
+            tl_py_handle_ctx_decref(hctx);
+            return NULL;
+        }
+    }
+
+    tl_py_drain_retired(hctx, 0);
+    tl_py_handle_ctx_decref(hctx);
+    Py_RETURN_NONE;
+}
 
 static PyObject*
 PyTimelog_delete_range(PyTimelog* self, PyObject* args)
@@ -1876,31 +1906,7 @@ PyTimelog_delete_range(PyTimelog* self, PyObject* args)
     st = tl_delete_range(self->tl, (tl_ts_t)t1_ll, (tl_ts_t)t2_ll);
     TL_PY_UNLOCK(self);
 
-    if (st == TL_OK) {
-        goto success;
-    }
-
-    if (st == TL_EBUSY) {
-        /*
-         * CRITICAL: EBUSY means tombstone WAS inserted, but backpressure.
-         * Same handling as append.
-         */
-        if (tl_py_handle_write_ebusy(self,
-                "Tombstone inserted but backpressure occurred. "
-                "Call flush() or wait for background maintenance to relieve.") < 0) {
-            tl_py_handle_ctx_decref(hctx);
-            return NULL;
-        }
-        goto success;
-    }
-
-    tl_py_handle_ctx_decref(hctx);
-    return TL_PY_RAISE_STATUS(self, st);
-
-success:
-    tl_py_drain_retired(hctx, 0);
-    tl_py_handle_ctx_decref(hctx);
-    Py_RETURN_NONE;
+    return tl_py_finish_tombstone_write(self, hctx, st);
 }
 
 /*===========================================================================
@@ -1929,28 +1935,7 @@ PyTimelog_delete_before(PyTimelog* self, PyObject* args)
     st = tl_delete_before(self->tl, (tl_ts_t)cutoff_ll);
     TL_PY_UNLOCK(self);
 
-    if (st == TL_OK) {
-        goto success;
-    }
-
-    if (st == TL_EBUSY) {
-        /* Same handling as delete_range */
-        if (tl_py_handle_write_ebusy(self,
-                "Tombstone inserted but backpressure occurred. "
-                "Call flush() or wait for background maintenance to relieve.") < 0) {
-            tl_py_handle_ctx_decref(hctx);
-            return NULL;
-        }
-        goto success;
-    }
-
-    tl_py_handle_ctx_decref(hctx);
-    return TL_PY_RAISE_STATUS(self, st);
-
-success:
-    tl_py_drain_retired(hctx, 0);
-    tl_py_handle_ctx_decref(hctx);
-    Py_RETURN_NONE;
+    return tl_py_finish_tombstone_write(self, hctx, st);
 }
 
 /*===========================================================================
@@ -1977,13 +1962,7 @@ PyTimelog_flush(PyTimelog* self, PyObject* Py_UNUSED(args))
 
     /* Drain under GIL, holding an owned handle_ctx ref so a concurrent
      * close() cannot free the context mid-drain. */
-    {
-        tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
-        if (dctx != NULL) {
-            tl_py_drain_retired(dctx, 0);
-            tl_py_handle_ctx_decref(dctx);
-        }
-    }
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -2008,13 +1987,7 @@ PyTimelog_compact(PyTimelog* self, PyObject* Py_UNUSED(args))
 
     /* Opportunistic drain after compact (owned ref guards against a
      * concurrent close() freeing the context). */
-    {
-        tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
-        if (dctx != NULL) {
-            tl_py_drain_retired(dctx, 0);
-            tl_py_handle_ctx_decref(dctx);
-        }
-    }
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -2167,11 +2140,7 @@ PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     if (st == TL_OK) {
-        tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
-        if (dctx != NULL) {
-            tl_py_drain_retired(dctx, 0);
-            tl_py_handle_ctx_decref(dctx);
-        }
+        tl_py_drain_owned(self);
         Py_RETURN_TRUE;
     }
     if (st == TL_EOF) {
@@ -2382,13 +2351,7 @@ PyTimelog_stop_maint(PyTimelog* self, PyObject* Py_UNUSED(args))
 
     /* Drain after stop - no more on_drop callbacks possible. Owned ref guards
      * against a concurrent close() freeing the context mid-drain. */
-    {
-        tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
-        if (dctx != NULL) {
-            tl_py_drain_retired(dctx, 0);
-            tl_py_handle_ctx_decref(dctx);
-        }
-    }
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -3049,8 +3012,4 @@ PyObject* TlPy_CreateTimelogType(PyObject* module)
     return PyType_FromModuleAndSpec(module, &PyTimelog_spec, NULL);
 }
 
-int TlPyTimelog_Check(PyObject* op, const tl_py_module_state_t* st)
-{
-    return op != NULL && st != NULL && st->type_timelog != NULL &&
-           PyObject_TypeCheck(op, (PyTypeObject*)st->type_timelog);
-}
+TL_PY_DEFINE_CHECK(TlPyTimelog_Check, type_timelog)

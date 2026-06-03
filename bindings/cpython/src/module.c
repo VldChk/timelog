@@ -54,6 +54,66 @@ static const char* const managed_export_names[] = {
 static tl_py_module_failpoint_t tl_py_module_failpoint = TL_PY_MODULE_FAIL_NONE;
 #endif
 
+/*
+ * Registry of the module-state heap types, in creation order. This is the
+ * single source of truth for create / traverse / clear / completeness; adding
+ * a type means adding one row here (and, if it is exported, one row in
+ * timelog_export_public_refs). NOTE the registry is deliberately *types only*:
+ * the two exception objects are GC-visited and cleared separately, and the
+ * export set differs (it includes the exceptions and excludes the non-exported
+ * ObjectsViewIter), so those paths are not folded in here.
+ */
+typedef struct {
+    size_t offset;                          /* offsetof into tl_py_module_state_t */
+    PyObject* (*create)(PyObject* module);
+    tl_py_module_failpoint_t create_failpoint;
+    const char* create_stage;
+} timelog_type_desc_t;
+
+static const timelog_type_desc_t timelog_type_table[] = {
+    {offsetof(tl_py_module_state_t, type_timelog),
+     TlPy_CreateTimelogType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_TIMELOG, "after Timelog type creation"},
+    {offsetof(tl_py_module_state_t, type_timelog_iter),
+     TlPy_CreateTimelogIterType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_ITER, "after TimelogIter type creation"},
+    {offsetof(tl_py_module_state_t, type_pagespan),
+     TlPy_CreatePageSpanType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN, "after PageSpan type creation"},
+    {offsetof(tl_py_module_state_t, type_pagespan_iter),
+     TlPy_CreatePageSpanIterType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_ITER, "after PageSpanIter type creation"},
+    {offsetof(tl_py_module_state_t, type_pagespan_objects_view),
+     TlPy_CreatePageSpanObjectsViewType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW,
+     "after PageSpanObjectsView type creation"},
+    {offsetof(tl_py_module_state_t, type_pagespan_objects_view_iter),
+     TlPy_CreatePageSpanObjectsViewIterType,
+     TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW_ITER,
+     "after PageSpanObjectsViewIter type creation"},
+};
+
+#define TIMELOG_TYPE_COUNT \
+    (sizeof(timelog_type_table) / sizeof(timelog_type_table[0]))
+
+/* Must list every type_* slot in tl_py_module_state_t exactly once. */
+_Static_assert(TIMELOG_TYPE_COUNT == 6,
+               "timelog_type_table must list all six module-state type slots");
+
+/* Writable address of the type slot described by `d` within state `st`. */
+static PyObject** timelog_type_slot(tl_py_module_state_t* st,
+                                    const timelog_type_desc_t* d)
+{
+    return (PyObject**)((char*)st + d->offset);
+}
+
+/* Current value of the type slot described by `d` (read-only). */
+static PyObject* timelog_type_value(const tl_py_module_state_t* st,
+                                    const timelog_type_desc_t* d)
+{
+    return *(PyObject* const*)((const char*)st + d->offset);
+}
+
 static int timelog_traverse(PyObject* module, visitproc visit, void* arg)
 {
     tl_py_module_state_t* st = TlPy_ModuleState(module);
@@ -64,12 +124,10 @@ static int timelog_traverse(PyObject* module, visitproc visit, void* arg)
 
     Py_VISIT(st->exc_timelog_error);
     Py_VISIT(st->exc_timelog_busy_error);
-    Py_VISIT(st->type_timelog);
-    Py_VISIT(st->type_timelog_iter);
-    Py_VISIT(st->type_pagespan);
-    Py_VISIT(st->type_pagespan_iter);
-    Py_VISIT(st->type_pagespan_objects_view);
-    Py_VISIT(st->type_pagespan_objects_view_iter);
+    for (size_t i = 0; i < TIMELOG_TYPE_COUNT; i++) {
+        PyObject* type_obj = timelog_type_value(st, &timelog_type_table[i]);
+        Py_VISIT(type_obj);
+    }
     return 0;
 }
 
@@ -79,13 +137,12 @@ static void timelog_clear_types(tl_py_module_state_t* st)
         return;
     }
 
+    /* Clear in reverse creation order (dependents before dependencies). */
     TL_PY_PRESERVE_EXC_BEGIN;
-    Py_CLEAR(st->type_pagespan_objects_view_iter);
-    Py_CLEAR(st->type_pagespan_objects_view);
-    Py_CLEAR(st->type_pagespan_iter);
-    Py_CLEAR(st->type_pagespan);
-    Py_CLEAR(st->type_timelog_iter);
-    Py_CLEAR(st->type_timelog);
+    for (size_t i = TIMELOG_TYPE_COUNT; i-- > 0;) {
+        PyObject** slot = timelog_type_slot(st, &timelog_type_table[i]);
+        Py_CLEAR(*slot);
+    }
     TL_PY_PRESERVE_EXC_END;
 }
 
@@ -144,24 +201,28 @@ static int timelog_state_has_empty_errors(const tl_py_module_state_t* st)
 
 static int timelog_state_has_empty_types(const tl_py_module_state_t* st)
 {
-    return st != NULL &&
-           st->type_timelog == NULL &&
-           st->type_timelog_iter == NULL &&
-           st->type_pagespan == NULL &&
-           st->type_pagespan_iter == NULL &&
-           st->type_pagespan_objects_view == NULL &&
-           st->type_pagespan_objects_view_iter == NULL;
+    if (st == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < TIMELOG_TYPE_COUNT; i++) {
+        if (timelog_type_value(st, &timelog_type_table[i]) != NULL) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int timelog_state_has_complete_types(const tl_py_module_state_t* st)
 {
-    return st != NULL &&
-           st->type_timelog != NULL &&
-           st->type_timelog_iter != NULL &&
-           st->type_pagespan != NULL &&
-           st->type_pagespan_iter != NULL &&
-           st->type_pagespan_objects_view != NULL &&
-           st->type_pagespan_objects_view_iter != NULL;
+    if (st == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < TIMELOG_TYPE_COUNT; i++) {
+        if (timelog_type_value(st, &timelog_type_table[i]) == NULL) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static int timelog_state_is_invalid(const tl_py_module_state_t* st)
@@ -350,46 +411,14 @@ static int timelog_create_types(PyObject* module, tl_py_module_state_t* st)
         return -1;
     }
 
-    st->type_timelog = TlPy_CreateTimelogType(module);
-    if (st->type_timelog == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_TIMELOG,
-                           "after Timelog type creation") < 0) {
-        goto error;
-    }
-
-    st->type_timelog_iter = TlPy_CreateTimelogIterType(module);
-    if (st->type_timelog_iter == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_ITER,
-                           "after TimelogIter type creation") < 0) {
-        goto error;
-    }
-
-    st->type_pagespan = TlPy_CreatePageSpanType(module);
-    if (st->type_pagespan == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN,
-                           "after PageSpan type creation") < 0) {
-        goto error;
-    }
-
-    st->type_pagespan_iter = TlPy_CreatePageSpanIterType(module);
-    if (st->type_pagespan_iter == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_ITER,
-                           "after PageSpanIter type creation") < 0) {
-        goto error;
-    }
-
-    st->type_pagespan_objects_view = TlPy_CreatePageSpanObjectsViewType(module);
-    if (st->type_pagespan_objects_view == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW,
-                           "after PageSpanObjectsView type creation") < 0) {
-        goto error;
-    }
-
-    st->type_pagespan_objects_view_iter = TlPy_CreatePageSpanObjectsViewIterType(module);
-    if (st->type_pagespan_objects_view_iter == NULL ||
-        timelog_maybe_fail(TL_PY_MODULE_FAIL_AFTER_CREATE_PAGESPAN_OBJECTS_VIEW_ITER,
-                           "after PageSpanObjectsViewIter type creation") < 0) {
-        goto error;
+    for (size_t i = 0; i < TIMELOG_TYPE_COUNT; i++) {
+        const timelog_type_desc_t* d = &timelog_type_table[i];
+        PyObject** slot = timelog_type_slot(st, d);
+        *slot = d->create(module);
+        if (*slot == NULL ||
+            timelog_maybe_fail(d->create_failpoint, d->create_stage) < 0) {
+            goto error;
+        }
     }
     return 0;
 

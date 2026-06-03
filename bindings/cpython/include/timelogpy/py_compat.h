@@ -142,4 +142,42 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
 #define TL_PY_OBJ_UNLOCK2()   } while (0)
 #endif
 
+/*===========================================================================
+ * Shared object idioms
+ *===========================================================================*/
+
+/*
+ * Standard tp_dealloc epilogue for a GC-tracked heap type: capture the type,
+ * untrack, run the type-specific cleanup, free the instance, then drop the
+ * reference the instance held on its (heap) type. Centralizing this keeps the
+ * easy-to-forget Py_DECREF(tp) correct across every heap type. cleanup_stmt is
+ * a single statement (no trailing semicolon) and runs after untrack, before
+ * the instance is freed.
+ */
+#define TL_PY_GC_DEALLOC(self, cleanup_stmt)             \
+    do {                                                 \
+        PyTypeObject* tl_dealloc_tp__ = Py_TYPE(self);   \
+        PyObject_GC_UnTrack(self);                       \
+        cleanup_stmt;                                    \
+        tl_dealloc_tp__->tp_free((PyObject*)(self));     \
+        Py_DECREF(tl_dealloc_tp__);                      \
+    } while (0)
+
+/*
+ * Define a read-only `closed` boolean getter that samples self->closed under
+ * the per-object critical section. Used by the iterator/span heap types whose
+ * `closed` flag is a plain field guarded by TL_PY_OBJ_LOCK (PyTimelog's is
+ * _Atomic and intentionally keeps its own getter).
+ */
+#define TL_PY_DEFINE_CLOSED_GETTER(Fn, Type)             \
+    static PyObject* Fn(Type* self, void* closure)       \
+    {                                                    \
+        (void)closure;                                   \
+        int closed;                                      \
+        TL_PY_OBJ_LOCK(self);                            \
+        closed = self->closed;                           \
+        TL_PY_OBJ_UNLOCK();                              \
+        return PyBool_FromLong(closed);                  \
+    }
+
 #endif /* TIMELOGPY_PY_COMPAT_H */

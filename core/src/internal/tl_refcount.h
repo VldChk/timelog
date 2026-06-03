@@ -7,7 +7,11 @@
 /*
  * Shared release pattern for intrusive refcounted objects:
  * - post-decrement guard via TL_VERIFY (safe in release builds)
- * - acquire fence before final destruction
+ * - acq_rel decrement: the acquire half orders the final (->0) decrement after
+ *   every prior release so destruction observes their writes. Folded into the
+ *   RMW rather than a standalone atomic_thread_fence, which GCC ThreadSanitizer
+ *   does not model (the fence is invisible to it, producing a spurious
+ *   free-vs-read race report on the destroyed object).
  */
 #define TL_REFCOUNT_ACQUIRE(refcnt_ptr, after_final_msg, overflow_msg) \
     do { \
@@ -27,10 +31,9 @@
 
 #define TL_REFCOUNT_RELEASE(refcnt_ptr, on_zero, double_release_msg) \
     do { \
-        uint32_t tl_refcount_old__ = tl_atomic_fetch_sub_u32((refcnt_ptr), 1, TL_MO_RELEASE); \
+        uint32_t tl_refcount_old__ = tl_atomic_fetch_sub_u32((refcnt_ptr), 1, TL_MO_ACQ_REL); \
         TL_VERIFY(tl_refcount_old__ >= 1 && (double_release_msg)); \
         if (tl_refcount_old__ == 1) { \
-            tl_atomic_fence(TL_MO_ACQUIRE); \
             do { on_zero; } while (0); \
         } \
     } while (0)

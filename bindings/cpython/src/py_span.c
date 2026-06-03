@@ -192,12 +192,8 @@ static int PyPageSpan_clear(PyPageSpan* self)
 
 static void PyPageSpan_dealloc(PyPageSpan* self)
 {
-    PyTypeObject* tp = Py_TYPE(self);
-    PyObject_GC_UnTrack(self);
     /* exports > 0 here means a bug; cleanup anyway to avoid leaks. */
-    pagespan_cleanup(self);
-    tp->tp_free((PyObject*)self);
-    Py_DECREF(tp);
+    TL_PY_GC_DEALLOC(self, pagespan_cleanup(self));
 }
 
 /*===========================================================================
@@ -510,15 +506,7 @@ static PyObject* PyPageSpan_get_last_ts(PyPageSpan* self, void* closure)
     return PyPageSpan_get_end_ts(self, closure);
 }
 
-static PyObject* PyPageSpan_get_closed(PyPageSpan* self, void* closure)
-{
-    (void)closure;
-    int closed;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    TL_PY_OBJ_UNLOCK();
-    return PyBool_FromLong(closed);
-}
+TL_PY_DEFINE_CLOSED_GETTER(PyPageSpan_get_closed, PyPageSpan)
 
 /*===========================================================================
  * Method/GetSet Tables
@@ -593,8 +581,4 @@ PyObject* TlPy_CreatePageSpanType(PyObject* module)
     return PyType_FromModuleAndSpec(module, &PyPageSpan_spec, NULL);
 }
 
-int TlPyPageSpan_Check(PyObject* op, const tl_py_module_state_t* st)
-{
-    return op != NULL && st != NULL && st->type_pagespan != NULL &&
-           PyObject_TypeCheck(op, (PyTypeObject*)st->type_pagespan);
-}
+TL_PY_DEFINE_CHECK(TlPyPageSpan_Check, type_pagespan)

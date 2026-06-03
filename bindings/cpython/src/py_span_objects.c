@@ -58,11 +58,7 @@ PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 
 static void PyPageSpanObjectsView_dealloc(PyPageSpanObjectsView* self)
 {
-    PyTypeObject* tp = Py_TYPE(self);
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(self->span);
-    tp->tp_free((PyObject*)self);
-    Py_DECREF(tp);
+    TL_PY_GC_DEALLOC(self, Py_XDECREF(self->span));
 }
 
 static int PyPageSpanObjectsView_traverse(PyPageSpanObjectsView* self,
@@ -160,11 +156,7 @@ typedef struct {
 
 static void objectsviewiter_dealloc(PyPageSpanObjectsViewIter* self)
 {
-    PyTypeObject* tp = Py_TYPE(self);
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(self->view);
-    tp->tp_free((PyObject*)self);
-    Py_DECREF(tp);
+    TL_PY_GC_DEALLOC(self, Py_XDECREF(self->view));
 }
 
 static int objectsviewiter_traverse(PyPageSpanObjectsViewIter* self,
@@ -399,8 +391,4 @@ PyObject* TlPy_CreatePageSpanObjectsViewIterType(PyObject* module)
     return PyType_FromModuleAndSpec(module, &PyPageSpanObjectsViewIter_spec, NULL);
 }
 
-int TlPyPageSpanObjectsView_Check(PyObject* op, const tl_py_module_state_t* st)
-{
-    return op != NULL && st != NULL && st->type_pagespan_objects_view != NULL &&
-           PyObject_TypeCheck(op, (PyTypeObject*)st->type_pagespan_objects_view);
-}
+TL_PY_DEFINE_CHECK(TlPyPageSpanObjectsView_Check, type_pagespan_objects_view)

@@ -138,14 +138,16 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
 /*===========================================================================
  * Reference Counting
  *
- * Memory ordering:
+ * Memory ordering (see TL_REFCOUNT_RELEASE):
  * - Acquire (increment): relaxed is sufficient (already have a reference)
- * - Release (decrement): release ordering, acquire fence before destruction
+ * - Release (decrement): acq_rel — release publishes prior writes; the acquire
+ *   half on the final (->0) decrement synchronizes with other releasers before
+ *   destruction. (Folded into the RMW rather than a standalone acquire fence,
+ *   which GCC ThreadSanitizer does not model.)
  *
  * Pattern for release:
- *   uint32_t old = tl_atomic_fetch_sub_u32(&refcnt, 1, TL_MO_RELEASE);
+ *   uint32_t old = tl_atomic_fetch_sub_u32(&refcnt, 1, TL_MO_ACQ_REL);
  *   if (old == 1) {
- *       tl_atomic_fence(TL_MO_ACQUIRE);
  *       destroy(obj);
  *   }
  *===========================================================================*/

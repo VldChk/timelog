@@ -218,29 +218,35 @@ static int PyTimelogIter_clear(PyTimelogIter* self)
 
 static void PyTimelogIter_dealloc(PyTimelogIter* self)
 {
-    PyTypeObject* tp = Py_TYPE(self);
-    PyObject_GC_UnTrack(self);
-    pytimelogiter_cleanup(self);  /* Idempotent */
-    tp->tp_free((PyObject*)self);
-    Py_DECREF(tp);
+    /* pytimelogiter_cleanup is idempotent. */
+    TL_PY_GC_DEALLOC(self, pytimelogiter_cleanup(self));
 }
 
 /*===========================================================================
  * Iterator Protocol
  *===========================================================================*/
 
-static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
+/*
+ * Perform one iteration step. Under the iterator's critical section, advance
+ * the engine (tl_iter_next) and pin the decoded payload with a strong ref so a
+ * concurrent close()+drain cannot free it before materialization; on EOF/error
+ * detach the iterator's resources under the same CS. Outside the CS,
+ * materialize the (timestamp, obj) 2-tuple. Holding the CS across the pure-C
+ * engine call is the irreducible close-vs-next UAF guard (see py_compat.h); no
+ * Python runs under it.
+ *
+ * Returns a new 2-tuple on success. Returns NULL with *out_stop=1 on
+ * closed/EOF (StopIteration; no exception set). Returns NULL with *out_stop=0
+ * on error (Python exception set) or a fired failpoint. test_fail_hook, when
+ * non-NULL, is consulted once per produced record and MUST be checked here,
+ * not at the call site, so it only fires on a materializing step.
+ */
+static PyObject* pytimelogiter_step(PyTimelogIter* self,
+                                    int (*test_fail_hook)(void),
+                                    int* out_stop)
 {
-    /*
-     * Hold the iter's CS across tl_iter_next so a concurrent close() cannot
-     * tl_iter_destroy(self->iter) mid-call (which would be UAF). The engine
-     * call is pure C and executes no Python, so the "no Python work under
-     * any internal lock" rule is preserved.
-     *
-     * Py_BEGIN_CRITICAL_SECTION introduces a scope; structure the function
-     * as a single LOCK/UNLOCK pair so locally-declared inner state cannot
-     * leak past the close brace.
-     */
+    *out_stop = 0;
+
     tl_record_t rec;
     tl_status_t st = TL_EOF;
     int was_closed = 0;
@@ -250,8 +256,6 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     tl_py_handle_ctx_t* handle_ctx = NULL;
     tl_py_engine_ctx_t* engine_ctx = NULL;
     PyObject* owner = NULL;
-    /* Strong ref to the decoded payload, taken UNDER the CS so a concurrent
-     * close()+drain cannot free it before we materialize the result. */
     PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK(self);
@@ -279,6 +283,7 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
     TL_PY_OBJ_UNLOCK();
 
     if (was_closed) {
+        *out_stop = 1;
         return NULL;  /* StopIteration */
     }
 
@@ -287,14 +292,15 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
             pytimelogiter_release_resources(it, snap, handle_ctx, engine_ctx, owner);
         }
         if (st == TL_EOF) {
+            *out_stop = 1;
             return NULL;  /* StopIteration */
         }
         return TlPy_RaiseFromObject((PyObject*)self, st);
     }
 
-    /* obj is now an owned strong ref. Remaining materialization (the
-     * timestamp Long + the result tuple) runs OUTSIDE the CS. */
-    if (tl_py_iter_test_should_fail_iternext()) {
+    /* obj is now an owned strong ref. Materialization (the timestamp Long +
+     * the result tuple) runs OUTSIDE the CS. */
+    if (test_fail_hook != NULL && test_fail_hook()) {
         Py_DECREF(obj);
         pytimelogiter_cleanup(self);
         return NULL;
@@ -317,8 +323,15 @@ static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
 
     PyTuple_SET_ITEM(tup, 0, ts);  /* steals ref */
     PyTuple_SET_ITEM(tup, 1, obj);
-
     return tup;
+}
+
+static PyObject* PyTimelogIter_iternext(PyTimelogIter* self)
+{
+    /* One step; NULL is StopIteration (stop) or a raised error / failpoint. */
+    int stop = 0;
+    return pytimelogiter_step(
+        self, tl_py_iter_test_should_fail_iternext, &stop);
 }
 
 /*===========================================================================
@@ -380,79 +393,16 @@ static PyObject* PyTimelogIter_next_batch(PyTimelogIter* self, PyObject* arg_n)
 
     Py_ssize_t i = 0;
     for (; i < n; i++) {
-        /* Per-record CS: lock, engine call, update counter, unlock. The
-         * engine call is the irreducible race window; holding CS through
-         * it prevents close from freeing the iter mid-call. Materialize
-         * the Python tuple outside the CS. */
-        tl_record_t rec;
-        tl_status_t st = TL_EOF;
-        int was_closed = 0;
-        int do_release = 0;
-        tl_iter_t* it_local = NULL;
-        tl_snapshot_t* snap_local = NULL;
-        tl_py_handle_ctx_t* hctx_local = NULL;
-        tl_py_engine_ctx_t* ectx_local = NULL;
-        PyObject* owner_local = NULL;
-        PyObject* obj = NULL;  /* payload ref taken under CS (see iternext) */
-
-        TL_PY_OBJ_LOCK(self);
-        if (self->closed) {
-            was_closed = 1;
-        } else {
-            st = tl_iter_next(self->iter, &rec);
-            if (st == TL_OK) {
-                /* Pin the payload before releasing the CS so a concurrent
-                 * close()+drain cannot free it before materialization. */
-                obj = Py_NewRef(tl_py_handle_decode(rec.handle));
-                if (self->remaining_valid && self->remaining_count > 0) {
-                    self->remaining_count--;
-                }
-            } else {
-                do_release = pytimelogiter_detach_locked(
-                    self, &it_local, &snap_local, &hctx_local,
-                    &ectx_local, &owner_local);
+        int stop = 0;
+        PyObject* tup = pytimelogiter_step(
+            self, tl_py_iter_test_should_fail_next_batch, &stop);
+        if (tup == NULL) {
+            if (stop) {
+                break;    /* closed/EOF: trim the list below */
             }
+            goto fail;    /* error (exception set) or a fired failpoint */
         }
-        TL_PY_OBJ_UNLOCK();
-
-        if (was_closed) {
-            break;
-        }
-        if (st != TL_OK) {
-            if (do_release) {
-                pytimelogiter_release_resources(
-                    it_local, snap_local, hctx_local, ectx_local, owner_local);
-            }
-            if (st == TL_EOF) {
-                break;
-            }
-            TlPy_RaiseFromObject((PyObject*)self, st);
-            goto fail;
-        }
-
-        /* obj is owned; build the tuple outside the CS. */
-        if (tl_py_iter_test_should_fail_next_batch()) {
-            Py_DECREF(obj);
-            pytimelogiter_cleanup(self);
-            goto fail;
-        }
-
-        PyObject* ts = PyLong_FromLongLong((long long)rec.ts);
-        if (!ts) {
-            Py_DECREF(obj);
-            pytimelogiter_cleanup(self);
-            goto fail;
-        }
-        PyObject* tup = PyTuple_New(2);
-        if (!tup) {
-            Py_DECREF(ts);
-            Py_DECREF(obj);
-            pytimelogiter_cleanup(self);
-            goto fail;
-        }
-        PyTuple_SET_ITEM(tup, 0, ts);
-        PyTuple_SET_ITEM(tup, 1, obj);
-        PyList_SET_ITEM(list, i, tup);
+        PyList_SET_ITEM(list, i, tup);  /* steals ref */
     }
 
     /* Trim list if exhausted before n. */
@@ -497,15 +447,7 @@ static Py_ssize_t PyTimelogIter_len(PyTimelogIter* self)
     return (Py_ssize_t)count;
 }
 
-static PyObject* PyTimelogIter_get_closed(PyTimelogIter* self, void* closure)
-{
-    (void)closure;
-    int closed;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    TL_PY_OBJ_UNLOCK();
-    return PyBool_FromLong(closed);
-}
+TL_PY_DEFINE_CLOSED_GETTER(PyTimelogIter_get_closed, PyTimelogIter)
 
 /*===========================================================================
  * Method/GetSet Tables
@@ -598,8 +540,4 @@ PyObject* TlPy_CreateTimelogIterType(PyObject* module)
     return PyType_FromModuleAndSpec(module, &PyTimelogIter_spec, NULL);
 }
 
-int TlPyTimelogIter_Check(PyObject* op, const tl_py_module_state_t* st)
-{
-    return op != NULL && st != NULL && st->type_timelog_iter != NULL &&
-           PyObject_TypeCheck(op, (PyTypeObject*)st->type_timelog_iter);
-}
+TL_PY_DEFINE_CHECK(TlPyTimelogIter_Check, type_timelog_iter)

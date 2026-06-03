@@ -53,23 +53,34 @@ struct tl_py_live_entry {
  * (where free-threaded builds do not exist) the GIL-presence check is
  * equivalent.
  */
-static int tl_py_attached_to_interp(const tl_py_handle_ctx_t* ctx)
+/*
+ * The interpreter owning the currently-attached Python thread state, or NULL
+ * if none is attached. On 3.13+ this asks the right free-threaded question
+ * ("is a thread state attached?", via PyThreadState_GetUnchecked) rather than
+ * "is the GIL held?" (PyGILState_Check), which does not track attachment under
+ * Py_GIL_DISABLED. On 3.12 (no free-threaded build) the two are equivalent.
+ * Used both to capture ctx->interp and to probe it, so the two never diverge.
+ */
+static PyInterpreterState* tl_py_current_interp_or_null(void)
 {
-    if (ctx == NULL || !Py_IsInitialized()) {
-        return 0;
+    if (!Py_IsInitialized()) {
+        return NULL;
     }
 #if PY_VERSION_HEX >= 0x030D0000
     PyThreadState* ts = PyThreadState_GetUnchecked();
-    if (ts == NULL) {
-        return 0;
-    }
-    return PyThreadState_GetInterpreter(ts) == ctx->interp;
+    return (ts != NULL) ? PyThreadState_GetInterpreter(ts) : NULL;
 #else
-    if (!PyGILState_Check()) {
+    return PyGILState_Check() ? PyInterpreterState_Get() : NULL;
+#endif
+}
+
+static int tl_py_attached_to_interp(const tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
         return 0;
     }
-    return PyInterpreterState_Get() == ctx->interp;
-#endif
+    PyInterpreterState* cur = tl_py_current_interp_or_null();
+    return cur != NULL && cur == ctx->interp;
 }
 
 static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
@@ -148,15 +159,26 @@ static tl_status_t tl_py_live_rehash(tl_py_handle_ctx_t* ctx, size_t new_cap)
     return TL_OK;
 }
 
-/* Re-attach an undrained suffix after a bounded drain. Producers may push
- * concurrently, so this uses the same Treiber-stack CAS discipline as
- * tl_py_on_drop_handle(). */
+/*
+ * Push a [head..tail] sublist onto the lock-free retired stack (Treiber,
+ * multi-producer). Used both by tl_py_on_drop_handle() (a single node, where
+ * head==tail) and by the bounded-drain reattach path (an undrained suffix).
+ *
+ * The CAS is ACQ_REL, not plain RELEASE: the acquire half makes each producer
+ * synchronize-with the producer that published the head it links behind, so
+ * all live nodes form a single happens-before chain that the draining consumer
+ * (an ACQ_REL exchange) joins. A release-only CAS would leave deeper nodes
+ * reachable only via the C11 release-sequence-through-RMW rule, which C++20
+ * weakened and which ThreadSanitizer does not model -- surfacing a
+ * (benign-under-strict-C11 but fragile) malloc/free race on node memory.
+ * Weak CAS is fine since we loop on failure.
+ */
 static void
-tl_py_reattach_retired_suffix(tl_py_handle_ctx_t* ctx,
-                              tl_py_drop_node_t* remaining,
-                              tl_py_drop_node_t* tail)
+tl_py_retired_push(tl_py_handle_ctx_t* ctx,
+                   tl_py_drop_node_t* head,
+                   tl_py_drop_node_t* tail)
 {
-    if (remaining == NULL) {
+    if (head == NULL) {
         return;
     }
 
@@ -168,7 +190,7 @@ tl_py_reattach_retired_suffix(tl_py_handle_ctx_t* ctx,
     } while (!atomic_compare_exchange_weak_explicit(
                 &ctx->retired_head,
                 &current_head,
-                remaining,
+                head,
                 memory_order_acq_rel,
                 memory_order_acquire));
 }
@@ -192,7 +214,7 @@ tl_py_process_retired_list(tl_py_handle_ctx_t* ctx,
 
     while (list != NULL) {
         if (batch_limit != 0 && count >= batch_limit) {
-            tl_py_reattach_retired_suffix(ctx, list, list_tail);
+            tl_py_retired_push(ctx, list, list_tail);
             break;
         }
 
@@ -308,8 +330,7 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     /* Initialize atomics */
     atomic_init(&ctx->refcnt, 1);
     ctx->heap_allocated = 0;
-    ctx->interp = (Py_IsInitialized() && PyGILState_Check()) ?
-        PyInterpreterState_Get() : NULL;
+    ctx->interp = tl_py_current_interp_or_null();
     atomic_init(&ctx->retired_head, NULL);
     atomic_init(&ctx->pins, 0);
     atomic_init(&ctx->retired_count, 0);
@@ -392,7 +413,7 @@ void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx)
         tl_py_live_release_all(ctx);
     } else {
         const char* reason = "no attached Python thread state";
-        if (Py_IsInitialized() && PyGILState_Check()) {
+        if (tl_py_current_interp_or_null() != NULL) {
             reason = "wrong interpreter or active pins";
         }
         tl_py_handle_ctx_warn_unsafe_destroy(
@@ -500,7 +521,8 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
     /* Last pin holder: opportunistically drain retired objects. Claim the
      * retired list before releasing pin_lock, otherwise another thread could
      * enter a new pinned snapshot between the zero observation and the claim. */
-    if (old_pins == 1 && tl_py_attached_to_interp(ctx)) {
+    if (old_pins == 1 && tl_py_attached_to_interp(ctx) &&
+        atomic_load_explicit(&ctx->retired_head, memory_order_relaxed) != NULL) {
         began_drain = tl_py_try_begin_drain_and_claim_locked(ctx, 0, &list);
     }
     TL_PY_MUTEX_UNLOCK(&ctx->pin_lock);
@@ -561,27 +583,8 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
     node->obj = tl_py_handle_decode(handle);
     node->ts = ts;
 
-    /*
-     * Treiber stack push (multi-producer). The CAS is ACQ_REL, not plain
-     * RELEASE: the acquire half makes each producer synchronize-with the
-     * producer that published the head it links behind, so all live nodes
-     * form a single happens-before chain that the draining consumer (an
-     * ACQ_REL exchange) joins. A release-only CAS would leave deeper nodes
-     * reachable only via the C11 release-sequence-through-RMW rule, which
-     * C++20 weakened and which ThreadSanitizer does not model — surfacing a
-     * (benign-under-strict-C11 but fragile) malloc/free race on node memory.
-     * Weak CAS is fine since we loop on failure.
-     */
-    tl_py_drop_node_t* head;
-    do {
-        head = atomic_load_explicit(&ctx->retired_head, memory_order_acquire);
-        node->next = head;
-    } while (!atomic_compare_exchange_weak_explicit(
-                &ctx->retired_head,
-                &head,
-                node,
-                memory_order_acq_rel,
-                memory_order_acquire));
+    /* Single-node push (head == tail); ACQ_REL rationale in tl_py_retired_push. */
+    tl_py_retired_push(ctx, node, node);
 
     /* Metrics counter (relaxed). */
     atomic_fetch_add_explicit(&ctx->retired_count, 1, memory_order_relaxed);
@@ -601,6 +604,16 @@ size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
     assert(tl_py_attached_to_interp(ctx) &&
            "tl_py_drain_retired requires owning interpreter");
 #endif
+
+    /* Fast path: an opportunistic (non-force) drain skips the lock + claim
+     * when the retired stack is observably empty. A producer pushing
+     * concurrently with this relaxed load simply leaves the work for the next
+     * drain — the node is never lost (it stays on the stack until a later
+     * drain or the force=1 teardown claims it). */
+    if (!force &&
+        atomic_load_explicit(&ctx->retired_head, memory_order_relaxed) == NULL) {
+        return 0;
+    }
 
     tl_py_drop_node_t* list = NULL;
     int began_drain = 0;

@@ -200,16 +200,17 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
 /*===========================================================================
  * Reference Counting
  *
- * Memory ordering for reference counting:
+ * Memory ordering for reference counting (see TL_REFCOUNT_RELEASE):
  * - Acquire (increment): relaxed is sufficient for the fetch-add itself
- * - Release (decrement): release ordering ensures all prior writes are visible
- *   before the potential destruction
- * - Destruction: acquire fence before destroy to synchronize with releasers
+ * - Release (decrement): acq_rel — the release half makes all prior writes
+ *   visible before a potential destruction; the acquire half on the final
+ *   (->0) decrement synchronizes with every other releaser so destruction
+ *   observes their writes. (Folded into the RMW rather than release plus a
+ *   standalone acquire fence, which GCC ThreadSanitizer does not model.)
  *
  * Pattern for release:
- *   uint32_t old = tl_atomic_fetch_sub_u32(&refcnt, 1, TL_MO_RELEASE);
+ *   uint32_t old = tl_atomic_fetch_sub_u32(&refcnt, 1, TL_MO_ACQ_REL);
  *   if (old == 1) {
- *       tl_atomic_fence(TL_MO_ACQUIRE);
  *       destroy(obj);
  *   }
  *
