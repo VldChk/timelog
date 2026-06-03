@@ -8,140 +8,196 @@
 #include <assert.h>
 #include <stdarg.h>
 
-/*===========================================================================
- * Exception Types
- *===========================================================================*/
-
-PyObject* TlPy_TimelogError = NULL;
-PyObject* TlPy_TimelogBusyError = NULL;
-
-/*===========================================================================
- * Module Initialization
- *===========================================================================*/
-
-int TlPy_InitErrors(PyObject* module)
+int TlPy_StateHasCompleteErrors(const tl_py_module_state_t* st)
 {
-    /* Qualified name matches installed module path (timelog/_timelog). */
-    TlPy_TimelogError = PyErr_NewException(
-        "timelog._timelog.TimelogError",  /* name (installed path: timelog/_timelog) */
-        NULL,                              /* base (Exception) */
-        NULL                               /* dict */
-    );
+    return st != NULL &&
+           st->exc_timelog_error != NULL &&
+           st->exc_timelog_busy_error != NULL;
+}
 
-    if (TlPy_TimelogError == NULL) {
+static int tlpy_validate_error_pair(PyObject* error, PyObject* busy)
+{
+    int is_subclass = 0;
+
+    if (!PyExceptionClass_Check(error) || !PyExceptionClass_Check(busy)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "timelog module errors must be exception classes");
         return -1;
     }
 
-    if (PyModule_AddObject(module, "TimelogError", TlPy_TimelogError) < 0) {
-        Py_DECREF(TlPy_TimelogError);
-        TlPy_TimelogError = NULL;
+    is_subclass = PyObject_IsSubclass(busy, error);
+    if (is_subclass < 0) {
         return -1;
     }
-
-    /* PyModule_AddObject steals ref on success; keep our own. */
-    Py_INCREF(TlPy_TimelogError);
-
-    /* TimelogBusyError: subclass for TL_EBUSY conditions. */
-    TlPy_TimelogBusyError = PyErr_NewException(
-        "timelog._timelog.TimelogBusyError",  /* name */
-        TlPy_TimelogError,                     /* base (TimelogError) */
-        NULL                                   /* dict */
-    );
-
-    if (TlPy_TimelogBusyError == NULL) {
-        Py_DECREF(TlPy_TimelogError);
-        TlPy_TimelogError = NULL;
+    if (is_subclass == 0) {
+        PyErr_SetString(PyExc_TypeError,
+                        "timelog module TimelogBusyError must subclass TimelogError");
         return -1;
     }
-
-    if (PyModule_AddObject(module, "TimelogBusyError", TlPy_TimelogBusyError) < 0) {
-        Py_DECREF(TlPy_TimelogBusyError);
-        TlPy_TimelogBusyError = NULL;
-        Py_DECREF(TlPy_TimelogError);
-        TlPy_TimelogError = NULL;
-        return -1;
-    }
-
-    Py_INCREF(TlPy_TimelogBusyError);
 
     return 0;
 }
 
-void TlPy_FiniErrors(void)
+int TlPy_InitErrors(PyObject* module, tl_py_module_state_t* st)
 {
-    Py_CLEAR(TlPy_TimelogBusyError);
-    Py_CLEAR(TlPy_TimelogError);
+    PyObject* error = NULL;
+    PyObject* busy = NULL;
+
+    if (module == NULL || st == NULL) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "timelog module state is unavailable");
+        return -1;
+    }
+
+    if ((st->exc_timelog_error == NULL) != (st->exc_timelog_busy_error == NULL)) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "timelog module state has incomplete exception pair");
+        TlPy_ClearErrors(st);
+        return -1;
+    }
+
+    if (TlPy_StateHasCompleteErrors(st)) {
+        return tlpy_validate_error_pair(st->exc_timelog_error,
+                                        st->exc_timelog_busy_error);
+    }
+
+    error = PyErr_NewException("timelog._timelog.TimelogError", NULL, NULL);
+    if (error == NULL) {
+        return -1;
+    }
+
+    busy = PyErr_NewException("timelog._timelog.TimelogBusyError", error, NULL);
+    if (busy == NULL) {
+        Py_DECREF(error);
+        return -1;
+    }
+
+    if (tlpy_validate_error_pair(error, busy) < 0) {
+        Py_DECREF(busy);
+        Py_DECREF(error);
+        return -1;
+    }
+
+    st->exc_timelog_error = error;
+    st->exc_timelog_busy_error = busy;
+
+    return 0;
 }
 
-/*===========================================================================
- * Error Translation
- *===========================================================================*/
+void TlPy_ClearErrors(tl_py_module_state_t* st)
+{
+    if (st == NULL) {
+        return;
+    }
 
-/** Map tl_status_t to Python exception type (see py_errors.h for mapping). */
-static PyObject* status_to_exception_type(tl_status_t status)
+    TL_PY_PRESERVE_EXC_BEGIN;
+    Py_CLEAR(st->exc_timelog_busy_error);
+    Py_CLEAR(st->exc_timelog_error);
+    TL_PY_PRESERVE_EXC_END;
+}
+
+static PyObject* tlpy_status_to_exception_type(const tl_py_module_state_t* st,
+                                               tl_status_t status)
 {
     switch (status) {
         case TL_EINVAL:
             return PyExc_ValueError;
-
-        case TL_EBUSY:
-            return TlPy_TimelogBusyError ? TlPy_TimelogBusyError
-                                          : PyExc_RuntimeError;
-
         case TL_ENOMEM:
             return PyExc_MemoryError;
-
         case TL_EOVERFLOW:
             return PyExc_OverflowError;
-
         case TL_EINTERNAL:
             return PyExc_SystemError;
-
+        case TL_EBUSY:
+            if (st != NULL && st->exc_timelog_busy_error != NULL) {
+                return st->exc_timelog_busy_error;
+            }
+            return PyExc_RuntimeError;
         case TL_ESTATE:
         default:
-            return TlPy_TimelogError ? TlPy_TimelogError : PyExc_RuntimeError;
+            if (st != NULL && st->exc_timelog_error != NULL) {
+                return st->exc_timelog_error;
+            }
+            return PyExc_RuntimeError;
     }
 }
 
-PyObject* TlPy_RaiseFromStatus(tl_status_t status)
+PyObject* TlPy_RaiseFromState(const tl_py_module_state_t* st,
+                              tl_status_t status)
 {
 #ifndef NDEBUG
     assert(status != TL_OK && status != TL_EOF &&
-           "TlPy_RaiseFromStatus called with success status");
+           "TlPy_RaiseFromState called with success status");
 #endif
 
-    PyObject* exc_type = status_to_exception_type(status);
-    const char* msg = tl_strerror(status);
-
-    PyErr_SetString(exc_type, msg);
+    PyErr_SetString(tlpy_status_to_exception_type(st, status), tl_strerror(status));
     return NULL;
 }
 
-PyObject* TlPy_RaiseFromStatusFmt(tl_status_t status,
-                                   const char* format, ...)
+PyObject* TlPy_RaiseFromStateFmt(const tl_py_module_state_t* st,
+                                 tl_status_t status,
+                                 const char* format, ...)
 {
+    char buffer[512];
+    int n;
+    va_list args;
+
 #ifndef NDEBUG
     assert(status != TL_OK && status != TL_EOF &&
-           "TlPy_RaiseFromStatusFmt called with success status");
+           "TlPy_RaiseFromStateFmt called with success status");
 #endif
 
-    PyObject* exc_type = status_to_exception_type(status);
-
-    va_list args;
     va_start(args, format);
-
-    /* Format: "user message: tl_strerror(status)" */
-    char buffer[512];
-    int n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
+    n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
     va_end(args);
 
-    /* Append status string if there's room (truncation is harmless). */
     if (n >= 0 && (size_t)n < sizeof(buffer) - 64) {
         const char* status_msg = tl_strerror(status);
         size_t remaining = sizeof(buffer) - (size_t)n;
         snprintf(buffer + n, remaining, ": %s", status_msg);
     }
 
-    PyErr_SetString(exc_type, buffer);
+    PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
+    return NULL;
+}
+
+PyObject* TlPy_RaiseFromObject(PyObject* obj, tl_status_t status)
+{
+    tl_py_module_state_t* st = TlPy_StateFromObject(obj);
+    if (st == NULL) {
+        return NULL;
+    }
+    return TlPy_RaiseFromState(st, status);
+}
+
+PyObject* TlPy_RaiseFromObjectFmt(PyObject* obj,
+                                  tl_status_t status,
+                                  const char* format, ...)
+{
+    tl_py_module_state_t* st = TlPy_StateFromObject(obj);
+    char buffer[512];
+    int n;
+    va_list args;
+
+#ifndef NDEBUG
+    assert(status != TL_OK && status != TL_EOF &&
+           "TlPy_RaiseFromObjectFmt called with success status");
+#endif
+
+    if (st == NULL) {
+        return NULL;
+    }
+
+    va_start(args, format);
+    n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
+    va_end(args);
+
+    if (n >= 0 && (size_t)n < sizeof(buffer) - 64) {
+        const char* status_msg = tl_strerror(status);
+        size_t remaining = sizeof(buffer) - (size_t)n;
+        snprintf(buffer + n, remaining, ": %s", status_msg);
+    }
+
+    PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
     return NULL;
 }

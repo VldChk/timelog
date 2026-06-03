@@ -7,18 +7,29 @@
  * and maintenance.
  *
  * Thread Safety:
- *   Single-writer model: the same instance must not be used concurrently
- *   for writes or lifecycle operations without external synchronization.
- *   The binding serializes core calls to prevent concurrent use while the
- *   GIL is released, but this is not a guarantee of full thread safety.
- *   Snapshot-based iterators are safe for concurrent reads.
+ *   Single-writer API contract: the same instance must not be used
+ *   concurrently for *writes* or lifecycle operations without external
+ *   serialization. Snapshot-based iterators are safe for concurrent reads
+ *   from independent threads.
  *
- *   The GIL is released during flush(), compact(), stop_maintenance(), and
- *   close(). The user must ensure no other thread touches this Timelog
- *   instance while these operations are in progress.
+ *   The binding's internal synchronization layers:
+ *     - per-instance core_lock (PyThread_type_lock)
+ *     - atomic mirrors for the hot-path closed/tl fields
+ *     - per-object Py_BEGIN_CRITICAL_SECTION on mutable extension fields
+ *     - live_lock on the handle context's live-handle table
+ *     - atomic refcount on the core tl_pagespan_owner
+ *     - lock-free retired-stack between maintenance thread and drain
  *
- *   This binding requires the CPython GIL and is NOT supported on
- *   free-threaded/no-GIL Python builds.
+ *   Thread states required, not the GIL: Python C-API access requires an
+ *   attached thread state on the owning interpreter. The binding releases
+ *   the active interpreter's GIL during flush(), compact(),
+ *   stop_maintenance(), and close().
+ *
+ *   Supported builds:
+ *     - Regular CPython 3.12-3.14 (single interpreter).
+ *     - Isolated subinterpreters with per-interpreter GIL (3.12+).
+ *     - Free-threaded CPython 3.14t (Py_GIL_DISABLED=1): the module's
+ *       PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED.
  *
  * Known Limitations:
  *   - Unflushed records are dropped on close(). The binding tracks all
@@ -35,14 +46,25 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <stdatomic.h>
+#include <stdint.h>
 
 #include "timelog/timelog.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
+
+#include <stdatomic.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct tl_py_engine_ctx {
+    _Atomic(uint64_t) refcnt;
+    tl_timelog_t* tl;
+} tl_py_engine_ctx_t;
 
 /*===========================================================================
  * Busy Policy Enum
@@ -80,22 +102,47 @@ typedef struct {
     /**
      * Engine instance.
      * Set to NULL after close() to prevent use-after-free.
+     *
+     * Atomic so fast-path checks (CHECK_CLOSED) and the strict/best_effort
+     * core-call paths can read without taking core_lock. Writes happen
+     * under core_lock with memory_order_release.
      */
-    tl_timelog_t* tl;
+    _Atomic(tl_timelog_t*) tl;
 
     /**
      * Lifecycle state.
      * 0 = open, 1 = closed.
      * Set early in close() to prevent reentrancy.
+     *
+     * Atomic mirror of the lifecycle state so the fast-path unlocked
+     * closed check is synchronized, not racy. Writers hold core_lock and
+     * use memory_order_release; readers may use memory_order_acquire
+     * without the lock.
      */
-    int closed;
+    _Atomic(uint8_t) closed;
 
     /**
-     * Handle/lifetime context (embedded, not pointer).
-     * Embedding simplifies shutdown sequence - no separate allocation.
-     * Contains: retired queue, pin counter, metrics.
+     * Refcounted handle/lifetime context.
+     * Iterators and PageSpan owner hooks hold independent references so GC
+     * clearing a Timelog cannot invalidate active snapshot pins.
+     *
+     * Atomic, and mutated (set to NULL) only under core_lock: a mutation or
+     * maintenance path captures an OWNED reference under core_lock before it
+     * performs post-commit bookkeeping (live-tracking / retired drain) off the
+     * lock, so a concurrent close() can neither null the field from under it
+     * nor free the context while that bookkeeping is in flight. close() defers
+     * the live-table teardown to the refcount destructor (refcnt -> 0), which
+     * by definition runs with no other reference outstanding.
      */
-    tl_py_handle_ctx_t handle_ctx;
+    _Atomic(tl_py_handle_ctx_t*) handle_ctx;
+
+    /**
+     * Refcounted engine lifetime context.
+     * Iterator snapshots and PageSpan owners hold independent references so
+     * GC clearing a Timelog cannot free tl_timelog_t before their core
+     * snapshots have been released.
+     */
+    tl_py_engine_ctx_t* engine_ctx;
 
     /**
      * Per-instance lock to serialize all core calls.
@@ -116,27 +163,19 @@ typedef struct {
      */
     tl_py_busy_policy_t busy_policy;
 
-    /**
-     * Weak reference list head for Python weakref support.
-     */
-    PyObject* weakreflist;
-
 } PyTimelog;
 
 /*===========================================================================
  * Type Object
  *===========================================================================*/
 
-/**
- * PyTimelog type object.
- * Defined in py_timelog.c.
- */
-extern PyTypeObject PyTimelog_Type;
+PyObject* TlPy_CreateTimelogType(PyObject* module);
+int TlPyTimelog_Check(PyObject* op, const tl_py_module_state_t* st);
 
-/**
- * Type check macro.
- */
-#define PyTimelog_Check(op) PyObject_TypeCheck(op, &PyTimelog_Type)
+tl_py_engine_ctx_t* tl_py_engine_ctx_new(tl_timelog_t* tl);
+void tl_py_engine_ctx_incref(tl_py_engine_ctx_t* ctx);
+void tl_py_engine_ctx_decref(tl_py_engine_ctx_t* ctx);
+void tl_py_engine_ctx_close(tl_py_engine_ctx_t* ctx, int allow_threads);
 
 /**
  * Internal helper: acquire core lock and re-check closed state.
@@ -154,8 +193,10 @@ int tl_py_lock_checked(PyTimelog* self);
  */
 #define CHECK_CLOSED(self) \
     do { \
-        if ((self)->closed || (self)->tl == NULL) { \
-            return TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
+        if (atomic_load_explicit(&(self)->closed, memory_order_acquire) || \
+            atomic_load_explicit(&(self)->tl, memory_order_acquire) == NULL) { \
+            return TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
+                                           "Timelog is closed"); \
         } \
     } while (0)
 
@@ -165,8 +206,10 @@ int tl_py_lock_checked(PyTimelog* self);
  */
 #define CHECK_CLOSED_INT(self) \
     do { \
-        if ((self)->closed || (self)->tl == NULL) { \
-            TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed"); \
+        if (atomic_load_explicit(&(self)->closed, memory_order_acquire) || \
+            atomic_load_explicit(&(self)->tl, memory_order_acquire) == NULL) { \
+            TlPy_RaiseFromObjectFmt((PyObject*)(self), TL_ESTATE, \
+                                    "Timelog is closed"); \
             return -1; \
         } \
     } while (0)

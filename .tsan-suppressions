@@ -1,0 +1,28 @@
+# ThreadSanitizer suppressions for the free-threaded (3.14t) CI leg.
+#
+# These suppress races that originate INSIDE CPython's own free-threaded
+# runtime, not in the timelog extension. They are upstream-CPython noise:
+# the biased reference counting (BRC) subsystem merges per-thread refcount
+# queues using a lock-free object stack whose malloc/free TSan flags as a
+# benign race (the synchronization is via CPython's stop-the-world / QSBR
+# machinery that TSan does not model).
+#
+# Every frame in these reports is in libpython3.14t.so; none is in
+# _timelog.so. If a suppressed report ever grows a _timelog.so frame,
+# tighten the rule — do NOT broaden it.
+#
+# Reference: CPython Python/brc.c, Python/object_stack.c,
+# Include/internal/pycore_object_stack.h.
+
+# Biased reference counting cross-thread refcount merge.
+race:_Py_brc_merge_refcounts
+race:merge_queued_objects
+
+# Lock-free object stack used by BRC and the GC.
+race:_PyObjectStack_Pop
+race:_PyObjectStackChunk_New
+race:_PyObjectStack_Push
+
+# NOTE: deliberately NO broad `called_from_lib:libpython3.14t.so` rule —
+# that would mask a genuine timelog race surfaced through a libpython
+# callback. Suppress by specific CPython-internal function only.

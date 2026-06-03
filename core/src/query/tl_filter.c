@@ -53,11 +53,10 @@ tl_status_t tl_filter_iter_next(tl_filter_iter_t* it, tl_record_t* out) {
             return st;
         }
 
-        /*
-         * Compute max tombstone seq at this timestamp and compare against
-         * the record's watermark (rec_seq for mutable, applied_seq for immutable).
-         * Drop if tomb_seq > watermark.
-         */
+        /* A record is deleted iff the strongest tombstone covering its
+         * timestamp was applied after the record itself. The watermark
+         * here is rec_seq for mutable sources and applied_seq for
+         * immutable ones. */
         tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&it->tomb_cursor, rec.ts);
         if (tomb_seq > watermark) {
             if (tl_kmerge_iter_can_skip(it->merge, tomb_seq)) {

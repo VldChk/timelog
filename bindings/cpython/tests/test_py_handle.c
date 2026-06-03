@@ -151,6 +151,59 @@ TEST(ctx_init_null_fails)
     ASSERT_EQ(st, TL_EINVAL);
 }
 
+TEST(ctx_new_refcount_incref_decref)
+{
+    tl_py_handle_ctx_t* ctx = tl_py_handle_ctx_new(0);
+    ASSERT(ctx != NULL);
+    ASSERT_EQ(atomic_load_explicit(&ctx->refcnt, memory_order_acquire), 1);
+
+    tl_py_handle_ctx_incref(ctx);
+    ASSERT_EQ(atomic_load_explicit(&ctx->refcnt, memory_order_acquire), 2);
+
+    tl_py_handle_ctx_decref(ctx);
+    ASSERT_EQ(atomic_load_explicit(&ctx->refcnt, memory_order_acquire), 1);
+
+    tl_py_handle_ctx_decref(ctx);
+}
+
+TEST(ctx_last_decref_drains_retired_queue)
+{
+    tl_py_handle_ctx_t* ctx = tl_py_handle_ctx_new(0);
+    ASSERT(ctx != NULL);
+
+    PyObject* obj = PyDict_New();
+    ASSERT(obj != NULL);
+    Py_INCREF(obj);  /* Simulating engine-owned ref. */
+    Py_ssize_t refcnt_with_engine_ref = Py_REFCNT(obj);
+
+    tl_py_on_drop_handle(ctx, 1000, tl_py_handle_encode(obj));
+    ASSERT_EQ(tl_py_retired_queue_len(ctx), 1);
+
+    tl_py_handle_ctx_decref(ctx);
+    ASSERT_EQ(Py_REFCNT(obj), refcnt_with_engine_ref - 1);
+
+    Py_DECREF(obj);
+}
+
+TEST(ctx_last_decref_releases_live_table)
+{
+    tl_py_handle_ctx_t* ctx = tl_py_handle_ctx_new(0);
+    ASSERT(ctx != NULL);
+
+    PyObject* obj = PyDict_New();
+    ASSERT(obj != NULL);
+    Py_INCREF(obj);  /* Simulating engine-owned ref. */
+    Py_ssize_t refcnt_with_engine_ref = Py_REFCNT(obj);
+
+    ASSERT_EQ(tl_py_live_note_insert(ctx, obj), TL_OK);
+    ASSERT_EQ(ctx->live_len, 1);
+
+    tl_py_handle_ctx_decref(ctx);
+    ASSERT_EQ(Py_REFCNT(obj), refcnt_with_engine_ref - 1);
+
+    Py_DECREF(obj);
+}
+
 TEST(pins_enter_exit)
 {
     tl_py_handle_ctx_t ctx;
@@ -402,6 +455,9 @@ int run_py_handle_tests(void)
 
     run_ctx_init_destroy();
     run_ctx_init_null_fails();
+    run_ctx_new_refcount_incref_decref();
+    run_ctx_last_decref_drains_retired_queue();
+    run_ctx_last_decref_releases_live_table();
     run_pins_enter_exit();
     run_handle_encode_decode_roundtrip();
     run_on_drop_enqueues();

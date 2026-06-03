@@ -8,26 +8,26 @@
 /*===========================================================================
  * Point Lookup Fast Path
  *
- * Dedicated single-timestamp lookup that bypasses the full K-way merge.
- * Uses direct binary search on each component to find all records with
- * the exact timestamp.
+ * Dedicated single-timestamp lookup that skips the K-way merge by
+ * binary-searching each component directly for the exact timestamp.
  *
  * Algorithm:
- * 1. Tombstone watermark check: tomb_seq(ts) compared per row watermark
- * 2. L1 lookup: binary search window, catalog, page for ts
- * 3. L0 lookup: scan overlapping segments with binary search
- * 4. Memview lookup: binary search active_run, OOO head, OOO runs, sealed memruns
- * 5. Concatenate results (duplicates preserved, order unspecified)
+ * 1. Compute tomb_seq(ts) across all sources; a row is dropped iff
+ *    tomb_seq(ts) > row_watermark.
+ * 2. L1: binary-search the window catalog, then the page catalog,
+ *    then within the page.
+ * 3. L0: same, repeated for each overlapping segment.
+ * 4. Memview: binary-search the active sorted run, the OOO head, each
+ *    OOO run, and each sealed memrun.
+ * 5. Concatenate results. Duplicates are preserved; order is unspecified.
  *
- * Complexity:
- * - O(log S1) to find L1 window
- * - O(log P) per segment page catalog
- * - O(log rows) per page binary search
- * - Much cheaper than full K-way merge for single-timestamp queries
+ * Complexity is O(log S1) for the L1 window lookup plus O(log P) per
+ * segment page catalog and O(log rows) within a page; for a single
+ * timestamp this is dramatically cheaper than building the full merge.
  *
  * Thread Safety:
- * - Snapshot must remain valid for the lifetime of the result
- * - Result array is owned by caller
+ * - Snapshot must remain valid for the lifetime of the result.
+ * - The result array is owned by the caller.
  *===========================================================================*/
 
 /**
@@ -46,19 +46,16 @@ typedef struct tl_point_result {
  *===========================================================================*/
 
 /**
- * Perform point lookup for exact timestamp.
+ * Find every visible record at exactly `ts` in the snapshot.
  *
- * Finds all visible records with record.ts == ts in the snapshot.
- * Uses direct binary search on each component (no K-way merge).
+ * Watermark semantics: a row is treated as deleted only when
+ * tomb_seq(ts) > row_watermark.
  *
- * Records are filtered using watermark semantics:
- * a row is deleted only when tomb_seq(ts) > row_watermark.
- *
- * @param result  Output result (caller-allocated, zero-initialized)
+ * @param result  Output result (caller-allocated, zero-initialised)
  * @param snap    Snapshot to search
  * @param ts      Timestamp to find
  * @param alloc   Allocator for result records
- * @return TL_OK on success (even if no records found),
+ * @return TL_OK on success (even when no records match),
  *         TL_ENOMEM on allocation failure
  */
 tl_status_t tl_point_lookup(tl_point_result_t* result,

@@ -1,5 +1,7 @@
 # Timelog Benchmark Report
 
+> Historical benchmark snapshot. For publishable claims and current framing, use `docs/performance.md` and `docs/PERFORMANCE_METHODOLOGY.md`.
+
 **Version:** 0.4.5
 **Date:** 2026-01-17
 **Dataset:** `tiny_order_book_mostly_ordered_clean.csv` (100K records)

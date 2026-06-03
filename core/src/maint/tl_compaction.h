@@ -10,48 +10,56 @@
 /*===========================================================================
  * Compaction Module
  *
- * Implements L0 -> L1 compaction for the LSM-style storage layer.
+ * L0 -> L1 compaction for the LSM-style storage layer.
  *
  * Goals:
  * 1. Bound read amplification: L0 count <= max_delta_segments
  * 2. Enforce L1 non-overlap: L1 segments aligned to time windows
  * 3. Fold tombstones: L1 segments are tombstone-free
  * 4. Preserve snapshot isolation: atomic manifest publication
- * 5. Support handle drop callback: notify when records retired
+ * 5. Support a handle-drop callback when records are retired
  *
- * Phases:
- * 1. Trigger check (tl_compact_needed)
- * 2. Selection (tl_compact_select) - window-bounded or greedy
- * 3. Merge (tl_compact_merge) - k-way merge with tombstone filtering
- * 4. Publication (tl_compact_publish) - with rebase support
+ * Stages (run sequentially per compaction):
+ *   tl_compact_needed   -- cheap trigger check
+ *   tl_compact_select   -- pin manifest, choose input segments
+ *   tl_compact_merge    -- k-way merge with tombstone filtering (off-lock)
+ *   tl_compact_publish  -- atomically swap to a new manifest
  *
- * Phase 2 OOO Scaling Enhancements:
- * - Window-bounded selection: anchor on oldest backlog, limit to max_compaction_windows
- * - Reshape compaction (L0→L0): split wide L0s into window-contained pieces
- * - Rebase publish: if manifest changed but inputs still exist, rebuild and publish
- *   without full retry (tracks rebase_publish_success/fallback/l1_conflict stats)
+ * Bounded selection for OOO workloads
+ * -----------------------------------
+ * Out-of-order ingestion can produce wide L0 spans that, if compacted in
+ * one shot, would rewrite huge L1 ranges. To keep work bounded:
+ *
+ * - Selection is anchored on the oldest backlog and capped at
+ *   max_compaction_windows windows, max_compaction_inputs L0 segments,
+ *   and compaction_target_bytes estimated output.
+ * - L1 segments are pulled in only when their window bounds overlap the
+ *   bounded output range.
+ * - On a manifest race, publish returns TL_EBUSY and tl_compact_one()
+ *   re-selects and re-merges from the new manifest (bounded retries).
  *
  * Thread Safety:
- * - Compaction is serialized externally by maint_mu (one compaction at a time)
- * - writer_mu held only during short publication phase
- * - Long-running merge happens without locks
- * - consecutive_reshapes accessed only by maintenance thread (single-threaded)
+ * - Compaction is serialised externally by maint_mu (one at a time).
+ * - writer_mu is held only for the short publication phase; the long
+ *   merge runs without locks.
  *
- * Trigger Coupling with Flush (Background Mode):
- * - tl_compact_needed() is only called when flush work is pending
- * - This is safe because compaction triggers depend on segment state
- * - See tl_compact_needed() documentation for full details
+ * Trigger coupling with flush (background mode):
+ * In background mode the worker only calls tl_compact_needed() when flush
+ * work is also pending. This is safe because compaction triggers only
+ * change when segment state changes (flush adds L0; compaction removes
+ * L0/L1 and adds L1). On idle wakes with no writes the trigger state is
+ * unchanged and there is nothing to evaluate. See tl_compact_needed()
+ * for the full explanation.
  *
- * Handle Drop Callback Semantics:
- * - Callbacks are DEFERRED until AFTER successful publication
- * - During merge, dropped records are collected but NOT fired
- * - Only after publish succeeds are callbacks invoked for all dropped records
- * - If compaction fails/retries, pending drops are discarded (will be re-collected)
- * - IMPORTANT: This is a "retire" notification, NOT a "safe to free" signal
- * - Existing snapshots may still reference the dropped record until released
- * - User must implement their own epoch/RCU/hazard-pointer scheme if they
- *   need safe payload reclamation (see tl_on_drop_fn docs in timelog.h)
- *
+ * Handle-drop callback semantics:
+ * - Callbacks are DEFERRED until AFTER a successful publish. During merge,
+ *   dropped (ts, handle) pairs are collected but not fired.
+ * - On failure/retry, pending drops are discarded and will be re-collected
+ *   from the next merge.
+ * - The callback is a "retired" notification, NOT a "safe to free" signal:
+ *   existing snapshots may still reference the dropped record. Users who
+ *   need safe payload reclamation must layer their own epoch / RCU /
+ *   hazard-pointer scheme on top (see tl_on_drop_fn docs in timelog.h).
  *===========================================================================*/
 
 /* Forward declarations */
@@ -116,19 +124,15 @@ typedef struct tl_compact_ctx {
     tl_on_drop_fn       on_drop_handle;
     void*               on_drop_ctx;
 
-    /* Deferred drop records - collected during merge, fired after publish.
+    /* (ts, handle) pairs of records tombstoned during merge, queued
+     * here so that the on_drop_handle callback fires only AFTER a
+     * successful publish.
      *
-     * CRITICAL CORRECTNESS INVARIANT: If compaction fails (ENOMEM/EBUSY)
-     * or retries, callbacks MUST NOT fire for records still visible in
-     * the manifest. This would violate the on_drop_handle contract and
-     * can cause double-free/UAF in user code that treats it as final
-     * reclamation.
-     *
-     * Solution: Collect dropped (ts, handle) pairs during merge, but only
-     * invoke callbacks after successful publish. On failure/retry, the
-     * drops are discarded when ctx is destroyed; re-merge re-collects them.
-     *
-     * Uses tl_record_t for storage since it has (ts, handle) pair. */
+     * Firing before publish would let user code free a payload while
+     * the record is still visible in the manifest if merge or publish
+     * later fails, producing UAF/double-free. On failure or retry the
+     * queue is discarded; the next merge will re-collect the same
+     * drops from the freshly selected inputs. */
     tl_record_t*        dropped_records;
     size_t              dropped_len;
     size_t              dropped_cap;
@@ -166,67 +170,44 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  *===========================================================================*/
 
 /**
- * Check if compaction is needed.
+ * Returns true if compaction should run.
  *
- * Returns true if:
+ * Triggers:
  * - L0 count >= max_delta_segments
- * - compact_pending flag is set (checked by caller)
- * - Delete debt threshold exceeded (optional)
+ * - Delete-debt fraction exceeds delete_debt_threshold (when configured)
  *
- * Briefly acquires writer_mu to pin manifest (prevents UAF).
- * This is an advisory check; selection re-validates.
+ * Briefly acquires writer_mu to pin the manifest (prevents UAF on a
+ * concurrent swap). This is an advisory check; the selection phase
+ * re-validates from the live manifest.
  *
- * Flush/Compaction Trigger Coupling (Background Mode):
- * =====================================================
- * In background mode, the worker loop only calls this function when:
- *   - do_flush is true (flush work pending), AND
- *   - do_compact is false (compact_pending was NOT already set)
+ * Background mode trigger coupling
+ * --------------------------------
+ * The background worker only calls this function on wakes that already
+ * have flush work pending, and only when compact_pending is not already
+ * set. The invariant "compaction triggers can only change when segments
+ * change" makes idle re-checks pointless: only flush or compaction
+ * itself can move the L0 count or alter the tombstone set.
  *
- * See tl_timelog.c:1749: `if (!do_compact && do_flush)`
- *
- * This is an optimization based on the invariant:
- *
- *   "Compaction triggers can only change when segments change"
- *
- * Segment state changes only via:
- * - Flush: creates new L0 segments (increases L0 count, adds tombstones)
- * - Compaction: removes L0/L1, creates L1 (decreases L0 count)
- *
- * On idle periodic wakes with no pending work, calling this is wasteful
- * because triggers are unchanged from the previous check.
- *
- * When compact_pending is already set (explicit tl_compact() request), this
- * function is SKIPPED because we already know compaction should run.
- *
- * IMPORTANT: This coupling means delete-debt compaction won't be triggered
- * on pure idle wakes without write activity. Users wanting prompt delete-debt
- * response should either:
- * - Use tl_compact() for explicit compaction requests
- * - Ensure continued write activity
- *
- * This coupling does NOT affect:
- * - Explicit requests via compact_pending flag (bypasses this check entirely)
- * - Manual mode (tl_maint_step always checks triggers unconditionally)
- *
- * Reference: tl_timelog.c worker loop (tl__maint_worker_entry)
+ * Side effect: delete-debt compaction will NOT fire on pure idle wakes
+ * without write activity. Callers that need prompt delete-debt response
+ * should either invoke tl_compact() explicitly or generate write
+ * activity. Manual maintenance mode is unaffected (the manual stepper
+ * always evaluates triggers unconditionally).
  */
 bool tl_compact_needed(const tl_timelog_t* tl);
 
 /**
- * Select segments for compaction.
+ * Select inputs for the next compaction.
  *
- * Implements baseline policy:
- * 1. Pin current manifest
- * 2. Select all L0 segments
- * 3. Compute covered time range (records + tombstones)
- * 4. Select overlapping L1 segments
+ * Pins the current manifest, greedily picks L0 segments (subject to
+ * input/window/byte caps), computes their covered time range, and pulls
+ * in every L1 segment whose window overlaps that range.
  *
- * IMPORTANT: Caller MUST call tl_compact_ctx_destroy() regardless of
- * return status. This function acquires resources (manifest pin, segment
- * refs) that are cleaned up by destroy. This follows the init/destroy
- * lifecycle pattern - select may partially succeed before failing.
+ * The caller MUST call tl_compact_ctx_destroy() regardless of the
+ * return value: this function acquires manifest pins and segment refs
+ * that even a partial failure leaves attached to the context.
  *
- * @param ctx  Initialized compaction context
+ * @param ctx  Initialised compaction context
  * @return TL_OK on success (inputs selected and pinned)
  *         TL_EOF if no work needed
  *         TL_ENOMEM on allocation failure
@@ -235,19 +216,18 @@ bool tl_compact_needed(const tl_timelog_t* tl);
 tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 
 /**
- * Execute compaction merge.
+ * Run the K-way merge over the selected inputs and produce output
+ * segments.
  *
- * Implements merge algorithm:
- * 1. Build effective tombstone set
- * 2. K-way merge all input segments
- * 3. Skip deleted records (tombstone filtering)
- * 4. Partition output by window boundaries
- * 5. Build L1 segments for windows with live records
- * 6. Build residual tombstone segment if needed
+ * The merge filters out records covered by the snapshot tombstone set
+ * (clipped to the output window range), partitions surviving records
+ * along window boundaries to form L1 segments, and builds a residual
+ * tombstone-only L0 segment for any tombstone portions that extend
+ * outside the output range.
  *
- * Deleted records are COLLECTED but callbacks are NOT fired here.
- * See header comment for deferred callback semantics - callbacks
- * are only invoked after successful publish in tl_compact_one().
+ * Dropped records are queued onto ctx->dropped_records for the
+ * callback that fires later, AFTER publish succeeds (see the
+ * dropped_records comment above for why).
  *
  * @param ctx  Context with selected inputs
  * @return TL_OK on success (outputs built)
@@ -257,15 +237,15 @@ tl_status_t tl_compact_select(tl_compact_ctx_t* ctx);
 tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx);
 
 /**
- * Publish compaction results.
+ * Atomically swap the manifest to one that includes the compaction
+ * outputs.
  *
- * Implements publication protocol:
- * 1. Build new manifest (OFF-LOCK - this is the expensive part)
- * 2. Acquire writer_mu + seqlock
- * 3. Verify manifest unchanged (abort if changed)
- * 4. Swap manifest pointer (O(1))
- * 5. Release locks
- * 6. Release old manifest
+ * The expensive manifest builder runs OFF-LOCK; writer_mu is then taken
+ * only for an O(1) pointer swap protected by the seqlock so concurrent
+ * readers see either the old or new manifest. If the live manifest no
+ * longer matches the base used during merge (a concurrent flush
+ * published in the meantime), TL_EBUSY is returned and the caller must
+ * re-select and re-merge.
  *
  * @param ctx  Context with built outputs
  * @return TL_OK on success
@@ -275,13 +255,11 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx);
 tl_status_t tl_compact_publish(tl_compact_ctx_t* ctx);
 
 /**
- * Complete compaction (all phases).
- *
- * Convenience function that runs select -> merge -> publish.
- * On TL_EBUSY from publish, retries up to max_retries times.
+ * Run select -> merge -> publish as one operation, retrying up to
+ * max_retries times when publish returns TL_EBUSY.
  *
  * @param tl          Timelog instance
- * @param max_retries Max publish retries (default 3)
+ * @param max_retries Max publish retries (>= 1)
  * @return TL_OK on success
  *         TL_EOF if no work needed
  *         TL_EBUSY if all retries exhausted
@@ -292,8 +270,7 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries);
 
 #ifdef TL_TEST_HOOKS
 /**
- * Test-only: compute delete debt ratio for a manifest.
- * Exposes internal heuristic for unit testing.
+ * Test-only: exposes the delete-debt heuristic for unit testing.
  */
 double tl_test_compute_delete_debt(const tl_timelog_t* tl,
                                    const tl_manifest_t* m);

@@ -43,7 +43,6 @@ void tl__memrun_compute_bounds(tl_memrun_t* mr) {
  * Creation
  *===========================================================================*/
 
-/** Initialize pre-allocated memrun. Takes ownership of arrays. */
 tl_status_t tl_memrun_init(tl_memrun_t* mr,
                             tl_alloc_ctx_t* alloc,
                             tl_record_t* run, size_t run_len,
@@ -157,7 +156,9 @@ tl_memrun_t* tl_memrun_acquire(tl_memrun_t* mr) {
         return NULL;
     }
 
-    tl_atomic_fetch_add_u32(&mr->refcnt, 1, TL_MO_RELAXED);
+    TL_REFCOUNT_ACQUIRE(&mr->refcnt,
+                        "memrun acquire after final release",
+                        "memrun refcount overflow");
     return mr;
 }
 
@@ -231,7 +232,8 @@ static bool is_tombs_valid(const tl_interval_t* arr, size_t len) {
         if (curr->end > next->start) {
             return false;
         }
-        /* Adjacent with same seq should have been coalesced */
+        /* Touching intervals with identical seq should already have been
+         * merged into a single interval by the coalescing pass. */
         if (curr->end == next->start && curr->max_seq == next->max_seq) {
             return false;
         }

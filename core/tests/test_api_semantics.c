@@ -12,8 +12,7 @@
  * These tests ensure the public API behaves predictably and safely
  * when given invalid inputs or called in invalid states.
  *
- * Migration Status: COMPLETE (migrated from test_phase0.c)
- * Note: Test names prefixed with "api_" to avoid conflicts during migration.
+ * Test names are prefixed with "api_" to keep their symbols unique.
  *===========================================================================*/
 
 #include "test_harness.h"

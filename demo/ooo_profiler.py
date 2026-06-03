@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OOO (Out-of-Order) Profiler for Timelog A2B Investigation
+OOO (Out-of-Order) Profiler for Timelog ingestion.
 
 This tool provides real-time profiling of Timelog ingestion performance
 with focus on out-of-order timestamp handling.

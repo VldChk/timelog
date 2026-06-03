@@ -3,13 +3,6 @@ name: Packaging (PR)
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "core/**"
-      - "bindings/**"
-      - "python/**"
-      - "pyproject.toml"
-      - "CMakeLists.txt"
-      - ".github/workflows/packaging-pr.yml"
 
 concurrency:
   group: packaging-pr-${{ github.ref }}
@@ -17,7 +10,32 @@ concurrency:
 
 jobs:
   packaging-pr:
+    strategy:
+      fail-fast: false
+      matrix:
+        # cp313 is the default regular build; cp314t verifies that the
+        # free-threaded ABI wheel imports and runs the full suite under
+        # Py_GIL_DISABLED.
+        include:
+          - python: "3.13"
+            cibw_build: "cp313-manylinux_x86_64"
+            wheel_tag: "cp313"
+            arch: "x86_64"
+          # The cp314t leg MUST set up the free-threaded interpreter ("3.14t"):
+          # the host Python becomes the smoke-test venv base, and a cp314t ABI
+          # wheel only installs on a Py_GIL_DISABLED interpreter. Using plain
+          # "3.14" here would make the smoke + Py_mod_gil check run on a regular
+          # GIL build (and the cp314t wheel would fail to install).
+          - python: "3.14t"
+            cibw_build: "cp314t-manylinux_x86_64"
+            wheel_tag: "cp314t"
+            arch: "x86_64"
+          - python: "3.14t"
+            cibw_build: "cp314t-manylinux_aarch64"
+            wheel_tag: "cp314t-aarch64"
+            arch: "aarch64"
     runs-on: ubuntu-latest
+    name: packaging-pr (${{ matrix.wheel_tag }})
 
     steps:
       - name: Checkout
@@ -26,18 +44,26 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
 
       - name: Install packaging tools
         run: python -m pip install --upgrade pip build twine cibuildwheel
 
+      - name: Setup QEMU (aarch64 wheel leg)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Build sdist
+        if: matrix.wheel_tag == 'cp313'
         run: python -m build --sdist
 
-      - name: Build representative wheel (cp313-manylinux_x86_64)
+      - name: Build representative wheel (${{ matrix.cibw_build }})
         env:
-          CIBW_BUILD: cp313-manylinux_x86_64
-          CIBW_ARCHS_LINUX: x86_64
+          CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
           CIBW_CONFIG_SETTINGS: >-
             cmake.define.TIMELOG_BUILD_PYTHON=true
             cmake.define.TIMELOG_BUILD_PY_TESTS=false
@@ -53,12 +79,34 @@ jobs:
         run: python -m twine check dist/*
 
       - name: Wheel install + smoke tests
+        if: matrix.arch == 'x86_64'
         shell: bash
+        env:
+          # Bound the free-threaded stress/freethreading harnesses so the
+          # smoke run stays fast; full-depth soak lives in the sanitizer legs.
+          TIMELOG_SHORT_STRESS: "1"
         run: |
+          if [ "${{ matrix.wheel_tag }}" = "cp314t" ]; then
+            export PYTHON_GIL=0
+          fi
           python -m venv .venv-wheel
           source .venv-wheel/bin/activate
+          # For the cp314t leg the smoke venv MUST be a Py_GIL_DISABLED
+          # interpreter: otherwise the cp314t ABI wheel cannot install and the
+          # Py_mod_gil check below would run on a regular GIL build (no signal).
+          if [ "${{ matrix.wheel_tag }}" = "cp314t" ]; then
+            python - <<'PY'
+          import sys, sysconfig
+          assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1, (
+              "cp314t smoke must run on a free-threaded interpreter; got a "
+              f"regular GIL build: {sys.version}"
+          )
+          assert sys._is_gil_enabled() is False, "PYTHON_GIL=0 must disable the runtime GIL"
+          print("Smoke venv is free-threaded with GIL disabled. OK.")
+          PY
+          fi
           python -m pip install --upgrade pip
-          wheel_path="$(ls dist/timelog_lib-*.whl)"
+          wheel_path="$(ls dist/timelog_lib-*${{ matrix.wheel_tag }}*.whl)"
           python -m pip install "${wheel_path}[test]"
           python -m pytest python/tests -q
           python - <<'PY'
@@ -70,9 +118,27 @@ jobs:
           print(__version__)
           PY
 
+      - name: Verify Py_mod_gil declaration honored (free-threaded only)
+        if: matrix.wheel_tag == 'cp314t'
+        shell: bash
+        run: |
+          source .venv-wheel/bin/activate
+          PYTHON_GIL=0 python - <<'PY'
+          import sys
+          before = sys._is_gil_enabled()
+          import timelog
+          after = sys._is_gil_enabled()
+          assert before is False, "PYTHON_GIL=0 should disable GIL"
+          assert after is False, (
+              "Importing timelog re-enabled the GIL on a free-threaded "
+              "build. Py_mod_gil = Py_MOD_GIL_NOT_USED was not honored."
+          )
+          print("Free-threaded import keeps GIL disabled. OK.")
+          PY
+
       - name: Upload packaging artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: packaging-pr-dist
+          name: packaging-pr-dist-${{ matrix.wheel_tag }}
           path: dist/*

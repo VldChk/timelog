@@ -9,8 +9,7 @@
  * These tests validate the building blocks used by storage,
  * query, and maintenance subsystems.
  *
- * Migration Status: COMPLETE (migrated from test_phase2.c)
- * Note: Test names prefixed with "ds_" to avoid conflicts during migration.
+ * Test names are prefixed with "ds_" to keep their symbols unique.
  *===========================================================================*/
 
 #include "test_harness.h"

@@ -9,13 +9,14 @@
  * - Lock-free Treiber stack for retired object queue (MPSC pattern)
  * - Pin counter prevents drain while snapshots are active
  * - on_drop callback does NOT acquire GIL or call Python C-API
- * - All Py_DECREF happens in drain() on Python threads with GIL held
+ * - All Py_DECREF happens in drain() on the owning interpreter's attached
+ *   Python thread state
  *
  * Memory ordering model:
- * - Pin increment: RELAXED (gating counter, not a publication barrier;
- *   actual sync happens via Timelog snapshot acquisition)
+ * - Pin increment: RELAXED while holding pin_lock (gating counter; actual
+ *   snapshot data sync happens via Timelog snapshot acquisition)
  * - Pin decrement: RELEASE (ensures iterator operations visible to drain)
- * - Stack push CAS: RELEASE (make node fields visible)
+ * - Stack push CAS: ACQ_REL (make node fields visible and chain producers)
  * - Stack exchange (drain): ACQ_REL (see all pushed nodes)
  */
 
@@ -24,7 +25,7 @@
 #include <assert.h>   /* assert for debug checks */
 #include <inttypes.h> /* PRIu64 for portable uint64_t formatting */
 #include <stdio.h>    /* fprintf, stderr */
-#include <stdlib.h>   /* malloc, free - NOT Python allocators (no GIL in on_drop) */
+#include <stdlib.h>   /* malloc, free - NOT Python allocators in on_drop */
 #include <string.h>   /* memset */
 
 /*===========================================================================
@@ -41,6 +42,67 @@ struct tl_py_live_entry {
     uint64_t  count;
     uint8_t   state;
 };
+
+/*
+ * Returns 1 if the current thread has an attached Python thread state that
+ * belongs to the same interpreter that owns this ctx.
+ *
+ * Under free-threaded CPython the right precondition for Python C-API
+ * access is "an attached thread state on the owning interpreter", not
+ * "GIL held". On 3.13+ we query the thread state directly. On 3.12
+ * (where free-threaded builds do not exist) the GIL-presence check is
+ * equivalent.
+ */
+/*
+ * The interpreter owning the currently-attached Python thread state, or NULL
+ * if none is attached. On 3.13+ this asks the right free-threaded question
+ * ("is a thread state attached?", via PyThreadState_GetUnchecked) rather than
+ * "is the GIL held?" (PyGILState_Check), which does not track attachment under
+ * Py_GIL_DISABLED. On 3.12 (no free-threaded build) the two are equivalent.
+ * Used both to capture ctx->interp and to probe it, so the two never diverge.
+ */
+static PyInterpreterState* tl_py_current_interp_or_null(void)
+{
+    if (!Py_IsInitialized()) {
+        return NULL;
+    }
+#if PY_VERSION_HEX >= 0x030D0000
+    PyThreadState* ts = PyThreadState_GetUnchecked();
+    return (ts != NULL) ? PyThreadState_GetInterpreter(ts) : NULL;
+#else
+    return PyGILState_Check() ? PyInterpreterState_Get() : NULL;
+#endif
+}
+
+static int tl_py_attached_to_interp(const tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return 0;
+    }
+    PyInterpreterState* cur = tl_py_current_interp_or_null();
+    return cur != NULL && cur == ctx->interp;
+}
+
+static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
+                                                 const char* reason)
+{
+    tl_py_drop_node_t* remaining = atomic_load_explicit(
+        (_Atomic(tl_py_drop_node_t*)*)&ctx->retired_head,
+        memory_order_relaxed);
+    uint64_t pins = atomic_load_explicit(
+        (_Atomic(uint64_t)*)&ctx->pins, memory_order_relaxed);
+
+    if (remaining != NULL || ctx->live_len != 0 || pins != 0) {
+        fprintf(stderr,
+            "WARNING: tl_py_handle_ctx final destroy skipped Python ref "
+            "drain (%s): live=%zu retired=%p pins=%" PRIu64 ". "
+            "Objects may leak.\n",
+            reason,
+            ctx->live_len,
+            (void*)remaining,
+            pins);
+    }
+}
 
 static size_t tl_py_live_hash_ptr(const void* ptr)
 {
@@ -97,6 +159,121 @@ static tl_status_t tl_py_live_rehash(tl_py_handle_ctx_t* ctx, size_t new_cap)
     return TL_OK;
 }
 
+/*
+ * Push a [head..tail] sublist onto the lock-free retired stack (Treiber,
+ * multi-producer). Used both by tl_py_on_drop_handle() (a single node, where
+ * head==tail) and by the bounded-drain reattach path (an undrained suffix).
+ *
+ * The CAS is ACQ_REL, not plain RELEASE: the acquire half makes each producer
+ * synchronize-with the producer that published the head it links behind, so
+ * all live nodes form a single happens-before chain that the draining consumer
+ * (an ACQ_REL exchange) joins. A release-only CAS would leave deeper nodes
+ * reachable only via the C11 release-sequence-through-RMW rule, which C++20
+ * weakened and which ThreadSanitizer does not model -- surfacing a
+ * (benign-under-strict-C11 but fragile) malloc/free race on node memory.
+ * Weak CAS is fine since we loop on failure.
+ */
+static void
+tl_py_retired_push(tl_py_handle_ctx_t* ctx,
+                   tl_py_drop_node_t* head,
+                   tl_py_drop_node_t* tail)
+{
+    if (head == NULL) {
+        return;
+    }
+
+    tl_py_drop_node_t* current_head;
+    do {
+        current_head = atomic_load_explicit(
+            &ctx->retired_head, memory_order_acquire);
+        tail->next = current_head;
+    } while (!atomic_compare_exchange_weak_explicit(
+                &ctx->retired_head,
+                &current_head,
+                head,
+                memory_order_acq_rel,
+                memory_order_acquire));
+}
+
+static size_t
+tl_py_process_retired_list(tl_py_handle_ctx_t* ctx,
+                           tl_py_drop_node_t* list,
+                           int force)
+{
+    if (list == NULL) {
+        return 0;
+    }
+
+    tl_py_drop_node_t* list_tail = list;
+    while (list_tail->next != NULL) {
+        list_tail = list_tail->next;
+    }
+
+    size_t count = 0;
+    uint32_t batch_limit = force ? 0 : ctx->drain_batch_limit;
+
+    while (list != NULL) {
+        if (batch_limit != 0 && count >= batch_limit) {
+            tl_py_retired_push(ctx, list, list_tail);
+            break;
+        }
+
+        tl_py_drop_node_t* node = list;
+        list = node->next;
+        if (list == NULL) {
+            list_tail = NULL;
+        }
+
+        tl_py_live_note_drop(ctx, node->obj);
+
+        /* Safe: owning interpreter is attached, object unreachable from
+         * Timelog, and this batch was claimed while pins were zero (or force
+         * close explicitly overrode that check). */
+        Py_DECREF(node->obj);
+
+        free(node);
+        count++;
+    }
+
+    if (count != 0) {
+        atomic_fetch_add_explicit(&ctx->drained_count, count,
+                                  memory_order_relaxed);
+    }
+    return count;
+}
+
+static tl_py_drop_node_t*
+tl_py_claim_retired_for_drain_locked(tl_py_handle_ctx_t* ctx, int force)
+{
+    uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_acquire);
+    if (pins != 0 && !force) {
+        return NULL;
+    }
+
+    return atomic_exchange_explicit(
+        &ctx->retired_head, NULL, memory_order_acq_rel);
+}
+
+static int
+tl_py_try_begin_drain_and_claim_locked(tl_py_handle_ctx_t* ctx,
+                                       int force,
+                                       tl_py_drop_node_t** out)
+{
+    *out = NULL;
+    if (atomic_flag_test_and_set_explicit(
+            &ctx->drain_guard, memory_order_acquire)) {
+        return 0;
+    }
+    *out = tl_py_claim_retired_for_drain_locked(ctx, force);
+    return 1;
+}
+
+static void
+tl_py_end_drain(tl_py_handle_ctx_t* ctx)
+{
+    atomic_flag_clear_explicit(&ctx->drain_guard, memory_order_release);
+}
+
 static tl_status_t tl_py_live_ensure(tl_py_handle_ctx_t* ctx, size_t needed)
 {
     size_t cap = ctx->live_cap;
@@ -151,6 +328,9 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     }
 
     /* Initialize atomics */
+    atomic_init(&ctx->refcnt, 1);
+    ctx->heap_allocated = 0;
+    ctx->interp = tl_py_current_interp_or_null();
     atomic_init(&ctx->retired_head, NULL);
     atomic_init(&ctx->pins, 0);
     atomic_init(&ctx->retired_count, 0);
@@ -164,9 +344,88 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
-    ctx->live_tracking_failed = 0;
+    atomic_init(&ctx->live_tracking_failed, 0);
+
+    /* On 3.13+ PyMutex is statically zero-initializable and cannot fail;
+     * on 3.12 the PyThread_type_lock fallback allocates and may return -1. */
+    if (tl_py_mutex_init(&ctx->pin_lock) != 0) {
+        return TL_ENOMEM;
+    }
+    if (tl_py_mutex_init(&ctx->live_lock) != 0) {
+        tl_py_mutex_deinit(&ctx->pin_lock);
+        return TL_ENOMEM;
+    }
 
     return TL_OK;
+}
+
+tl_py_handle_ctx_t* tl_py_handle_ctx_new(uint32_t drain_batch_limit)
+{
+    tl_py_handle_ctx_t* ctx = PyMem_Malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    if (tl_py_handle_ctx_init(ctx, drain_batch_limit) != TL_OK) {
+        PyMem_Free(ctx);
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    ctx->heap_allocated = 1;
+    return ctx;
+}
+
+void tl_py_handle_ctx_incref(tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    atomic_fetch_add_explicit(&ctx->refcnt, 1, memory_order_relaxed);
+}
+
+void tl_py_handle_ctx_decref(tl_py_handle_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    uint64_t old_refcnt = atomic_fetch_sub_explicit(
+        &ctx->refcnt, 1, memory_order_acq_rel);
+
+#ifndef NDEBUG
+    assert(old_refcnt > 0 && "handle context refcount underflow");
+#endif
+
+    if (old_refcnt != 1) {
+        return;
+    }
+
+    /*
+     * Final destruction should happen from an attached Python thread. If that
+     * contract is violated, avoid Python C-API calls and leak Python refs
+     * rather than risking a crash.
+     */
+    if (tl_py_attached_to_interp(ctx) &&
+        tl_py_pins_count(ctx) == 0) {
+        (void)tl_py_drain_retired(ctx, 1);
+        tl_py_live_release_all(ctx);
+    } else {
+        const char* reason = "no attached Python thread state";
+        if (tl_py_current_interp_or_null() != NULL) {
+            reason = "wrong interpreter or active pins";
+        }
+        tl_py_handle_ctx_warn_unsafe_destroy(
+            ctx,
+            reason);
+    }
+
+    int heap_allocated = ctx->heap_allocated;
+    tl_py_handle_ctx_destroy(ctx);
+    if (heap_allocated) {
+        PyMem_Free(ctx);
+    }
 }
 
 void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
@@ -175,7 +434,13 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
         return;
     }
 
-    /* Warn on leaked resources (cannot DECREF without GIL). */
+    /* By the lifetime invariant in py_handle.h, refcount cannot reach zero
+     * while any thread is still inside a ctx-protected section, so it is safe
+     * to tear the mutexes down here. Deinit is NULL-safe on 3.12. */
+    tl_py_mutex_deinit(&ctx->live_lock);
+    tl_py_mutex_deinit(&ctx->pin_lock);
+
+    /* Warn on leaked resources (cannot DECREF without owning thread state). */
 #ifndef NDEBUG
     tl_py_drop_node_t* remaining = atomic_load_explicit(
         &ctx->retired_head, memory_order_relaxed);
@@ -209,33 +474,42 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
-    ctx->live_tracking_failed = 0;
+    atomic_store_explicit(&ctx->live_tracking_failed, 0,
+                          memory_order_relaxed);
 }
 
 /*===========================================================================
- * Pin Tracking Implementation (Invariant I3)
+ * Pin Tracking Implementation
  *
  * Memory ordering rationale:
  * - RELAXED on increment: gating counter only; Timelog snapshot provides sync
  * - RELEASE on decrement: ensures drain sees all our iterator operations
  *
- * GIL requirement:
- * - pins_exit_and_maybe_drain must be called with GIL held (may call drain)
+ * Python thread-state requirement:
+ * - pins_exit_and_maybe_drain must run on the owning interpreter with an
+ *   attached thread state (it may call drain and DECREF Python objects).
  *===========================================================================*/
 
 void tl_py_pins_enter(tl_py_handle_ctx_t* ctx)
 {
-    /* RELAXED: snapshot acquisition provides the actual memory barrier. */
+    /* RELAXED: snapshot acquisition provides the actual data barrier. pin_lock
+     * serializes this zero->nonzero transition against drain list claiming. */
+    TL_PY_MUTEX_LOCK(&ctx->pin_lock);
     atomic_fetch_add_explicit(&ctx->pins, 1, memory_order_relaxed);
+    TL_PY_MUTEX_UNLOCK(&ctx->pin_lock);
 }
 
 void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_pins_exit_and_maybe_drain requires GIL");
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_pins_exit_and_maybe_drain requires owning interpreter");
 #endif
 
+    tl_py_drop_node_t* list = NULL;
+    int began_drain = 0;
+
+    TL_PY_MUTEX_LOCK(&ctx->pin_lock);
     uint64_t old_pins = atomic_fetch_sub_explicit(
         &ctx->pins, 1, memory_order_release);
 
@@ -244,9 +518,20 @@ void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
            "Pin underflow: exit called without matching enter");
 #endif
 
-    /* Last pin holder: opportunistically drain retired objects. */
-    if (old_pins == 1) {
-        (void)tl_py_drain_retired(ctx, 0);
+    /* Last pin holder: opportunistically drain retired objects. Claim the
+     * retired list before releasing pin_lock, otherwise another thread could
+     * enter a new pinned snapshot between the zero observation and the claim. */
+    if (old_pins == 1 && tl_py_attached_to_interp(ctx) &&
+        atomic_load_explicit(&ctx->retired_head, memory_order_relaxed) != NULL) {
+        began_drain = tl_py_try_begin_drain_and_claim_locked(ctx, 0, &list);
+    }
+    TL_PY_MUTEX_UNLOCK(&ctx->pin_lock);
+
+    if (list != NULL) {
+        (void)tl_py_process_retired_list(ctx, list, 0);
+    }
+    if (began_drain) {
+        tl_py_end_drain(ctx);
     }
 }
 
@@ -259,7 +544,7 @@ uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx)
 }
 
 /*===========================================================================
- * On-Drop Callback Implementation (Invariant I4)
+ * On-Drop Callback Implementation
  *
  * CRITICAL CONSTRAINTS:
  * - Called from any thread invoking flush or compaction (NOT necessarily a Python thread)
@@ -298,20 +583,8 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
     node->obj = tl_py_handle_decode(handle);
     node->ts = ts;
 
-    /*
-     * Treiber stack push: RELEASE CAS makes node visible to drain.
-     * Weak CAS is fine since we loop on failure.
-     */
-    tl_py_drop_node_t* head;
-    do {
-        head = atomic_load_explicit(&ctx->retired_head, memory_order_relaxed);
-        node->next = head;
-    } while (!atomic_compare_exchange_weak_explicit(
-                &ctx->retired_head,
-                &head,
-                node,
-                memory_order_release,
-                memory_order_relaxed));
+    /* Single-node push (head == tail); ACQ_REL rationale in tl_py_retired_push. */
+    tl_py_retired_push(ctx, node, node);
 
     /* Metrics counter (relaxed). */
     atomic_fetch_add_explicit(&ctx->retired_count, 1, memory_order_relaxed);
@@ -320,108 +593,63 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 /*===========================================================================
  * Drain Implementation
  *
- * PRECONDITION: Caller must hold the GIL.
- * Performs deferred Py_DECREF for retired objects on a Python thread.
+ * PRECONDITION: Caller runs on the owning interpreter with an attached
+ * Python thread state.
+ * Performs deferred Py_DECREF for retired objects on that thread.
  *===========================================================================*/
 
 size_t tl_py_drain_retired(tl_py_handle_ctx_t* ctx, int force)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_drain_retired requires GIL");
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_drain_retired requires owning interpreter");
 #endif
 
-    /* Reentrancy guard: __del__ during Py_DECREF could re-enter drain. */
-    if (atomic_flag_test_and_set_explicit(
-            &ctx->drain_guard, memory_order_acquire)) {
+    /* Fast path: an opportunistic (non-force) drain skips the lock + claim
+     * when the retired stack is observably empty. A producer pushing
+     * concurrently with this relaxed load simply leaves the work for the next
+     * drain — the node is never lost (it stays on the stack until a later
+     * drain or the force=1 teardown claims it). */
+    if (!force &&
+        atomic_load_explicit(&ctx->retired_head, memory_order_relaxed) == NULL) {
         return 0;
     }
 
-    size_t count = 0;
+    tl_py_drop_node_t* list = NULL;
+    int began_drain = 0;
 
-    /*
-     * Drain blocked while pins > 0 (active snapshots may reference
-     * retired objects). force=1 bypasses this during close().
-     */
-    uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_acquire);
-    if (pins != 0 && !force) {
-        goto out;
+    TL_PY_MUTEX_LOCK(&ctx->pin_lock);
+    began_drain = tl_py_try_begin_drain_and_claim_locked(ctx, force, &list);
+    TL_PY_MUTEX_UNLOCK(&ctx->pin_lock);
+
+    if (!began_drain) {
+        return 0;
     }
 
-    /* Atomically claim entire list (ACQ_REL: see on_drop writes). */
-    tl_py_drop_node_t* list = atomic_exchange_explicit(
-        &ctx->retired_head, NULL, memory_order_acq_rel);
-
-    if (list == NULL) {
-        goto out;  /* Nothing to drain */
-    }
-
-    tl_py_drop_node_t* list_tail = list;
-    while (list_tail->next != NULL) {
-        list_tail = list_tail->next;
-    }
-
-    /* force=1 overrides batch limit to prevent leaks at close. */
-    uint32_t batch_limit = force ? 0 : ctx->drain_batch_limit;
-
-    while (list != NULL) {
-        if (batch_limit != 0 && count >= batch_limit) {
-            /* Re-attach remaining nodes atomically (on_drop may be concurrent). */
-            tl_py_drop_node_t* remaining = list;
-            tl_py_drop_node_t* current_head;
-            do {
-                current_head = atomic_load_explicit(
-                    &ctx->retired_head, memory_order_relaxed);
-                list_tail->next = current_head;
-            } while (!atomic_compare_exchange_weak_explicit(
-                        &ctx->retired_head,
-                        &current_head,
-                        remaining,
-                        memory_order_release,
-                        memory_order_relaxed));
-            break;
-        }
-
-        tl_py_drop_node_t* node = list;
-        list = node->next;
-        if (list == NULL) {
-            list_tail = NULL;
-        }
-
-        tl_py_live_note_drop(ctx, node->obj);
-
-        /* Safe: GIL held, object unreachable from Timelog, pins == 0. */
-        Py_DECREF(node->obj);
-
-        free(node);  /* libc malloc'd in on_drop */
-        count++;
-    }
-
-    atomic_fetch_add_explicit(&ctx->drained_count, count, memory_order_relaxed);
-
-out:
-    atomic_flag_clear_explicit(&ctx->drain_guard, memory_order_release);
+    size_t count = tl_py_process_retired_list(ctx, list, force);
+    tl_py_end_drain(ctx);
     return count;
 }
 
 /*===========================================================================
  * Live Handle Tracking (multiset) Implementation
+ *
+ * The _locked helpers contain the pure table operations; callers must hold
+ * ctx->live_lock. The public _note_* wrappers take the lock around them.
+ *
+ * Hard rule: no Py_DECREF, warning, weakref callback or any other code
+ * that may execute Python may run while live_lock is held — otherwise a
+ * __del__ that touches the same context would deadlock or reenter the
+ * table mid-mutation. release_all and traverse therefore build a local
+ * array of strong references under the lock, then drop the lock before
+ * Py_DECREF or visit() touches each entry.
  *===========================================================================*/
 
-tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
+static tl_status_t tl_py_live_insert_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
-#ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_note_insert requires GIL");
-#endif
-
-    if (ctx == NULL || obj == NULL) {
-        return TL_EINVAL;
-    }
-
     tl_status_t st = tl_py_live_ensure(ctx, 1);
     if (st != TL_OK) {
-        ctx->live_tracking_failed = 1;
+        atomic_store_explicit(&ctx->live_tracking_failed, 1, memory_order_release);
         return st;
     }
 
@@ -454,17 +682,11 @@ tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
     }
 }
 
-void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
+static void tl_py_live_drop_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
-#ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_note_drop requires GIL");
-#endif
-
-    if (ctx == NULL || obj == NULL || ctx->live_cap == 0) {
+    if (ctx->live_cap == 0) {
         return;
     }
-
     size_t mask = ctx->live_cap - 1;
     size_t idx = tl_py_live_hash_ptr(obj) & mask;
 
@@ -489,30 +711,117 @@ void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
     }
 }
 
+tl_status_t tl_py_live_note_insert(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_live_note_insert requires owning interpreter");
+#endif
+
+    if (ctx == NULL || obj == NULL) {
+        return TL_EINVAL;
+    }
+
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    tl_status_t st = tl_py_live_insert_locked(ctx, obj);
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+    return st;
+}
+
+void tl_py_live_note_drop(tl_py_handle_ctx_t* ctx, PyObject* obj)
+{
+#ifndef NDEBUG
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_live_note_drop requires owning interpreter");
+#endif
+
+    if (ctx == NULL || obj == NULL) {
+        return;
+    }
+
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    tl_py_live_drop_locked(ctx, obj);
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+}
+
 void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_live_release_all requires GIL");
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_live_release_all requires owning interpreter");
 #endif
 
-    if (ctx == NULL || ctx->live_entries == NULL) {
+    if (ctx == NULL) {
+        return;
+    }
+
+    PyObject** refs = NULL;
+    size_t total = 0;
+
+    /* Phase 1: collect strong refs under live_lock; free the table. */
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    if (ctx->live_entries == NULL) {
+        TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
         return;
     }
 
 #ifndef NDEBUG
-    if (ctx->live_tracking_failed) {
+    if (atomic_load_explicit(&ctx->live_tracking_failed,
+                             memory_order_acquire)) {
         fprintf(stderr,
             "WARNING: live handle tracking encountered allocation failures; "
             "some objects may leak.\n");
     }
 #endif
 
+    /* Two-pass: count the multiset total (live_len counts distinct
+     * entries; total refs = sum of e->count over FULL entries). */
+    size_t needed = 0;
+    for (size_t i = 0; i < ctx->live_cap; i++) {
+        tl_py_live_entry_t* e = &ctx->live_entries[i];
+        if (e->state == TL_PY_LIVE_FULL) {
+            needed += (size_t)e->count;
+        }
+    }
+
+    if (needed > 0) {
+        /* libc malloc, not PyMem_*: the latter can acquire CPython's
+         * internal allocator lock and reach back into Python state, which
+         * is forbidden while we still hold live_lock. */
+        refs = (PyObject**)malloc(needed * sizeof(PyObject*));
+        if (refs == NULL) {
+            /* OOM. We must not Py_DECREF under live_lock, so the only safe
+             * option is to drop the entries here and let the payloads leak
+             * until interpreter teardown. The ctx is being destroyed
+             * anyway; the alternative is deadlock or UAF via __del__. */
+            atomic_store_explicit(&ctx->live_tracking_failed, 1,
+                                  memory_order_release);
+            for (size_t i = 0; i < ctx->live_cap; i++) {
+                tl_py_live_entry_t* e = &ctx->live_entries[i];
+                e->obj = NULL;
+                e->count = 0;
+                e->state = TL_PY_LIVE_EMPTY;
+            }
+            free(ctx->live_entries);
+            ctx->live_entries = NULL;
+            ctx->live_cap = 0;
+            ctx->live_len = 0;
+            ctx->live_tombstones = 0;
+            TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+#ifndef NDEBUG
+            fprintf(stderr,
+                "WARNING: tl_py_live_release_all OOM during snapshot; "
+                "deliberately leaked tracked PyObjects.\n");
+#endif
+            return;
+        }
+    }
+
     for (size_t i = 0; i < ctx->live_cap; i++) {
         tl_py_live_entry_t* e = &ctx->live_entries[i];
         if (e->state == TL_PY_LIVE_FULL) {
             for (uint64_t c = e->count; c > 0; c--) {
-                Py_DECREF(e->obj);
+                refs[total++] = e->obj;
             }
             e->obj = NULL;
             e->count = 0;
@@ -525,56 +834,84 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
     ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+
+    /* Phase 2: Py_DECREF outside live_lock. __del__ may reenter Python
+     * freely now that no internal lock is held. */
+    for (size_t i = 0; i < total; i++) {
+        Py_DECREF(refs[i]);
+    }
+    free(refs);
 }
 
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
 {
 #ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_handle_ctx_traverse requires GIL");
+    assert(tl_py_attached_to_interp(ctx) &&
+           "tl_py_handle_ctx_traverse requires owning interpreter");
 #endif
     if (ctx == NULL || visit == NULL) {
         return 0;
     }
 
-    if (ctx->live_entries != NULL) {
-        for (size_t i = 0; i < ctx->live_cap; i++) {
-            tl_py_live_entry_t* e = &ctx->live_entries[i];
-            if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
-                int st = visit(e->obj, arg);
-                if (st != 0) {
-                    return st;
+    PyObject** snap = NULL;
+    size_t snap_n = 0;
+
+    /* Phase 1: snapshot strong refs under live_lock. A raw pointer snapshot is
+     * not enough under no-GIL: a concurrent drain can drop the last reference
+     * immediately after we unlock, before visit() sees the pointer. */
+    TL_PY_MUTEX_LOCK(&ctx->live_lock);
+    if (ctx->live_entries != NULL && ctx->live_len > 0) {
+        snap = (PyObject**)malloc(ctx->live_len * sizeof(PyObject*));
+        if (snap == NULL) {
+            TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+            PyErr_NoMemory();
+            return -1;
+        } else {
+            for (size_t i = 0; i < ctx->live_cap; i++) {
+                tl_py_live_entry_t* e = &ctx->live_entries[i];
+                if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
+                    Py_INCREF(e->obj);
+                    snap[snap_n++] = e->obj;
                 }
             }
         }
     }
+    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
 
-    tl_py_drop_node_t* retired = atomic_load_explicit(
-        &ctx->retired_head, memory_order_acquire);
-    while (retired != NULL) {
-        if (retired->obj != NULL) {
-            int st = visit(retired->obj, arg);
-            if (st != 0) {
-                return st;
-            }
+    /* Phase 2: visit live snapshot outside live_lock. */
+    int rc = 0;
+    for (size_t i = 0; i < snap_n; i++) {
+        rc = visit(snap[i], arg);
+        if (rc != 0) {
+            break;
         }
-        retired = retired->next;
+    }
+    for (size_t i = 0; i < snap_n; i++) {
+        Py_DECREF(snap[i]);
+    }
+    free(snap);
+    if (rc != 0) {
+        return rc;
     }
 
+    /*
+     * The retired Treiber stack is deliberately NOT walked here. Walking it
+     * would read node->next non-atomically while a concurrent
+     * tl_py_drain_retired() on another thread atomically claims the list and
+     * free()s the nodes — a use-after-free under free-threaded builds where
+     * tp_traverse can be invoked outside a stop-the-world collection (e.g.
+     * gc.get_referents() / gc.get_objects()).
+     *
+     * This loses nothing for GC correctness: an object enters the retired
+     * stack via on_drop_handle but is removed from the live table only later,
+     * during drain (tl_py_live_note_drop). So every retired-but-not-drained
+     * object that was successfully live-tracked is still reported by the
+     * Phase-1 live-table walk above. Objects that were never tracked (insert
+     * OOM) are already best-effort and may leak — acceptable, and not a
+     * UAF.
+     */
     return 0;
-}
-
-void tl_py_handle_ctx_clear(tl_py_handle_ctx_t* ctx)
-{
-#ifndef NDEBUG
-    assert(PyGILState_Check() &&
-           "tl_py_handle_ctx_clear requires GIL");
-#endif
-    if (ctx == NULL) {
-        return;
-    }
-    (void)tl_py_drain_retired(ctx, 1);
-    tl_py_live_release_all(ctx);
 }
 
 /*===========================================================================

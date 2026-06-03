@@ -8,6 +8,15 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - Exceptions: `TimelogError`, `TimelogBusyError`
 - Iterator/span types: `TimelogIter`, `PageSpan`, `PageSpanIter`, `PageSpanObjectsView`
 
+## Runtime Support
+
+- Regular CPython 3.12-3.14 builds are supported.
+- Isolated subinterpreters with a per-interpreter GIL are supported (Layer A complete).
+- Free-threaded CPython 3.14t (Py_GIL_DISABLED=1) is supported (Layer B complete).
+  The extension declares `Py_mod_gil = Py_MOD_GIL_NOT_USED` and synchronizes all
+  mutable state with per-object critical sections, an explicit live_lock, and
+  atomic refcounts on the engine/handle contexts and the core pagespan owner.
+
 ## Lifecycle
 
 - `Timelog(**kwargs)`
@@ -18,6 +27,7 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
+- Live `Timelog` objects keep using their originating module state across manual reload/reimport of `timelog._timelog`.
 
 ## Write API
 

@@ -11,26 +11,26 @@
 /*===========================================================================
  * Query Plan
  *
- * A query plan is built from a snapshot for a given range [t1, t2) or
- * [t1, +inf). It identifies all sources (segments, memruns, active memview)
- * that overlap the range and prepares iterators for them.
+ * Built from a snapshot for a given range [t1, t2) or [t1, +inf), the
+ * plan identifies every source (segment, sealed memrun, active
+ * memview) that overlaps the range and primes iterators for them. The
+ * plan is then fed to the K-way merge iterator, which produces a
+ * single sorted record stream.
  *
- * The plan is the input to the merge iterator, which combines all sources
- * into a single sorted stream.
- *
- * UNBOUNDED QUERY DESIGN:
- * - If t2_unbounded == true, the query is [t1, +inf)
- * - When t2_unbounded is true, the 't2' field is ignored (pass 0 for clarity)
+ * Range semantics:
+ * - t2_unbounded == true means [t1, +inf); the t2 field is ignored.
+ * - Otherwise the query is the half-open interval [t1, t2).
  *
  * Thread Safety:
- * - Not thread-safe; create one plan per query per thread
- * - Snapshot must remain valid for the lifetime of the plan
+ * - Not thread-safe; one plan per query per thread.
+ * - Snapshot must remain valid for the lifetime of the plan.
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
  * Iterator Source Types
  *
- * A union of all iterator types to enable polymorphic iteration.
+ * Tagged-union envelope that lets the merge iterator drive segment,
+ * memrun, and active-memview iterators through one polymorphic API.
  *---------------------------------------------------------------------------*/
 
 typedef enum tl_iter_kind {
@@ -119,20 +119,14 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
                            bool t2_unbounded);
 
 /**
- * Destroy a query plan.
+ * Destroy a query plan, freeing its sources and tombstone arrays.
  *
- * Frees dynamically allocated memory (sources, tombstones).
- * Does NOT release the snapshot - caller is responsible for that.
+ * Does NOT release the snapshot; that is the caller's responsibility.
  *
- * Idempotent: Safe to call on:
- * - NULL plan pointer (no-op)
- * - Zeroed plan (e.g., from memset(0)) - all NULL checks pass
- * - Already-destroyed plan (pointers set to NULL after free)
- *
- * This enables simpler cleanup paths: callers can unconditionally call
- * destroy() without checking initialization state.
- *
- * @param plan  Plan to destroy (may be NULL or zeroed)
+ * Idempotent and safe on NULL, on a zero-initialised plan, and on an
+ * already-destroyed plan (internal pointers are nulled after free).
+ * Callers can therefore unconditionally call destroy() in cleanup
+ * paths without tracking initialisation state.
  */
 void tl_plan_destroy(tl_plan_t* plan);
 

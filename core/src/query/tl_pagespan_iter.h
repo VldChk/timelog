@@ -17,9 +17,9 @@
  *   (owner/hooks are still created and released on close)
  *
  * Thread safety:
- * - The owner refcount is NOT atomic (B4 constraint)
- * - All incref/decref operations MUST be serialized by the caller
- * - For CPython bindings, the GIL provides this serialization
+ * - Owner incref/decref operations are atomic.
+ * - The iterator object itself is not thread-safe; do not call next/close
+ *   concurrently on the same iterator.
  */
 
 #include "timelog/timelog.h"
@@ -71,23 +71,25 @@ typedef struct tl_pagespan_view {
 /*===========================================================================
  * Release Hooks (Binding Integration)
  *
- * Bindings need to drop pins and run deferred DECREF logic when the last
- * span is released. Core does not know about Python, so an optional release
- * hook is provided.
+ * Bindings need to drop pins and run deferred DECREF logic when the
+ * last span view is released. Core stays language-agnostic by exposing
+ * an optional release hook instead of touching binding internals.
  *
- * Destruction order (CRITICAL):
- * 1. Copy out hooks from owner struct
- * 2. Release snapshot/segment refs (no binding code runs)
- * 3. Free owner struct BEFORE calling hook
- * 4. Invoke on_release(user) if non-NULL
+ * Destruction order matters: the owner struct is freed BEFORE the
+ * release hook runs. A binding hook (for example one that
+ * Py_DECREF()s the timelog object) may in turn free the allocator that
+ * owns the owner struct, so freeing the owner after the hook would be
+ * a use-after-free. Concretely the sequence is:
+ *   1. Copy hook fields out of the owner struct.
+ *   2. Release snapshot/segment refs.
+ *   3. Free the owner struct using its allocator.
+ *   4. Invoke on_release(user) if non-NULL.
  *
- * Rationale: The hook may Py_DECREF the timelog, which owns the allocator.
- * Freeing owner after the hook could use a freed allocator (UAF).
- *
- * Constraints:
- * - Hook must NOT assume owner struct exists (it has been freed)
- * - Hook must NOT call back into pagespan API (re-entrancy forbidden)
- * - For CPython, hook must run with GIL held
+ * Hook contract:
+ * - Must not assume the owner struct still exists.
+ * - Must not call back into the pagespan API (no re-entrancy).
+ * - Under CPython, must run on the owning interpreter with an attached
+ *   Python thread state.
  *===========================================================================*/
 
 typedef void (*tl_pagespan_owner_release_fn)(void* user);
@@ -100,22 +102,26 @@ typedef struct tl_pagespan_owner_hooks {
 /*===========================================================================
  * Flags
  *
- * B4 Constraints:
- * - TL_PAGESPAN_SEGMENTS_ONLY is required (return TL_EINVAL if not set)
- * - TL_PAGESPAN_VISIBLE_ONLY is reserved (return TL_EINVAL if set)
- * - flags == 0 is treated as TL_PAGESPAN_DEFAULT
+ * Current support matrix:
+ * - TL_PAGESPAN_SEGMENTS_ONLY MUST be set; calling without it returns
+ *   TL_EINVAL. Iteration over memview/memtable pages is not yet
+ *   implemented.
+ * - TL_PAGESPAN_VISIBLE_ONLY is reserved; setting it returns TL_EINVAL
+ *   until tombstone-aware filtering is implemented.
+ * - flags == 0 is normalised to TL_PAGESPAN_DEFAULT.
  *===========================================================================*/
 
 enum {
     TL_PAGESPAN_SEGMENTS_ONLY    = 1u << 0,  /**< Ignore memview/memtable */
     TL_PAGESPAN_INCLUDE_L0       = 1u << 1,  /**< Include L0 segments */
     TL_PAGESPAN_INCLUDE_L1       = 1u << 2,  /**< Include L1 segments */
-    TL_PAGESPAN_VISIBLE_ONLY     = 1u << 3,  /**< Reserved (EINVAL in B4) */
+    TL_PAGESPAN_VISIBLE_ONLY     = 1u << 3,  /**< Reserved; returns EINVAL */
     TL_PAGESPAN_REQUIRE_ZEROCOPY = 1u << 4   /**< Must not allocate staging */
 };
 
 /**
- * Default flags for B4: segments only, both L0/L1, zero-copy required.
+ * Default flag set: segments only, include both L0 and L1, require
+ * zero-copy.
  */
 #define TL_PAGESPAN_DEFAULT \
     (TL_PAGESPAN_SEGMENTS_ONLY | TL_PAGESPAN_INCLUDE_L0 | \
@@ -191,18 +197,13 @@ TL_API void tl_pagespan_iter_close(tl_pagespan_iter_t* it);
 /*===========================================================================
  * Owner Reference Counting
  *
- * CONCURRENCY CONSTRAINT (B4):
- * The refcount is plain uint32_t, NOT atomic. All incref/decref operations
- * MUST be serialized by the caller. For CPython bindings, the GIL provides
- * this serialization.
- *
- * Future enhancement: If multi-threaded bindings are needed, change to
- * _Atomic uint32_t with fetch_add/fetch_sub (acq_rel ordering).
+ * Owner references may be acquired or released from different threads.
+ * Destroy runs exactly once when the last reference is released.
  *===========================================================================*/
 
 /**
  * Increment owner reference count.
- * Thread safety: Caller must ensure serialization.
+ * Thread safety: atomic.
  *
  * @param owner  Owner to incref (must not be NULL)
  */
@@ -211,7 +212,7 @@ TL_API void tl_pagespan_owner_incref(tl_pagespan_owner_t* owner);
 /**
  * Decrement owner reference count.
  * When refcnt reaches 0, destroys owner and calls release hook if provided.
- * Thread safety: Caller must ensure serialization.
+ * Thread safety: atomic.
  *
  * @param owner  Owner to decref (must not be NULL)
  */

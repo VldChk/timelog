@@ -1,6 +1,6 @@
 /**
  * @file py_span_iter.c
- * @brief PyPageSpanIter CPython extension type implementation (Core API Integration)
+ * @brief PyPageSpanIter CPython extension type implementation
  *
  * Implements streaming iteration over page spans using core tl_pagespan_iter_*.
  * Delegates span enumeration and ownership management to core.
@@ -10,6 +10,7 @@
 #include <Python.h>
 #include <string.h>  /* For strcmp, memset */
 
+#include "timelogpy/py_compat.h"
 #include "timelogpy/py_span_iter.h"
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_timelog.h"
@@ -33,7 +34,7 @@ static void pagespaniter_cleanup(PyPageSpanIter* self);
  * The core owner calls our hook when refcount reaches 0.
  * The hook handles:
  *   1. pins_exit_and_maybe_drain() - allow handle cleanup
- *   2. Py_DECREF(timelog) - release our strong reference
+ *   2. release handle/engine lifetime refs
  *   3. PyMem_Free(ctx) - free this context struct
  *
  * The "armed" flag prevents double cleanup if core calls the hook during
@@ -41,14 +42,15 @@ static void pagespaniter_cleanup(PyPageSpanIter* self);
  *===========================================================================*/
 
 typedef struct tl_py_pagespan_hook_ctx {
-    PyObject* timelog;          /**< Strong ref, decref on release */
-    tl_py_handle_ctx_t* ctx;    /**< Borrowed handle context */
+    tl_py_handle_ctx_t* ctx;    /**< Strong lifetime ref */
+    tl_py_engine_ctx_t* engine_ctx; /**< Strong engine lifetime ref */
     int armed;                  /**< 0 until iter_open succeeds */
 } tl_py_pagespan_hook_ctx_t;
 
 /**
  * Release hook: called by core when owner refcount reaches 0.
- * GIL must be held. Preserves exception state (may run during GC).
+ * Must run on the owning interpreter with an attached Python thread state.
+ * Preserves exception state (may run during GC).
  */
 static void tl_py_pagespan_on_release(void* user)
 {
@@ -70,30 +72,15 @@ static void tl_py_pagespan_on_release(void* user)
     if (hook_ctx->ctx != NULL) {
         tl_py_pins_exit_and_maybe_drain(hook_ctx->ctx);
     }
+    if (hook_ctx->engine_ctx != NULL) {
+        tl_py_engine_ctx_decref(hook_ctx->engine_ctx);
+    }
+    if (hook_ctx->ctx != NULL) {
+        tl_py_handle_ctx_decref(hook_ctx->ctx);
+    }
 
-    Py_XDECREF(hook_ctx->timelog);
     PyMem_Free(hook_ctx);
     PyErr_Restore(exc_type, exc_value, exc_tb);
-}
-
-/*===========================================================================
- * Block Direct Construction
- *
- * PageSpanIter is only created via page_spans() factory.
- *===========================================================================*/
-
-static PyObject* PyPageSpanIter_new_error(PyTypeObject* type,
-                                           PyObject* args,
-                                           PyObject* kwds)
-{
-    (void)type;
-    (void)args;
-    (void)kwds;
-
-    PyErr_SetString(PyExc_TypeError,
-        "PageSpanIter cannot be instantiated directly; "
-        "use Timelog.page_spans()");
-    return NULL;
 }
 
 /*===========================================================================
@@ -115,8 +102,13 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
         return NULL;
     }
 
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject(timelog);
+    if (mod_st == NULL) {
+        return NULL;
+    }
+
     /* Defensive type check for internal C callers. */
-    if (!PyTimelog_Check(timelog)) {
+    if (!TlPyTimelog_Check(timelog, mod_st)) {
         PyErr_SetString(PyExc_TypeError,
             "page_spans: expected Timelog instance");
         return NULL;
@@ -124,51 +116,64 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
 
     PyTimelog* tl_obj = (PyTimelog*)timelog;
 
-    /* Check closed state. */
-    if (tl_obj->closed || tl_obj->tl == NULL) {
-        TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
-        return NULL;
-    }
-
-    /* Enter pins BEFORE iter_open (snapshot acquisition). */
-    tl_py_pins_enter(&tl_obj->handle_ctx);
-
-    /* Hook context: armed=0 prevents double cleanup on iter_open failure. */
+    /* Allocate the hook context before taking the lock (no lifecycle state
+     * touched yet). armed=0 prevents double cleanup on iter_open failure. */
     tl_py_pagespan_hook_ctx_t* hook_ctx = PyMem_Malloc(sizeof(*hook_ctx));
     if (hook_ctx == NULL) {
-        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
         PyErr_NoMemory();
         return NULL;
     }
-    hook_ctx->timelog = Py_NewRef((PyObject*)tl_obj);
-    hook_ctx->ctx = &tl_obj->handle_ctx;
     hook_ctx->armed = 0;
+    hook_ctx->ctx = NULL;
+    hook_ctx->engine_ctx = NULL;
 
-    /* Set up release hook for core owner. */
+    /*
+     * Acquire all lifetime guards under core_lock so a concurrent close()
+     * cannot free handle_ctx/engine_ctx in the window between the open-state
+     * check and the pin/incref. Under the lock: recheck open
+     * (tl_py_lock_checked), own a handle_ctx + engine_ctx ref, enter the
+     * pin, then open the core iterator. The owned refs + pin are
+     * transferred to the hook context, which releases them when
+     * tl_py_pagespan_on_release fires (the owner refcount reaches zero).
+     */
+    if (tl_py_lock_checked(tl_obj) < 0) {
+        PyMem_Free(hook_ctx);
+        return NULL;
+    }
+
+    tl_py_handle_ctx_t* hctx = tl_obj->handle_ctx;
+    tl_py_engine_ctx_t* ectx = tl_obj->engine_ctx;
+    if (hctx == NULL || ectx == NULL) {
+        TL_PY_UNLOCK(tl_obj);
+        PyMem_Free(hook_ctx);
+        PyErr_SetString(PyExc_RuntimeError,
+                        "timelog context is unavailable");
+        return NULL;
+    }
+    tl_py_handle_ctx_incref(hctx);
+    tl_py_engine_ctx_incref(ectx);
+    tl_py_pins_enter(hctx);
+    hook_ctx->ctx = hctx;
+    hook_ctx->engine_ctx = ectx;
+
     tl_pagespan_owner_hooks_t hooks = {
         .user = hook_ctx,
         .on_release = tl_py_pagespan_on_release
     };
 
-    /* Open core iterator (acquires snapshot, creates owner). */
     uint32_t flags = TL_PAGESPAN_DEFAULT;
     tl_pagespan_iter_t* core_iter = NULL;
-
-    if (tl_py_lock_checked(tl_obj) < 0) {
-        Py_DECREF(hook_ctx->timelog);
-        PyMem_Free(hook_ctx);
-        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        return NULL;
-    }
     tl_status_t st = tl_pagespan_iter_open(tl_obj->tl, t1, t2, flags, &hooks, &core_iter);
     TL_PY_UNLOCK(tl_obj);
 
     if (st != TL_OK) {
-        /* iter_open failed: hook not armed, manual cleanup required. */
-        Py_DECREF(hook_ctx->timelog);
+        /* iter_open failed: hook not armed, manual cleanup required.
+         * Release outside the lock (pins_exit may drain Python objects). */
+        tl_py_pins_exit_and_maybe_drain(hctx);
+        tl_py_engine_ctx_decref(ectx);
+        tl_py_handle_ctx_decref(hctx);
         PyMem_Free(hook_ctx);
-        tl_py_pins_exit_and_maybe_drain(&tl_obj->handle_ctx);
-        TlPy_RaiseFromStatus(st);
+        TlPy_RaiseFromObject((PyObject*)tl_obj, st);
         return NULL;
     }
 
@@ -176,7 +181,8 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     hook_ctx->armed = 1;
 
     /* Allocate Python iterator. */
-    PyPageSpanIter* self = PyObject_GC_New(PyPageSpanIter, &PyPageSpanIter_Type);
+    PyTypeObject* span_iter_type = (PyTypeObject*)mod_st->type_pagespan_iter;
+    PyPageSpanIter* self = (PyPageSpanIter*)span_iter_type->tp_alloc(span_iter_type, 0);
     if (self == NULL) {
         /* Close core iter triggers armed hook for cleanup. */
         tl_pagespan_iter_close(core_iter);
@@ -187,9 +193,6 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
     self->iter = core_iter;
     self->timelog = Py_NewRef((PyObject*)tl_obj);
     self->closed = 0;
-
-    /* GC track after full initialization. */
-    PyObject_GC_Track((PyObject*)self);
     return (PyObject*)self;
 }
 
@@ -201,27 +204,52 @@ PyObject* PyPageSpanIter_Create(PyObject* timelog,
  * the release hook if that was the last ref.
  *===========================================================================*/
 
-static void pagespaniter_cleanup(PyPageSpanIter* self)
+/* Detach iterator resources under CS. Caller must release outside. */
+static int pagespaniter_detach_locked(PyPageSpanIter* self,
+                                       tl_pagespan_iter_t** out_iter,
+                                       PyObject** out_timelog)
 {
     if (self->closed) {
-        return;
+        *out_iter = NULL;
+        *out_timelog = NULL;
+        return 0;
     }
     self->closed = 1;
-
-    /* Releases iterator's owner ref; hook fires if that was the last. */
-    tl_pagespan_iter_t* iter = self->iter;
+    *out_iter = self->iter;
     self->iter = NULL;
+    *out_timelog = self->timelog;
+    self->timelog = NULL;
+    return 1;
+}
 
+static void pagespaniter_release_resources(tl_pagespan_iter_t* iter,
+                                            PyObject* timelog)
+{
     if (iter != NULL) {
+        /* Releases iterator's owner ref; release hook fires if last ref. */
         tl_pagespan_iter_close(iter);
     }
-
-    /* Preserve exception state across Py_CLEAR (may run __del__). */
-    {
+    if (timelog != NULL) {
+        /* Preserve exception state across Py_DECREF (may run __del__). */
         PyObject *exc_type, *exc_value, *exc_tb;
         PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-        Py_CLEAR(self->timelog);
+        Py_DECREF(timelog);
         PyErr_Restore(exc_type, exc_value, exc_tb);
+    }
+}
+
+static void pagespaniter_cleanup(PyPageSpanIter* self)
+{
+    tl_pagespan_iter_t* iter = NULL;
+    PyObject* timelog = NULL;
+    int detached;
+
+    TL_PY_OBJ_LOCK(self);
+    detached = pagespaniter_detach_locked(self, &iter, &timelog);
+    TL_PY_OBJ_UNLOCK();
+
+    if (detached) {
+        pagespaniter_release_resources(iter, timelog);
     }
 }
 
@@ -231,6 +259,7 @@ static void pagespaniter_cleanup(PyPageSpanIter* self)
 
 static int PyPageSpanIter_traverse(PyPageSpanIter* self, visitproc visit, void* arg)
 {
+    Py_VISIT(Py_TYPE(self));
     Py_VISIT(self->timelog);
     return 0;
 }
@@ -243,49 +272,69 @@ static int PyPageSpanIter_clear(PyPageSpanIter* self)
 
 static void PyPageSpanIter_dealloc(PyPageSpanIter* self)
 {
-    PyObject_GC_UnTrack(self);
-    pagespaniter_cleanup(self);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    TL_PY_GC_DEALLOC(self, pagespaniter_cleanup(self));
 }
 
 /*===========================================================================
  * Iterator Protocol
  *
  * Each __next__ call invokes core iter_next to get the next span on-demand.
- * This is streaming - no pre-collection of spans.
+ * No pre-collection of spans.
  *===========================================================================*/
 
 static PyObject* PyPageSpanIter_iternext(PyPageSpanIter* self)
 {
-    if (self->closed || self->iter == NULL) {
-        return NULL;  /* StopIteration */
-    }
+    /* Hold CS through the engine call so a concurrent close cannot free
+     * self->iter mid-call. tl_pagespan_iter_next is pure C, honoring the
+     * "no Python work under internal locks" invariant. */
     tl_pagespan_view_t view;
     memset(&view, 0, sizeof(view));
+    tl_status_t st = TL_EOF;
+    int was_closed = 0;
+    int do_release = 0;
+    tl_pagespan_iter_t* iter_local = NULL;
+    PyObject* timelog_local = NULL;
+    /* Capture timelog under CS for PyPageSpan_FromView below. */
+    PyObject* timelog_ref = NULL;
 
-    tl_status_t st = tl_pagespan_iter_next(self->iter, &view);
-
-    if (st == TL_OK) {
-        /* PyPageSpan_FromView consumes view.owner on success. */
-        PyObject* span = PyPageSpan_FromView(&view, self->timelog);
-        if (span == NULL) {
-            /* Creation failed; release the view's owner ref. */
-            tl_pagespan_view_release(&view);
-            return NULL;
+    TL_PY_OBJ_LOCK(self);
+    if (self->closed || self->iter == NULL) {
+        was_closed = 1;
+    } else {
+        st = tl_pagespan_iter_next(self->iter, &view);
+        if (st == TL_OK) {
+            /* PyPageSpan_FromView needs a Python ref to the timelog. Take
+             * a strong ref under CS so close cannot null it from us. */
+            timelog_ref = self->timelog ? Py_NewRef(self->timelog) : NULL;
+        } else {
+            do_release = pagespaniter_detach_locked(
+                self, &iter_local, &timelog_local);
         }
-        return span;
     }
+    TL_PY_OBJ_UNLOCK();
 
-    if (st == TL_EOF) {
-        /* Exhausted. */
-        pagespaniter_cleanup(self);
+    if (was_closed) {
         return NULL;  /* StopIteration */
     }
+    if (st != TL_OK) {
+        if (do_release) {
+            pagespaniter_release_resources(iter_local, timelog_local);
+        }
+        if (st == TL_EOF) {
+            return NULL;
+        }
+        return TlPy_RaiseFromObject((PyObject*)self, st);
+    }
 
-    /* Error. */
-    pagespaniter_cleanup(self);
-    TlPy_RaiseFromStatus(st);
-    return NULL;
+    /* PyPageSpan_FromView consumes view.owner on success. */
+    PyObject* span = PyPageSpan_FromView(&view, timelog_ref);
+    Py_XDECREF(timelog_ref);
+    if (span == NULL) {
+        /* Creation failed; release the view's owner ref. */
+        tl_pagespan_view_release(&view);
+        return NULL;
+    }
+    return span;
 }
 
 /*===========================================================================
@@ -316,11 +365,7 @@ static PyObject* PyPageSpanIter_exit(PyPageSpanIter* self, PyObject* args)
  * Properties
  *===========================================================================*/
 
-static PyObject* PyPageSpanIter_get_closed(PyPageSpanIter* self, void* closure)
-{
-    (void)closure;
-    return PyBool_FromLong(self->closed);
-}
+TL_PY_DEFINE_CLOSED_GETTER(PyPageSpanIter_get_closed, PyPageSpanIter)
 
 /*===========================================================================
  * Method/GetSet Tables
@@ -343,26 +388,38 @@ static PyGetSetDef PyPageSpanIter_getset[] = {
 };
 
 /*===========================================================================
- * Type Object
+ * Type Specification
  *===========================================================================*/
 
-PyTypeObject PyPageSpanIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpanIter",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyPageSpanIter_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Streaming iterator yielding PageSpan objects for a time range.\n\n"
         "Cannot be instantiated directly; use Timelog.page_spans()."
-    ),
-    .tp_basicsize = sizeof(PyPageSpanIter),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .tp_new = PyPageSpanIter_new_error,
-    .tp_dealloc = (destructor)PyPageSpanIter_dealloc,
-    .tp_traverse = (traverseproc)PyPageSpanIter_traverse,
-    .tp_clear = (inquiry)PyPageSpanIter_clear,
-    .tp_free = PyObject_GC_Del,
-    .tp_iter = PyObject_SelfIter,
-    .tp_iternext = (iternextfunc)PyPageSpanIter_iternext,
-    .tp_methods = PyPageSpanIter_methods,
-    .tp_getset = PyPageSpanIter_getset,
+    )},
+    {Py_tp_dealloc, (void*)PyPageSpanIter_dealloc},
+    {Py_tp_traverse, (void*)PyPageSpanIter_traverse},
+    {Py_tp_clear, (void*)PyPageSpanIter_clear},
+    {Py_tp_iter, PyObject_SelfIter},
+    {Py_tp_iternext, (void*)PyPageSpanIter_iternext},
+    {Py_tp_methods, PyPageSpanIter_methods},
+    {Py_tp_getset, PyPageSpanIter_getset},
+    {0, NULL}
 };
+
+static PyType_Spec PyPageSpanIter_spec = {
+    .name = "timelog._timelog.PageSpanIter",
+    .basicsize = sizeof(PyPageSpanIter),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpanIter_slots,
+};
+
+PyObject* TlPy_CreatePageSpanIterType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpanIter_spec, NULL);
+}
+
+TL_PY_DEFINE_CHECK(TlPyPageSpanIter_Check, type_pagespan_iter)

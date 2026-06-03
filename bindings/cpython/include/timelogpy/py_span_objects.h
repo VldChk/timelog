@@ -1,6 +1,6 @@
 /**
  * @file py_span_objects.h
- * @brief PyPageSpanObjectsView CPython extension type declaration (Core API Integration)
+ * @brief PyPageSpanObjectsView CPython extension type declaration
  *
  * This module provides the PyPageSpanObjectsView type which provides
  * lazy access to decoded Python objects from a PageSpan.
@@ -26,6 +26,8 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+
+#include "timelogpy/py_module_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,23 +57,9 @@ typedef struct {
  * Type Object
  *===========================================================================*/
 
-/**
- * PyPageSpanObjectsView type object.
- * Defined in py_span_objects.c.
- */
-extern PyTypeObject PyPageSpanObjectsView_Type;
-
-/**
- * PyPageSpanObjectsViewIter type object.
- * Internal iterator type for PageSpanObjectsView.
- * Must be readied by module init.
- */
-extern PyTypeObject PyPageSpanObjectsViewIter_Type;
-
-/**
- * Type check macro.
- */
-#define PyPageSpanObjectsView_Check(op) PyObject_TypeCheck(op, &PyPageSpanObjectsView_Type)
+PyObject* TlPy_CreatePageSpanObjectsViewType(PyObject* module);
+PyObject* TlPy_CreatePageSpanObjectsViewIterType(PyObject* module);
+int TlPyPageSpanObjectsView_Check(PyObject* op, const tl_py_module_state_t* st);
 
 /*===========================================================================
  * Factory Function (Internal)

@@ -26,7 +26,8 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
     tl_seqvec_init(&mt->ooo_head_seqs, alloc);
     tl_intervals_init(&mt->active_tombs, alloc);
 
-    /* Preallocate: seal path must not realloc */
+    /* Preallocated to its final capacity so the seal hot path never needs to
+     * realloc and never has a partial-failure mode to roll back. */
     mt->sealed = TL_NEW_ARRAY(alloc, tl_memrun_t*, sealed_max_runs);
     if (mt->sealed == NULL) {
         tl_recvec_destroy(&mt->active_run);
@@ -56,9 +57,10 @@ tl_status_t tl_memtable_init(tl_memtable_t* mt,
     mt->ooo_head_last_handle = 0;
     mt->ooo_next_gen = 0;
 
-    /* Derive OOO chunk size from budget (bounded).
-     * Use head-record footprint (record + seq watermark) to avoid
-     * optimistic chunk sizing that can overshoot OOO budget pressure. */
+    /* Pick OOO chunk size so a few chunks fit within the OOO byte budget.
+     * Sizing uses the head-record footprint (record + per-record seq) instead
+     * of just sizeof(tl_record_t); using the smaller value would let the head
+     * grow past the budget before the threshold is crossed. */
     size_t ooo_head_record_bytes = TL_RECORD_SIZE + sizeof(tl_seq_t);
     size_t budget_records = ooo_budget_bytes / ooo_head_record_bytes;
     size_t chunk = budget_records / TL_OOO_TARGET_RUNS;
@@ -404,7 +406,7 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
 
     if (tl_recvec_len(&mt->active_run) == 0 ||
         ts >= mt->last_inorder_ts) {
-        /* In-order: append to run */
+        /* In-order fast path: append to the sorted run. */
         size_t run_len = tl_recvec_len(&mt->active_run);
         if (run_len == SIZE_MAX) {
             return TL_ENOMEM;
@@ -423,7 +425,8 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
         TL_ASSERT(st == TL_OK);
         mt->last_inorder_ts = ts;
     } else {
-        /* Out-of-order: append to OOO head (sorted on flush/seal). */
+        /* Out-of-order: append to the OOO head buffer. The head stays
+         * unsorted until flush or seal, keeping ingest O(1). */
         size_t head_len = tl_recvec_len(&mt->ooo_head);
         if (head_len == SIZE_MAX) {
             return TL_ENOMEM;
@@ -446,19 +449,23 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
     mt->epoch++;
     memtable_add_record_bytes(mt, 1);
 
-    /* Best-effort head flush when threshold reached */
+    /* Opportunistic head flush: once the head reaches the chunk size, turn it
+     * into a sorted immutable run so the head buffer stays bounded. The
+     * insert itself is already committed, so a flush failure only surfaces as
+     * TL_EBUSY (the record IS in the log). */
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
         tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
                                                        NULL, NULL, NULL);
         if (flush_st != TL_OK) {
-            return TL_EBUSY; /* Insert succeeded, flush failed */
+            return TL_EBUSY;
         }
     }
 
     return TL_OK;
 }
 
-/** Check if batch is sorted by timestamp (full scan, no sampling). */
+/* Full scan: a hint of "mostly sorted" is not a guarantee, so we must verify
+ * the entire batch before taking the fast-path bulk append. */
 static bool batch_is_sorted(const tl_record_t* records, size_t n) {
     if (n <= 1) {
         return true;
@@ -477,7 +484,7 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
                                       tl_seq_t seq) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(seq > 0);
-    (void)flags; /* Hint only - we verify sortedness regardless */
+    (void)flags;
 
     if (n == 0) {
         return TL_OK;
@@ -488,32 +495,29 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
     tl_status_t st;
     size_t inserted = 0;
 
-    /* Determine if we can use fast path (bulk append to run) */
     bool use_fast_path = false;
     bool first_fits = (tl_recvec_len(&mt->active_run) == 0) ||
                       (records[0].ts >= mt->last_inorder_ts);
 
     if (first_fits) {
-        /* Verify batch is sorted: FULL CHECK, NO SAMPLING */
         if (batch_is_sorted(records, n)) {
             use_fast_path = true;
         }
     }
 
     if (use_fast_path) {
-        /* Fast path: bulk append to active_run */
+        /* Bulk-append straight into the sorted run. */
         size_t len = tl_recvec_len(&mt->active_run);
 
-        /* Check for addition overflow before computing new capacity */
         if (n > SIZE_MAX - len) {
             return TL_EOVERFLOW;
         }
 
-        /* Pre-reserve to make this all-or-nothing (no partial state on failure) */
+        /* Reserve up front so the push step cannot fail partway through and
+         * leave the batch in a half-inserted state. */
         size_t new_cap = len + n;
         st = tl_recvec_reserve(&mt->active_run, new_cap);
         if (st != TL_OK) {
-            /* No records inserted, clean failure */
             return st;
         }
         st = tl_seqvec_reserve(&mt->active_run_seqs, new_cap);
@@ -521,7 +525,6 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
             return st;
         }
 
-        /* Cannot fail after reserve (memcpy is all-or-nothing) */
         st = tl_recvec_push_n(&mt->active_run, records, n);
         if (st != TL_OK) {
             return st;
@@ -532,19 +535,19 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
         mt->last_inorder_ts = records[n - 1].ts;
         inserted = n;
     } else {
-        /* Slow path: pre-reserve both vectors for all-or-nothing semantics */
+        /* Per-record path: pre-reserve worst-case capacity in both the run
+         * and OOO head so each push is infallible and the whole batch is
+         * all-or-nothing. */
         size_t run_len = tl_recvec_len(&mt->active_run);
         size_t ooo_len = tl_recvec_len(&mt->ooo_head);
 
-        /* Overflow checks before computing sums */
         if (n > SIZE_MAX - run_len || n > SIZE_MAX - ooo_len) {
             return TL_EOVERFLOW;
         }
 
-        /* Pre-reserve to guarantee all-or-nothing semantics */
         st = tl_recvec_reserve(&mt->active_run, run_len + n);
         if (st != TL_OK) {
-            return st;  /* No records inserted, clean failure */
+            return st;
         }
         st = tl_seqvec_reserve(&mt->active_run_seqs, run_len + n);
         if (st != TL_OK) {
@@ -553,29 +556,25 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
 
         st = tl_recvec_reserve(&mt->ooo_head, ooo_len + n);
         if (st != TL_OK) {
-            return st;  /* No records inserted, clean failure */
+            return st;
         }
         st = tl_seqvec_reserve(&mt->ooo_head_seqs, ooo_len + n);
         if (st != TL_OK) {
             return st;
         }
 
-        /* Loop: push/insert cannot fail on allocation after pre-reserve */
         for (size_t i = 0; i < n; i++) {
             tl_ts_t ts = records[i].ts;
             tl_handle_t handle = records[i].handle;
 
             if (tl_recvec_len(&mt->active_run) == 0 || ts >= mt->last_inorder_ts) {
                 st = tl_recvec_push(&mt->active_run, ts, handle);
-                /* Capacity guaranteed, can only fail on programming error */
                 TL_ASSERT(st == TL_OK);
                 st = tl_seqvec_push(&mt->active_run_seqs, seq);
                 TL_ASSERT(st == TL_OK);
                 mt->last_inorder_ts = ts;
             } else {
-                /* OOO head append (sorted on flush/seal) */
                 st = tl_recvec_push(&mt->ooo_head, ts, handle);
-                /* Capacity guaranteed, can only fail on programming error */
                 TL_ASSERT(st == TL_OK);
                 st = tl_seqvec_push(&mt->ooo_head_seqs, seq);
                 TL_ASSERT(st == TL_OK);
@@ -588,12 +587,13 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
     mt->epoch++;
     memtable_add_record_bytes(mt, inserted);
 
-    /* Best-effort head flush when threshold reached */
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
         tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
                                                        NULL, NULL, NULL);
         if (flush_st != TL_OK) {
-            return TL_EBUSY; /* Inserted all records, flush failed */
+            /* Records are already in the log; flush failure is signalled as
+             * backpressure so the caller can retry the maintenance step. */
+            return TL_EBUSY;
         }
     }
 
@@ -605,12 +605,12 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t 
     TL_ASSERT(mt != NULL);
     TL_ASSERT(seq > 0);
 
-    /* Delegate to tl_intervals which handles validation and coalescing */
     size_t before_len = tl_intervals_len(&mt->active_tombs);
     tl_status_t st = tl_intervals_insert(&mt->active_tombs, t1, t2, seq);
 
+    /* Empty intervals (t1 == t2) succeed but are no-ops; skip bookkeeping in
+     * that case so the epoch only ticks on observable state changes. */
     if (st == TL_OK && t1 < t2) {
-        /* Only update metadata if actual insert happened (not empty interval) */
         mt->epoch++;
         size_t after_len = tl_intervals_len(&mt->active_tombs);
         memtable_adjust_tomb_bytes(mt, before_len, after_len);
@@ -666,7 +666,7 @@ bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt) {
     TL_ASSERT(mt != NULL);
 
     if (mt->ooo_budget_bytes == 0) {
-        return false;  /* Unlimited budget */
+        return false;  /* 0 means "no budget configured" */
     }
 
     size_t ooo_bytes = memtable_ooo_bytes_est(mt);
@@ -698,28 +698,30 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     size_t dropped_len = 0;
     size_t dropped_cap = 0;
 
-    /* Step 1: Nothing to seal? */
     if (tl_memtable_is_active_empty(mt)) {
-        return TL_OK; /* Nothing to seal */
+        return TL_OK;
     }
 
-    /* Step 2: Check queue capacity */
+    /* Reject quickly when the sealed queue has no room: callers must apply
+     * backpressure or wait. The same check is repeated under the lock at
+     * publish time because flushers can drain entries concurrently. */
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
-        return TL_EBUSY; /* Active state PRESERVED */
+        return TL_EBUSY;
     }
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
-    /* Step 3: Pre-allocate memrun struct before detaching arrays.
-     * This preserves active state on ENOMEM (arrays not yet taken). */
+    /* Allocate the memrun shell before detaching the active arrays so that an
+     * ENOMEM here leaves the writer-visible state intact and retryable. */
     tl_memrun_t* mr = NULL;
     tl_status_t alloc_st = tl_memrun_alloc(mt->alloc, &mr);
     if (alloc_st != TL_OK) {
-        return TL_ENOMEM; /* Active state PRESERVED */
+        return TL_ENOMEM;
     }
 
-    /* Step 4: Flush OOO head */
+    /* Drain the OOO head into a final sorted run so the sealed memrun contains
+     * a complete, immutable picture of pending out-of-order writes. */
     tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq,
                                                    &dropped, &dropped_len, &dropped_cap);
     if (flush_st != TL_OK) {
@@ -727,10 +729,11 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
             tl__free(mt->alloc, dropped);
         }
         tl__free(mt->alloc, mr);
-        return flush_st; /* Active state PRESERVED */
+        return flush_st;
     }
 
-    /* Step 5: Take ownership of active arrays */
+    /* Detach the active arrays into the memrun; from this point on the
+     * memtable is empty and the new memrun owns the data. */
     size_t run_len = 0;
     size_t run_seqs_len = 0;
     size_t tombs_len = 0;
@@ -783,14 +786,15 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         run_seqs = NULL;
     }
 
-    /* Step 6: Initialize memrun in-place */
     tl_status_t init_st = tl_memrun_init(mr, mt->alloc,
                                          run, run_len,
                                          ooo_runs,
                                          tombs, tombs_len,
                                          applied_seq);
     if (init_st != TL_OK) {
-        /* Internal invariant violation - avoid leaks, but data is lost */
+        /* Invariant violation reaching this point means the arrays are no
+         * longer reachable from the memtable: free them here so they do not
+         * leak, even though the caller will lose the data. */
         if (run != NULL) tl__free(mt->alloc, run);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
         if (tombs != NULL) tl__free(mt->alloc, tombs);
@@ -799,7 +803,8 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         return TL_EINTERNAL;
     }
 
-    /* Step 7: Push to sealed queue */
+    /* Publish: re-check capacity under the lock since concurrent flushers may
+     * have changed the queue between the pre-check and now. */
     TL_LOCK(mu, TL_LOCK_MEMTABLE_MU);
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
@@ -814,14 +819,12 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     mt->sealed_epoch++;
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
-    /* Step 8: Reset active state */
     mt->last_inorder_ts = TL_TS_MIN;
     mt->active_bytes_est = 0;
     mt->epoch++;
     memtable_reset_ooo_head(mt);
     mt->ooo_next_gen = 0;
 
-    /* Signal waiters if provided */
     if (cond != NULL) {
         tl_cond_signal(cond);
     }
@@ -864,7 +867,7 @@ tl_status_t tl_memtable_peek_oldest(const tl_memtable_t* mt, tl_memrun_t** out) 
         return TL_OK;
     }
 
-    /* Peek oldest (FIFO: sealed_head) and acquire reference */
+    /* FIFO: oldest entry sits at sealed_head; pin it for the caller. */
     tl_memrun_t* mr = tl_memtable_sealed_at(mt, 0);
     *out = tl_memrun_acquire(mr);
     return TL_OK;
@@ -874,12 +877,12 @@ void tl_memtable_pop_oldest(tl_memtable_t* mt, tl_cond_t* cond) {
     TL_ASSERT(mt != NULL);
     TL_ASSERT(mt->sealed_len > 0);
 
-    /* Get oldest (FIFO: sealed_head) */
     size_t idx = tl_memtable_sealed_index(mt, 0);
     tl_memrun_t* mr = mt->sealed[idx];
     mt->sealed[idx] = NULL;
 
-    /* Advance head */
+    /* Advance ring head; reset to 0 when the queue empties to keep the
+     * starting index predictable across drain cycles. */
     mt->sealed_head++;
     if (mt->sealed_head == mt->sealed_max_runs) {
         mt->sealed_head = 0;
@@ -890,13 +893,11 @@ void tl_memtable_pop_oldest(tl_memtable_t* mt, tl_cond_t* cond) {
     }
     mt->sealed_epoch++;
 
-    /* Release queue's reference */
     tl_memrun_release(mr);
 
-    /* Sealed queue changed (flush removed a memrun) */
+    /* Bump the visible epoch so memview caches recognise the queue shrank. */
     mt->epoch++;
 
-    /* Signal waiters (backpressure) */
     if (cond != NULL) {
         tl_cond_signal(cond);
     }
@@ -917,35 +918,26 @@ bool tl_memtable_wait_for_space(const tl_memtable_t* mt, tl_mutex_t* mu,
     TL_ASSERT(mu != NULL);
     TL_ASSERT(cond != NULL);
 
-    /*
-     * Loop to handle spurious wakeups properly.
-     * memtable_cond is dedicated to sealed queue space signaling.
-     * Use monotonic time to track actual elapsed time across wakeups.
-     */
+    /* Track an absolute deadline against the monotonic clock so spurious
+     * wakeups cannot extend the total wait, and so that each retry only
+     * blocks for the time still remaining. */
     uint64_t start_ms = tl_monotonic_ms();
     uint64_t deadline_ms = start_ms + timeout_ms;
 
     while (mt->sealed_len >= mt->sealed_max_runs) {
         uint64_t now_ms = tl_monotonic_ms();
 
-        /* Check if deadline passed (handles wraparound via unsigned math) */
         if (now_ms >= deadline_ms) {
-            /* Timeout expired */
             break;
         }
 
-        /* Compute remaining time (safe: now_ms < deadline_ms) */
         uint64_t remaining = deadline_ms - now_ms;
         uint32_t wait_ms = (remaining > UINT32_MAX) ? UINT32_MAX : (uint32_t)remaining;
 
-        /* Wait with remaining timeout */
         bool signaled = tl_cond_timedwait(cond, mu, wait_ms);
         if (!signaled) {
-            /* Timed out - but re-check condition before returning */
             break;
         }
-
-        /* Signaled (possibly spuriously) - loop will re-check condition */
     }
 
     return (mt->sealed_len < mt->sealed_max_runs);
@@ -982,7 +974,8 @@ bool tl_memtable_validate(const tl_memtable_t* mt) {
         return false;
     }
 
-    /* OOO head is unsorted during append; sorted on flush/seal */
+    /* No sortedness check on the OOO head: it is intentionally unsorted
+     * during ingest and only sorted when flushed or sealed. */
 
     if (!tl_intervals_validate(&mt->active_tombs)) {
         return false;

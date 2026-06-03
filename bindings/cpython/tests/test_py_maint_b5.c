@@ -18,6 +18,7 @@
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
 
 #include <stdio.h>
@@ -72,15 +73,9 @@ static void tlpy_set_pythonhome(void)
 
 /* Module storage for full init */
 static PyObject* test_module = NULL;
-
-/* Module definition for test harness */
-static struct PyModuleDef test_module_def = {
-    PyModuleDef_HEAD_INIT,
-    "test_maint_b5",
-    NULL,
-    -1,
-    NULL
-};
+static tl_py_module_state_t* test_module_state = NULL;
+static PyObject* test_timelog_type = NULL;
+static PyObject* test_timelog_busy_error = NULL;
 
 /* Full init for PyTimelog tests */
 static int tlpy_init_python_full(void)
@@ -88,22 +83,37 @@ static int tlpy_init_python_full(void)
     tlpy_set_pythonhome();
     Py_Initialize();
 
-    /* Create test module for error registration */
-    test_module = PyModule_Create(&test_module_def);
+    /* Create the real timelog module object for this process. */
+    test_module = TlPy_Test_CreateModule();
     if (test_module == NULL) {
         fprintf(stderr, "Failed to create test module\n");
         return -1;
     }
 
-    /* Initialize error types FIRST */
-    if (TlPy_InitErrors(test_module) < 0) {
-        fprintf(stderr, "Failed to initialize error types\n");
+    if (TlPy_Test_ExecModule(test_module) < 0) {
+        fprintf(stderr, "Failed to exec test module\n");
         return -1;
     }
 
-    /* Ready PyTimelog type */
-    if (PyType_Ready(&PyTimelog_Type) < 0) {
-        fprintf(stderr, "Failed to initialize PyTimelog type\n");
+    test_module_state = TlPy_ModuleState(test_module);
+    if (test_module_state == NULL) {
+        fprintf(stderr, "Failed to get test module state\n");
+        return -1;
+    }
+
+    if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+
+    test_timelog_type = PyObject_GetAttrString(test_module, "Timelog");
+    if (test_timelog_type == NULL) {
+        fprintf(stderr, "Failed to fetch Timelog type\n");
+        return -1;
+    }
+
+    test_timelog_busy_error = PyObject_GetAttrString(test_module, "TimelogBusyError");
+    if (test_timelog_busy_error == NULL) {
+        fprintf(stderr, "Failed to fetch TimelogBusyError\n");
         return -1;
     }
 
@@ -112,8 +122,14 @@ static int tlpy_init_python_full(void)
 
 static int tlpy_finalize_python(void)
 {
+    if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
+        PyErr_Clear();
+    }
+    Py_CLEAR(test_timelog_busy_error);
+    Py_CLEAR(test_timelog_type);
     Py_XDECREF(test_module);
     test_module = NULL;
+    test_module_state = NULL;
     return Py_FinalizeEx();
 }
 
@@ -235,19 +251,7 @@ static PyTimelog* create_timelog_custom(const char* maint_mode,
         Py_DECREF(val);
     }
 
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -300,7 +304,7 @@ static PyTimelog* create_timelog_custom_with_memtable(const char* maint_mode,
         Py_DECREF(val);
     }
 
-    PyObject* obj = PyObject_Call((PyObject*)&PyTimelog_Type, args, kwargs);
+    PyObject* obj = PyObject_Call(test_timelog_type, args, kwargs);
     Py_DECREF(kwargs);
     Py_DECREF(args);
 
@@ -556,8 +560,8 @@ TEST(dealloc_with_pins_warning)
     ASSERT_NOT_NULL(tl);
 
     /* Simulate active snapshot by incrementing pins */
-    tl_py_pins_enter(&tl->handle_ctx);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    tl_py_pins_enter(tl->handle_ctx);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /*
      * Dealloc without releasing pins.
@@ -696,8 +700,7 @@ TEST(ebusy_raise_exception)
     ASSERT_NOT_NULL(tl);
     ASSERT_EQ(tl->busy_policy, TL_PY_BUSY_RAISE);
 
-    /* Verify TlPy_TimelogBusyError is initialized */
-    ASSERT(TlPy_TimelogBusyError != NULL);
+    ASSERT(test_timelog_busy_error != NULL);
 
     close_and_dealloc(tl);
 }
@@ -730,7 +733,7 @@ TEST(ebusy_raise_triggers_exception)
         Py_DECREF(args);
 
         if (result == NULL) {
-            if (PyErr_ExceptionMatches(TlPy_TimelogBusyError)) {
+            if (PyErr_ExceptionMatches(test_timelog_busy_error)) {
                 PyErr_Clear();
                 saw_busy = true;
                 break;
@@ -860,14 +863,14 @@ TEST(ebusy_extend_partial_commit)
 
 TEST(error_mapping_overflow)
 {
-    PyObject* res = TlPy_RaiseFromStatus(TL_EOVERFLOW);
+    PyObject* res = TlPy_RaiseFromState(test_module_state, TL_EOVERFLOW);
     ASSERT_NULL(res);
     ASSERT_EXCEPTION(PyExc_OverflowError);
 }
 
 TEST(error_mapping_enomem)
 {
-    PyObject* res = TlPy_RaiseFromStatus(TL_ENOMEM);
+    PyObject* res = TlPy_RaiseFromState(test_module_state, TL_ENOMEM);
     ASSERT_NULL(res);
     ASSERT_EXCEPTION(PyExc_MemoryError);
 }

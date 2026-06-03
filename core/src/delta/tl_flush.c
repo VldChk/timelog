@@ -23,23 +23,19 @@ void tl_merge_iter_init(tl_merge_iter_t* it,
 const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it) {
     TL_ASSERT(it != NULL);
 
-    /* If 'a' is exhausted, peek from 'b' */
     if (it->a_pos >= it->a_len) {
         if (it->b_pos >= it->b_len) {
-            return NULL; /* Both exhausted */
+            return NULL;
         }
         return &it->b[it->b_pos];
     }
 
-    /* If 'b' is exhausted, peek from 'a' */
     if (it->b_pos >= it->b_len) {
         return &it->a[it->a_pos];
     }
 
-    /*
-     * Both have elements: compare timestamps.
-     * Stable merge: prefer 'a' on equal timestamps.
-     */
+    /* Stable merge: ties resolved in favour of 'a' so callers see a deterministic
+     * ordering even when both sources contain the same timestamp. */
     if (it->a[it->a_pos].ts <= it->b[it->b_pos].ts) {
         return &it->a[it->a_pos];
     }
@@ -49,25 +45,19 @@ const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it) {
 const tl_record_t* tl_merge_iter_next(tl_merge_iter_t* it) {
     TL_ASSERT(it != NULL);
 
-    /* If 'a' is exhausted, take from 'b' */
     if (it->a_pos >= it->a_len) {
         if (it->b_pos >= it->b_len) {
-            return NULL; /* Both exhausted */
+            return NULL;
         }
         return &it->b[it->b_pos++];
     }
 
-    /* If 'b' is exhausted, take from 'a' */
     if (it->b_pos >= it->b_len) {
         return &it->a[it->a_pos++];
     }
 
-    /*
-     * Both have elements: compare timestamps.
-     * Stable merge: prefer 'a' (run) on equal timestamps.
-     * This preserves insertion order: in-order records before OOO records
-     * with the same timestamp.
-     */
+    /* Stable merge: 'a' (in-order run) wins ties against 'b' (OOO records) so
+     * that records with identical timestamps emerge in insertion order. */
     if (it->a[it->a_pos].ts <= it->b[it->b_pos].ts) {
         return &it->a[it->a_pos++];
     } else {
@@ -103,17 +93,18 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     *out_dropped = NULL;
     *out_dropped_len = 0;
 
-    /* Step 1: Overflow check for total record count */
+    /* Reject before allocating: the combined record count must fit in size_t,
+     * otherwise the merge buffer sizing below would silently wrap. */
     if (mr->run_len > SIZE_MAX - mr->ooo_total_len) {
         return TL_EOVERFLOW;
     }
 
     size_t total_records = mr->run_len + mr->ooo_total_len;
 
-    /* Step 2: Handle tombstone-only case */
     if (total_records == 0) {
         if (mr->tombs_len > 0) {
-            /* Tombstone-only segment */
+            /* No records survived but tombstones still need to be published so the
+             * read path can suppress matching records from older segments. */
             return tl_segment_build_l0(ctx->alloc,
                                         NULL, 0,
                                         mr->tombs, mr->tombs_len,
@@ -126,12 +117,10 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         }
     }
 
-    /* Step 3: Allocation overflow check */
     if (total_records > SIZE_MAX / sizeof(tl_record_t)) {
         return TL_EOVERFLOW;
     }
 
-    /* Step 4: Allocate merged buffer */
     size_t merged_size = total_records * sizeof(tl_record_t);
     tl_record_t* merged = tl__malloc(ctx->alloc, merged_size);
     if (merged == NULL) {
@@ -142,7 +131,9 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     size_t dropped_len = 0;
     size_t dropped_cap = 0;
 
-    /* Step 5: K-way merge (stable: run first, then OOO by gen order) */
+    /* Stable k-way merge across the in-order run and every OOO run. Tie-break
+     * key is the source's tie_id (active_run=0, OOO runs=1..N in generation
+     * order), guaranteeing equal-timestamp records keep their relative order. */
     size_t run_count = mr->ooo_run_count;
     if (run_count > UINT32_MAX - 1) {
         tl__free(ctx->alloc, merged);
@@ -247,8 +238,9 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         if (ctx->tombs.len > 0) {
             tomb_seq = tl_intervals_cursor_max_seq(&tomb_cursor, top->ts);
         }
-        /* Tie semantics: tomb_seq == watermark -> record kept (strict >).
-         * The tombstone was already applied at build time and this record survived. */
+        /* Strict greater-than: a tombstone with seq equal to the source's
+         * watermark was already applied at build time, so the record was
+         * deliberately retained and must survive the merge. */
         if (tomb_seq <= top->watermark) {
             merged[i].ts = top->ts;
             merged[i].handle = top->handle;
@@ -303,7 +295,6 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
 
     size_t kept = i;
 
-    /* Step 6: Build L0 segment */
     if (kept == 0) {
         if (mr->tombs_len > 0) {
             st = tl_segment_build_l0(ctx->alloc,
@@ -327,7 +318,6 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
                                  out_seg);
     }
 
-    /* Step 7: Free merged buffer */
     tl__free(ctx->alloc, merged);
 
     if (st != TL_OK) {

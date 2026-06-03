@@ -9,30 +9,23 @@
 /*===========================================================================
  * K-way Merge Iterator
  *
- * K-way merge over all component iterators (segments, memruns, active).
- * Uses a min-heap to efficiently produce records in sorted order.
+ * Min-heap K-way merge over all component iterators referenced by a
+ * query plan (segment iterators, memrun iterators, the active memview
+ * iterator). Each next() pops the minimum-timestamp entry, advances the
+ * source it came from, and pushes the replacement entry.
  *
- * NOTE: This is distinct from tl_merge_iter_t in tl_flush.h, which is
- * a simple two-way merge used during flush. This is a K-way merge for
- * the read path query execution.
- *
- * The merge iterator takes a query plan as input. The plan contains
- * initialized iterators for all sources that overlap the query range.
- *
- * Algorithm:
- * 1. Initialize: prime each source iterator with next(), push onto heap
- * 2. On next(): pop minimum, output record, advance source, push replacement
- * 3. Continue until heap is empty
+ * Distinct from the simple two-way merge used by flush; that lives in
+ * tl_flush.h and is unrelated.
  *
  * Tie-Breaking (implementation detail, not a public guarantee):
- * - On timestamp ties, sources are ordered by tie_break_key (priority assigned
- *   by the query plan, not necessarily the iterator array index)
- * - This provides deterministic results for testing, but clients must not
- *   depend on tie-break ordering - it may change in future versions
+ * - On timestamp ties, sources are ordered by tie_break_key (priority
+ *   assigned by the query plan, not the iterator array index).
+ * - This is deterministic for tests but may change between versions;
+ *   clients must not depend on the ordering.
  *
  * Thread Safety:
- * - Not thread-safe (each thread needs its own iterator)
- * - Plan must remain valid for the lifetime of the iterator
+ * - Not thread-safe (each thread needs its own iterator).
+ * - Plan must remain valid for the lifetime of the iterator.
  *===========================================================================*/
 
 typedef struct tl_kmerge_iter {

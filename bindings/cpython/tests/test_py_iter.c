@@ -3,7 +3,7 @@
  * @brief Unit tests for PyTimelogIter CPython extension
  *
  * TDD-driven tests for the PyTimelogIter iterator type.
- * Tests run with Python initialized and GIL held.
+ * Tests run with Python initialized on an attached Python thread state.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -13,6 +13,7 @@
 #include "timelogpy/py_iter.h"
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
 
 #include <stdio.h>
@@ -80,6 +81,59 @@ static void tlpy_init_python(void)
 static int tlpy_finalize_python(void)
 {
     return Py_FinalizeEx();
+}
+
+static PyObject* test_module = NULL;
+static PyObject* test_timelog_type = NULL;
+static PyObject* test_timelog_iter_type = NULL;
+static PyObject* test_timelog_error = NULL;
+
+static int tlpy_init_test_module(void)
+{
+    PyObject* modules = NULL;
+
+    test_module = TlPy_Test_CreateModule();
+    if (test_module == NULL) {
+        return -1;
+    }
+
+    if (TlPy_Test_ExecModule(test_module) < 0) {
+        return -1;
+    }
+
+    modules = PyImport_GetModuleDict();
+    if (modules != NULL) {
+        if (PyDict_DelItemString(modules, "timelog._timelog") < 0) {
+            PyErr_Clear();
+        }
+    }
+
+    test_timelog_type = PyObject_GetAttrString(test_module, "Timelog");
+    test_timelog_iter_type = PyObject_GetAttrString(test_module, "TimelogIter");
+    test_timelog_error = PyObject_GetAttrString(test_module, "TimelogError");
+    if (test_timelog_type == NULL ||
+        test_timelog_iter_type == NULL ||
+        test_timelog_error == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void tlpy_clear_test_module(void)
+{
+    PyObject* modules = PyImport_GetModuleDict();
+
+    if (modules != NULL) {
+        if (PyDict_DelItemString(modules, "timelog._timelog") < 0) {
+            PyErr_Clear();
+        }
+    }
+
+    Py_CLEAR(test_timelog_error);
+    Py_CLEAR(test_timelog_iter_type);
+    Py_CLEAR(test_timelog_type);
+    Py_CLEAR(test_module);
 }
 
 #define TEST(name) \
@@ -173,21 +227,7 @@ static PyTimelog* create_timelog_default(void)
         return NULL;
     }
 
-    /* Allocate object */
-    PyTimelog* self = (PyTimelog*)PyTimelog_Type.tp_alloc(&PyTimelog_Type, 0);
-    if (self == NULL) {
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
-
-    /* Initialize */
-    if (PyTimelog_Type.tp_init((PyObject*)self, args, kwargs) < 0) {
-        Py_DECREF(self);
-        Py_DECREF(args);
-        Py_DECREF(kwargs);
-        return NULL;
-    }
+    PyTimelog* self = (PyTimelog*)PyObject_Call(test_timelog_type, args, kwargs);
 
     Py_DECREF(args);
     Py_DECREF(kwargs);
@@ -288,7 +328,7 @@ TEST(direct_instantiation_blocked)
     ASSERT_NOT_NULL(args);
 
     /* Try to call TimelogIter() */
-    PyObject* result = PyObject_Call((PyObject*)&PyTimelogIter_Type, args, NULL);
+    PyObject* result = PyObject_Call(test_timelog_iter_type, args, NULL);
 
     /* Should fail with TypeError */
     ASSERT_NULL(result);
@@ -339,7 +379,7 @@ TEST(range_basic)
     Py_DECREF(range_method);
 
     ASSERT_NOT_NULL(iter);
-    ASSERT(PyTimelogIter_Check(iter));
+    ASSERT(PyObject_TypeCheck(iter, (PyTypeObject*)test_timelog_iter_type));
 
     /* Iterate and count */
     int count = 0;
@@ -514,7 +554,7 @@ TEST(iter_on_closed_timelog)
     PyObject* iter = PyObject_Call(range_method, args, NULL);
 
     ASSERT_NULL(iter);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     Py_DECREF(args);
     Py_DECREF(t2);
@@ -757,7 +797,7 @@ TEST(close_drops_pin)
     ASSERT_NOT_NULL(tl);
 
     /* Initial pins should be 0 */
-    uint64_t initial_pins = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t initial_pins = tl_py_pins_count(tl->handle_ctx);
     ASSERT_EQ(initial_pins, 0);
 
     PyObject* obj = PyDict_New();
@@ -771,7 +811,7 @@ TEST(close_drops_pin)
     Py_DECREF(range_method);
 
     ASSERT_NOT_NULL(iter);
-    uint64_t pins_with_iter = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t pins_with_iter = tl_py_pins_count(tl->handle_ctx);
     ASSERT_EQ(pins_with_iter, 1);
 
     /* Close iterator - pins should be 0 */
@@ -780,7 +820,7 @@ TEST(close_drops_pin)
     Py_XDECREF(close_result);
     Py_DECREF(close_method);
 
-    uint64_t pins_after_close = tl_py_pins_count(&tl->handle_ctx);
+    uint64_t pins_after_close = tl_py_pins_count(tl->handle_ctx);
     ASSERT_EQ(pins_after_close, 0);
 
     Py_DECREF(iter);
@@ -918,7 +958,7 @@ TEST(exhaust_clears_resources)
     Py_DECREF(range_method);
 
     ASSERT_NOT_NULL(iter);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /* Exhaust the iterator */
     PyObject* item;
@@ -927,7 +967,7 @@ TEST(exhaust_clears_resources)
     }
 
     /* After exhaustion, pins should be 0 */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 0);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 0);
 
     Py_DECREF(iter);
     Py_DECREF(obj);
@@ -951,7 +991,7 @@ TEST(two_iterators_two_pins)
     append_record(tl, 2, obj);
 
     /* Initial pins: 0 */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 0);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 0);
 
     /* Create first iterator */
     PyObject* range_method = PyObject_GetAttrString((PyObject*)tl, "range");
@@ -959,7 +999,7 @@ TEST(two_iterators_two_pins)
     PyObject* iter1 = PyObject_Call(range_method, args1, NULL);
     Py_DECREF(args1);
     ASSERT_NOT_NULL(iter1);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /* Create second iterator */
     PyObject* args2 = make_range_args(0, 100);
@@ -967,7 +1007,7 @@ TEST(two_iterators_two_pins)
     Py_DECREF(args2);
     Py_DECREF(range_method);
     ASSERT_NOT_NULL(iter2);
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 2);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 2);
 
     /* Both iterators work */
     PyObject* item1 = PyIter_Next(iter1);
@@ -1010,7 +1050,7 @@ TEST(close_one_keeps_other)
     Py_DECREF(range_method);
     ASSERT_NOT_NULL(iter2);
 
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 2);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 2);
 
     /* Close iter1 */
     PyObject* close_method = PyObject_GetAttrString(iter1, "close");
@@ -1019,7 +1059,7 @@ TEST(close_one_keeps_other)
     Py_DECREF(close_method);
 
     /* Pins drops to 1 */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /* iter2 still works */
     int count = 0;
@@ -1031,7 +1071,7 @@ TEST(close_one_keeps_other)
     ASSERT_EQ(count, 2);
 
     /* Now pins is 0 (iter2 exhausted) */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 0);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 0);
 
     Py_DECREF(iter1);
     Py_DECREF(iter2);
@@ -1110,13 +1150,13 @@ TEST(close_timelog_with_live_iterator)
     ASSERT_NOT_NULL(iter);
 
     /* Verify pins are active */
-    ASSERT_EQ(tl_py_pins_count(&tl->handle_ctx), 1);
+    ASSERT_EQ(tl_py_pins_count(tl->handle_ctx), 1);
 
     /* Attempt to close Timelog - should fail with TimelogError */
     PyObject* close_method = PyObject_GetAttrString((PyObject*)tl, "close");
     PyObject* close_result = PyObject_CallNoArgs(close_method);
     ASSERT_NULL(close_result);
-    ASSERT_EXCEPTION(TlPy_TimelogError);
+    ASSERT_EXCEPTION(test_timelog_error);
 
     /* Timelog should still be open */
     ASSERT(!tl->closed);
@@ -1507,15 +1547,6 @@ TEST(next_batch_alloc_failure_is_fail_closed)
  * Test Runner
  *===========================================================================*/
 
-/* Module definition for test harness */
-static struct PyModuleDef test_module_def = {
-    PyModuleDef_HEAD_INIT,
-    "_timelog_iter_test",
-    NULL,
-    -1,
-    NULL
-};
-
 int main(int argc, char* argv[])
 {
     (void)argc;
@@ -1524,23 +1555,8 @@ int main(int argc, char* argv[])
     /* Initialize Python */
     tlpy_init_python();
 
-    /* Initialize error types first */
-    PyObject* module = PyModule_Create(&test_module_def);
-
-    if (TlPy_InitErrors(module) < 0) {
+    if (tlpy_init_test_module() < 0) {
         fprintf(stderr, "Failed to initialize error types\n");
-        return 1;
-    }
-
-    /* Initialize PyTimelog type */
-    if (PyType_Ready(&PyTimelog_Type) < 0) {
-        fprintf(stderr, "Failed to initialize PyTimelog type\n");
-        return 1;
-    }
-
-    /* Initialize PyTimelogIter type */
-    if (PyType_Ready(&PyTimelogIter_Type) < 0) {
-        fprintf(stderr, "Failed to initialize PyTimelogIter type\n");
         return 1;
     }
 
@@ -1597,7 +1613,7 @@ int main(int argc, char* argv[])
 
     printf("\n%d tests run, %d failed\n", tests_run, tests_failed);
 
-    Py_DECREF(module);
+    tlpy_clear_test_module();
 
     /* Finalize Python */
     if (tlpy_finalize_python() < 0) {

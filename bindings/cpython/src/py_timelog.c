@@ -24,6 +24,7 @@
 #include "timelogpy/py_span_iter.h"  /* PageSpan factory */
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_errors.h"
+#include "timelogpy/py_module_state.h"
 #include "timelogpy/py_compat.h"
 #include "timelog/timelog.h"
 
@@ -32,27 +33,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <math.h>
-
-/*===========================================================================
- * Exception Preservation Helpers
- *===========================================================================*/
-
-#if PY_VERSION_HEX >= 0x030C0000
-#define TL_PY_PRESERVE_EXC_BEGIN \
-    PyObject *tl_py_saved_exc = PyErr_GetRaisedException()
-#define TL_PY_PRESERVE_EXC_END \
-    PyErr_SetRaisedException(tl_py_saved_exc)
-#else
-#define TL_PY_PRESERVE_EXC_BEGIN \
-    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL; \
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb)
-#define TL_PY_PRESERVE_EXC_END \
-    PyErr_Restore(exc_type, exc_value, exc_tb)
-#endif
-
-/*===========================================================================
- * Finalization Helpers (Python 3.12+)
- *===========================================================================*/
+#include <assert.h>
 
 /*===========================================================================
  * Forward Declarations
@@ -76,7 +57,106 @@ static tl_status_t tl_py_core_call_best_effort(PyTimelog* self,
                                                 tl_py_core_call_fn fn);
 
 /* Internal non-throwing close helper */
-static void pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
+static uint64_t pytimelog_close_no_raise(PyTimelog* self, int from_finalizer);
+static void tl_py_timelog_drop_handle_ctx(PyTimelog* self);
+static void tl_py_timelog_drop_engine_ctx(PyTimelog* self);
+
+#define TL_PY_RAISE_STATUS(self, status) \
+    TlPy_RaiseFromObject((PyObject*)(self), (status))
+
+#define TL_PY_RAISE_STATUS_FMT(self, status, ...) \
+    TlPy_RaiseFromObjectFmt((PyObject*)(self), (status), __VA_ARGS__)
+
+static void tl_py_timelog_drop_handle_ctx(PyTimelog* self)
+{
+    if (self == NULL) {
+        return;
+    }
+    /* Atomically detach so this is consistent with the atomic field used by
+     * the lock-free mutation/maintenance capture paths. */
+    tl_py_handle_ctx_t* ctx =
+        atomic_exchange_explicit(&self->handle_ctx, NULL, memory_order_acq_rel);
+    if (ctx == NULL) {
+        return;
+    }
+    tl_py_handle_ctx_decref(ctx);
+}
+
+tl_py_engine_ctx_t* tl_py_engine_ctx_new(tl_timelog_t* tl)
+{
+    tl_py_engine_ctx_t* ctx = PyMem_Malloc(sizeof(*ctx));
+    if (ctx == NULL) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+
+    atomic_init(&ctx->refcnt, 1);
+    ctx->tl = tl;
+    return ctx;
+}
+
+void tl_py_engine_ctx_incref(tl_py_engine_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    atomic_fetch_add_explicit(&ctx->refcnt, 1, memory_order_relaxed);
+}
+
+void tl_py_engine_ctx_close(tl_py_engine_ctx_t* ctx, int allow_threads)
+{
+    if (ctx == NULL || ctx->tl == NULL) {
+        return;
+    }
+
+    tl_timelog_t* tl = ctx->tl;
+    ctx->tl = NULL;
+
+    if (allow_threads) {
+        Py_BEGIN_ALLOW_THREADS
+        tl_close(tl);
+        Py_END_ALLOW_THREADS
+    } else {
+        tl_close(tl);
+    }
+}
+
+void tl_py_engine_ctx_decref(tl_py_engine_ctx_t* ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+
+    uint64_t old_refcnt = atomic_fetch_sub_explicit(
+        &ctx->refcnt, 1, memory_order_acq_rel);
+
+#ifndef NDEBUG
+    assert(old_refcnt > 0 && "engine context refcount underflow");
+#endif
+
+    if (old_refcnt != 1) {
+        return;
+    }
+
+    /*
+     * During interpreter finalization this may join the core maintenance
+     * worker without releasing the current Python thread state. The core
+     * worker must remain Python-agnostic and must never call Python C-API.
+     */
+    tl_py_engine_ctx_close(ctx, !TL_PY_IS_FINALIZING());
+    PyMem_Free(ctx);
+}
+
+static void tl_py_timelog_drop_engine_ctx(PyTimelog* self)
+{
+    if (self == NULL || self->engine_ctx == NULL) {
+        return;
+    }
+
+    tl_py_engine_ctx_t* ctx = self->engine_ctx;
+    self->engine_ctx = NULL;
+    tl_py_engine_ctx_decref(ctx);
+}
 
 /*===========================================================================
  * Config Parsing Helpers
@@ -207,7 +287,7 @@ static int tl_py_validate_ts(long long v, const char* name)
 static int tl_py_handle_write_ebusy(PyTimelog* self, const char* msg)
 {
     if (self->busy_policy == TL_PY_BUSY_RAISE) {
-        PyErr_SetString(TlPy_TimelogBusyError, msg);
+        TL_PY_RAISE_STATUS_FMT(self, TL_EBUSY, "%s", msg);
         return -1;
     }
 
@@ -234,10 +314,57 @@ int tl_py_lock_checked(PyTimelog* self)
     TL_PY_LOCK(self);
     if (self->closed || self->tl == NULL) {
         TL_PY_UNLOCK(self);
-        TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
+        TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE, "Timelog is closed");
         return -1;
     }
     return 0;
+}
+
+/*
+ * Capture an OWNED reference to handle_ctx while core_lock is already held by
+ * the caller. The owned ref keeps the context (and its live/retired tables)
+ * alive across post-unlock bookkeeping even if a concurrent close() drops the
+ * canonical reference. Returns NULL if the context has already been dropped.
+ *
+ * Pairs with tl_py_handle_ctx_decref(), which the caller MUST invoke once the
+ * bookkeeping is complete (with no locks held — the final decref may run the
+ * live-table teardown, which performs Py_DECREF).
+ */
+static tl_py_handle_ctx_t* tl_py_own_handle_ctx_locked(PyTimelog* self)
+{
+    tl_py_handle_ctx_t* h =
+        atomic_load_explicit(&self->handle_ctx, memory_order_acquire);
+    if (h != NULL) {
+        tl_py_handle_ctx_incref(h);
+    }
+    return h;
+}
+
+/*
+ * Same, but acquires core_lock itself. For paths (flush/compact/maintenance)
+ * that release the lock inside a core-call helper before draining.
+ */
+static tl_py_handle_ctx_t* tl_py_acquire_owned_handle_ctx(PyTimelog* self)
+{
+    TL_PY_LOCK(self);
+    tl_py_handle_ctx_t* h = tl_py_own_handle_ctx_locked(self);
+    TL_PY_UNLOCK(self);
+    return h;
+}
+
+/*
+ * Opportunistic post-core-call drain. Own a handle_ctx reference (so a
+ * concurrent close() cannot free it mid-drain), drain retired Python refs
+ * best-effort (force=0), then drop the reference. Runs with no lock held:
+ * the drain may Py_DECREF, so it must never be called under core_lock.
+ */
+static void tl_py_drain_owned(PyTimelog* self)
+{
+    tl_py_handle_ctx_t* dctx = tl_py_acquire_owned_handle_ctx(self);
+    if (dctx != NULL) {
+        tl_py_drain_retired(dctx, 0);
+        tl_py_handle_ctx_decref(dctx);
+    }
 }
 
 static int
@@ -284,6 +411,78 @@ tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
     }
 
     return st;
+}
+
+/*
+ * Acquire a consistent snapshot with all lifetime guards taken atomically
+ * under core_lock — without the lock, a concurrent close() could free
+ * handle_ctx or engine_ctx in the window between checking the open state
+ * and pinning them.
+ *
+ * Under the lock we:
+ *   - own a reference on handle_ctx (so drain bookkeeping survives the
+ *     unlock even if close() nulls self->handle_ctx);
+ *   - own a reference on engine_ctx (so the core tl_timelog_t cannot be
+ *     freed by a concurrent close's final engine_ctx_decref while our
+ *     snapshot still points into it — tl_close asserts snapshot_count==0);
+ *   - enter the pin (blocks retired-object drain while the snapshot lives);
+ *   - acquire the snapshot itself.
+ *
+ * On success returns 0 and the caller owns (snap, hctx, ectx); it MUST
+ * release them via tl_py_release_snapshot_pinned(). On failure returns -1
+ * with a Python exception set and no guards held.
+ */
+static int tl_py_acquire_snapshot_pinned(PyTimelog* self,
+                                         tl_snapshot_t** out_snap,
+                                         tl_py_handle_ctx_t** out_hctx,
+                                         tl_py_engine_ctx_t** out_ectx)
+{
+    *out_snap = NULL;
+    *out_hctx = NULL;
+    *out_ectx = NULL;
+
+    if (tl_py_lock_checked(self) < 0) {
+        return -1;
+    }
+
+    /* Under core_lock: self->handle_ctx / engine_ctx / tl are all stable. */
+    tl_py_handle_ctx_t* hctx =
+        atomic_load_explicit(&self->handle_ctx, memory_order_acquire);
+    tl_py_engine_ctx_t* ectx = self->engine_ctx;
+    tl_py_handle_ctx_incref(hctx);
+    tl_py_engine_ctx_incref(ectx);
+    tl_py_pins_enter(hctx);
+
+    tl_status_t st = tl_snapshot_acquire(self->tl, out_snap);
+    TL_PY_UNLOCK(self);
+
+    if (st != TL_OK) {
+        tl_py_pins_exit_and_maybe_drain(hctx);
+        tl_py_engine_ctx_decref(ectx);
+        tl_py_handle_ctx_decref(hctx);
+        TL_PY_RAISE_STATUS(self, st);
+        return -1;
+    }
+
+    *out_hctx = hctx;
+    *out_ectx = ectx;
+    return 0;
+}
+
+static void tl_py_release_snapshot_pinned(tl_snapshot_t* snap,
+                                          tl_py_handle_ctx_t* hctx,
+                                          tl_py_engine_ctx_t* ectx)
+{
+    /* Order: release the snapshot first (drops engine snapshot_count) so
+     * that if our engine_ctx_decref below is the last ref and triggers
+     * tl_close, snapshot_count is already 0. Then exit the pin (may drain),
+     * then drop the ctx refs. None of this runs under core_lock. */
+    if (snap != NULL) {
+        tl_snapshot_release(snap);
+    }
+    tl_py_pins_exit_and_maybe_drain(hctx);
+    tl_py_engine_ctx_decref(ectx);
+    tl_py_handle_ctx_decref(hctx);
 }
 
 /*===========================================================================
@@ -378,13 +577,36 @@ static int
 PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 {
     /* Re-init not allowed. */
-    if (self->tl != NULL) {
+    if (atomic_load_explicit(&self->tl, memory_order_acquire) != NULL) {
         PyErr_SetString(PyExc_TypeError, "Timelog already initialized");
         return -1;
     }
 
-    self->core_lock = NULL;
-    self->weakreflist = NULL;
+    /* Keep partially initialized and facade-reopened instances observably
+     * closed until every lifetime guard (handle_ctx, engine_ctx, core_lock)
+     * has been installed. A subclass can leak `self` from __new__ under a
+     * free-threaded build; methods seeing this object during __init__ must
+     * fail closed rather than running with a half-published core pointer. */
+    atomic_store_explicit(&self->closed, 1, memory_order_release);
+
+    /* core_lock is per-PyObject, not per-engine. A closed instance may be
+     * reopened by the Python facade, so preserve an existing lock instead of
+     * losing its pointer and leaking it. Fresh tp_alloc memory is already
+     * zeroed, so new instances still start with core_lock == NULL. */
+    atomic_store_explicit(&self->handle_ctx, NULL, memory_order_release);
+    self->engine_ctx = NULL;
+
+    if (TlPy_StateFromObject((PyObject*)self) == NULL) {
+        return -1;
+    }
+
+    if (self->core_lock == NULL) {
+        self->core_lock = PyThread_allocate_lock();
+        if (self->core_lock == NULL) {
+            PyErr_NoMemory();
+            return -1;
+        }
+    }
 
     enum {
         KW_TIME_UNIT = 0,
@@ -654,12 +876,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     uint32_t drain_limit = (drain_batch_limit == PY_SSIZE_T_MIN) ? 0
         : (uint32_t)drain_batch_limit;
 
-    /* Initialize handle context first */
-    tl_status_t st = tl_py_handle_ctx_init(&self->handle_ctx, drain_limit);
-    if (st != TL_OK) {
-        TlPy_RaiseFromStatus(st);
+    /* Initialize handle context first. */
+    tl_py_handle_ctx_t* hctx = tl_py_handle_ctx_new(drain_limit);
+    if (hctx == NULL) {
         return -1;
     }
+    atomic_store_explicit(&self->handle_ctx, hctx, memory_order_release);
 
     /* Build tl_config_t */
     tl_config_t cfg;
@@ -668,32 +890,32 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     /* Parse and apply time_unit */
     int time_unit_set;
     if (parse_time_unit(time_unit_str, &cfg.time_unit, &time_unit_set) < 0) {
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
+        tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
 
     /* Parse and apply maintenance mode */
     if (parse_maint_mode(maint_str, &cfg.maintenance_mode) < 0) {
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
+        tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
 
     /* Parse and apply busy_policy */
     if (parse_busy_policy(busy_policy_str, &self->busy_policy) < 0) {
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
+        tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
 
     /* Apply numeric overrides with range/overflow validation. */
     if (memtable_max_bytes != PY_SSIZE_T_MIN) {
         if (memtable_max_bytes < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "memtable_max_bytes must be >= 0");
             return -1;
         }
         if ((size_t)memtable_max_bytes != (uint64_t)memtable_max_bytes) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "memtable_max_bytes too large for this platform");
             return -1;
@@ -702,13 +924,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
     if (target_page_bytes != PY_SSIZE_T_MIN) {
         if (target_page_bytes < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "target_page_bytes must be >= 0");
             return -1;
         }
         if ((size_t)target_page_bytes != (uint64_t)target_page_bytes) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "target_page_bytes too large for this platform");
             return -1;
@@ -717,13 +939,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
     if (sealed_max_runs != PY_SSIZE_T_MIN) {
         if (sealed_max_runs < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "sealed_max_runs must be >= 0");
             return -1;
         }
         if ((size_t)sealed_max_runs != (uint64_t)sealed_max_runs) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "sealed_max_runs too large for this platform");
             return -1;
@@ -733,13 +955,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (ooo_budget_bytes != PY_SSIZE_T_MIN) {
         if (ooo_budget_bytes < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "ooo_budget_bytes must be >= 0");
             return -1;
         }
         if ((size_t)ooo_budget_bytes != (uint64_t)ooo_budget_bytes) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "ooo_budget_bytes too large for this platform");
             return -1;
@@ -749,7 +971,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (sealed_wait_ms != PY_SSIZE_T_MIN) {
         if (sealed_wait_ms < 0 || (uint64_t)sealed_wait_ms > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "sealed_wait_ms must be 0-4294967295");
             return -1;
@@ -759,7 +981,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (maintenance_wakeup_ms != PY_SSIZE_T_MIN) {
         if (maintenance_wakeup_ms < 0 || (uint64_t)maintenance_wakeup_ms > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "maintenance_wakeup_ms must be 0-4294967295");
             return -1;
@@ -769,13 +991,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (max_delta_segments != PY_SSIZE_T_MIN) {
         if (max_delta_segments < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "max_delta_segments must be >= 0");
             return -1;
         }
         if ((size_t)max_delta_segments != (uint64_t)max_delta_segments) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "max_delta_segments too large for this platform");
             return -1;
@@ -785,7 +1007,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (window_size != LLONG_MIN) {
         if (window_size < 0 || window_size > (long long)TL_TS_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "window_size must be in [0, INT64_MAX]");
             return -1;
@@ -796,7 +1018,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     if (window_origin != LLONG_MIN) {
         if (window_origin < (long long)TL_TS_MIN ||
             window_origin > (long long)TL_TS_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "window_origin out of int64 range");
             return -1;
@@ -806,13 +1028,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (delete_debt_threshold_set) {
         if (!isfinite(delete_debt_threshold)) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "delete_debt_threshold must be finite");
             return -1;
         }
         if (delete_debt_threshold < 0.0 || delete_debt_threshold > 1.0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "delete_debt_threshold must be in [0.0, 1.0]");
             return -1;
@@ -822,13 +1044,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (compaction_target_bytes != PY_SSIZE_T_MIN) {
         if (compaction_target_bytes < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "compaction_target_bytes must be >= 0");
             return -1;
         }
         if ((size_t)compaction_target_bytes != (uint64_t)compaction_target_bytes) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_OverflowError,
                 "compaction_target_bytes too large for this platform");
             return -1;
@@ -838,7 +1060,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (max_compaction_inputs != PY_SSIZE_T_MIN) {
         if (max_compaction_inputs < 0 || (uint64_t)max_compaction_inputs > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "max_compaction_inputs must be 0-4294967295");
             return -1;
@@ -848,7 +1070,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (max_compaction_windows != PY_SSIZE_T_MIN) {
         if (max_compaction_windows < 0 || (uint64_t)max_compaction_windows > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "max_compaction_windows must be 0-4294967295");
             return -1;
@@ -858,7 +1080,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_target_records != PY_SSIZE_T_MIN) {
         if (adaptive_target_records < 0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_target_records must be >= 0");
             return -1;
@@ -868,7 +1090,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_min_window != LLONG_MIN) {
         if (adaptive_min_window < 0 || adaptive_min_window > (long long)TL_TS_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_min_window must be in [0, INT64_MAX]");
             return -1;
@@ -878,7 +1100,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_max_window != LLONG_MIN) {
         if (adaptive_max_window < 0 || adaptive_max_window > (long long)TL_TS_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_max_window must be in [0, INT64_MAX]");
             return -1;
@@ -888,7 +1110,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_hysteresis_pct != PY_SSIZE_T_MIN) {
         if (adaptive_hysteresis_pct < 0 || (uint64_t)adaptive_hysteresis_pct > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_hysteresis_pct must be 0-4294967295");
             return -1;
@@ -898,7 +1120,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_window_quantum != LLONG_MIN) {
         if (adaptive_window_quantum < 0 || adaptive_window_quantum > (long long)TL_TS_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_window_quantum must be in [0, INT64_MAX]");
             return -1;
@@ -908,13 +1130,13 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_alpha_set) {
         if (!isfinite(adaptive_alpha)) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_alpha must be finite");
             return -1;
         }
         if (adaptive_alpha < 0.0 || adaptive_alpha > 1.0) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_alpha must be in [0.0, 1.0]");
             return -1;
@@ -924,7 +1146,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_warmup_flushes != PY_SSIZE_T_MIN) {
         if (adaptive_warmup_flushes < 0 || (uint64_t)adaptive_warmup_flushes > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_warmup_flushes must be 0-4294967295");
             return -1;
@@ -934,7 +1156,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     if (adaptive_stale_flushes != PY_SSIZE_T_MIN) {
         if (adaptive_stale_flushes < 0 || (uint64_t)adaptive_stale_flushes > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_stale_flushes must be 0-4294967295");
             return -1;
@@ -945,7 +1167,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     if (adaptive_failure_backoff_threshold != PY_SSIZE_T_MIN) {
         if (adaptive_failure_backoff_threshold < 0 ||
             (uint64_t)adaptive_failure_backoff_threshold > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_failure_backoff_threshold must be 0-4294967295");
             return -1;
@@ -957,7 +1179,7 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     if (adaptive_failure_backoff_pct != PY_SSIZE_T_MIN) {
         if (adaptive_failure_backoff_pct < 0 ||
             (uint64_t)adaptive_failure_backoff_pct > UINT32_MAX) {
-            tl_py_handle_ctx_destroy(&self->handle_ctx);
+            tl_py_timelog_drop_handle_ctx(self);
             PyErr_SetString(PyExc_ValueError,
                 "adaptive_failure_backoff_pct must be 0-4294967295");
             return -1;
@@ -968,32 +1190,34 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 
     /* Wire up drop callback */
     cfg.on_drop_handle = tl_py_on_drop_handle;
-    cfg.on_drop_ctx = &self->handle_ctx;
+    cfg.on_drop_ctx = hctx;
 
-    /* Open the timelog */
-    st = tl_open(&cfg, &self->tl);
+    /* Open the timelog. tl_open writes its result through a plain
+     * tl_timelog_t** out-parameter; self->tl is _Atomic so we can't take
+     * its address directly (would be UB per C11). Stage through a local
+     * and publish under memory_order_release once the engine is open. */
+    tl_timelog_t* tl_local = NULL;
+    tl_status_t st = tl_open(&cfg, &tl_local);
     if (st != TL_OK) {
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
-        self->tl = NULL;
-        self->closed = 1;
-        TlPy_RaiseFromStatus(st);
+        tl_py_timelog_drop_handle_ctx(self);
+        atomic_store_explicit(&self->tl, NULL, memory_order_release);
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
+        TL_PY_RAISE_STATUS(self, st);
         return -1;
     }
 
-    /* Allocate per-instance core lock */
-    self->core_lock = PyThread_allocate_lock();
-    if (self->core_lock == NULL) {
-        /* Best-effort shutdown on allocation failure */
-        tl_close(self->tl);
-        self->tl = NULL;
-        self->closed = 1;
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
-        PyErr_NoMemory();
+    self->engine_ctx = tl_py_engine_ctx_new(tl_local);
+    if (self->engine_ctx == NULL) {
+        tl_close(tl_local);
+        atomic_store_explicit(&self->tl, NULL, memory_order_release);
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
+        tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
 
     /* Success - store introspection fields */
-    self->closed = 0;
+    atomic_store_explicit(&self->tl, tl_local, memory_order_release);
+    atomic_store_explicit(&self->closed, 0, memory_order_release);
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
 
@@ -1010,61 +1234,99 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
  * Non-throwing close helper (close, finalizer, dealloc).
  * Skips Python handle drain during interpreter finalization.
  */
-static void
+static uint64_t
 pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
 {
     if (self == NULL) {
-        return;
+        return 0;
     }
 
-    /* Idempotence guard */
-    if (self->closed || self->tl == NULL) {
-        return;
+    /* Idempotence guard (unlocked fast path). Gate only on the atomic
+     * lifecycle fields; engine_ctx is a plain pointer written under
+     * core_lock, so reading it unlocked here would be a data race. The
+     * atomic closed/tl loads are sufficient — engine_ctx transitions to
+     * NULL in lockstep with tl under core_lock, and the authoritative
+     * re-check below runs under the lock. */
+    if (atomic_load_explicit(&self->closed, memory_order_acquire) ||
+        atomic_load_explicit(&self->tl, memory_order_acquire) == NULL) {
+        return 0;
     }
     int finalizing = TL_PY_IS_FINALIZING();
     int allow_threads = (!finalizing && !from_finalizer);
+    uint64_t pins = 0;
+    int defer_engine_close = 0;
+    tl_py_engine_ctx_t* engine_ctx = NULL;
+    tl_py_handle_ctx_t* handle_ctx = NULL;
 
     TL_PY_LOCK(self);
-    if (self->closed || self->tl == NULL) {
+    if (self->closed || self->tl == NULL || self->engine_ctx == NULL) {
         TL_PY_UNLOCK(self);
-        return;
+        return 0;
     }
-    self->closed = 1;
-    if (self->tl != NULL) {
-        tl_timelog_t* tl = self->tl;
-        if (allow_threads) {
-            Py_BEGIN_ALLOW_THREADS
-            tl_close(tl);
-            self->tl = NULL;
-            /*
-             * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-             * deadlock: Thread A holds core_lock + wants GIL, Thread B
-             * holds GIL + wants core_lock.
-             */
-            PyThread_release_lock(self->core_lock);
-            Py_END_ALLOW_THREADS
-        } else {
-            /* Keep GIL during interpreter shutdown / finalizer paths. */
-            tl_close(tl);
-            self->tl = NULL;
-            TL_PY_UNLOCK(self);
-        }
-    } else {
+    handle_ctx = atomic_load_explicit(&self->handle_ctx, memory_order_acquire);
+    pins = handle_ctx != NULL ? tl_py_pins_count(handle_ctx) : 0;
+    /*
+     * Finalizer/GC paths must not destroy the core engine while active
+     * snapshots exist. Sample pins while holding core_lock so an iterator
+     * cannot acquire a snapshot between the sample and close detach.
+     * Iterators/PageSpan owners hold engine_ctx refs and will close the
+     * engine after releasing their snapshots. Explicit close() rejects pins
+     * here while holding the same lock used by snapshot acquisition, so it
+     * cannot accidentally detach the contexts after a stale unlocked sample.
+     */
+    if (!from_finalizer && pins != 0) {
         TL_PY_UNLOCK(self);
+        return pins;
+    }
+    defer_engine_close = (pins != 0);
+    atomic_store_explicit(&self->closed, 1, memory_order_release);
+    atomic_store_explicit(&self->tl, NULL, memory_order_release);
+    engine_ctx = self->engine_ctx;
+    self->engine_ctx = NULL;
+    /*
+     * Detach handle_ctx UNDER core_lock as well. Mutation/maintenance paths
+     * capture an owned reference under this same lock before doing post-commit
+     * bookkeeping off the lock, so detaching here means a concurrent path
+     * either captured a ref before us (keeping the context alive until it
+     * decrefs) or sees the field already NULL and skips. Either way there is
+     * no torn field read and no teardown racing in-flight bookkeeping.
+     */
+    atomic_store_explicit(&self->handle_ctx, NULL, memory_order_release);
+    TL_PY_UNLOCK(self);
+
+    if (!defer_engine_close) {
+        tl_py_engine_ctx_close(engine_ctx, allow_threads);
     }
 
-    /* Skip handle drain during interpreter finalization. */
-    if (!finalizing) {
+    tl_py_engine_ctx_decref(engine_ctx);
+
+    /* Degradation metrics read from our captured ref (field already NULL). */
+    uint64_t alloc_failures = handle_ctx != NULL ?
+        tl_py_alloc_failures(handle_ctx) : 0;
+    int live_tracking_failed = 0;
+    if (handle_ctx != NULL) {
+        live_tracking_failed = atomic_load_explicit(
+            &handle_ctx->live_tracking_failed,
+            memory_order_acquire) != 0;
+    }
+
+    /*
+     * Drop the canonical handle_ctx reference. We deliberately do NOT drain
+     * the retired stack or release the live table here: that teardown lives in
+     * the refcount destructor (refcnt -> 0), which by construction runs only
+     * once no other reference is outstanding. If a concurrent mutation or
+     * maintenance path captured an owned ref (under core_lock, above), it keeps
+     * the context alive until it finishes its bookkeeping and decrefs; whoever
+     * drops the last reference triggers teardown with no concurrent access. In
+     * the common single-threaded close, this decref IS the last reference, so
+     * teardown happens synchronously here. PRESERVE_EXC because the destructor
+     * may run Py_DECREF (object finalizers).
+     */
+    if (handle_ctx != NULL) {
         TL_PY_PRESERVE_EXC_BEGIN;
-        tl_py_drain_retired(&self->handle_ctx, 1);
-        tl_py_live_release_all(&self->handle_ctx);
+        tl_py_handle_ctx_decref(handle_ctx);
         TL_PY_PRESERVE_EXC_END;
     }
-
-    uint64_t alloc_failures = tl_py_alloc_failures(&self->handle_ctx);
-    int live_tracking_failed = (self->handle_ctx.live_tracking_failed != 0);
-
-    tl_py_handle_ctx_destroy(&self->handle_ctx);
 
     if (!finalizing && (alloc_failures > 0 || live_tracking_failed)) {
         TL_PY_PRESERVE_EXC_BEGIN;
@@ -1078,36 +1340,44 @@ pytimelog_close_no_raise(PyTimelog* self, int from_finalizer)
         TL_PY_PRESERVE_EXC_END;
     }
 
-    if (self->core_lock) {
-        PyThread_type_lock lk = self->core_lock;
-        self->core_lock = NULL;
-        PyThread_free_lock(lk);
-    }
+    /*
+     * Do NOT free core_lock here. close() runs while the PyTimelog is still
+     * reachable from Python: a concurrent thread can pass the unlocked
+     * preflight in a method, then this thread frees core_lock, then the
+     * other thread's TL_PY_LOCK dereferences freed lock storage (UAF) — or
+     * worse, TL_PY_LOCK becomes a silent no-op (core_lock==NULL) and the
+     * method runs its locked section unsynchronized. core_lock is freed
+     * only in tp_dealloc, when refcount has reached zero and no other thread
+     * can reach the object. After close, methods still acquire the live
+     * lock and bail on the atomic closed flag.
+     */
+    return 0;
 }
 
 static PyObject*
 PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
-    if (self->closed) {
+    if (atomic_load_explicit(&self->closed, memory_order_acquire)) {
         Py_RETURN_NONE;
     }
 
     /* Engine already NULL (partial init failure). */
-    if (self->tl == NULL) {
-        self->closed = 1;
-        tl_py_handle_ctx_destroy(&self->handle_ctx);
+    if (atomic_load_explicit(&self->tl, memory_order_acquire) == NULL) {
+        atomic_store_explicit(&self->closed, 1, memory_order_release);
+        tl_py_timelog_drop_engine_ctx(self);
+        tl_py_timelog_drop_handle_ctx(self);
         Py_RETURN_NONE;
     }
 
-    /* Reject close with active pins to avoid inconsistent state. */
-    uint64_t pins = tl_py_pins_count(&self->handle_ctx);
+    /* Reject close with active pins to avoid inconsistent state. The helper
+     * performs this check under core_lock so the handle context cannot be
+     * detached between loading it and counting pins. */
+    uint64_t pins = pytimelog_close_no_raise(self, 0);
     if (pins != 0) {
-        return TlPy_RaiseFromStatusFmt(TL_ESTATE,
+        return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE,
             "Cannot close: %llu active snapshots/iterators",
             (unsigned long long)pins);
     }
-
-    pytimelog_close_no_raise(self, 0);
 
     Py_RETURN_NONE;
 }
@@ -1121,27 +1391,19 @@ static void
 PyTimelog_finalize(PyObject* self_obj)
 {
     PyTimelog* self = (PyTimelog*)self_obj;
-#if PY_VERSION_HEX >= 0x030C0000
-    PyObject* exc = PyErr_GetRaisedException();
+    TL_PY_PRESERVE_EXC_BEGIN;
     pytimelog_close_no_raise(self, 1);
     if (PyErr_Occurred()) {
         PyErr_WriteUnraisable(self_obj);
     }
-    PyErr_SetRaisedException(exc);
-#else
-    PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
-    pytimelog_close_no_raise(self, 1);
-    if (PyErr_Occurred()) {
-        PyErr_WriteUnraisable(self_obj);
-    }
-    PyErr_Restore(exc_type, exc_value, exc_tb);
-#endif
+    TL_PY_PRESERVE_EXC_END;
 }
 
 static void
 PyTimelog_dealloc(PyTimelog* self)
 {
+    PyTypeObject* tp = Py_TYPE(self);
+
     PyObject_GC_UnTrack((PyObject*)self);
 
     /* Run tp_finalize before deallocation. */
@@ -1154,9 +1416,7 @@ PyTimelog_dealloc(PyTimelog* self)
         return;
     }
 
-    if (self->weakreflist != NULL) {
-        PyObject_ClearWeakRefs((PyObject*)self);
-    }
+    PyObject_ClearWeakRefs((PyObject*)self);
 
     if (self->core_lock) {
         PyThread_type_lock lk = self->core_lock;
@@ -1164,19 +1424,39 @@ PyTimelog_dealloc(PyTimelog* self)
         PyThread_free_lock(lk);
     }
 
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    tl_py_timelog_drop_engine_ctx(self);
+    tl_py_timelog_drop_handle_ctx(self);
+
+    tp->tp_free((PyObject*)self);
+    Py_DECREF(tp);
 }
 
 static int
 PyTimelog_traverse(PyTimelog* self, visitproc visit, void* arg)
 {
-    return tl_py_handle_ctx_traverse(&self->handle_ctx, visit, arg);
+    Py_VISIT(Py_TYPE(self));
+
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    if (hctx == NULL) {
+        return 0;
+    }
+
+    int rc = tl_py_handle_ctx_traverse(hctx, visit, arg);
+    tl_py_handle_ctx_decref(hctx);
+    return rc;
 }
 
 static int
 PyTimelog_clear(PyTimelog* self)
 {
-    pytimelog_close_no_raise(self, 1);
+    /*
+     * tp_finalize performs lifecycle close. tp_clear only breaks Python
+     * reference cycles after the object is already API-closed, avoiding
+     * maintenance-thread joins from the GC clear phase.
+     */
+    if (self->closed || self->tl == NULL) {
+        tl_py_timelog_drop_handle_ctx(self);
+    }
     return 0;
 }
 
@@ -1215,21 +1495,25 @@ PyTimelog_append(PyTimelog* self, PyObject* args)
         Py_DECREF(obj);
         return NULL;
     }
+    /* Own handle_ctx under core_lock so post-unlock bookkeeping is immune to a
+     * concurrent close() dropping/freeing the context. */
+    tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
     st = tl_append(self->tl, ts, h);
     TL_PY_UNLOCK(self);
 
     if (st == TL_OK) {
-        (void)tl_py_live_note_insert(&self->handle_ctx, obj);
+        (void)tl_py_live_note_insert(hctx, obj);
         goto success;
     }
 
     if (st == TL_EBUSY) {
         /* Record IS in engine; do NOT rollback INCREF or retry. */
-        (void)tl_py_live_note_insert(&self->handle_ctx, obj);
+        (void)tl_py_live_note_insert(hctx, obj);
 
         if (tl_py_handle_write_ebusy(self,
                 "Record inserted but backpressure occurred. "
                 "Call flush() or wait for background maintenance to relieve.") < 0) {
+            tl_py_handle_ctx_decref(hctx);
             return NULL;
         }
         goto success;
@@ -1237,11 +1521,13 @@ PyTimelog_append(PyTimelog* self, PyObject* args)
 
     /* True failure - rollback INCREF */
     Py_DECREF(obj);
-    return TlPy_RaiseFromStatus(st);
+    tl_py_handle_ctx_decref(hctx);
+    return TL_PY_RAISE_STATUS(self, st);
 
 success:
-    /* Opportunistic drain */
-    tl_py_drain_retired(&self->handle_ctx, 0);
+    /* Opportunistic drain, then release our owned handle_ctx ref. */
+    tl_py_drain_retired(hctx, 0);
+    tl_py_handle_ctx_decref(hctx);
     Py_RETURN_NONE;
 }
 
@@ -1344,12 +1630,13 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
                 Py_DECREF(seq);
                 return NULL;
             }
+            tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
             st = tl_append_batch(self->tl, records, (size_t)n, flags);
             TL_PY_UNLOCK(self);
 
             if (st == TL_OK || st == TL_EBUSY) {
                 for (Py_ssize_t i = 0; i < n; i++) {
-                    (void)tl_py_live_note_insert(&self->handle_ctx, objs[i]);
+                    (void)tl_py_live_note_insert(hctx, objs[i]);
                 }
 
                 if (st == TL_EBUSY) {
@@ -1357,6 +1644,7 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
                             "Backpressure during batch insert. "
                             "All records were committed. "
                             "Call flush() or wait for background maintenance to relieve.") < 0) {
+                        tl_py_handle_ctx_decref(hctx);
                         free(records);
                         free(objs);
                         Py_DECREF(seq);
@@ -1367,7 +1655,8 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
                 free(records);
                 free(objs);
                 Py_DECREF(seq);
-                tl_py_drain_retired(&self->handle_ctx, 0);
+                tl_py_drain_retired(hctx, 0);
+                tl_py_handle_ctx_decref(hctx);
                 Py_RETURN_NONE;
             }
 
@@ -1375,10 +1664,11 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
             for (Py_ssize_t i = 0; i < n; i++) {
                 Py_DECREF(objs[i]);
             }
+            tl_py_handle_ctx_decref(hctx);
             free(records);
             free(objs);
             Py_DECREF(seq);
-            return TlPy_RaiseFromStatus(st);
+            return TL_PY_RAISE_STATUS(self, st);
         }
 
 error_seq:
@@ -1470,29 +1760,33 @@ error_seq:
             if (tl_py_lock_checked(self) < 0) {
                 goto error_stream;
             }
+            tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
             st = tl_append_batch(self->tl, records, n, flags);
             TL_PY_UNLOCK(self);
 
             if (st == TL_OK || st == TL_EBUSY) {
                 for (size_t i = 0; i < n; i++) {
-                    (void)tl_py_live_note_insert(&self->handle_ctx, objs[i]);
+                    (void)tl_py_live_note_insert(hctx, objs[i]);
                 }
                 if (st == TL_EBUSY) {
                     if (tl_py_handle_write_ebusy(self,
                             "Backpressure during batch insert. "
                             "All records were committed. "
                             "Call flush() or wait for background maintenance to relieve.") < 0) {
+                        tl_py_handle_ctx_decref(hctx);
                         free(records);
                         free(objs);
                         Py_DECREF(it);
                         return NULL;
                     }
                 }
+                tl_py_handle_ctx_decref(hctx);
                 n = 0;
                 continue;
             }
 
             /* True failure: rollback this chunk */
+            tl_py_handle_ctx_decref(hctx);
             goto error_stream;
         }
     }
@@ -1503,25 +1797,29 @@ error_seq:
         if (tl_py_lock_checked(self) < 0) {
             goto error_stream;
         }
+        tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
         st = tl_append_batch(self->tl, records, n, flags);
         TL_PY_UNLOCK(self);
 
         if (st == TL_OK || st == TL_EBUSY) {
             for (size_t i = 0; i < n; i++) {
-                (void)tl_py_live_note_insert(&self->handle_ctx, objs[i]);
+                (void)tl_py_live_note_insert(hctx, objs[i]);
             }
             if (st == TL_EBUSY) {
                 if (tl_py_handle_write_ebusy(self,
                         "Backpressure during batch insert. "
                         "All records were committed. "
                         "Call flush() or wait for background maintenance to relieve.") < 0) {
+                    tl_py_handle_ctx_decref(hctx);
                     free(records);
                     free(objs);
                     Py_DECREF(it);
                     return NULL;
                 }
             }
+            tl_py_handle_ctx_decref(hctx);
         } else {
+            tl_py_handle_ctx_decref(hctx);
             goto error_stream;
         }
     }
@@ -1529,7 +1827,7 @@ error_seq:
     free(records);
     free(objs);
     Py_DECREF(it);
-    tl_py_drain_retired(&self->handle_ctx, 0);
+    tl_py_drain_owned(self);
     Py_RETURN_NONE;
 
 error_stream:
@@ -1547,6 +1845,37 @@ error_stream:
  *
  * CRITICAL: Same TL_EBUSY semantics as append.
  *===========================================================================*/
+
+/*
+ * Finish a tombstone write (delete_range / delete_before) after the core call
+ * returned and core_lock was released. Consumes the owned hctx reference
+ * (always decrefs it). Mirrors the append EBUSY contract: on TL_EBUSY the
+ * tombstone IS already in the log, so the busy policy is applied and the write
+ * is never rolled back. On success (TL_OK or backpressure-handled EBUSY) the
+ * retired refs are drained and None is returned; otherwise NULL is returned
+ * with a Python exception set.
+ */
+static PyObject*
+tl_py_finish_tombstone_write(PyTimelog* self, tl_py_handle_ctx_t* hctx,
+                             tl_status_t st)
+{
+    if (st != TL_OK) {
+        if (st != TL_EBUSY) {
+            tl_py_handle_ctx_decref(hctx);
+            return TL_PY_RAISE_STATUS(self, st);
+        }
+        if (tl_py_handle_write_ebusy(self,
+                "Tombstone inserted but backpressure occurred. "
+                "Call flush() or wait for background maintenance to relieve.") < 0) {
+            tl_py_handle_ctx_decref(hctx);
+            return NULL;
+        }
+    }
+
+    tl_py_drain_retired(hctx, 0);
+    tl_py_handle_ctx_decref(hctx);
+    Py_RETURN_NONE;
+}
 
 static PyObject*
 PyTimelog_delete_range(PyTimelog* self, PyObject* args)
@@ -1573,31 +1902,11 @@ PyTimelog_delete_range(PyTimelog* self, PyObject* args)
     if (tl_py_lock_checked(self) < 0) {
         return NULL;
     }
+    tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
     st = tl_delete_range(self->tl, (tl_ts_t)t1_ll, (tl_ts_t)t2_ll);
     TL_PY_UNLOCK(self);
 
-    if (st == TL_OK) {
-        goto success;
-    }
-
-    if (st == TL_EBUSY) {
-        /*
-         * CRITICAL: EBUSY means tombstone WAS inserted, but backpressure.
-         * Same handling as append.
-         */
-        if (tl_py_handle_write_ebusy(self,
-                "Tombstone inserted but backpressure occurred. "
-                "Call flush() or wait for background maintenance to relieve.") < 0) {
-            return NULL;
-        }
-        goto success;
-    }
-
-    return TlPy_RaiseFromStatus(st);
-
-success:
-    tl_py_drain_retired(&self->handle_ctx, 0);
-    Py_RETURN_NONE;
+    return tl_py_finish_tombstone_write(self, hctx, st);
 }
 
 /*===========================================================================
@@ -1622,28 +1931,11 @@ PyTimelog_delete_before(PyTimelog* self, PyObject* args)
     if (tl_py_lock_checked(self) < 0) {
         return NULL;
     }
+    tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
     st = tl_delete_before(self->tl, (tl_ts_t)cutoff_ll);
     TL_PY_UNLOCK(self);
 
-    if (st == TL_OK) {
-        goto success;
-    }
-
-    if (st == TL_EBUSY) {
-        /* Same handling as delete_range */
-        if (tl_py_handle_write_ebusy(self,
-                "Tombstone inserted but backpressure occurred. "
-                "Call flush() or wait for background maintenance to relieve.") < 0) {
-            return NULL;
-        }
-        goto success;
-    }
-
-    return TlPy_RaiseFromStatus(st);
-
-success:
-    tl_py_drain_retired(&self->handle_ctx, 0);
-    Py_RETURN_NONE;
+    return tl_py_finish_tombstone_write(self, hctx, st);
 }
 
 /*===========================================================================
@@ -1661,15 +1953,16 @@ PyTimelog_flush(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     if (st == TL_EBUSY) {
-        return TlPy_RaiseFromStatusFmt(TL_EBUSY,
+        return TL_PY_RAISE_STATUS_FMT(self, TL_EBUSY,
             "Flush publish retry exhausted (safe to retry)");
     }
     if (st != TL_OK && st != TL_EOF) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
-    /* Drain under GIL */
-    tl_py_drain_retired(&self->handle_ctx, 0);
+    /* Drain under GIL, holding an owned handle_ctx ref so a concurrent
+     * close() cannot free the context mid-drain. */
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -1689,11 +1982,12 @@ PyTimelog_compact(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     if (st != TL_OK && st != TL_EOF) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
-    /* Opportunistic drain after compact. */
-    tl_py_drain_retired(&self->handle_ctx, 0);
+    /* Opportunistic drain after compact (owned ref guards against a
+     * concurrent close() freeing the context). */
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -1735,26 +2029,19 @@ PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_snapshot_t* snap = NULL;
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
     tl_stats_t stats;
 
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_stats(snap, &stats);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_stats(snap, &stats);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
     PyObject* out = PyDict_New();
@@ -1853,13 +2140,13 @@ PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     if (st == TL_OK) {
-        tl_py_drain_retired(&self->handle_ctx, 0);
+        tl_py_drain_owned(self);
         Py_RETURN_TRUE;
     }
     if (st == TL_EOF) {
         Py_RETURN_FALSE;
     }
-    return TlPy_RaiseFromStatus(st);
+    return TL_PY_RAISE_STATUS(self, st);
 }
 
 /*===========================================================================
@@ -1874,27 +2161,20 @@ PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_min_ts(snap, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_min_ts(snap, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
     }
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
     return PyLong_FromLongLong((long long)out);
 }
@@ -1907,27 +2187,20 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_max_ts(snap, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_max_ts(snap, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
     }
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
     return PyLong_FromLongLong((long long)out);
 }
@@ -1949,27 +2222,20 @@ PyTimelog_next_ts(PyTimelog* self, PyObject* args)
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_next_ts(snap, (tl_ts_t)ts_ll, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_next_ts(snap, (tl_ts_t)ts_ll, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
     }
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
     return PyLong_FromLongLong((long long)out);
 }
@@ -1991,27 +2257,20 @@ PyTimelog_prev_ts(PyTimelog* self, PyObject* args)
     tl_snapshot_t* snap = NULL;
     tl_ts_t out;
 
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_prev_ts(snap, (tl_ts_t)ts_ll, &out);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_prev_ts(snap, (tl_ts_t)ts_ll, &out);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st == TL_EOF) {
         Py_RETURN_NONE;
     }
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
     return PyLong_FromLongLong((long long)out);
 }
@@ -2026,25 +2285,17 @@ PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     tl_snapshot_t* snap = NULL;
-
-    tl_py_pins_enter(&self->handle_ctx);
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
-        return TlPy_RaiseFromStatus(st);
-    }
 
-    st = tl_validate(snap);
-    tl_snapshot_release(snap);
-    tl_py_pins_exit_and_maybe_drain(&self->handle_ctx);
+    tl_status_t st = tl_validate(snap);
+    tl_py_release_snapshot_pinned(snap, hctx, ectx);
 
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
     Py_RETURN_NONE;
@@ -2060,7 +2311,7 @@ PyTimelog_start_maint(PyTimelog* self, PyObject* Py_UNUSED(args))
     CHECK_CLOSED(self);
 
     if (self->maint_mode != TL_MAINT_BACKGROUND) {
-        return TlPy_RaiseFromStatusFmt(TL_ESTATE,
+        return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE,
             "start_maintenance requires maintenance='background'");
     }
 
@@ -2077,7 +2328,7 @@ PyTimelog_start_maint(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     /* TL_EBUSY = stop in progress, caller should retry */
-    return TlPy_RaiseFromStatus(st);
+    return TL_PY_RAISE_STATUS(self, st);
 }
 
 /*===========================================================================
@@ -2095,11 +2346,12 @@ PyTimelog_stop_maint(PyTimelog* self, PyObject* Py_UNUSED(args))
     }
 
     if (st != TL_OK) {
-        return TlPy_RaiseFromStatus(st);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
-    /* Drain after stop - no more on_drop callbacks possible */
-    tl_py_drain_retired(&self->handle_ctx, 0);
+    /* Drain after stop - no more on_drop callbacks possible. Owned ref guards
+     * against a concurrent close() freeing the context mid-drain. */
+    tl_py_drain_owned(self);
 
     Py_RETURN_NONE;
 }
@@ -2112,7 +2364,7 @@ static PyObject*
 PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
     if (self->closed) {
-        return TlPy_RaiseFromStatusFmt(TL_ESTATE, "Timelog is closed");
+        return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE, "Timelog is closed");
     }
 
     /* Idempotent: re-starts maintenance if previously stopped. */
@@ -2124,7 +2376,7 @@ PyTimelog_enter(PyTimelog* self, PyObject* Py_UNUSED(args))
         st = tl_maint_start(self->tl);
         TL_PY_UNLOCK(self);
         if (st != TL_OK) {
-            return TlPy_RaiseFromStatus(st);
+            return TL_PY_RAISE_STATUS(self, st);
         }
     }
 
@@ -2192,22 +2444,24 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 {
     CHECK_CLOSED(self);
 
-    tl_py_handle_ctx_t* ctx = &self->handle_ctx;
-
-    /* Enter pins BEFORE snapshot acquisition. */
-    tl_py_pins_enter(ctx);
-
-    tl_snapshot_t* snap = NULL;
-    if (tl_py_lock_checked(self) < 0) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject((PyObject*)self);
+    if (mod_st == NULL) {
         return NULL;
     }
-    tl_status_t st = tl_snapshot_acquire(self->tl, &snap);
-    TL_PY_UNLOCK(self);
-    if (st != TL_OK) {
-        tl_py_pins_exit_and_maybe_drain(ctx);
-        return TlPy_RaiseFromStatus(st);
+
+    /* Acquire snapshot + pin + owned handle_ctx/engine_ctx refs atomically
+     * under core_lock so a concurrent close() cannot free the contexts
+     * between pin entry and snapshot acquisition. On success these owned
+     * refs and the pin are TRANSFERRED to the iterator below — no
+     * additional incref — so the iterator's cleanup releases them exactly
+     * once. */
+    tl_snapshot_t* snap = NULL;
+    tl_py_handle_ctx_t* hctx = NULL;
+    tl_py_engine_ctx_t* ectx = NULL;
+    if (tl_py_acquire_snapshot_pinned(self, &snap, &hctx, &ectx) < 0) {
+        return NULL;
     }
+    tl_status_t st;
 
     tl_iter_t* it = NULL;
     switch (mode) {
@@ -2229,30 +2483,32 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
 
         default:
             /* Unreachable: enum covers all cases, but satisfy -Wswitch-default */
-            tl_snapshot_release(snap);
-            tl_py_pins_exit_and_maybe_drain(ctx);
+            tl_py_release_snapshot_pinned(snap, hctx, ectx);
             PyErr_SetString(PyExc_SystemError, "Invalid iterator mode");
             return NULL;
     }
 
     if (st != TL_OK) {
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(ctx);
-        return TlPy_RaiseFromStatus(st);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
+        return TL_PY_RAISE_STATUS(self, st);
     }
 
-    PyTimelogIter* pyit = PyObject_GC_New(PyTimelogIter, &PyTimelogIter_Type);
+    PyTypeObject* iter_type = (PyTypeObject*)mod_st->type_timelog_iter;
+    PyTimelogIter* pyit = (PyTimelogIter*)iter_type->tp_alloc(iter_type, 0);
     if (!pyit) {
         tl_iter_destroy(it);
-        tl_snapshot_release(snap);
-        tl_py_pins_exit_and_maybe_drain(ctx);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
         return PyErr_NoMemory();
     }
 
+    /* Transfer the helper's owned pin + handle_ctx/engine_ctx refs and the
+     * snapshot to the iterator. No extra incref: the iterator's cleanup
+     * (pins_exit + decref both ctxs + snapshot release) balances exactly. */
     pyit->owner = Py_NewRef((PyObject*)self);
     pyit->pinned_snapshot = snap;
     pyit->iter = it;
-    pyit->handle_ctx = ctx;  /* borrowed pointer, safe due to strong owner ref */
+    pyit->handle_ctx = hctx;
+    pyit->engine_ctx = ectx;
     pyit->remaining_count = 0;
     pyit->remaining_valid = 0;
     pyit->closed = 0;
@@ -2299,22 +2555,22 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         Py_END_ALLOW_THREADS
     }
     if (st != TL_OK) {
-        /* Clear pointers before Py_DECREF to prevent UAF via __del__. */
+        /* Clear the iterator's pointers before Py_DECREF so its cleanup
+         * does not double-release the resources we release manually here
+         * via tl_py_release_snapshot_pinned. */
         pyit->iter = NULL;
         pyit->pinned_snapshot = NULL;
         pyit->handle_ctx = NULL;
+        pyit->engine_ctx = NULL;
         pyit->closed = 1;
         tl_iter_destroy(it);
-        tl_snapshot_release(snap);
         Py_DECREF(pyit->owner);
         pyit->owner = NULL;
-        PyObject_GC_Del((PyObject*)pyit);
-        tl_py_pins_exit_and_maybe_drain(ctx);
-        return TlPy_RaiseFromStatus(st);
+        tl_py_release_snapshot_pinned(snap, hctx, ectx);
+        Py_DECREF(pyit);
+        return TL_PY_RAISE_STATUS(self, st);
     }
     pyit->remaining_valid = 1;
-
-    PyObject_GC_Track((PyObject*)pyit);
 
     return (PyObject*)pyit;
 }
@@ -2487,7 +2743,10 @@ static PyObject* PyTimelog_page_spans(PyTimelog* self,
 
 static PyObject* PyTimelog_get_closed(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    return PyBool_FromLong(self->closed);
+    /* Unlocked read; must be atomic so concurrent Python threads (e.g.,
+     * one reading .closed while another runs .close()) cannot race. */
+    uint8_t c = atomic_load_explicit(&self->closed, memory_order_acquire);
+    return PyBool_FromLong((long)c);
 }
 
 static PyObject* PyTimelog_get_time_unit(PyTimelog* self, void* Py_UNUSED(closure))
@@ -2528,13 +2787,21 @@ static PyObject* PyTimelog_get_busy_policy(PyTimelog* self, void* Py_UNUSED(clos
 
 static PyObject* PyTimelog_get_retired_queue_len(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    uint64_t len = tl_py_retired_queue_len(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    uint64_t len = hctx != NULL ? tl_py_retired_queue_len(hctx) : 0;
+    if (hctx != NULL) {
+        tl_py_handle_ctx_decref(hctx);
+    }
     return PyLong_FromUnsignedLongLong(len);
 }
 
 static PyObject* PyTimelog_get_alloc_failures(PyTimelog* self, void* Py_UNUSED(closure))
 {
-    uint64_t failures = tl_py_alloc_failures(&self->handle_ctx);
+    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    uint64_t failures = hctx != NULL ? tl_py_alloc_failures(hctx) : 0;
+    if (hctx != NULL) {
+        tl_py_handle_ctx_decref(hctx);
+    }
     return PyLong_FromUnsignedLongLong(failures);
 }
 
@@ -2705,30 +2972,44 @@ static PyMethodDef PyTimelog_methods[] = {
 };
 
 /*===========================================================================
- * Type Object Definition
+ * Type Specification
  *===========================================================================*/
 
-PyTypeObject PyTimelog_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.Timelog",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyTimelog_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Timelog engine wrapper.\n\n"
         "A time-indexed multimap for (timestamp, object) records.\n\n"
         "Thread Safety:\n"
         "    Single-writer model. External synchronization is required for\n"
         "    concurrent writes or lifecycle operations. Snapshot-based iterators\n"
         "    are safe for concurrent reads.\n"
-    ),
-    .tp_basicsize = sizeof(PyTimelog),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
-    .tp_new = PyType_GenericNew,
-    .tp_init = (initproc)PyTimelog_init,
-    .tp_dealloc = (destructor)PyTimelog_dealloc,
-    .tp_finalize = (destructor)PyTimelog_finalize,
-    .tp_traverse = (traverseproc)PyTimelog_traverse,
-    .tp_clear = (inquiry)PyTimelog_clear,
-    .tp_weaklistoffset = offsetof(PyTimelog, weakreflist),
-    .tp_methods = PyTimelog_methods,
-    .tp_getset = PyTimelog_getset,
+    )},
+    {Py_tp_new, PyType_GenericNew},
+    {Py_tp_init, (void*)PyTimelog_init},
+    {Py_tp_dealloc, (void*)PyTimelog_dealloc},
+    {Py_tp_finalize, (void*)PyTimelog_finalize},
+    {Py_tp_traverse, (void*)PyTimelog_traverse},
+    {Py_tp_clear, (void*)PyTimelog_clear},
+    {Py_tp_methods, PyTimelog_methods},
+    {Py_tp_getset, PyTimelog_getset},
+    {0, NULL}
 };
+
+static PyType_Spec PyTimelog_spec = {
+    .name = "timelog._timelog.Timelog",
+    .basicsize = sizeof(PyTimelog),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_BASETYPE |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_MANAGED_WEAKREF,
+    .slots = PyTimelog_slots,
+};
+
+PyObject* TlPy_CreateTimelogType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyTimelog_spec, NULL);
+}
+
+TL_PY_DEFINE_CHECK(TlPyTimelog_Check, type_timelog)

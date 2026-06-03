@@ -164,19 +164,20 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
             break;
         }
 
-        /* Skip if page ends before ts (shouldn't happen after find_first_ge) */
+        /* Defensive: a page ending before ts should already have been
+         * skipped by find_first_ge. */
         if (meta->max_ts < ts) {
             page_idx++;
             continue;
         }
 
-        /* Skip fully deleted pages (bitmask test for future flag compatibility) */
+        /* Use a bitmask test so adding future page flags does not
+         * silently change visibility. */
         if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
             page_idx++;
             continue;
         }
 
-        /* Collect from this page */
         tl_status_t st = collect_from_page(result, meta->page, ts,
                                            seg->applied_seq, tomb_seq);
         if (st != TL_OK) {
@@ -287,8 +288,12 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
 }
 
 /**
- * Compute max tombstone seq at a given timestamp across all sources.
- * Uses bounds pruning to skip sources where ts is outside their range.
+ * Maximum tombstone seq covering `ts` across every source in the
+ * snapshot. Bounds-prunes sources whose [min_ts, max_ts] excludes ts.
+ *
+ * Returning the per-source maximum is what lets the caller decide
+ * visibility row-by-row: a row with watermark w is dropped iff
+ * max_tomb_seq_at(ts) > w.
  */
 static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     const tl_manifest_t* manifest = snap->manifest;
@@ -296,18 +301,16 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
 
     tl_seq_t max_seq = 0;
 
-    /* Check memview tombstones (no bounds check - memview tombs cover full range) */
+    /* Memview tombstones span the full range; no bounds check. */
     tl_intervals_imm_t mv_tombs = tl_memview_tombs_imm(mv);
     tl_seq_t seq = tl_intervals_imm_max_seq(mv_tombs, ts);
     if (seq > max_seq) {
         max_seq = seq;
     }
 
-    /* Check sealed memrun tombstones */
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
-        /* Skip if ts outside memrun bounds */
         if (ts < tl_memrun_min_ts(mr) || ts > tl_memrun_max_ts(mr)) {
             continue;
         }
@@ -319,11 +322,9 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
         }
     }
 
-    /* Check L0 segment tombstones */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
-        /* Skip if ts outside segment bounds */
         if (ts < seg->min_ts || ts > seg->max_ts) {
             continue;
         }
@@ -335,11 +336,11 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
         }
     }
 
-    /* Defensive: check any L1 tombstones if present. */
+    /* L1 segments are tombstone-free by invariant, but check
+     * defensively to stay correct if that ever changes. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
-        /* Skip if ts outside segment bounds */
         if (ts < seg->min_ts || ts > seg->max_ts) {
             continue;
         }
@@ -369,24 +370,25 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
     memset(result, 0, sizeof(*result));
     result->alloc = alloc;
 
-    /* Fast path: no data in snapshot */
+    /* Fast path: empty snapshot. */
     if (!snap->has_data) {
         return TL_OK;
     }
 
-    /* Step 1: Compute tombstone max seq for ts (watermark filtering) */
+    /* The watermark used for visibility checks: the strongest
+     * tombstone covering this ts across all sources. */
     tl_seq_t tomb_seq = max_tomb_seq_at(snap, ts);
 
     tl_status_t st;
     const tl_manifest_t* manifest = snap->manifest;
     const tl_memview_t* mv = tl_snapshot_memview(snap);
 
-    /* Step 2: L1 lookup (non-overlapping windows) */
+    /* L1: windows are non-overlapping and sorted by window_start; once
+     * we pass ts we are done. */
     size_t l1_start = tl_manifest_l1_find_first_overlap(manifest, ts);
     for (size_t i = l1_start; i < tl_manifest_l1_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
-        /* L1 segments are sorted, stop if past ts */
         if (seg->min_ts > ts) {
             break;
         }
@@ -397,7 +399,7 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
         }
     }
 
-    /* Step 3: L0 lookup (overlapping segments) */
+    /* L0: segments may overlap, scan every one. */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
         const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
 
@@ -407,9 +409,7 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
         }
     }
 
-    /* Step 4: Memview lookup */
-
-    /* Sealed memruns */
+    /* Memview: sealed memruns, then the active buffers. */
     for (size_t i = 0; i < tl_memview_sealed_len(mv); i++) {
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
@@ -419,7 +419,6 @@ tl_status_t tl_point_lookup(tl_point_result_t* result,
         }
     }
 
-    /* Active buffers */
     st = collect_from_memview(result, mv, ts, tomb_seq);
     if (st != TL_OK) {
         goto fail;

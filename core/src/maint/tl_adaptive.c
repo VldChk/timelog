@@ -1,9 +1,8 @@
 /*===========================================================================
  * tl_adaptive.c - Adaptive Segmentation Implementation
  *
- * Implements adaptive window size computation for L1 segmentation based on
- * data density. Pure policy module with no allocation in the computation loop.
- *
+ * Window size computation for L1 segmentation, driven by EWMA-smoothed
+ * data density. The policy loop allocates nothing.
  *===========================================================================*/
 
 #include "tl_adaptive.h"
@@ -153,16 +152,13 @@ bool tl__adaptive_hysteresis_skip(double candidate,
 }
 
 /**
- * Apply nearest-quantum snapping.
- * Returns snapped value, or current_window if snapping fails.
+ * Snap a floating-point candidate window to the nearest multiple of
+ * window_quantum using banker-style midpoint rounding (midpoint and above
+ * rounds up). Returns current_window for any out-of-range or non-finite
+ * input so the adaptive control loop remains stable on bad samples.
  *
- * Algorithm:
- * 1. wi = llround(candidate)
- * 2. qid = floor_div(wi, quantum)
- * 3. snapped = qid * quantum
- * 4. remainder = wi - snapped
- * 5. if remainder >= quantum/2: round up (with overflow guard)
- * 6. return snapped if > 0, else current_window
+ * The threshold (q+1)/2 produces correct half-up rounding for both even
+ * and odd quanta (e.g. q=7 -> threshold 4; q=8 -> threshold 4).
  */
 tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
                                      tl_ts_t window_quantum,
@@ -178,52 +174,41 @@ tl_ts_t tl__adaptive_snap_to_quantum(double candidate,
         return (wi > 0) ? (tl_ts_t)wi : current_window;
     }
 
-    /* Check for invalid candidate */
     if (candidate <= 0.0 || isnan(candidate) || isinf(candidate)) {
         return current_window;
     }
 
-    /* Range check: avoid UB in llround for out-of-range values */
+    /* Avoid UB in llround for out-of-range values */
     if (candidate >= (double)INT64_MAX) {
         return current_window;
     }
 
-    /* Step 1: Round candidate to nearest integer */
     long long wi = llround(candidate);
     if (wi <= 0) {
         return current_window;
     }
 
-    /* Step 2: Floor division to get quantum ID */
     int64_t q = (int64_t)window_quantum;
     int64_t qid = tl_floor_div_i64(wi, q);
 
-    /* Defensive overflow check for qid * q.
-     * Mathematically, qid * q <= wi < INT64_MAX, so overflow is impossible.
-     * Defensive check: prevents propagation of invalid density values. */
+    /* Defensive overflow check: mathematically qid * q <= wi < INT64_MAX,
+     * but a corrupted density could trigger this path. */
     if (qid > 0 && q > INT64_MAX / qid) {
-        return current_window;  /* Overflow - should never happen */
+        return current_window;
     }
 
-    /* Step 3: compute snapped value after overflow checks. */
     int64_t snapped = qid * q;
-
-    /* Step 4: Compute remainder */
     int64_t remainder = wi - snapped;
 
-    /* Step 5: Round up if remainder >= ceil(quantum/2)
-     * Use (q+1)/2 for correct rounding with odd quantums.
-     * For q=7: threshold=4 (values 4,5,6 round up)
-     * For q=8: threshold=4 (values 4,5,6,7 round up) */
+    /* Half-up rounding: (q+1)/2 produces correct threshold for odd and
+     * even quanta alike. */
     if (remainder >= (q + 1) / 2) {
-        /* Overflow guard: check if snapped + q would overflow */
         if (snapped > TL_TS_MAX - q) {
             return current_window;
         }
         snapped += q;
     }
 
-    /* Step 6: Return if valid, else fallback */
     return (snapped > 0) ? (tl_ts_t)snapped : current_window;
 }
 
@@ -260,19 +245,16 @@ void tl_adaptive_update_density(tl_adaptive_state_t* state,
         return;
     }
 
-    /* Update EWMA */
     if (!state->ewma_initialized) {
-        /* First sample: initialize directly (no smoothing) */
+        /* Seed EWMA with the first sample directly. */
         state->ewma_density = sample_density;
         state->ewma_initialized = true;
     } else {
-        /* Subsequent samples: EWMA smoothing */
         /* new = alpha * sample + (1 - alpha) * old */
         state->ewma_density = cfg->alpha * sample_density +
                               (1.0 - cfg->alpha) * state->ewma_density;
 
-        /* Guard against corrupted EWMA state (NaN propagation).
-         * If the result is not finite or is <= 0, reset to current sample. */
+        /* Reset on NaN/Inf/non-positive to stop bad state propagating. */
         if (!isfinite(state->ewma_density) || state->ewma_density <= 0.0) {
             state->ewma_density = sample_density;
         }
@@ -296,32 +278,32 @@ tl_ts_t tl_adaptive_compute_candidate(const tl_adaptive_state_t* state,
     TL_ASSERT(cfg != NULL);
 
     /*-----------------------------------------------------------------------
-     * Fallback checks - all return current_window for control-loop stability
+     * Fallback checks: every "not ready" condition returns current_window
+     * rather than the configured base. Resetting to base on transient
+     * problems would oscillate the window between base and the target,
+     * destabilising the control loop.
      *-----------------------------------------------------------------------*/
 
-    /* Check 1: Adaptive disabled */
     if (cfg->target_records == 0) {
         return current_window;
     }
 
-    /* Check 2: Warmup not complete */
     if (state->flush_count < cfg->warmup_flushes) {
         return current_window;
     }
 
-    /* Check 3: EWMA not initialized */
     if (!state->ewma_initialized) {
         return current_window;
     }
 
-    /* Check 4: Invalid EWMA density (zero, negative, NaN, Inf) */
     if (state->ewma_density <= 0.0 ||
         isnan(state->ewma_density) ||
         isinf(state->ewma_density)) {
         return current_window;
     }
 
-    /* Check 5: Density is stale */
+    /* Stale density: too many flushes since the last density update.
+     * The recorded density no longer reflects the current input rate. */
     if (cfg->stale_flushes > 0) {
         uint64_t flushes_since_update = state->flush_count -
                                         state->last_density_update_flush;
@@ -332,49 +314,49 @@ tl_ts_t tl_adaptive_compute_candidate(const tl_adaptive_state_t* state,
 
     /*-----------------------------------------------------------------------
      * Compute candidate window
+     *
+     * Target a stable record count per window: candidate = target / density.
+     * Apply backoff after repeated publish failures, clamp to guardrails,
+     * gate small changes via hysteresis, then snap to the quantum grid.
+     * Re-clamp after snapping because rounding can push past the
+     * guardrails at edge cases.
      *-----------------------------------------------------------------------*/
 
-    /* Step 5: Compute raw candidate = target_records / ewma_density */
     double candidate = tl__adaptive_compute_raw_candidate(cfg->target_records,
                                                           state->ewma_density);
     if (candidate <= 0.0) {
         return current_window;
     }
 
-    /* Step 6: Apply failure backoff if triggered */
+    /* Backoff expands the window when recent compactions failed, giving
+     * the system more headroom before retrying. */
     if (cfg->failure_backoff_threshold > 0 &&
         state->consecutive_failures >= cfg->failure_backoff_threshold) {
         double backoff_mult = 1.0 + (double)cfg->failure_backoff_pct / 100.0;
         candidate *= backoff_mult;
     }
 
-    /* Step 7: Clamp to guardrails */
     candidate = tl__adaptive_apply_guardrails(candidate,
                                               cfg->min_window,
                                               cfg->max_window);
 
-    /* Validate candidate after guardrails */
     if (candidate <= 0.0 || isnan(candidate) || isinf(candidate)) {
         return current_window;
     }
 
-    /* Step 8: Apply hysteresis - skip small changes */
+    /* Hysteresis band: avoid resizing on small fluctuations that would
+     * churn windows. The band is a percentage of current_window. */
     if (tl__adaptive_hysteresis_skip(candidate, current_window,
                                      cfg->hysteresis_pct)) {
         return current_window;
     }
 
-    /* Step 9-10: Apply quantum snapping (returns current_window on failure) */
     tl_ts_t result = tl__adaptive_snap_to_quantum(candidate,
                                                   cfg->window_quantum,
                                                   current_window);
 
-    /* Step 11: Re-clamp to guardrails after snapping.
-     * Quantum snapping might round outside the guardrail boundaries.
-     * E.g., candidate=99.9, max=100, quantum=10 -> snapped=100 (ok)
-     * but candidate=95.1, max=100, quantum=10 -> snapped=100 (ok)
-     * and candidate=95.5, max=100, quantum=10 -> snapped=100 (close to boundary)
-     * In edge cases snapping could push result past guardrails. */
+    /* Snapping can round outside the guardrails (e.g. candidate just
+     * below max_window rounds up across the boundary). Re-clamp. */
     if (cfg->min_window > 0 && result < cfg->min_window) {
         result = cfg->min_window;
     }
@@ -405,42 +387,22 @@ void tl_adaptive_record_failure(tl_adaptive_state_t* state) {
 /*===========================================================================
  * Advisory Resize Query
  *
- * THREADING NOTE: This function intentionally reads fields without holding
- * maint_mu. This is safe because:
- *
- * 1. This is an ADVISORY function - it returns a hint, not a decision.
- *    The actual resize decision happens under maint_mu in tl_compact_one().
- *
- * 2. window_grid_frozen is monotonic (false -> true, never back).
- *    A stale read of 'false' when it's actually 'true' just means we might
- *    consider resizing when we shouldn't, but the actual resize path will
- *    catch this under lock.
- *
- * 3. flush_count only increases. A stale read means we might return false
- *    when we could return true (miss an opportunity), but the next call
- *    will see the updated value. No correctness issue.
- *
- * 4. config.adaptive.* fields are immutable after tl_open().
- *
- * Taking maint_mu here would add unnecessary contention on a hot path.
+ * Hint for the scheduler: "is a resize potentially worthwhile right now?".
+ * Adaptive state is protected by maint_mu. This helper is advisory, but it
+ * still takes the lock so the no-GIL build has no production C data races.
  *===========================================================================*/
 
 bool tl_adaptive_wants_resize(const tl_timelog_t* tl) {
     TL_ASSERT(tl != NULL);
 
-    /* Grid frozen means no resizing possible.
-     * (Advisory read - actual resize path re-checks under maint_mu) */
-    if (tl->window_grid_frozen) {
-        return false;
-    }
-
-    /* Adaptive disabled (immutable after config) */
     if (tl->config.adaptive.target_records == 0) {
         return false;
     }
 
-    /* Check if we have completed warmup (minimum flushes for resize consideration).
-     * This is the same check as compute_candidate's warmup.
-     * (Advisory read - flush_count is monotonically increasing) */
-    return tl->adaptive.flush_count >= tl->config.adaptive.warmup_flushes;
+    tl_timelog_t* tl_mut = (tl_timelog_t*)tl;
+    tl_mutex_lock(&tl_mut->maint_mu);
+    bool wants = !tl_mut->window_grid_frozen &&
+        tl_mut->adaptive.flush_count >= tl_mut->config.adaptive.warmup_flushes;
+    tl_mutex_unlock(&tl_mut->maint_mu);
+    return wants;
 }

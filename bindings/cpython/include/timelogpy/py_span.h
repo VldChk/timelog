@@ -1,14 +1,14 @@
 /**
  * @file py_span.h
- * @brief PyPageSpan CPython extension type declaration (Core API Integration)
+ * @brief PyPageSpan CPython extension type declaration
  *
  * This module provides the PyPageSpan type which exposes a contiguous
  * slice of page memory (timestamps) via the CPython buffer protocol.
  *
- * Architecture (Post-Migration):
- *   PageSpan now wraps the core tl_pagespan_view_t, storing ts/h/len
- *   pointers directly instead of page pointer + row indices. The core
- *   tl_pagespan_owner_t manages snapshot lifetime via hooks.
+ * Architecture:
+ *   PageSpan wraps the core tl_pagespan_view_t, storing ts/h/len pointers
+ *   directly. The core tl_pagespan_owner_t manages snapshot lifetime via
+ *   hooks invoked when the owner refcount reaches zero.
  *
  * Zero-Copy Promise:
  *   The .timestamps property returns a memoryview directly backed by
@@ -18,7 +18,6 @@
  * Thread Safety:
  *   A PageSpan instance is NOT thread-safe. Do not access the same
  *   instance from multiple threads without external synchronization.
- *   All owner refcount operations must be serialized by the GIL.
  *
  * Lifetime:
  *   PageSpan holds a reference to the core tl_pagespan_owner_t which
@@ -38,27 +37,10 @@
 #include "timelog/timelog.h"
 #include "query/tl_pagespan_iter.h"
 #include "timelogpy/py_handle.h"
+#include "timelogpy/py_module_state.h"
 
 #ifdef __cplusplus
 extern "C" {
-#endif
-
-/*===========================================================================
- * Py_NewRef Compatibility
- *
- * Py_NewRef was added in Python 3.10. For older versions, provide
- * an inline equivalent.
- *===========================================================================*/
-
-#if PY_VERSION_HEX < 0x030A0000
-#ifndef TL_Py_NewRef_DEFINED
-#define TL_Py_NewRef_DEFINED
-static inline PyObject* TL_Py_NewRef(PyObject* obj) {
-    Py_INCREF(obj);
-    return obj;
-}
-#define Py_NewRef TL_Py_NewRef
-#endif
 #endif
 
 /*===========================================================================
@@ -67,7 +49,7 @@ static inline PyObject* TL_Py_NewRef(PyObject* obj) {
  * Zero-copy view of timestamps from a single span slice.
  * Implements the buffer protocol for memoryview exposure.
  *
- * Data Layout (Core API Integration):
+ * Data layout:
  *   The span stores pointers from tl_pagespan_view_t directly:
  *   - ts: pointer to timestamp array (borrowed from owner's snapshot)
  *   - h:  pointer to handle array (borrowed from owner's snapshot)
@@ -152,16 +134,8 @@ typedef struct {
  * Type Object
  *===========================================================================*/
 
-/**
- * PyPageSpan type object.
- * Defined in py_span.c.
- */
-extern PyTypeObject PyPageSpan_Type;
-
-/**
- * Type check macro.
- */
-#define PyPageSpan_Check(op) PyObject_TypeCheck(op, &PyPageSpan_Type)
+PyObject* TlPy_CreatePageSpanType(PyObject* module);
+int TlPyPageSpan_Check(PyObject* op, const tl_py_module_state_t* st);
 
 /*===========================================================================
  * Span Creation API (Internal)

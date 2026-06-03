@@ -72,7 +72,7 @@ static tl_status_t intervals_split_at(tl_intervals_t* iv, tl_ts_t ts) {
 
     size_t idx = intervals_lower_bound(iv, ts);
     if (idx < iv->len && iv->data[idx].start == ts) {
-        return TL_OK; /* Already a boundary */
+        return TL_OK;
     }
     if (idx == 0) {
         return TL_OK;

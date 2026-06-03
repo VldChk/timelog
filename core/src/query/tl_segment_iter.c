@@ -16,10 +16,12 @@ static void init_page_bounds(tl_segment_iter_t* it) {
     const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
     const tl_page_t* page = meta->page;
 
-    /* Skip FULLY_DELETED pages (bitmask test for future flag compatibility) */
+    /* Bitmask test (not equality) so future page flags do not
+     * accidentally suppress visibility. An empty range here causes the
+     * outer loop to advance to the next page. */
     if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
         it->row_idx = 0;
-        it->row_end = 0;  /* Empty range, will advance to next page */
+        it->row_end = 0;
         return;
     }
 
@@ -173,7 +175,7 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
         return;
     }
 
-    /* Save position for monotonicity clamping (seek must never go backwards) */
+    /* Captured for monotonicity clamping: seek must never rewind. */
     size_t old_page_idx = it->page_idx;
     size_t old_row_idx = it->row_idx;
 
@@ -194,18 +196,16 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
     const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
     const tl_page_t* page = meta->page;
 
-    /* Skip FULLY_DELETED pages (bitmask test for future flag compatibility) */
     if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
         it->row_idx = 0;
         it->row_end = 0;
     } else {
-        /* Binary search for row >= target */
         size_t new_row_idx = tl_page_lower_bound(page, target);
 
-        /*
-         * CRITICAL: Clamp row_idx to maintain monotonicity.
-         * When staying on the same page, never go backwards.
-         */
+        /* Forward-only contract: when staying on the same page, the
+         * cursor must never move backwards even if the binary search
+         * resolves to an earlier row (callers may have already
+         * consumed records past lower_bound(target)). */
         if (it->page_idx == old_page_idx && new_row_idx < old_row_idx) {
             new_row_idx = old_row_idx;
         }

@@ -85,12 +85,10 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
     memset(snap, 0, sizeof(*snap));
     snap->alloc = alloc;
 
-    /*
-     * Snapshot consistency is guaranteed by writer_mu:
-     * - Writers hold writer_mu during publish (manifest swap + memtable pop)
-     * - Snapshots hold writer_mu during capture
-     * Therefore, we do not need a seqlock retry loop here.
-     */
+    /* writer_mu serialises publishers (manifest swap and memtable pop)
+     * AND snapshot acquisition, so the manifest pin and the memview
+     * capture taken below are guaranteed to belong to the same state.
+     * No seqlock retry loop is needed. */
     tl_manifest_t* manifest = NULL;
     tl_memview_shared_t* mv = NULL;
     bool used_cache = false;
@@ -99,7 +97,8 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
 
     manifest = tl_manifest_acquire(tl->manifest);
 
-    /* Capture or reuse memview (locks memtable_mu internally) */
+    /* Reuse the cached memview if it still matches the memtable epoch,
+     * otherwise capture a fresh one (capture locks memtable_mu). */
     uint64_t epoch = tl_memtable_epoch(&tl->memtable);
     if (tl->memview_cache != NULL && tl->memview_cache_epoch == epoch) {
         mv = tl_memview_shared_acquire(tl->memview_cache);
@@ -122,7 +121,10 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
 
     TL_UNLOCK_WRITER(tl);
 
-    /* Sort OOO head off writer_mu for fresh captures. */
+    /* Sort the OOO head off writer_mu for fresh captures so we never
+     * block publishers on what can be an O(N log N) cost. The result
+     * is cached only if the memtable epoch has not advanced
+     * (two-phase capture). */
     if (!used_cache) {
         tl_status_t sort_st = tl_memview_sort_head(&mv->view);
         if (sort_st != TL_OK) {
@@ -132,7 +134,6 @@ tl_status_t tl_snapshot_acquire_internal(struct tl_timelog* tl,
             return sort_st;
         }
 
-        /* Update cache if epoch unchanged (two-phase capture). */
         TL_LOCK_WRITER(tl);
         if (tl_memtable_epoch(&tl->memtable) == epoch) {
             if (tl->memview_cache == NULL ||

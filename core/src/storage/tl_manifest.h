@@ -165,14 +165,13 @@ tl_status_t tl_manifest_builder_remove_l1(tl_manifest_builder_t* mb,
 /**
  * Build the new manifest.
  *
- * Steps:
- * 1. Allocate new manifest
- * 2. Copy segments from base, excluding removals
- * 3. Add new segments
- * 4. Sort L1 by window_start
- * 5. Compute cached bounds
- * 6. Set version = base->version + 1 (or 1 if base is NULL)
- * 7. Acquire references on ALL included segments
+ * Copy-on-write produces a fresh manifest that contains the base's segments
+ * minus the queued removals plus the queued additions. The resulting L1
+ * array is sorted by window_start so the read path can binary-search it,
+ * the cached global bounds are recomputed, and the version is bumped to
+ * base->version + 1 (or 1 for an initial build). Every segment in the new
+ * manifest is acquired, so the caller may release its own references on
+ * success.
  *
  * Returned manifest has refcnt = 1 (caller owns reference).
  *

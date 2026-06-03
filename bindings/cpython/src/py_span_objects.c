@@ -1,6 +1,6 @@
 /**
  * @file py_span_objects.c
- * @brief PyPageSpanObjectsView CPython extension type implementation (Core API Integration)
+ * @brief PyPageSpanObjectsView CPython extension type implementation
  *
  * Implements lazy access to decoded Python objects from a PageSpan.
  * Uses span->h[] pointer directly (borrowed from core owner's snapshot).
@@ -9,43 +9,12 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include "timelogpy/py_compat.h"
 #include "timelogpy/py_span_objects.h"
 #include "timelogpy/py_span.h"
 #include "timelogpy/py_handle.h"
+#include "query/tl_pagespan_iter.h"  /* for tl_pagespan_owner_incref/decref */
 
-
-/*===========================================================================
- * Py_NewRef Compatibility
- *===========================================================================*/
-
-#if PY_VERSION_HEX < 0x030A0000
-#ifndef TL_Py_NewRef_DEFINED
-#define TL_Py_NewRef_DEFINED
-static inline PyObject* TL_Py_NewRef_OV(PyObject* obj) {
-    Py_INCREF(obj);
-    return obj;
-}
-#define Py_NewRef TL_Py_NewRef_OV
-#endif
-#endif
-
-/*===========================================================================
- * Block Direct Construction
- *===========================================================================*/
-
-static PyObject* PyPageSpanObjectsView_new_error(PyTypeObject* type,
-                                                  PyObject* args,
-                                                  PyObject* kwds)
-{
-    (void)type;
-    (void)args;
-    (void)kwds;
-
-    PyErr_SetString(PyExc_TypeError,
-        "PageSpanObjectsView cannot be instantiated directly; "
-        "use PageSpan.objects()");
-    return NULL;
-}
 
 /*===========================================================================
  * Factory Function
@@ -53,19 +22,28 @@ static PyObject* PyPageSpanObjectsView_new_error(PyTypeObject* type,
 
 PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 {
-    if (!PyPageSpan_Check(span)) {
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject(span);
+    if (mod_st == NULL) {
+        return NULL;
+    }
+    if (!TlPyPageSpan_Check(span, mod_st)) {
         PyErr_SetString(PyExc_TypeError, "expected PageSpan");
         return NULL;
     }
 
     PyPageSpan* span_obj = (PyPageSpan*)span;
-    if (span_obj->closed) {
+    int closed;
+    TL_PY_OBJ_LOCK(span_obj);
+    closed = span_obj->closed;
+    TL_PY_OBJ_UNLOCK();
+    if (closed) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
 
-    PyPageSpanObjectsView* self = PyObject_New(PyPageSpanObjectsView,
-                                                &PyPageSpanObjectsView_Type);
+    PyTypeObject* view_type = (PyTypeObject*)mod_st->type_pagespan_objects_view;
+    PyPageSpanObjectsView* self =
+        (PyPageSpanObjectsView*)view_type->tp_alloc(view_type, 0);
     if (!self) {
         return NULL;
     }
@@ -80,8 +58,22 @@ PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 
 static void PyPageSpanObjectsView_dealloc(PyPageSpanObjectsView* self)
 {
-    Py_XDECREF(self->span);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    TL_PY_GC_DEALLOC(self, Py_XDECREF(self->span));
+}
+
+static int PyPageSpanObjectsView_traverse(PyPageSpanObjectsView* self,
+                                          visitproc visit,
+                                          void* arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->span);
+    return 0;
+}
+
+static int PyPageSpanObjectsView_clear(PyPageSpanObjectsView* self)
+{
+    Py_CLEAR(self->span);
+    return 0;
 }
 
 /*===========================================================================
@@ -91,10 +83,11 @@ static void PyPageSpanObjectsView_dealloc(PyPageSpanObjectsView* self)
 static Py_ssize_t PyPageSpanObjectsView_length(PyPageSpanObjectsView* self)
 {
     PyPageSpan* span = (PyPageSpan*)self->span;
-    if (span->closed) {
-        return 0;
-    }
-    return (Py_ssize_t)span->len;
+    Py_ssize_t n;
+    TL_PY_OBJ_LOCK(span);
+    n = span->closed ? 0 : (Py_ssize_t)span->len;
+    TL_PY_OBJ_UNLOCK();
+    return n;
 }
 
 static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
@@ -102,41 +95,54 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
 {
     PyPageSpan* span = (PyPageSpan*)self->span;
 
+    /* Decode AND Py_NewRef the payload UNDER the span's CS. Holding the
+     * span's CS prevents this span's close() from detaching the owner, so
+     * its snapshot (and the pin that blocks retired-object drain) stay
+     * live — the decoded object cannot be freed before we incref it. The
+     * incref is a lone INCREF of a distinct object (permitted, py_compat.h);
+     * Py_DECREF on error is moot since we only succeed here. */
+    int err = 0; /* 0=ok 1=closed 2=no-h 3=out-of-range 4=bad-handle */
+    PyObject* obj = NULL;
+
+    TL_PY_OBJ_LOCK(span);
     if (span->closed) {
+        err = 1;
+    } else if (span->h == NULL) {
+        err = 2;
+    } else {
+        Py_ssize_t len = (Py_ssize_t)span->len;
+        Py_ssize_t adj = index < 0 ? index + len : index;
+        if (adj < 0 || adj >= len) {
+            err = 3;
+        } else {
+            PyObject* decoded = tl_py_handle_decode(span->h[adj]);
+            if (decoded == NULL) {
+                err = 4;
+            } else {
+                obj = Py_NewRef(decoded);
+            }
+        }
+    }
+    TL_PY_OBJ_UNLOCK();
+
+    if (err == 1) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
-
-    if (span->h == NULL) {
+    if (err == 2) {
         PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
         return NULL;
     }
-
-    const Py_ssize_t len = (Py_ssize_t)span->len;
-
-    if (index < 0) {
-        index += len;
-    }
-
-    if (index < 0 || index >= len) {
+    if (err == 3) {
         PyErr_SetString(PyExc_IndexError, "index out of range");
         return NULL;
     }
-
-    tl_handle_t h = span->h[index];
-    PyObject* obj = tl_py_handle_decode(h);
-    if (!obj) {
+    if (err == 4) {
         PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
-
-    return Py_NewRef(obj);
+    return obj;
 }
-
-static PySequenceMethods objectsview_as_sequence = {
-    .sq_length = (lenfunc)PyPageSpanObjectsView_length,
-    .sq_item = (ssizeargfunc)PyPageSpanObjectsView_getitem,
-};
 
 /*===========================================================================
  * Iterator Protocol
@@ -148,63 +154,96 @@ typedef struct {
     Py_ssize_t index;   /* Current position */
 } PyPageSpanObjectsViewIter;
 
-/* Forward declaration (non-static, exported via header) */
-extern PyTypeObject PyPageSpanObjectsViewIter_Type;
-
 static void objectsviewiter_dealloc(PyPageSpanObjectsViewIter* self)
 {
-    Py_XDECREF(self->view);
-    Py_TYPE(self)->tp_free((PyObject*)self);
+    TL_PY_GC_DEALLOC(self, Py_XDECREF(self->view));
+}
+
+static int objectsviewiter_traverse(PyPageSpanObjectsViewIter* self,
+                                    visitproc visit,
+                                    void* arg)
+{
+    Py_VISIT(Py_TYPE(self));
+    Py_VISIT(self->view);
+    return 0;
+}
+
+static int objectsviewiter_clear(PyPageSpanObjectsViewIter* self)
+{
+    Py_CLEAR(self->view);
+    return 0;
 }
 
 static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
 {
     PyPageSpanObjectsView* view = (PyPageSpanObjectsView*)self->view;
+    if (view == NULL) {
+        return NULL;  /* StopIteration — cleared by GC */
+    }
     PyPageSpan* span = (PyPageSpan*)view->span;
-
-    if (span->closed) {
-        return NULL;  /* StopIteration */
+    if (span == NULL) {
+        return NULL;
     }
 
-    if (span->h == NULL) {
+    /*
+     * Two objects need protection here:
+     *  - self->index (read+advance on this iter)
+     *  - span->closed/h/len (read on the span)
+     * Use the two-object critical section to acquire both atomically and
+     * avoid lock-order issues. The payload is decoded AND Py_NewRef'd
+     * UNDER the span's CS (held via LOCK2): the span's CS prevents its
+     * close()/owner-detach, so the snapshot + drain-blocking pin stay live
+     * and the decoded object cannot be freed before we incref it. Only the
+     * final result return happens after the CS.
+     */
+    int err = 0;  /* 0=ok 1=eof 2=no-h 3=bad-handle */
+    PyObject* obj = NULL;
+
+    TL_PY_OBJ_LOCK2(self, span);
+    if (span->closed || self->view == NULL) {
+        err = 1;
+    } else if (span->h == NULL) {
+        err = 2;
+    } else {
+        Py_ssize_t len = (Py_ssize_t)span->len;
+        if (self->index >= len) {
+            err = 1;
+        } else {
+            PyObject* decoded = tl_py_handle_decode(span->h[self->index]);
+            if (decoded == NULL) {
+                err = 3;
+            } else {
+                obj = Py_NewRef(decoded);
+                self->index++;
+            }
+        }
+    }
+    TL_PY_OBJ_UNLOCK2();
+
+    if (err == 1) {
+        return NULL;  /* StopIteration */
+    }
+    if (err == 2) {
         PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
         return NULL;
     }
-
-    const Py_ssize_t len = (Py_ssize_t)span->len;
-
-    if (self->index >= len) {
-        return NULL;  /* StopIteration */
-    }
-
-    tl_handle_t h = span->h[self->index];
-    PyObject* obj = tl_py_handle_decode(h);
-    if (!obj) {
+    if (err == 3) {
         PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
-
-    self->index++;
-    return Py_NewRef(obj);
+    return obj;
 }
-
-/* Exported (non-static) so module.c can call PyType_Ready */
-PyTypeObject PyPageSpanObjectsViewIter_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpanObjectsViewIter",
-    .tp_basicsize = sizeof(PyPageSpanObjectsViewIter),
-    .tp_dealloc = (destructor)objectsviewiter_dealloc,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_iter = PyObject_SelfIter,
-    .tp_iternext = (iternextfunc)objectsviewiter_next,
-};
 
 static PyObject* PyPageSpanObjectsView_iter(PyPageSpanObjectsView* self)
 {
-    /* Type readied by module init (module.c) - no lazy init needed. */
+    tl_py_module_state_t* mod_st = TlPy_StateFromObject((PyObject*)self);
+    if (mod_st == NULL) {
+        return NULL;
+    }
 
-    PyPageSpanObjectsViewIter* iter = PyObject_New(PyPageSpanObjectsViewIter,
-                                                    &PyPageSpanObjectsViewIter_Type);
+    PyTypeObject* iter_type = (PyTypeObject*)mod_st->type_pagespan_objects_view_iter;
+    PyPageSpanObjectsViewIter* iter =
+        (PyPageSpanObjectsViewIter*)iter_type->tp_alloc(iter_type, 0);
     if (!iter) {
         return NULL;
     }
@@ -226,35 +265,61 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
 
     PyPageSpan* span = (PyPageSpan*)self->span;
 
+    /* Pin the owner across the copy so the underlying h[] array cannot be
+     * freed by a concurrent close. Read len + h + owner under the span's
+     * CS, incref the owner, release CS, then iterate using the pinned
+     * pointers. */
+    int err = 0;  /* 0=ok 1=closed 2=no-h */
+    Py_ssize_t len = 0;
+    const tl_handle_t* h_local = NULL;
+    tl_pagespan_owner_t* owner = NULL;
+
+    TL_PY_OBJ_LOCK(span);
     if (span->closed) {
+        err = 1;
+    } else if (span->h == NULL) {
+        err = 2;
+    } else {
+        len = (Py_ssize_t)span->len;
+        h_local = span->h;
+        owner = span->owner;
+        if (owner != NULL) {
+            tl_pagespan_owner_incref(owner);
+        }
+    }
+    TL_PY_OBJ_UNLOCK();
+
+    if (err == 1) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
-
-    if (span->h == NULL) {
+    if (err == 2) {
         PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
         return NULL;
     }
-
-    const Py_ssize_t len = (Py_ssize_t)span->len;
+    if (owner == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "PageSpan has no underlying buffer");
+        return NULL;
+    }
 
     PyObject* list = PyList_New(len);
     if (!list) {
+        tl_pagespan_owner_decref(owner);
         return NULL;
     }
 
     for (Py_ssize_t i = 0; i < len; i++) {
-        tl_handle_t h = span->h[i];
-        PyObject* obj = tl_py_handle_decode(h);
+        PyObject* obj = tl_py_handle_decode(h_local[i]);
         if (!obj) {
             Py_DECREF(list);
+            tl_pagespan_owner_decref(owner);
             PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
             return NULL;
         }
-
         PyList_SET_ITEM(list, i, Py_NewRef(obj));
     }
 
+    tl_pagespan_owner_decref(owner);
     return list;
 }
 
@@ -266,23 +331,64 @@ static PyMethodDef PyPageSpanObjectsView_methods[] = {
 };
 
 /*===========================================================================
- * Type Object
+ * Type Specifications
  *===========================================================================*/
 
-PyTypeObject PyPageSpanObjectsView_Type = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "timelog._timelog.PageSpanObjectsView",
-    .tp_doc = PyDoc_STR(
+static PyType_Slot PyPageSpanObjectsView_slots[] = {
+    {Py_tp_doc, PyDoc_STR(
         "Lazy sequence view over decoded Python objects from a PageSpan.\n\n"
         "Supports len(), indexing, and iteration.\n"
         "Cannot be instantiated directly; use PageSpan.objects()."
-    ),
-    .tp_basicsize = sizeof(PyPageSpanObjectsView),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = PyPageSpanObjectsView_new_error,
-    .tp_dealloc = (destructor)PyPageSpanObjectsView_dealloc,
-    .tp_as_sequence = &objectsview_as_sequence,
-    .tp_iter = (getiterfunc)PyPageSpanObjectsView_iter,
-    .tp_methods = PyPageSpanObjectsView_methods,
+    )},
+    {Py_tp_dealloc, (void*)PyPageSpanObjectsView_dealloc},
+    {Py_tp_traverse, (void*)PyPageSpanObjectsView_traverse},
+    {Py_tp_clear, (void*)PyPageSpanObjectsView_clear},
+    {Py_tp_iter, (void*)PyPageSpanObjectsView_iter},
+    {Py_tp_methods, PyPageSpanObjectsView_methods},
+    {Py_sq_length, (void*)PyPageSpanObjectsView_length},
+    {Py_sq_item, (void*)PyPageSpanObjectsView_getitem},
+    {0, NULL}
 };
+
+static PyType_Spec PyPageSpanObjectsView_spec = {
+    .name = "timelog._timelog.PageSpanObjectsView",
+    .basicsize = sizeof(PyPageSpanObjectsView),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpanObjectsView_slots,
+};
+
+static PyType_Slot PyPageSpanObjectsViewIter_slots[] = {
+    {Py_tp_dealloc, (void*)objectsviewiter_dealloc},
+    {Py_tp_traverse, (void*)objectsviewiter_traverse},
+    {Py_tp_clear, (void*)objectsviewiter_clear},
+    {Py_tp_iter, PyObject_SelfIter},
+    {Py_tp_iternext, (void*)objectsviewiter_next},
+    {0, NULL}
+};
+
+static PyType_Spec PyPageSpanObjectsViewIter_spec = {
+    .name = "timelog._timelog.PageSpanObjectsViewIter",
+    .basicsize = sizeof(PyPageSpanObjectsViewIter),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT |
+             Py_TPFLAGS_HAVE_GC |
+             Py_TPFLAGS_IMMUTABLETYPE |
+             Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .slots = PyPageSpanObjectsViewIter_slots,
+};
+
+PyObject* TlPy_CreatePageSpanObjectsViewType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpanObjectsView_spec, NULL);
+}
+
+PyObject* TlPy_CreatePageSpanObjectsViewIterType(PyObject* module)
+{
+    return PyType_FromModuleAndSpec(module, &PyPageSpanObjectsViewIter_spec, NULL);
+}
+
+TL_PY_DEFINE_CHECK(TlPyPageSpanObjectsView_Check, type_pagespan_objects_view)

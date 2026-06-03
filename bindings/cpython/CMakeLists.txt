@@ -289,6 +289,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
     add_executable(test_py_timelog
         tests/test_py_timelog.c
+        src/module.c            # Module definition helpers
         src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
         src/py_timelog.c        # PyTimelog implementation under test
@@ -309,6 +310,9 @@ if(TIMELOG_BUILD_PY_TESTS)
             TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
         )
     endif()
+    target_compile_definitions(test_py_timelog PRIVATE
+        TL_PY_MODULE_TEST_HOOKS
+    )
 
     target_link_libraries(test_py_timelog PRIVATE
         timelog
@@ -343,6 +347,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
     add_executable(test_py_iter
         tests/test_py_iter.c
+        src/module.c            # Module definition helpers
         src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
         src/py_timelog.c        # PyTimelog dependency (factory methods)
@@ -364,6 +369,7 @@ if(TIMELOG_BUILD_PY_TESTS)
         )
     endif()
     target_compile_definitions(test_py_iter PRIVATE
+        TL_PY_MODULE_TEST_HOOKS
         TL_PY_ITER_TEST_HOOKS
     )
 
@@ -400,6 +406,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
     add_executable(test_py_span
         tests/test_py_span.c
+        src/module.c            # Module definition helpers
         src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
         src/py_timelog.c        # PyTimelog dependency (factory methods)
@@ -420,6 +427,9 @@ if(TIMELOG_BUILD_PY_TESTS)
             TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
         )
     endif()
+    target_compile_definitions(test_py_span PRIVATE
+        TL_PY_MODULE_TEST_HOOKS
+    )
 
     target_link_libraries(test_py_span PRIVATE
         timelog
@@ -454,6 +464,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
     add_executable(test_py_maint_b5
         tests/test_py_maint_b5.c
+        src/module.c            # Module definition helpers
         src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation
         src/py_timelog.c        # PyTimelog dependency (factory methods)
@@ -474,6 +485,9 @@ if(TIMELOG_BUILD_PY_TESTS)
             TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
         )
     endif()
+    target_compile_definitions(test_py_maint_b5 PRIVATE
+        TL_PY_MODULE_TEST_HOOKS
+    )
 
     target_link_libraries(test_py_maint_b5 PRIVATE
         timelog
@@ -508,6 +522,7 @@ if(TIMELOG_BUILD_PY_TESTS)
     # =========================================================================
     add_executable(test_py_errors
         tests/test_py_errors.c
+        src/module.c            # Module definition helpers
         src/py_handle.c         # Handle dependency
         src/py_errors.c         # Error translation (primary target)
         src/py_timelog.c        # PyTimelog dependency (integration tests)
@@ -558,6 +573,108 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
+    # Test: test_py_module (black-box module import tests)
+    # =========================================================================
+    add_executable(test_py_module
+        tests/test_py_module.c
+    )
+
+    target_include_directories(test_py_module PRIVATE
+        ${Python3_INCLUDE_DIRS}
+    )
+
+    if(Python3_EXECUTABLE)
+        target_compile_definitions(test_py_module PRIVATE
+            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+        )
+    endif()
+
+    target_link_libraries(test_py_module PRIVATE
+        ${Python3_LIBRARIES}
+    )
+
+    timelog_copy_python_runtime(test_py_module)
+
+    if(MSVC)
+        target_compile_options(test_py_module PRIVATE
+            /W4
+            /WX-
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_module PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_module PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_module PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
+    # Test: test_py_module_exec (direct Py_mod_exec validation)
+    # =========================================================================
+    add_executable(test_py_module_exec
+        tests/test_py_module_exec.c
+        src/module.c
+        src/py_handle.c
+        src/py_errors.c
+        src/py_timelog.c
+        src/py_iter.c
+        src/py_span.c
+        src/py_span_iter.c
+        src/py_span_objects.c
+    )
+
+    target_include_directories(test_py_module_exec PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+        ${TIMELOG_ROOT}/core/src
+    )
+
+    if(Python3_EXECUTABLE)
+        target_compile_definitions(test_py_module_exec PRIVATE
+            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+        )
+    endif()
+    target_compile_definitions(test_py_module_exec PRIVATE
+        TL_PY_MODULE_TEST_HOOKS
+    )
+
+    target_link_libraries(test_py_module_exec PRIVATE
+        timelog
+        ${Python3_LIBRARIES}
+    )
+
+    timelog_copy_python_runtime(test_py_module_exec)
+
+    if(MSVC)
+        target_compile_options(test_py_module_exec PRIVATE
+            /W4
+            /WX-
+            /D_CRT_SECURE_NO_WARNINGS
+            /std:c17
+            /experimental:c11atomics
+        )
+    else()
+        target_compile_options(test_py_module_exec PRIVATE
+            -Wall -Wextra -Wpedantic
+            -Wno-unused-parameter
+        )
+        target_link_options(test_py_module_exec PRIVATE
+            -fsanitize=address,undefined
+        )
+        target_compile_options(test_py_module_exec PRIVATE
+            -fsanitize=address,undefined
+        )
+    endif()
+
+    # =========================================================================
     # CTest Integration - Run all tests with 'ctest' command
     # =========================================================================
     enable_testing()
@@ -592,6 +709,16 @@ if(TIMELOG_BUILD_PY_TESTS)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
+    add_test(NAME py_module_tests
+        COMMAND test_py_module
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+
+    add_test(NAME py_module_exec_tests
+        COMMAND test_py_module_exec
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    )
+
     set(_timelog_py_test_env "")
     if(TIMELOG_TEST_PYTHONHOME)
         list(APPEND _timelog_py_test_env "PYTHONHOME=${TIMELOG_TEST_PYTHONHOME}")
@@ -611,16 +738,25 @@ if(TIMELOG_BUILD_PY_TESTS)
             py_span_tests
             py_maint_b5_tests
             py_errors_tests
+            py_module_exec_tests
             PROPERTIES
             ENVIRONMENT "${_timelog_py_test_env}"
         )
     endif()
 
+    set(_timelog_py_module_test_env ${_timelog_py_test_env})
+    list(APPEND _timelog_py_module_test_env "PYTHONPATH=${TIMELOG_ROOT}/python")
+    set_tests_properties(
+        py_module_tests
+        PROPERTIES
+        ENVIRONMENT "${_timelog_py_module_test_env}"
+    )
+
     # Custom target to run all tests (alternative to ctest)
     # Note: -C $<CONFIG> is required for multi-config generators (MSVC)
     add_custom_target(run_all_tests
         COMMAND ${CMAKE_CTEST_COMMAND} -C $<CONFIG> --output-on-failure
-        DEPENDS test_py_handle test_py_timelog test_py_iter test_py_span test_py_maint_b5 test_py_errors
+        DEPENDS _timelog test_py_handle test_py_timelog test_py_iter test_py_span test_py_maint_b5 test_py_errors test_py_module test_py_module_exec
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMENT "Running all CPython binding tests..."
     )

@@ -45,7 +45,8 @@ void tl__alloc_init(tl_alloc_ctx_t* ctx, const tl_allocator_t* user_alloc) {
     if (user_alloc == NULL ||
         user_alloc->malloc_fn == NULL ||
         user_alloc->free_fn == NULL) {
-        /* Use default libc allocator */
+        /* Fall back to the libc allocator when the user supplied no hooks
+         * or omitted the mandatory malloc/free pair. */
         ctx->alloc.ctx = NULL;
         ctx->alloc.malloc_fn  = default_malloc;
         ctx->alloc.calloc_fn  = default_calloc;
@@ -53,16 +54,14 @@ void tl__alloc_init(tl_alloc_ctx_t* ctx, const tl_allocator_t* user_alloc) {
         ctx->alloc.free_fn    = default_free;
         ctx->is_default = true;
     } else {
-        /* Use user-provided allocator */
         ctx->alloc = *user_alloc;
         ctx->is_default = false;
 
-        /* Note: If calloc_fn is not provided (NULL), tl__calloc will emulate
-         * it with malloc + memset. No action needed here.
-         *
-         * Note: realloc_fn is optional. If not provided, tl__realloc will
-         * return NULL for resize operations (cannot emulate without old size).
-         * Callers requiring realloc must provide realloc_fn. */
+        /* calloc_fn is optional; tl__calloc will emulate it with malloc +
+         * memset when missing. realloc_fn is also optional but emulation is
+         * impossible without the old allocation size, so tl__realloc will
+         * fail-stop for resize operations rather than risk data corruption.
+         * Callers that must grow buffers therefore have to supply it. */
     }
 }
 
@@ -73,9 +72,8 @@ void tl__alloc_destroy(tl_alloc_ctx_t* ctx) {
     uint64_t count = tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED);
     if (count != 0) {
         uint64_t total = tl_atomic_load_u64(&ctx->total_allocated, TL_MO_RELAXED);
-        /* Note: Cannot use TL_LOG_WARN here since we don't have access to
-         * the log context from the allocator. Use stderr directly for this
-         * critical leak warning. */
+        /* The allocator carries no log context, so this leak warning bypasses
+         * the structured logging facility and writes straight to stderr. */
         fprintf(stderr, "[WARN] Memory leak detected: %zu allocations, %zu bytes\n",
                 (size_t)count, (size_t)total);
     }
@@ -121,10 +119,10 @@ void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
         return NULL;
     }
 
-    /* Check for overflow */
+    /* Overflow guard: rely on the round-trip identity (a*b)/a == b. */
     size_t total = count * size;
     if (total / count != size) {
-        return NULL; /* Overflow */
+        return NULL;
     }
 
     void* ptr;
@@ -132,7 +130,6 @@ void* tl__calloc(tl_alloc_ctx_t* ctx, size_t count, size_t size) {
     if (ctx->alloc.calloc_fn != NULL) {
         ptr = ctx->alloc.calloc_fn(ctx->alloc.ctx, count, size);
     } else {
-        /* Emulate calloc with malloc + memset */
         ptr = ctx->alloc.malloc_fn(ctx->alloc.ctx, total);
         if (ptr != NULL) {
             memset(ptr, 0, total);
@@ -182,7 +179,9 @@ void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size
     }
 
     if (tl__alloc_would_overflow(count, size)) {
-        return NULL;  /* ptr NOT freed; caller retains ownership */
+        /* Match POSIX reallocarray semantics: on overflow the original
+         * allocation is preserved so the caller keeps the only reference. */
+        return NULL;
     }
 
     return tl__realloc(ctx, ptr, count * size);
@@ -200,19 +199,18 @@ void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size) {
         return tl__malloc(ctx, new_size);
     }
 
-    /* realloc_fn is required for realloc operations.
-     * We cannot safely emulate realloc without knowing the old size,
-     * and silently corrupting data is unacceptable. */
+    /* Resize requires a user-supplied realloc_fn: without the original
+     * allocation size we cannot safely malloc-copy-free, and silently
+     * truncating would corrupt data. Fail rather than guess. */
     if (ctx->alloc.realloc_fn == NULL) {
         return NULL;
     }
 
     void* new_ptr = ctx->alloc.realloc_fn(ctx->alloc.ctx, ptr, new_size);
 
-    /* Note: In debug builds, we can't accurately track size changes without
-     * storing allocation sizes. For simplicity, we don't update counters here.
-     * A full implementation would use a size-tracking wrapper. */
-
+    /* Debug counters do not track resize deltas: we'd need a size-tracking
+     * wrapper to compute the difference, which is more bookkeeping than
+     * the diagnostic counters justify. */
     return new_ptr;
 }
 
@@ -220,8 +218,9 @@ void tl__free(tl_alloc_ctx_t* ctx, void* ptr) {
     if (ctx == NULL || ptr == NULL) return;
 
 #ifdef TL_DEBUG
-    /* Keep debug accounting sane even under internal mismatches.
-     * Verify non-underflow before decrementing to avoid wraparound noise. */
+    /* Debug-only allocation count: guard the CAS loop against underflow so
+     * an accounting mismatch produces an assertion rather than wrapping to
+     * UINT64_MAX and masking later bugs. */
     uint64_t expected = tl_atomic_load_u64(&ctx->allocation_count, TL_MO_RELAXED);
     for (;;) {
         TL_VERIFY(expected > 0);

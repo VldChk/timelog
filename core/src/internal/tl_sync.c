@@ -3,9 +3,10 @@
 #include "tl_log.h"
 
 /*
- * On some Linux toolchains, pthread_setname_np declaration is hidden behind
- * feature macros that may not be active under strict C17 builds. Provide the
- * expected prototype here so debug thread naming compiles with -Werror.
+ * Forward declaration for pthread_setname_np: on glibc the prototype lives
+ * behind _GNU_SOURCE, which strict C17 builds (-std=c17) do not set. Bring
+ * it in explicitly so debug thread naming compiles under -Werror without
+ * forcing every translation unit to be GNU-flavoured.
  */
 #if defined(TL_DEBUG) && defined(__linux__)
 extern int pthread_setname_np(pthread_t thread, const char* name);
@@ -40,7 +41,7 @@ tl_status_t tl_mutex_init(tl_mutex_t* mu) {
 
 void tl_mutex_destroy(tl_mutex_t* mu) {
     if (mu == NULL) return;
-    /* SRWLock doesn't require explicit destruction */
+    /* SRWLOCK has no explicit destroy operation. */
 #ifdef TL_DEBUG
     TL_ASSERT(mu->owner == 0);
 #endif
@@ -49,7 +50,9 @@ void tl_mutex_destroy(tl_mutex_t* mu) {
 void tl_mutex_lock(tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
 #ifdef TL_DEBUG
-    TL_ASSERT(mu->owner != GetCurrentThreadId()); /* Detect recursive lock */
+    /* Catch recursive locking: the engine treats all internal mutexes as
+     * non-recursive, and SRWLOCK would deadlock if we tried. */
+    TL_ASSERT(mu->owner != GetCurrentThreadId());
 #endif
     AcquireSRWLockExclusive(&mu->lock);
 #ifdef TL_DEBUG
@@ -69,7 +72,7 @@ void tl_mutex_unlock(tl_mutex_t* mu) {
 bool tl_mutex_trylock(tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
 #ifdef TL_DEBUG
-    TL_ASSERT(mu->owner != GetCurrentThreadId()); /* Detect recursive lock */
+    TL_ASSERT(mu->owner != GetCurrentThreadId());
 #endif
     if (TryAcquireSRWLockExclusive(&mu->lock)) {
 #ifdef TL_DEBUG
@@ -97,7 +100,7 @@ tl_status_t tl_cond_init(tl_cond_t* cv) {
 }
 
 void tl_cond_destroy(tl_cond_t* cv) {
-    /* CONDITION_VARIABLE doesn't require explicit destruction */
+    /* CONDITION_VARIABLE has no explicit destroy operation. */
     (void)cv;
 }
 
@@ -141,16 +144,17 @@ void tl_cond_broadcast(tl_cond_t* cv) {
 /*---------------------------------------------------------------------------
  * Thread
  *
- * IMPORTANT: We use _beginthreadex instead of CreateThread.
- * CreateThread does not initialize CRT per-thread data, which causes:
- * - Memory leaks if the thread uses CRT functions
- * - Potential crashes with errno, strerror, etc.
- * _beginthreadex properly initializes the CRT and is the recommended API.
+ * Threads are created via _beginthreadex rather than CreateThread because
+ * CreateThread does not initialise the CRT's per-thread state. A thread
+ * that then uses any libc function (errno, strerror, malloc on some
+ * runtimes, etc.) would leak per-thread bookkeeping or crash. The MS
+ * recommendation is unambiguous: use _beginthreadex for any thread that
+ * may touch the CRT.
  *---------------------------------------------------------------------------*/
 
-#include <process.h>  /* For _beginthreadex */
+#include <process.h>
 
-/* Windows thread wrapper - uses unsigned __stdcall for _beginthreadex */
+/* _beginthreadex requires an unsigned __stdcall entry point. */
 static unsigned __stdcall win32_thread_wrapper(void* arg) {
     tl_thread_t* t = (tl_thread_t*)arg;
     t->result = t->fn(t->arg);
@@ -165,14 +169,15 @@ tl_status_t tl_thread_create(tl_thread_t* thread, tl_thread_fn fn, void* arg) {
     thread->arg = arg;
     thread->result = NULL;
 
-    /* _beginthreadex returns handle or 0 on error (not INVALID_HANDLE_VALUE) */
+    /* Note: _beginthreadex signals failure by returning 0, not
+     * INVALID_HANDLE_VALUE. */
     uintptr_t h = _beginthreadex(
-        NULL,                   /* default security attributes */
-        0,                      /* default stack size */
+        NULL,                   /* default security */
+        0,                      /* default stack */
         win32_thread_wrapper,
         thread,
         0,                      /* run immediately */
-        NULL                    /* don't need thread ID */
+        NULL                    /* discard thread id */
     );
 
     if (h == 0) {
@@ -188,7 +193,8 @@ tl_status_t tl_thread_join(tl_thread_t* thread, void** result) {
 
     DWORD wait_result = WaitForSingleObject(thread->handle, INFINITE);
     if (wait_result != WAIT_OBJECT_0) {
-        /* Close handle even on error to prevent resource leak */
+        /* Even on wait failure the kernel object still needs CloseHandle
+         * to release its reference, otherwise the thread leaks. */
         CloseHandle(thread->handle);
         thread->handle = NULL;
         return TL_EINTERNAL;
@@ -209,9 +215,10 @@ uint64_t tl_thread_self_id(void) {
 
 #ifdef TL_DEBUG
 /*
- * Thread-safe one-time initialization for SetThreadDescription.
- * Uses InitOnceExecuteOnce to avoid data races when multiple threads
- * call tl_thread_set_name() concurrently at startup.
+ * SetThreadDescription is resolved at runtime via GetProcAddress because
+ * it only exists on Windows 10 1607+. InitOnceExecuteOnce makes the
+ * lookup race-free when several threads call tl_thread_set_name() during
+ * startup.
  */
 typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
 
@@ -238,18 +245,15 @@ static BOOL CALLBACK thread_name_init_callback(
 void tl_thread_set_name(const char* name) {
     if (name == NULL) return;
 
-    /*
-     * SetThreadDescription requires Windows 10 1607+.
-     * We dynamically load it to avoid breaking older systems.
-     * InitOnceExecuteOnce ensures thread-safe one-time initialization.
-     */
     InitOnceExecuteOnce(&g_thread_name_init_once, thread_name_init_callback, NULL, NULL);
 
     if (g_set_thread_desc_fn) {
-        /* Convert to wide string (simple ASCII conversion sufficient for thread names) */
+        /* Thread names are ASCII; a byte-by-byte widening avoids dragging
+         * in MultiByteToWideChar and is safe because the source charset
+         * is constrained. Bound the loop to leave room for the NUL. */
         wchar_t wname[64];
         int i = 0;
-        while (i < 63 && name[i]) {  /* Check bounds before array access */
+        while (i < 63 && name[i]) {
             wname[i] = (wchar_t)(unsigned char)name[i];
             i++;
         }
@@ -268,9 +272,10 @@ void tl_sleep_ms(uint32_t ms) {
 }
 
 uint64_t tl_monotonic_ms(void) {
-    /* GetTickCount64 returns milliseconds since system start.
-     * Available on Windows Vista and later (our minimum target).
-     * Never wraps (64-bit), monotonic, ~15ms resolution typical. */
+    /* GetTickCount64 is monotonic milliseconds since boot. The 64-bit
+     * counter never wraps in any realistic uptime, and typical resolution
+     * is ~15ms which is fine for bounded-wait deadlines. Available since
+     * Windows Vista. */
     return GetTickCount64();
 }
 
@@ -289,14 +294,12 @@ uint64_t tl_monotonic_ms(void) {
 /*---------------------------------------------------------------------------
  * POSIX Capability Detection
  *
- * pthread_condattr_setclock() is required to use CLOCK_MONOTONIC with
- * condition variables. It's available when:
- * - _POSIX_CLOCK_SELECTION is defined and > 0
- * - CLOCK_MONOTONIC is defined
- * - _POSIX_MONOTONIC_CLOCK is defined
- *
- * On systems where setclock isn't available (e.g., older macOS), we fall
- * back to CLOCK_REALTIME which can have issues with time jumps.
+ * We prefer to pair condition variables with CLOCK_MONOTONIC so timed
+ * waits are immune to wall-clock adjustments (NTP slew, manual time
+ * changes). This requires pthread_condattr_setclock(), which is only
+ * exposed when all three feature macros below are present. Platforms
+ * without it (notably older macOS) fall back to CLOCK_REALTIME and
+ * accept the risk that a backwards time jump may elongate a wait.
  *---------------------------------------------------------------------------*/
 #if defined(_POSIX_CLOCK_SELECTION) && (_POSIX_CLOCK_SELECTION > 0) && \
     defined(CLOCK_MONOTONIC) && defined(_POSIX_MONOTONIC_CLOCK)
@@ -313,7 +316,8 @@ tl_status_t tl_mutex_init(tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
 
 #ifdef TL_DEBUG
-    /* Use ERRORCHECK in debug mode for deadlock detection */
+    /* ERRORCHECK turns recursive locks and other misuse into immediate
+     * errors instead of silent deadlocks — invaluable during development. */
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
@@ -321,7 +325,7 @@ tl_status_t tl_mutex_init(tl_mutex_t* mu) {
     int rc = pthread_mutex_init(&mu->lock, &attr);
     pthread_mutexattr_destroy(&attr);
 #else
-    /* Use default (faster) mutex in release mode */
+    /* Release builds use the default mutex type for minimum overhead. */
     int rc = pthread_mutex_init(&mu->lock, NULL);
 #endif
 
@@ -330,7 +334,8 @@ tl_status_t tl_mutex_init(tl_mutex_t* mu) {
     }
 
 #ifdef TL_DEBUG
-    /* Note: We don't initialize owner since it's only valid when locked == 1 */
+    /* owner is only meaningful while locked == 1, so we leave it
+     * uninitialised on purpose. */
     mu->locked = 0;
 #endif
     return TL_OK;
@@ -347,7 +352,10 @@ void tl_mutex_destroy(tl_mutex_t* mu) {
 void tl_mutex_lock(tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
     int rc = pthread_mutex_lock(&mu->lock);
-    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
+    /* OS primitive: any failure here would indicate a corrupted mutex
+     * (EINVAL) or impossible state; abort rather than risk continuing
+     * with a broken lock. */
+    TL_VERIFY(rc == 0);
     (void)rc;
 #ifdef TL_DEBUG
     mu->owner = pthread_self();
@@ -360,12 +368,12 @@ void tl_mutex_unlock(tl_mutex_t* mu) {
 #ifdef TL_DEBUG
     TL_ASSERT(mu->locked);
     TL_ASSERT(pthread_equal(mu->owner, pthread_self()));
-    /* Clear locked flag first - owner is now invalid */
+    /* Clear locked first; owner becomes meaningless the moment we drop
+     * the lock, and pthread_t cannot be reset to a sentinel. */
     mu->locked = 0;
-    /* Note: We don't clear owner since pthread_t is opaque */
 #endif
     int rc = pthread_mutex_unlock(&mu->lock);
-    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
+    TL_VERIFY(rc == 0);
     (void)rc;
 }
 
@@ -396,7 +404,9 @@ tl_status_t tl_cond_init(tl_cond_t* cv) {
     TL_ASSERT(cv != NULL);
 
 #if TL_HAS_PTHREAD_CONDATTR_SETCLOCK
-    /* Use CLOCK_MONOTONIC for reliable timeouts */
+    /* Prefer CLOCK_MONOTONIC; fall back to the default at any error. The
+     * use_monotonic flag below records the choice so the matching clock
+     * is used when computing absolute timeout values. */
     pthread_condattr_t attr;
     int attr_rc = pthread_condattr_init(&attr);
     int rc;
@@ -407,13 +417,11 @@ tl_status_t tl_cond_init(tl_cond_t* cv) {
             rc = pthread_cond_init(&cv->cond, &attr);
             cv->use_monotonic = true;
         } else {
-            /* setclock failed, fall back to default (CLOCK_REALTIME) */
             rc = pthread_cond_init(&cv->cond, NULL);
             cv->use_monotonic = false;
         }
         pthread_condattr_destroy(&attr);
     } else {
-        /* attr init failed, fall back to default */
         rc = pthread_cond_init(&cv->cond, NULL);
         cv->use_monotonic = false;
     }
@@ -438,14 +446,15 @@ void tl_cond_wait(tl_cond_t* cv, tl_mutex_t* mu) {
     TL_ASSERT(mu != NULL);
 #ifdef TL_DEBUG
     TL_ASSERT(mu->locked);
-    /* Mark as unlocked before wait (mutex will be released during wait) */
+    /* pthread_cond_wait releases the mutex for the duration of the wait,
+     * so the debug ownership tracking must reflect that. */
     mu->locked = 0;
 #endif
     int rc = pthread_cond_wait(&cv->cond, &mu->lock);
-    TL_VERIFY(rc == 0);  /* OS primitive - abort on failure, not UB */
+    TL_VERIFY(rc == 0);
     (void)rc;
 #ifdef TL_DEBUG
-    /* Mutex is reacquired after wait */
+    /* Mutex has been re-acquired on return. */
     mu->owner = pthread_self();
     mu->locked = 1;
 #endif
@@ -457,11 +466,11 @@ bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms) {
 
     struct timespec ts;
 
-    /*
-     * Use the same clock that was configured in tl_cond_init().
-     * The condvar and timeout calculation MUST use the same clock,
-     * otherwise timeouts will be wrong (possibly very long or immediate).
-     */
+    /* Critical correctness requirement: pthread_cond_timedwait interprets
+     * the absolute deadline against the clock attached to the condvar.
+     * Reading from a different clock here would produce timeouts that are
+     * either always immediate (REALTIME ahead of MONOTONIC) or effectively
+     * infinite (the reverse). */
 #if TL_HAS_PTHREAD_CONDATTR_SETCLOCK
     if (cv->use_monotonic) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -469,14 +478,11 @@ bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms) {
         clock_gettime(CLOCK_REALTIME, &ts);
     }
 #else
-    /* CLOCK_MONOTONIC not available for condvars, use REALTIME */
     clock_gettime(CLOCK_REALTIME, &ts);
 #endif
 
-    /* Add timeout */
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-    /* Handle nanosecond overflow */
     if (ts.tv_nsec >= 1000000000L) {
         ts.tv_sec += 1;
         ts.tv_nsec -= 1000000000L;
@@ -484,23 +490,23 @@ bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms) {
 
 #ifdef TL_DEBUG
     TL_ASSERT(mu->locked);
-    /* Mark as unlocked before wait */
     mu->locked = 0;
 #endif
     int rc = pthread_cond_timedwait(&cv->cond, &mu->lock, &ts);
 #ifdef TL_DEBUG
-    /* Mutex is reacquired after wait */
     mu->owner = pthread_self();
     mu->locked = 1;
 #endif
 
     if (rc == 0) {
-        return true;  /* Signaled */
+        return true;
     }
     if (rc == ETIMEDOUT) {
-        return false; /* Timed out */
+        return false;
     }
-    TL_VERIFY(0);  /* Unexpected OS error - abort, not UB */
+    /* Any other return code (EINVAL, EPERM) indicates a programming bug
+     * or a corrupted primitive — neither is recoverable. */
+    TL_VERIFY(0);
     return false;
 }
 
@@ -551,10 +557,10 @@ tl_status_t tl_thread_join(tl_thread_t* thread, void** result) {
 
 uint64_t tl_thread_self_id(void) {
     /*
-     * pthread_t is an opaque type that may not be integer-convertible.
-     * We use memcpy to safely extract a numeric ID for debugging purposes.
-     * This ID is only used for debug output and lock tracking, not for
-     * thread comparison (use pthread_equal() for that).
+     * pthread_t is opaque and on some platforms not integer-convertible,
+     * so cast-to-uint would be undefined. memcpy extracts a stable bit
+     * pattern that is fine for log output and lock tracking. For thread
+     * equality checks, callers must use pthread_equal() instead.
      */
     pthread_t self = pthread_self();
     uint64_t id = 0;
@@ -568,13 +574,14 @@ void tl_thread_set_name(const char* name) {
     if (name == NULL) return;
 
 #if defined(__APPLE__)
-    /* macOS: pthread_setname_np takes only the name (current thread implicit) */
+    /* macOS exposes the single-arg form; the target is always the caller. */
     pthread_setname_np(name);
 #elif defined(__linux__)
-    /* Linux: pthread_setname_np takes thread handle and name (max 15 chars + NUL) */
+    /* Linux requires an explicit thread argument; names are truncated to
+     * 15 bytes plus a NUL by the kernel. */
     pthread_setname_np(pthread_self(), name);
 #else
-    /* Other POSIX: best-effort no-op */
+    /* Other POSIX systems lack a portable API; thread naming is a no-op. */
     (void)name;
 #endif
 }
@@ -586,17 +593,16 @@ void tl_thread_yield(void) {
 
 void tl_sleep_ms(uint32_t ms) {
     /*
-     * Use nanosleep instead of usleep:
-     * - usleep is obsolete in POSIX.1-2008
-     * - nanosleep handles interrupts properly (EINTR)
-     * - nanosleep provides remaining time on interrupt
+     * nanosleep over usleep: usleep was removed in POSIX.1-2008, and
+     * nanosleep's remaining-time output lets us correctly resume on
+     * EINTR rather than sleeping for the full duration again.
      */
     struct timespec ts;
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
 
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {
-        /* Retry with remaining time if interrupted */
+        /* Interrupted: resume with the remaining time written by the kernel. */
     }
 }
 
@@ -605,7 +611,8 @@ uint64_t tl_monotonic_ms(void) {
 #if defined(CLOCK_MONOTONIC)
     clock_gettime(CLOCK_MONOTONIC, &ts);
 #else
-    /* Fallback to realtime if monotonic unavailable (rare) */
+    /* Rare fallback when CLOCK_MONOTONIC is unavailable: callers must
+     * tolerate the possibility of backwards jumps. */
     clock_gettime(CLOCK_REALTIME, &ts);
 #endif
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;

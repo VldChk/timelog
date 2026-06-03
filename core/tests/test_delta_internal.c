@@ -1,19 +1,16 @@
 /*===========================================================================
  * test_delta_internal.c - Delta Layer Internal Tests
  *
- * These tests verify LLD-level invariants and internal API behavior for
- * the delta layer: memrun, memtable, merge iterator, and flush builder.
+ * These tests verify invariants and internal API behavior for the delta
+ * layer: memrun, memtable, merge iterator, and flush builder.
  *
- * CLASSIFICATION: Internal (LLD-Driven)
- * These are IMPLEMENTATION tests, not SPEC tests.
+ * CLASSIFICATION: Implementation tests, not public API contract tests.
  *
- * If these tests fail, the cause could be:
- * 1. A bug in the implementation (likely)
- * 2. An intentional internal refactor (update test accordingly)
+ * If these tests fail, the cause is typically either a real bug in the
+ * implementation or an intentional internal refactor that requires
+ * updating the test alongside it.
  *
- * These tests do NOT verify public API contracts - see test_functional.c.
- *
- * Part of Phase 10: Test Suite Reorganization
+ * Public API contracts are covered in test_functional.c.
  *===========================================================================*/
 
 #include "test_harness.h"

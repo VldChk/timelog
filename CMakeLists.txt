@@ -24,6 +24,10 @@ option(TIMELOG_STRICT_WARNINGS
 option(TIMELOG_BUILD_CORE_TESTS
     "Build core C test executable and register core CTest entry" ON)
 option(TIMELOG_BUILD_DEMOS "Build demo executables" ON)
+set(TIMELOG_SANITIZER "address-undefined" CACHE STRING
+    "Sanitizer set for non-MSVC Debug builds: address-undefined, thread, or none")
+set_property(CACHE TIMELOG_SANITIZER PROPERTY STRINGS
+    address-undefined thread none)
 
 # Build type defaults to Release
 if(NOT CMAKE_BUILD_TYPE)
@@ -68,6 +72,12 @@ else()
     if(TIMELOG_STRICT_WARNINGS)
         list(APPEND _timelog_gcc_warn_flags -Werror)
     endif()
+    if(TIMELOG_SANITIZER STREQUAL "thread" AND
+       CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        # GCC reports C11 fences as unsupported by TSan. Keep the diagnostic
+        # visible without making the advisory TSan build uncompilable.
+        list(APPEND _timelog_gcc_warn_flags -Wno-error=tsan)
+    endif()
 
     add_compile_options(
         ${_timelog_gcc_warn_flags}
@@ -86,8 +96,29 @@ else()
     endif()
 
     # Debug flags
-    set(CMAKE_C_FLAGS_DEBUG "-O0 -g3 -DTL_DEBUG=1 -fsanitize=address,undefined")
-    set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+    set(CMAKE_C_FLAGS_DEBUG "-O0 -g3 -DTL_DEBUG=1")
+    if(TIMELOG_SANITIZER STREQUAL "address-undefined")
+        set(_timelog_sanitizer_flags "-fsanitize=address,undefined")
+    elseif(TIMELOG_SANITIZER STREQUAL "thread")
+        set(_timelog_sanitizer_flags "-fsanitize=thread")
+    elseif(TIMELOG_SANITIZER STREQUAL "none")
+        set(_timelog_sanitizer_flags "")
+    else()
+        message(FATAL_ERROR
+            "Unsupported TIMELOG_SANITIZER='${TIMELOG_SANITIZER}'. "
+            "Use address-undefined, thread, or none.")
+    endif()
+
+    if(NOT _timelog_sanitizer_flags STREQUAL "")
+        set(CMAKE_C_FLAGS_DEBUG
+            "${CMAKE_C_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
+        set(CMAKE_EXE_LINKER_FLAGS_DEBUG
+            "${CMAKE_EXE_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
+        set(CMAKE_SHARED_LINKER_FLAGS_DEBUG
+            "${CMAKE_SHARED_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
+        set(CMAKE_MODULE_LINKER_FLAGS_DEBUG
+            "${CMAKE_MODULE_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
+    endif()
 endif()
 
 # =============================================================================
@@ -278,6 +309,8 @@ if(TIMELOG_BUILD_PYTHON)
             test_py_span
             test_py_maint_b5
             test_py_errors
+            test_py_module
+            test_py_module_exec
         )
     endif()
 

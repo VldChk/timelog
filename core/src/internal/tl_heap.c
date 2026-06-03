@@ -5,13 +5,14 @@
  * Internal Helpers
  *===========================================================================*/
 
-/** Minimum initial capacity for heap (small - heap is usually K sources) */
+/* Starting capacity: K-way merges typically have only a handful of sources,
+ * so a small initial buffer avoids over-allocation for the common case. */
 static const size_t HEAP_MIN_CAPACITY = 8;
 
 /**
- * Compare two heap entries.
- * Entries are compared by (ts, tie_break_key) for deterministic ordering.
- * @return true if a < b
+ * Strict less-than for the heap order. The tie-breaker on equal timestamps
+ * is mandatory: it gives the merge a stable, deterministic output across
+ * runs, which downstream consumers rely on for reproducible results.
  */
 TL_INLINE bool heap_entry_less(const tl_heap_entry_t* a, const tl_heap_entry_t* b) {
     if (a->ts != b->ts) {
@@ -20,24 +21,19 @@ TL_INLINE bool heap_entry_less(const tl_heap_entry_t* a, const tl_heap_entry_t* 
     return a->tie_break_key < b->tie_break_key;
 }
 
-/**
- * Swap two heap entries.
- */
 TL_INLINE void heap_entry_swap(tl_heap_entry_t* a, tl_heap_entry_t* b) {
     tl_heap_entry_t tmp = *a;
     *a = *b;
     *b = tmp;
 }
 
-/**
- * Sift up: restore heap property after insertion at idx.
- */
+/* Restore the heap property after an insertion at idx. */
 static void sift_up(tl_heap_t* h, size_t idx) {
     while (idx > 0) {
         size_t parent = (idx - 1) / 2;
 
         if (!heap_entry_less(&h->data[idx], &h->data[parent])) {
-            break; /* Heap property satisfied */
+            break;
         }
 
         heap_entry_swap(&h->data[idx], &h->data[parent]);
@@ -45,9 +41,7 @@ static void sift_up(tl_heap_t* h, size_t idx) {
     }
 }
 
-/**
- * Sift down: restore heap property after removal from root.
- */
+/* Restore the heap property after replacing the root. */
 static void sift_down(tl_heap_t* h, size_t idx) {
     while (true) {
         size_t left = 2 * idx + 1;
@@ -63,7 +57,7 @@ static void sift_down(tl_heap_t* h, size_t idx) {
         }
 
         if (smallest == idx) {
-            break; /* Heap property satisfied */
+            break;
         }
 
         heap_entry_swap(&h->data[idx], &h->data[smallest]);
@@ -90,12 +84,11 @@ void tl_heap_destroy(tl_heap_t* h) {
         return;
     }
 
-    /* State validation in debug builds.
-     * If data is allocated, we need a valid allocator to free it.
-     * If this fires, the heap was likely corrupted or double-destroyed. */
+    /* Allocator must outlive the heap data: if we own a buffer we must
+     * still be able to free it. A NULL allocator here usually indicates a
+     * use-after-destroy or memcpy'd heap struct. */
     TL_ASSERT(h->data == NULL || h->alloc != NULL);
 
-    /* Invariant check: len cannot exceed cap */
     TL_ASSERT(h->len <= h->cap);
 
     if (h->data != NULL) {
@@ -105,8 +98,8 @@ void tl_heap_destroy(tl_heap_t* h) {
     h->data = NULL;
     h->len = 0;
     h->cap = 0;
-    /* Note: h->alloc is left as-is (not set to NULL) since destroy may be
-     * called before full cleanup. Caller owns alloc lifetime. */
+    /* h->alloc is intentionally not cleared: the allocator outlives the
+     * heap and may be reused if init is called again on the same struct. */
 }
 
 void tl_heap_clear(tl_heap_t* h) {
@@ -154,11 +147,8 @@ tl_status_t tl_heap_push(tl_heap_t* h, const tl_heap_entry_t* entry) {
         return s;
     }
 
-    /* Insert at end */
     h->data[h->len] = *entry;
     h->len++;
-
-    /* Restore heap property */
     sift_up(h, h->len - 1);
 
     return TL_OK;
@@ -172,10 +162,10 @@ tl_status_t tl_heap_pop(tl_heap_t* h, tl_heap_entry_t* out) {
         return TL_EOF;
     }
 
-    /* Return minimum (root) */
     *out = h->data[0];
 
-    /* Move last element to root */
+    /* Standard binary-heap pop: move the last element to the root and
+     * sift it down to restore the heap order. */
     h->len--;
     if (h->len > 0) {
         h->data[0] = h->data[h->len];
@@ -211,13 +201,13 @@ tl_status_t tl_heap_build(tl_heap_t* h, const tl_heap_entry_t* entries, size_t n
         return s;
     }
 
-    /* Copy entries */
     memcpy(h->data, entries, n * sizeof(tl_heap_entry_t));
     h->len = n;
 
-    /* Bottom-up heapify: O(n) */
+    /* Floyd's bottom-up heapify: sift down every non-leaf node starting
+     * from the last parent. Runs in O(n) versus O(n log n) for repeated
+     * push, because most nodes need only a shallow sift. */
     if (n > 1) {
-        /* Start from last parent and work up to root */
         for (size_t i = n / 2; i > 0; i--) {
             sift_down(h, i - 1);
         }
