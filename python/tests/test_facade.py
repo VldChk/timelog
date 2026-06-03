@@ -77,6 +77,15 @@ class TestVersion:
         """Source-tree imports must not report a stale installed distribution."""
         import timelog
 
+        # This invariant only holds when `timelog` itself is imported from the
+        # source tree. Under cibuildwheel the package is installed into
+        # site-packages with no adjacent pyproject.toml, so the resolver
+        # correctly falls back to distribution metadata. Probe the package's own
+        # source-tree detector (not this test file's location, which still sees
+        # the mounted source) so the test scopes itself to its stated premise.
+        if timelog._resolve_local_version() is None:
+            pytest.skip("timelog imported as an installed wheel, not a source tree")
+
         project_root = Path(__file__).resolve().parents[2]
         pyproject_version = tomllib.loads(
             (project_root / "pyproject.toml").read_text(encoding="utf-8")
