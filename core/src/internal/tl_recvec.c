@@ -266,9 +266,23 @@ tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs) {
 size_t tl_recvec_lower_bound(const tl_recvec_t* rv, tl_ts_t ts) {
     TL_ASSERT(rv != NULL);
 
-    size_t lo = 0;
-    size_t hi = rv->len;
+    size_t n = rv->len;
 
+    /* Branchless (cmov) for memtable/page-sized runs; branchy fallback above the
+     * size gate. Identical: first i in [0,n) with data[i].ts >= ts (else n). */
+    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
+        size_t base = 0;
+        size_t length = n;
+        while (length > 0) {
+            size_t half = length / 2;
+            base += (size_t)(rv->data[base + half].ts < ts) * (length - half);
+            length = half;
+        }
+        return base;
+    }
+
+    size_t lo = 0;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (rv->data[mid].ts < ts) {
@@ -277,16 +291,29 @@ size_t tl_recvec_lower_bound(const tl_recvec_t* rv, tl_ts_t ts) {
             hi = mid;
         }
     }
-
     return lo;
 }
 
 size_t tl_recvec_upper_bound(const tl_recvec_t* rv, tl_ts_t ts) {
     TL_ASSERT(rv != NULL);
 
-    size_t lo = 0;
-    size_t hi = rv->len;
+    size_t n = rv->len;
 
+    /* Branchless (cmov) for memtable/page-sized runs; branchy fallback above the
+     * size gate. Identical: first i in [0,n) with data[i].ts > ts (else n). */
+    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
+        size_t base = 0;
+        size_t length = n;
+        while (length > 0) {
+            size_t half = length / 2;
+            base += (size_t)(rv->data[base + half].ts <= ts) * (length - half);
+            length = half;
+        }
+        return base;
+    }
+
+    size_t lo = 0;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (rv->data[mid].ts <= ts) {
@@ -295,7 +322,6 @@ size_t tl_recvec_upper_bound(const tl_recvec_t* rv, tl_ts_t ts) {
             hi = mid;
         }
     }
-
     return lo;
 }
 

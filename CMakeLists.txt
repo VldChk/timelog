@@ -219,6 +219,7 @@ if(TIMELOG_BUILD_CORE_TESTS)
         core/tests/test_internal_sync.c
         core/tests/test_internal_data_structures.c
         core/tests/test_storage_internal.c
+        core/tests/test_search_branchless.c
         core/tests/test_delta_internal.c
         core/tests/test_compaction_internal.c
         # Functional tests (public API behavior)
