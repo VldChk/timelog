@@ -145,6 +145,37 @@ class TestAppendMinTsGuard:
         assert list(tl.point(50)) == [(50, "now_ok")]
         tl.close()
 
+    def test_reopen_changes_guard_no_stale_leak(self):
+        # The C floor is the single source of truth and is re-applied by the
+        # facade on every reopen (PyTimelog_init no longer resets it). Reopening
+        # to a DIFFERENT bound must take effect exactly, with no stale leak from
+        # the prior floor and no fail-open gap.
+        tl = timelog.Timelog(min_ts=100)
+        with pytest.raises(ValueError):
+            tl.append(50, "below-old")
+        tl.close()
+        tl.reopen(min_ts=200)               # raise the floor
+        assert tl._min_ts == 200            # property reads the C field
+        with pytest.raises(ValueError):
+            tl.append(150, "below-new")     # was OK under old floor=100
+        tl.append(250, "ok")
+        assert list(tl.point(250)) == [(250, "ok")]
+        tl.close()
+        tl.reopen(min_ts=50)                # lower the floor
+        assert tl._min_ts == 50
+        tl.append(50, "now_ok")             # rejected under floor=200, ok now
+        assert list(tl.point(50)) == [(50, "now_ok")]
+        tl.close()
+
+    def test_fresh_instance_has_no_guard(self):
+        # Fresh tp_alloc memory must zero-initialize the floor fields even though
+        # PyTimelog_init no longer explicitly resets them.
+        tl = timelog.Timelog()
+        assert tl._min_ts is None
+        tl.append(-999, "neg")              # no floor -> negative ts accepted
+        assert list(tl.point(-999)) == [(-999, "neg")]
+        tl.close()
+
     def test_setitem_respects_guard(self):
         tl = timelog.Timelog(min_ts=100)
         with pytest.raises(ValueError):

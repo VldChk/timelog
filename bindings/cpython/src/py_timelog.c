@@ -29,6 +29,7 @@
 #include "timelog/timelog.h"
 
 #include <limits.h>
+#include <time.h>   /* timespec_get for in-C auto-timestamp (append fold) */
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -294,6 +295,60 @@ static int tl_py_fast_i64(PyObject* arg, long long* out)
     }
     *out = v;
     return 0;
+}
+
+/**
+ * Coerce a timestamp argument matching the facade _coerce_ts EXACTLY:
+ * reject bool -> TypeError("timestamp must be int (bool not allowed)");
+ * coerce via __index__ (PyNumber_Index) so float/str/None -> TypeError; and on
+ * out-of-int64 raise OverflowError with the facade's exact message. Used by the
+ * append fold's explicit-ts paths. (Distinct from tl_py_fast_i64, which ACCEPTS
+ * bool, for the idea-2 query/delete methods.) Returns 0 (*out set) or -1 w/ exc.
+ */
+static int tl_py_coerce_ts(PyObject* x, long long* out)
+{
+    if (PyBool_Check(x)) {
+        PyErr_SetString(PyExc_TypeError,
+            "timestamp must be int (bool not allowed)");
+        return -1;
+    }
+    PyObject* idx = PyNumber_Index(x);   /* == operator.index(x) */
+    if (idx == NULL) {
+        return -1;
+    }
+    long long v = PyLong_AsLongLong(idx);
+    if (v == -1 && PyErr_Occurred()) {
+        if (PyErr_ExceptionMatches(PyExc_OverflowError)) {
+            PyErr_Clear();
+            PyErr_Format(PyExc_OverflowError,
+                "timestamp %S is outside int64 range [%lld, %lld]",
+                idx, (long long)TL_TS_MIN, (long long)TL_TS_MAX);
+        }
+        Py_DECREF(idx);
+        return -1;
+    }
+    Py_DECREF(idx);
+    *out = v;
+    return 0;
+}
+
+/**
+ * Wall-clock auto-timestamp matching the facade _now_ts: time.time_ns() scaled
+ * by the instance's time_unit. time.time_ns() is CLOCK_REALTIME-based; use the
+ * portable C11 timespec_get(TIME_UTC) (works on Linux/macOS/Windows). The clock
+ * is non-negative, so integer division == floor (matching Python's //).
+ */
+static long long tl_py_now_ts(const PyTimelog* self)
+{
+    struct timespec tsp;
+    timespec_get(&tsp, TIME_UTC);
+    long long ns = (long long)tsp.tv_sec * 1000000000LL + (long long)tsp.tv_nsec;
+    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
+        case TL_TIME_S:  return ns / 1000000000LL;
+        case TL_TIME_MS: return ns / 1000000LL;
+        case TL_TIME_US: return ns / 1000LL;
+        case TL_TIME_NS: default: return ns;
+    }
 }
 
 /**
@@ -1234,14 +1289,18 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     /* Success - store introspection fields */
+    atomic_store_explicit(&self->time_unit,
+                          time_unit_set ? cfg.time_unit : TL_TIME_MS,
+                          memory_order_release);
     atomic_store_explicit(&self->tl, tl_local, memory_order_release);
     atomic_store_explicit(&self->closed, 0, memory_order_release);
-    self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
-    /* Reset the min_ts floor on every (re)open so a reopen cannot leak a stale
-     * guard; the facade re-applies it via _set_min_ts_floor() afterward. */
-    self->has_min_ts_floor = 0;
-    self->min_ts_floor = 0;
+    /* Deliberately do NOT reset the min_ts floor here. Fresh tp_alloc memory is
+     * already zeroed (no guard); on reopen the facade re-applies the floor via
+     * _set_min_ts_floor() as the sole authority. Resetting here would briefly
+     * expose a fail-OPEN window (guard absent) if an append raced a reopen;
+     * leaving the prior floor keeps that contract-excluded race fail-SAFE,
+     * matching the pre-fold facade's persistent `_min_ts` slot. */
 
     /* tl_open() auto-starts maintenance in background mode. */
 
@@ -1491,17 +1550,70 @@ PyTimelog_clear(PyTimelog* self)
  *===========================================================================*/
 
 static PyObject*
-PyTimelog_append(PyTimelog* self, PyObject* args)
+PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs,
+                 PyObject* kwnames)
 {
     CHECK_CLOSED(self);
 
+    /* Folded facade append: 3 signatures (idea 3).
+     *   append(obj)          -> auto-timestamp from the wall clock
+     *   append(obj, ts=X)    -> explicit keyword timestamp
+     *   append(ts, obj)      -> legacy 2-positional
+     * Matches the (now-deleted) Python override exactly, including: a ts= kw is
+     * IGNORED when 2 positional are given; the only accepted kw is 'ts'. */
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    Py_ssize_t nkw = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+
+    PyObject* ts_kw = NULL;   /* borrowed value of ts=, if present */
+    for (Py_ssize_t i = 0; i < nkw; i++) {
+        PyObject* name = PyTuple_GET_ITEM(kwnames, i);
+        if (PyUnicode_CompareWithASCIIString(name, "ts") == 0) {
+            ts_kw = args[n + i];
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "append() got an unexpected keyword argument '%S'", name);
+            return NULL;
+        }
+    }
+
     long long ts_ll;
     PyObject* obj;
-    if (!PyArg_ParseTuple(args, "LO", &ts_ll, &obj)) {
+    if (n == 1) {
+        obj = args[0];
+        if (ts_kw != NULL) {                      /* append(obj, ts=X) */
+            if (tl_py_coerce_ts(ts_kw, &ts_ll) < 0) {
+                return NULL;
+            }
+        } else {                                  /* append(obj) -> auto-timestamp */
+            ts_ll = tl_py_now_ts(self);
+        }
+    } else if (n == 2) {                           /* append(ts, obj); ts= kw ignored, like the facade */
+        if (tl_py_coerce_ts(args[0], &ts_ll) < 0) {
+            return NULL;
+        }
+        obj = args[1];
+    } else {
+        PyErr_Format(PyExc_TypeError,
+            "append() takes 1 or 2 positional arguments but %zd were given", n);
         return NULL;
     }
 
-    /* Validate timestamp range */
+    /* min_ts floor guard (single source of truth; matches facade _check_min_ts).
+     * Atomic acquire-load with flag-before-value ordering, paired with the
+     * release stores in _set_min_ts_floor, so a concurrent reopen can never
+     * expose the flag set against a torn/stale bound. */
+    if (atomic_load_explicit(&self->has_min_ts_floor, memory_order_acquire)) {
+        long long floor = atomic_load_explicit(&self->min_ts_floor,
+                                                memory_order_acquire);
+        if (ts_ll < floor) {
+            PyErr_Format(PyExc_ValueError,
+                "timestamp %lld is below min_ts boundary (%lld)",
+                ts_ll, floor);
+            return NULL;
+        }
+    }
+
+    /* Validate timestamp range (defense-in-depth) */
     if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
         return NULL;
     }
@@ -2254,26 +2366,29 @@ PyTimelog__set_min_ts_floor(PyTimelog* self, PyObject* value)
      * via _coerce_ts). Plain field state -> no CHECK_CLOSED (valid during
      * reopen() on a closed instance). */
     if (value == Py_None) {
-        self->has_min_ts_floor = 0;
-        self->min_ts_floor = 0;
+        atomic_store_explicit(&self->has_min_ts_floor, 0, memory_order_release);
+        atomic_store_explicit(&self->min_ts_floor, 0, memory_order_release);
         Py_RETURN_NONE;
     }
     long long v = PyLong_AsLongLong(value);
     if (v == -1 && PyErr_Occurred()) {
         return NULL;
     }
-    self->has_min_ts_floor = 1;
-    self->min_ts_floor = v;
+    /* Store the bound before the flag (release) so an append that acquires
+     * has_min_ts_floor==1 is guaranteed to observe the matching min_ts_floor. */
+    atomic_store_explicit(&self->min_ts_floor, v, memory_order_release);
+    atomic_store_explicit(&self->has_min_ts_floor, 1, memory_order_release);
     Py_RETURN_NONE;
 }
 
 static PyObject*
 PyTimelog__min_ts_floor(PyTimelog* self, PyObject* Py_UNUSED(args))
 {
-    if (!self->has_min_ts_floor) {
+    if (!atomic_load_explicit(&self->has_min_ts_floor, memory_order_acquire)) {
         Py_RETURN_NONE;
     }
-    return PyLong_FromLongLong(self->min_ts_floor);
+    return PyLong_FromLongLong(
+        atomic_load_explicit(&self->min_ts_floor, memory_order_acquire));
 }
 
 static PyObject*
@@ -2861,7 +2976,7 @@ static PyObject* PyTimelog_get_closed(PyTimelog* self, void* Py_UNUSED(closure))
 static PyObject* PyTimelog_get_time_unit(PyTimelog* self, void* Py_UNUSED(closure))
 {
     const char* unit_str;
-    switch (self->time_unit) {
+    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
         case TL_TIME_S:  unit_str = "s";  break;
         case TL_TIME_MS: unit_str = "ms"; break;
         case TL_TIME_US: unit_str = "us"; break;
@@ -2945,9 +3060,12 @@ static PyGetSetDef PyTimelog_getset[] = {
  *===========================================================================*/
 
 static PyMethodDef PyTimelog_methods[] = {
-    {"append", (PyCFunction)PyTimelog_append, METH_VARARGS,
-     "append(ts, obj) -> None\n\n"
-     "Append a record at timestamp ts with payload obj.\n\n"
+    {"append", (PyCFunction)(void(*)(void))PyTimelog_append,
+     METH_FASTCALL | METH_KEYWORDS,
+     "append(obj) | append(obj, ts=X) | append(ts, obj) -> None\n\n"
+     "Append a record. With one positional arg and no ts, the timestamp is\n"
+     "taken from the wall clock (scaled by time_unit). 'ts' may be given as a\n"
+     "keyword; the 2-positional form is (ts, obj).\n\n"
      "Note: TimelogBusyError means the record WAS committed; do not retry."},
 
     {"extend", (PyCFunction)PyTimelog_extend, METH_VARARGS | METH_KEYWORDS,

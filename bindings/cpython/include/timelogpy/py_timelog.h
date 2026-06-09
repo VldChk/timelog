@@ -152,22 +152,34 @@ typedef struct {
 
     /**
      * Config introspection (stored for Python access).
-     * Set during init, immutable after.
+     * Set during init. `time_unit` is read on the append auto-timestamp hot
+     * path (tl_py_now_ts) without core_lock, so it is atomic: written with
+     * release at (re)open, read with acquire. `maint_mode` is touched only by
+     * its getter, so it stays a plain field.
      */
-    tl_time_unit_t time_unit;
+    _Atomic(tl_time_unit_t) time_unit;
     tl_maint_mode_t maint_mode;
 
     /*
      * min_ts floor guard (single source of truth for the facade's min_ts).
      * has_min_ts_floor == 0 -> no guard; otherwise append() rejects ts <
      * min_ts_floor with ValueError. Set/cleared via _set_min_ts_floor() at
-     * facade __init__/reopen; RESET to 0 in PyTimelog_init so a reopen cannot
-     * leak a stale floor. Read by the facade `_min_ts` property + extend().
-     * Mutated only at construction/reopen (single-writer contract, like
-     * time_unit), so it is a plain field, not atomic.
+     * facade __init__/reopen, which is the SOLE authority. Read on the append
+     * hot path BEFORE core_lock, so both fields are atomic: the writer stores
+     * min_ts_floor then has_min_ts_floor (release); the append reader loads
+     * has_min_ts_floor (acquire) then min_ts_floor, so it never observes the
+     * flag set against a torn/stale bound.
+     *
+     * PyTimelog_init deliberately does NOT reset these: fresh tp_alloc memory
+     * is already zeroed (no guard), and on reopen the facade re-applies the
+     * floor via _set_min_ts_floor(). Resetting here would briefly expose a
+     * fail-OPEN window (guard absent) if an append raced a reopen; leaving the
+     * prior floor in place keeps that (single-writer-contract-excluded) race
+     * fail-SAFE, matching the pre-fold facade where the Python `_min_ts` slot
+     * retained its value across super().__init__().
      */
-    int has_min_ts_floor;
-    long long min_ts_floor;
+    _Atomic(int) has_min_ts_floor;
+    _Atomic(long long) min_ts_floor;
 
     /**
      * Backpressure policy.

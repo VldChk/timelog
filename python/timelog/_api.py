@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import operator
-import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,12 +12,8 @@ if TYPE_CHECKING:
 TL_TS_MIN = -(2**63)      # INT64_MIN
 TL_TS_MAX = 2**63 - 1     # INT64_MAX
 
-_UNIT_DIVISORS = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
-
-
-def _now_ts(time_unit: str) -> int:
-    """Return current wall-clock time as an integer timestamp in the given unit."""
-    return time.time_ns() // _UNIT_DIVISORS[time_unit]
+# Note: auto-timestamping now lives in C (tl_py_now_ts); the former Python
+# _now_ts/_UNIT_DIVISORS helpers were removed when append folded into C.
 
 
 def _coerce_ts(x: object) -> int:

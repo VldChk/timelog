@@ -76,7 +76,7 @@ except ImportError as e:
         "Ensure the package is properly installed."
     ) from e
 
-from timelog._api import _coerce_ts, _slice_to_iter, _now_ts, TL_TS_MIN, TL_TS_MAX
+from timelog._api import _coerce_ts, _slice_to_iter, TL_TS_MIN, TL_TS_MAX
 
 Record = tuple[int, object]
 RecordIter = Iterator[Record]
@@ -325,31 +325,9 @@ class Timelog(_CTimelog):
     # Write path
     # ------------------------------------------------------------------
 
-    def append(self, obj_or_ts, obj_or_none=_SENTINEL, *, ts=None):
-        """Append a record.
-
-        Signatures::
-
-            append(obj)              # auto-timestamp from wall clock
-            append(obj, ts=1000)     # explicit keyword timestamp
-            append(ts, obj)          # positional (legacy)
-
-        Note:
-            TimelogBusyError means the record WAS committed; do not retry.
-        """
-        if obj_or_none is _SENTINEL:
-            # Single arg: append(obj) or append(obj, ts=X)
-            obj = obj_or_ts
-            if ts is None:
-                ts = _now_ts(self.time_unit)
-            else:
-                ts = _coerce_ts(ts)
-        else:
-            # Two positional args: append(ts, obj) -- C-style compat
-            ts = _coerce_ts(obj_or_ts)
-            obj = obj_or_none
-        self._check_min_ts(ts)
-        super().append(ts, obj)
+    # append() is implemented entirely in C (METH_FASTCALL|METH_KEYWORDS):
+    # 3 signatures + wall-clock auto-timestamp + _coerce_ts parity (bool reject)
+    # + the min_ts floor guard (self._min_ts_floor in C). No Python override.
 
     def extend(self, ts_or_iterable, objects=None, *,
                mostly_ordered=None, insert_on_error=True):
