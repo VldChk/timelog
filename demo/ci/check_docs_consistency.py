@@ -36,7 +36,6 @@ REQUIRED_C_SYMBOLS = [
 
 REQUIRED_PY_SYMBOLS = [
     "class Timelog",
-    "def append(",
     "def extend(",
     "def __getitem__(",
     "def at(",
@@ -48,6 +47,14 @@ REQUIRED_PY_SYMBOLS = [
     "def for_streaming(",
     "def for_bulk_ingest(",
     "def for_low_latency(",
+]
+
+# Methods the facade exposes through the C extension base class rather than as
+# a Python ``def``. ``append`` was folded into the C binding for speed (it is a
+# METH_FASTCALL|METH_KEYWORDS handler), so its source of truth is the binding
+# method table, not python/timelog/__init__.py. We still assert it is exposed.
+REQUIRED_BINDING_SYMBOLS = [
+    '{"append"',
 ]
 
 
@@ -108,6 +115,21 @@ def _check_python_symbols(repo_root: Path) -> list[str]:
     return errors
 
 
+def _check_binding_symbols(repo_root: Path) -> list[str]:
+    errors: list[str] = []
+    binding = repo_root / "bindings/cpython/src/py_timelog.c"
+    try:
+        text = binding.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return [f"Missing required file: {binding.as_posix()}"]
+    except OSError as exc:
+        return [f"Failed reading {binding.as_posix()}: {exc}"]
+    for sym in REQUIRED_BINDING_SYMBOLS:
+        if sym not in text:
+            errors.append(f"Missing binding method-table symbol: {sym}")
+    return errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run docs consistency checks.")
     parser.add_argument(
@@ -125,6 +147,7 @@ def main() -> int:
     issues.extend(_check_links(docs_root))
     issues.extend(_check_c_symbols(repo_root))
     issues.extend(_check_python_symbols(repo_root))
+    issues.extend(_check_binding_symbols(repo_root))
 
     if issues:
         print("Docs consistency check failed:")
