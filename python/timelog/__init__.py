@@ -147,7 +147,15 @@ class Timelog(_CTimelog):
 
     Args (Advanced):
         maintenance_wakeup_ms: Worker wake interval (0 = engine default).
-        max_delta_segments: L0 segment bound (0 = engine default).
+        max_delta_segments: L0 segment bound (0 = engine default, 8). The
+            tiering<->leveling dial: when L0 reaches this many segments,
+            compaction collapses them into L1. Lower = eager leveling (faster
+            reads, more compaction CPU/write-amp); higher = lazy tiering
+            (cheaper writes, higher read fan-in). Raising it above the L0 count
+            your workload accumulates stops the *automatic* trigger -- a
+            delete-free workload that never calls compact() then grows
+            read-amplification unbounded. See docs/configuration.md for the
+            measured trade-off curve and guidance.
         window_size: L1 window size (0 = engine default based on time_unit).
         window_origin: Window origin (default 0).
         delete_debt_threshold: Ratio [0.0, 1.0] to trigger delete-debt

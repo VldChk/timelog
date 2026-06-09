@@ -265,7 +265,20 @@ typedef struct tl_config {
     /* Maintenance timing */
     uint32_t        maintenance_wakeup_ms;  /* 0 => default (100ms). Periodic wake interval. */
 
-    size_t          max_delta_segments;     /* 0 => default (8). L0 segment bound. */
+    /*
+     * max_delta_segments: 0 => default (8). Bounds the L0 segment count: when
+     * L0 reaches this many segments, compaction collapses them into the leveled
+     * L1. The tiering<->leveling dial -- an analogy for how eagerly the
+     * overlapping L0 tier is collapsed; it does NOT change the L0->L1 merge or
+     * L1's non-overlap discipline. Lower = eager leveling (low read fan-in, high
+     * write-amp + compaction CPU); higher = lazy tiering (cheap writes, higher
+     * read fan-in). Raising it above the L0 count a workload accumulates stops
+     * the *automatic* L0 trigger -- delete_debt_threshold and an explicit
+     * tl_compact() still fire, but a delete-free workload that never calls
+     * tl_compact() then grows read-amp unbounded. Measured curve + guidance:
+     * docs/configuration.md.
+     */
+    size_t          max_delta_segments;
 
     tl_ts_t         window_size;            /* 0 => default window (1 hour) */
     tl_ts_t         window_origin;          /* default: 0 */
