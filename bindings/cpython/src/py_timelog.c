@@ -45,8 +45,8 @@ static PyObject* PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
-static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject* args);
-static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject* args);
+static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
+static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
 static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
 static void PyTimelog_finalize(PyObject* self_obj);
 typedef tl_status_t (*tl_py_core_call_fn)(tl_timelog_t*);
@@ -275,6 +275,24 @@ static int tl_py_validate_ts(long long v, const char* name)
             "%s %lld out of int64 range", name, v);
         return -1;
     }
+    return 0;
+}
+
+/**
+ * Extract an int64 from a single METH_FASTCALL argument, matching
+ * PyArg_ParseTuple "L" semantics exactly. PyLong_AsLongLong, like "L", is
+ * __index__-based since CPython 3.10 (requires-python >= 3.12, so always):
+ * it accepts int and __index__-able objects, rejects float/str/None with
+ * TypeError, and raises OverflowError beyond the int64 range. Returns 0 on
+ * success (*out set), or -1 with a Python exception set on failure.
+ */
+static int tl_py_fast_i64(PyObject* arg, long long* out)
+{
+    long long v = PyLong_AsLongLong(arg);
+    if (v == -1 && PyErr_Occurred()) {
+        return -1;
+    }
+    *out = v;
     return 0;
 }
 
@@ -1878,12 +1896,19 @@ tl_py_finish_tombstone_write(PyTimelog* self, tl_py_handle_ctx_t* hctx,
 }
 
 static PyObject*
-PyTimelog_delete_range(PyTimelog* self, PyObject* args)
+PyTimelog_delete_range(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 2) {
+        PyErr_Format(PyExc_TypeError,
+            "delete_range() takes exactly 2 arguments (%zd given)", n);
+        return NULL;
+    }
     long long t1_ll, t2_ll;
-    if (!PyArg_ParseTuple(args, "LL", &t1_ll, &t2_ll)) {
+    if (tl_py_fast_i64(args[0], &t1_ll) < 0 ||
+        tl_py_fast_i64(args[1], &t2_ll) < 0) {
         return NULL;
     }
 
@@ -1914,12 +1939,18 @@ PyTimelog_delete_range(PyTimelog* self, PyObject* args)
  *===========================================================================*/
 
 static PyObject*
-PyTimelog_delete_before(PyTimelog* self, PyObject* args)
+PyTimelog_delete_before(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "delete_before() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long cutoff_ll;
-    if (!PyArg_ParseTuple(args, "L", &cutoff_ll)) {
+    if (tl_py_fast_i64(args[0], &cutoff_ll) < 0) {
         return NULL;
     }
 
@@ -2206,12 +2237,18 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
 }
 
 static PyObject*
-PyTimelog_next_ts(PyTimelog* self, PyObject* args)
+PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "next_ts() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long ts_ll;
-    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
+    if (tl_py_fast_i64(args[0], &ts_ll) < 0) {
         return NULL;
     }
 
@@ -2241,12 +2278,18 @@ PyTimelog_next_ts(PyTimelog* self, PyObject* args)
 }
 
 static PyObject*
-PyTimelog_prev_ts(PyTimelog* self, PyObject* args)
+PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "prev_ts() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long ts_ll;
-    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
+    if (tl_py_fast_i64(args[0], &ts_ll) < 0) {
         return NULL;
     }
 
@@ -2581,11 +2624,17 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
  * Create an iterator for records in [t1, t2).
  * If t1 > t2, raises ValueError; t1 == t2 yields empty iterator.
  */
-static PyObject* PyTimelog_range(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_range(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 2) {
+        PyErr_Format(PyExc_TypeError,
+            "range() takes exactly 2 arguments (%zd given)", n);
+        return NULL;
+    }
     long long t1, t2;
-
-    if (!PyArg_ParseTuple(args, "LL", &t1, &t2)) {
+    if (tl_py_fast_i64(args[0], &t1) < 0 ||
+        tl_py_fast_i64(args[1], &t2) < 0) {
         return NULL;
     }
 
@@ -2606,11 +2655,16 @@ static PyObject* PyTimelog_range(PyTimelog* self, PyObject* args)
  *
  * Create an iterator for records with ts >= t.
  */
-static PyObject* PyTimelog_since(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_since(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "since() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2626,11 +2680,16 @@ static PyObject* PyTimelog_since(PyTimelog* self, PyObject* args)
  *
  * Create an iterator for records with ts < t.
  */
-static PyObject* PyTimelog_until(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_until(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "until() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2657,11 +2716,16 @@ static PyObject* PyTimelog_all(PyTimelog* self, PyObject* Py_UNUSED(args))
  *
  * Create an iterator for records with ts == t.
  */
-static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_equal(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "equal() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2678,11 +2742,16 @@ static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
  * Create an iterator for records at exact timestamp t.
  * Alias for equal() for semantic clarity in point queries.
  */
-static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_point(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "point() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2850,12 +2919,12 @@ static PyMethodDef PyTimelog_methods[] = {
      "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
      "Note: TimelogBusyError means the records WERE committed; do not retry."},
 
-    {"delete_range", (PyCFunction)PyTimelog_delete_range, METH_VARARGS,
+    {"delete_range", (PyCFunction)(void(*)(void))PyTimelog_delete_range, METH_FASTCALL,
      "delete_range(t1, t2) -> None\n\n"
      "Mark records in [t1, t2) for deletion (tombstone).\n\n"
      "Note: TimelogBusyError means the tombstone WAS committed; do not retry."},
 
-    {"delete_before", (PyCFunction)PyTimelog_delete_before, METH_VARARGS,
+    {"delete_before", (PyCFunction)(void(*)(void))PyTimelog_delete_before, METH_FASTCALL,
      "delete_before(cutoff) -> None\n\n"
      "Mark records in [MIN, cutoff) for deletion.\n\n"
      "Note: TimelogBusyError means the tombstone WAS committed; do not retry."},
@@ -2896,16 +2965,16 @@ static PyMethodDef PyTimelog_methods[] = {
      "Note: close() should not raise TimelogBusyError."},
 
     /* Iterator factory methods */
-    {"range", (PyCFunction)PyTimelog_range, METH_VARARGS,
+    {"range", (PyCFunction)(void(*)(void))PyTimelog_range, METH_FASTCALL,
      "range(t1, t2) -> TimelogIter\n\n"
      "Return an iterator over records in [t1, t2).\n"
      "If t1 > t2, raises ValueError; t1 == t2 yields an empty iterator."},
 
-    {"since", (PyCFunction)PyTimelog_since, METH_VARARGS,
+    {"since", (PyCFunction)(void(*)(void))PyTimelog_since, METH_FASTCALL,
      "since(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts >= t."},
 
-    {"until", (PyCFunction)PyTimelog_until, METH_VARARGS,
+    {"until", (PyCFunction)(void(*)(void))PyTimelog_until, METH_FASTCALL,
      "until(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts < t."},
 
@@ -2913,11 +2982,11 @@ static PyMethodDef PyTimelog_methods[] = {
      "all() -> TimelogIter\n\n"
      "Return an iterator over all records."},
 
-    {"equal", (PyCFunction)PyTimelog_equal, METH_VARARGS,
+    {"equal", (PyCFunction)(void(*)(void))PyTimelog_equal, METH_FASTCALL,
      "equal(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts == t."},
 
-    {"point", (PyCFunction)PyTimelog_point, METH_VARARGS,
+    {"point", (PyCFunction)(void(*)(void))PyTimelog_point, METH_FASTCALL,
      "point(t) -> TimelogIter\n\n"
      "Return an iterator for the exact timestamp t.\n"
      "Alias for equal() for point query semantics."},
@@ -2931,11 +3000,11 @@ static PyMethodDef PyTimelog_methods[] = {
      "Return maximum timestamp in snapshot, or None if empty.\n"
      "WARNING: O(N) complexity."},
 
-    {"next_ts", (PyCFunction)PyTimelog_next_ts, METH_VARARGS,
+    {"next_ts", (PyCFunction)(void(*)(void))PyTimelog_next_ts, METH_FASTCALL,
      "next_ts(ts) -> int | None\n\n"
      "Return next timestamp strictly greater than ts, or None."},
 
-    {"prev_ts", (PyCFunction)PyTimelog_prev_ts, METH_VARARGS,
+    {"prev_ts", (PyCFunction)(void(*)(void))PyTimelog_prev_ts, METH_FASTCALL,
      "prev_ts(ts) -> int | None\n\n"
      "Return previous timestamp strictly less than ts, or None.\n"
      "WARNING: O(N) complexity."},
