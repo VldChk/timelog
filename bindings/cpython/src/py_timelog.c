@@ -3227,6 +3227,11 @@ static PyType_Slot PyTimelog_slots[] = {
     {Py_tp_clear, (void*)PyTimelog_clear},
     {Py_tp_methods, PyTimelog_methods},
     {Py_tp_getset, PyTimelog_getset},
+    /* Deliberately NO Py_tp_call / vectorcall slot: Timelog instances are not
+     * callable, and wiring tp_vectorcall on a heap type carries lifetime and
+     * tp_vectorcall_offset hazards. The METH_FASTCALL methods are per-method
+     * vectorcall (the correct, supported form). Regression-guarded by
+     * test_hardening.py (Py_TPFLAGS_HAVE_VECTORCALL must stay clear). */
     {0, NULL}
 };
 
