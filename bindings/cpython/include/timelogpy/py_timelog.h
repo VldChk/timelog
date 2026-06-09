@@ -157,6 +157,18 @@ typedef struct {
     tl_time_unit_t time_unit;
     tl_maint_mode_t maint_mode;
 
+    /*
+     * min_ts floor guard (single source of truth for the facade's min_ts).
+     * has_min_ts_floor == 0 -> no guard; otherwise append() rejects ts <
+     * min_ts_floor with ValueError. Set/cleared via _set_min_ts_floor() at
+     * facade __init__/reopen; RESET to 0 in PyTimelog_init so a reopen cannot
+     * leak a stale floor. Read by the facade `_min_ts` property + extend().
+     * Mutated only at construction/reopen (single-writer contract, like
+     * time_unit), so it is a plain field, not atomic.
+     */
+    int has_min_ts_floor;
+    long long min_ts_floor;
+
     /**
      * Backpressure policy.
      * Controls behavior when TL_EBUSY is returned.

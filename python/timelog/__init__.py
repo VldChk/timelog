@@ -208,7 +208,13 @@ class Timelog(_CTimelog):
         PageSpan: Zero-copy timestamp view.
     """
 
-    __slots__ = ("_min_ts", "_mostly_ordered_default")
+    __slots__ = ("_mostly_ordered_default",)
+
+    @property
+    def _min_ts(self):
+        # Single source of truth lives in C (self._min_ts_floor()); this
+        # read-only property keeps _check_min_ts/extend/slicing readers working.
+        return self._min_ts_floor()
 
     def __init__(self, *, min_ts=None, mostly_ordered_default=True, **kwargs):
         if not isinstance(mostly_ordered_default, bool):
@@ -216,7 +222,7 @@ class Timelog(_CTimelog):
         min_ts_val = None if min_ts is None else _coerce_ts(min_ts)
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_ordered_default
-        self._min_ts = min_ts_val
+        self._set_min_ts_floor(min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 
@@ -237,7 +243,7 @@ class Timelog(_CTimelog):
 
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_default
-        self._min_ts = min_ts_val
+        self._set_min_ts_floor(min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 

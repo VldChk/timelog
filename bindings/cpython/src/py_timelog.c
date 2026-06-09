@@ -1238,6 +1238,10 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     atomic_store_explicit(&self->closed, 0, memory_order_release);
     self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
+    /* Reset the min_ts floor on every (re)open so a reopen cannot leak a stale
+     * guard; the facade re-applies it via _set_min_ts_floor() afterward. */
+    self->has_min_ts_floor = 0;
+    self->min_ts_floor = 0;
 
     /* tl_open() auto-starts maintenance in background mode. */
 
@@ -2236,6 +2240,42 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     return PyLong_FromLongLong((long long)out);
 }
 
+/*===========================================================================
+ * min_ts floor guard (single source of truth; facade `_min_ts` property)
+ *
+ * NOTE: distinct from min_ts() above, which returns the engine's smallest
+ * stored timestamp. The "floor" is the facade's lower-bound REJECTION guard.
+ *===========================================================================*/
+
+static PyObject*
+PyTimelog__set_min_ts_floor(PyTimelog* self, PyObject* value)
+{
+    /* Accepts None (clear the guard) or an int (already coerced by the facade
+     * via _coerce_ts). Plain field state -> no CHECK_CLOSED (valid during
+     * reopen() on a closed instance). */
+    if (value == Py_None) {
+        self->has_min_ts_floor = 0;
+        self->min_ts_floor = 0;
+        Py_RETURN_NONE;
+    }
+    long long v = PyLong_AsLongLong(value);
+    if (v == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    self->has_min_ts_floor = 1;
+    self->min_ts_floor = v;
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+PyTimelog__min_ts_floor(PyTimelog* self, PyObject* Py_UNUSED(args))
+{
+    if (!self->has_min_ts_floor) {
+        Py_RETURN_NONE;
+    }
+    return PyLong_FromLongLong(self->min_ts_floor);
+}
+
 static PyObject*
 PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
@@ -2994,6 +3034,14 @@ static PyMethodDef PyTimelog_methods[] = {
     {"min_ts", (PyCFunction)PyTimelog_min_ts, METH_NOARGS,
      "min_ts() -> int | None\n\n"
      "Return minimum timestamp in snapshot, or None if empty."},
+
+    {"_set_min_ts_floor", (PyCFunction)PyTimelog__set_min_ts_floor, METH_O,
+     "_set_min_ts_floor(value) -> None\n\n"
+     "Internal: set (int) or clear (None) the min_ts rejection floor."},
+
+    {"_min_ts_floor", (PyCFunction)PyTimelog__min_ts_floor, METH_NOARGS,
+     "_min_ts_floor() -> int | None\n\n"
+     "Internal: the min_ts rejection floor (None if unset)."},
 
     {"max_ts", (PyCFunction)PyTimelog_max_ts, METH_NOARGS,
      "max_ts() -> int | None\n\n"
