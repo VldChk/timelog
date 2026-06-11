@@ -53,6 +53,8 @@ static PyObject* PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
+static PyObject* PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
+                                       Py_ssize_t nargs, PyObject* kwnames);
 static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
 static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
 static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
@@ -2062,6 +2064,325 @@ error_stream:
 }
 
 /*===========================================================================
+ * PyTimelog_bulk_append
+ *
+ * Typed-buffer bulk append fast path:
+ *   bulk_append(timestamps, objects, *, mostly_ordered=<instance default>)
+ *
+ * timestamps: contiguous 1-D buffer of NATIVE-endian int64 ('q'/'l',
+ * itemsize 8). objects: concrete ordered sequence (list/tuple) of equal
+ * length; str/bytes/iterators are rejected. Single all-or-nothing
+ * tl_append_batch. TL_EBUSY => all records committed; never rolled back.
+ *
+ * Free-threaded safety: `objects` is snapshotted with PySequence_Tuple()
+ * before any borrowed-item access, so concurrent mutation of a caller-owned
+ * list cannot tear reads (the copy runs under the list's own per-object
+ * lock on free-threaded builds). All later item reads go through our owned
+ * tuple.
+ *===========================================================================*/
+
+#if !defined(PY_BIG_ENDIAN) || !defined(PY_LITTLE_ENDIAN)
+#  error "pyport.h byte-order macros are required (CPython >= 3.12)"
+#endif
+
+static int
+tl_py_buffer_fmt_is_native_i64(const char* fmt)
+{
+    if (fmt == NULL) {
+        return 0;
+    }
+    const char* p = fmt;
+    if (*p == '@' || *p == '=') {
+        p++;                          /* native order, explicitly */
+    } else if (*p == '<' || *p == '>' || *p == '!') {
+#if PY_BIG_ENDIAN
+        if (*p == '<') {
+            return -1;                /* little-endian buffer on BE host */
+        }
+#else
+        if (*p == '>' || *p == '!') {
+            return -1;                /* big-endian buffer on LE host */
+        }
+#endif
+        p++;
+    }
+    if ((p[0] == 'q' || p[0] == 'l') && p[1] == '\0') {
+        return 1;
+    }
+    return 0;
+}
+
+static PyObject*
+PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
+                      Py_ssize_t nargs, PyObject* kwnames)
+{
+    CHECK_CLOSED(self);
+
+    /* Hand-rolled FASTCALL+kwnames parsing, mirroring append() above. */
+    Py_ssize_t n_pos = PyVectorcall_NARGS(nargs);
+    Py_ssize_t nkw = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+
+    PyObject* ts_obj = NULL;             /* borrowed */
+    PyObject* objects = NULL;            /* borrowed */
+    PyObject* mostly_ordered_obj = NULL; /* borrowed; NULL = not given */
+
+    if (n_pos > 2) {
+        PyErr_Format(PyExc_TypeError,
+            "bulk_append() takes 2 positional arguments but %zd were given",
+            n_pos);
+        return NULL;
+    }
+    if (n_pos >= 1) {
+        ts_obj = args[0];
+    }
+    if (n_pos == 2) {
+        objects = args[1];
+    }
+
+    for (Py_ssize_t i = 0; i < nkw; i++) {
+        PyObject* name = PyTuple_GET_ITEM(kwnames, i);
+        if (PyUnicode_CompareWithASCIIString(name, "timestamps") == 0) {
+            if (ts_obj != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'timestamps'");
+                return NULL;
+            }
+            ts_obj = args[n_pos + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "objects") == 0) {
+            if (objects != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'objects'");
+                return NULL;
+            }
+            objects = args[n_pos + i];
+        } else if (PyUnicode_CompareWithASCIIString(name,
+                                                    "mostly_ordered") == 0) {
+            if (mostly_ordered_obj != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'mostly_ordered'");
+                return NULL;
+            }
+            mostly_ordered_obj = args[n_pos + i];
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "bulk_append() got an unexpected keyword argument '%S'",
+                name);
+            return NULL;
+        }
+    }
+    if (ts_obj == NULL || objects == NULL) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() missing required arguments 'timestamps' and "
+            "'objects'");
+        return NULL;
+    }
+
+    /* Objects policy: a parallel array needs a stable order and per-item
+     * payloads. Reject text/bytes (would insert characters) and anything
+     * that is not a real sequence (sets, dicts, generators, iterators). */
+    if (PyUnicode_Check(objects) || PyBytes_Check(objects) ||
+        PyByteArray_Check(objects)) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() objects must be a sequence of payload objects, "
+            "not str/bytes");
+        return NULL;
+    }
+    if (!PySequence_Check(objects)) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() objects must be a concrete sequence "
+            "(use extend() for streaming/iterator input)");
+        return NULL;
+    }
+
+    /* Immutable snapshot (owned): FT-safe borrowed access from here on. */
+    PyObject* seq = PySequence_Tuple(objects);
+    if (seq == NULL) {
+        return NULL;
+    }
+
+    Py_buffer ts_view;
+    if (PyObject_GetBuffer(ts_obj, &ts_view,
+                           PyBUF_FORMAT | PyBUF_C_CONTIGUOUS) < 0) {
+        Py_DECREF(seq);
+        return NULL;
+    }
+    if (ts_view.ndim != 1) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be a 1-D buffer");
+        return NULL;
+    }
+    if (ts_view.itemsize != (Py_ssize_t)sizeof(int64_t)) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must have 8-byte items (int64)");
+        return NULL;
+    }
+    switch (tl_py_buffer_fmt_is_native_i64(ts_view.format)) {
+    case 1:
+        break;
+    case -1:
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be native byte order "
+            "(byteswap the array first)");
+        return NULL;
+    default:
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be int64 "
+            "(buffer format 'q' or 'l')");
+        return NULL;
+    }
+
+    Py_ssize_t bn = ts_view.shape[0];
+    if (PyTuple_GET_SIZE(seq) != bn) {
+        PyErr_Format(PyExc_ValueError,
+            "bulk_append() length mismatch: %zd timestamps, %zd objects",
+            bn, PyTuple_GET_SIZE(seq));
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return NULL;
+    }
+    if (bn == 0) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        Py_RETURN_NONE;
+    }
+    if ((size_t)bn > SIZE_MAX / sizeof(tl_record_t)) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return PyErr_Format(PyExc_OverflowError, "batch size too large");
+    }
+
+    /* Resolve mostly_ordered: explicit argument wins (None = use default);
+     * omitted/None -> the facade's _mostly_ordered_default (extend parity);
+     * attribute absent (raw _CTimelog) -> false. */
+    int mostly_ordered = 0;
+    if (mostly_ordered_obj != NULL && mostly_ordered_obj != Py_None) {
+        mostly_ordered = PyObject_IsTrue(mostly_ordered_obj);
+        if (mostly_ordered < 0) {
+            PyBuffer_Release(&ts_view);
+            Py_DECREF(seq);
+            return NULL;
+        }
+    } else {
+        PyObject* dflt = PyObject_GetAttrString((PyObject*)self,
+                                                "_mostly_ordered_default");
+        if (dflt == NULL) {
+            PyErr_Clear();
+        } else {
+            mostly_ordered = PyObject_IsTrue(dflt);
+            Py_DECREF(dflt);
+            if (mostly_ordered < 0) {
+                PyBuffer_Release(&ts_view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+    }
+
+    /* min_ts floor: snapshotted once per call with the same acquire pairing
+     * as append(). close()/reopen()/configure() are documented as externally
+     * serialized against all other users of the instance, so the floor
+     * cannot legally change mid-call; a caller who violates that contract
+     * gets unspecified floor application, never memory-unsafety. */
+    int has_floor = atomic_load_explicit(&self->has_min_ts_floor,
+                                         memory_order_acquire);
+    long long floor_v = has_floor
+        ? atomic_load_explicit(&self->min_ts_floor, memory_order_acquire)
+        : 0;
+
+    tl_record_t* records =
+        (tl_record_t*)PyMem_Malloc((size_t)bn * sizeof(tl_record_t));
+    if (records == NULL) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return PyErr_NoMemory();
+    }
+
+    const int64_t* ts_arr = (const int64_t*)ts_view.buf;
+    for (Py_ssize_t i = 0; i < bn; i++) {
+        long long ts_ll = (long long)ts_arr[i];
+        if (tl_py_validate_ts(ts_ll, "timestamp") < 0 ||
+            (has_floor && ts_ll < floor_v)) {
+            if (!PyErr_Occurred()) {
+                PyErr_Format(PyExc_ValueError,
+                    "bulk_append() timestamp %lld at index %zd is below "
+                    "min_ts %lld", ts_ll, i, floor_v);
+            }
+            for (Py_ssize_t j = 0; j < i; j++) {
+                Py_DECREF(PyTuple_GET_ITEM(seq, j));
+            }
+            PyMem_Free(records);
+            PyBuffer_Release(&ts_view);
+            Py_DECREF(seq);
+            return NULL;
+        }
+        PyObject* obj = PyTuple_GET_ITEM(seq, i); /* borrowed from OUR tuple */
+        Py_INCREF(obj);                           /* ownership -> the log */
+        records[i].ts = (tl_ts_t)ts_ll;
+        records[i].handle = tl_py_handle_encode(obj);
+    }
+    PyBuffer_Release(&ts_view);
+
+    {
+        uint32_t flags = mostly_ordered ? TL_APPEND_HINT_MOSTLY_IN_ORDER : 0;
+        tl_status_t st;
+        if (tl_py_lock_checked(self) < 0) {
+            for (Py_ssize_t i = 0; i < bn; i++) {
+                Py_DECREF(PyTuple_GET_ITEM(seq, i));
+            }
+            PyMem_Free(records);
+            Py_DECREF(seq);
+            return NULL;
+        }
+        tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
+        st = tl_append_batch(self->tl, records, (size_t)bn, flags);
+        TL_PY_UNLOCK(self);
+
+        if (st == TL_OK || st == TL_EBUSY) {
+            for (Py_ssize_t i = 0; i < bn; i++) {
+                (void)tl_py_live_note_insert(hctx, PyTuple_GET_ITEM(seq, i));
+            }
+            PyMem_Free(records);
+            if (st == TL_EBUSY) {
+                if (tl_py_handle_write_ebusy(self,
+                        "Backpressure during bulk insert. "
+                        "All records were committed. "
+                        "Call flush() or wait for background maintenance "
+                        "to relieve.") < 0) {
+                    tl_py_drain_retired(hctx, 0);
+                    tl_py_handle_ctx_decref(hctx);
+                    Py_DECREF(seq);
+                    return NULL;
+                }
+            }
+            tl_py_drain_retired(hctx, 0);
+            tl_py_handle_ctx_decref(hctx);
+            Py_DECREF(seq);
+            Py_RETURN_NONE;
+        }
+
+        /* True failure (ENOMEM/EOVERFLOW/...): engine inserted nothing. */
+        for (Py_ssize_t i = 0; i < bn; i++) {
+            Py_DECREF(PyTuple_GET_ITEM(seq, i));
+        }
+        tl_py_handle_ctx_decref(hctx);
+        PyMem_Free(records);
+        Py_DECREF(seq);
+        return TL_PY_RAISE_STATUS(self, st);
+    }
+}
+
+/*===========================================================================
  * PyTimelog_delete_range
  *
  * CRITICAL: Same TL_EBUSY semantics as append.
@@ -3165,6 +3486,16 @@ static PyMethodDef PyTimelog_methods[] = {
      "For generators, uses chunked batches; records from completed chunks\n"
      "are committed even if a later chunk fails.\n"
      "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
+     "Note: TimelogBusyError means the records WERE committed; do not retry."},
+
+    {"bulk_append", (PyCFunction)(void(*)(void))PyTimelog_bulk_append,
+     METH_FASTCALL | METH_KEYWORDS,
+     "bulk_append(timestamps, objects, *, mostly_ordered=None) -> None\n\n"
+     "Fast-path bulk append from a contiguous 1-D native-endian int64\n"
+     "timestamp buffer (numpy int64 array, array.array('q'), memoryview)\n"
+     "and a parallel concrete sequence of payload objects.\n\n"
+     "Single all-or-nothing batch append. mostly_ordered=None uses the\n"
+     "instance's mostly_ordered_default. Respects min_ts.\n\n"
      "Note: TimelogBusyError means the records WERE committed; do not retry."},
 
     {"delete_range", (PyCFunction)(void(*)(void))PyTimelog_delete_range, METH_FASTCALL,
