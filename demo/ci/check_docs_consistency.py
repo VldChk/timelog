@@ -60,6 +60,7 @@ REQUIRED_PY_METHODS = [
 # instead of only the newly folded append path.
 REQUIRED_BINDING_METHODS = [
     "append",
+    "bulk_append",
     "extend",
     "delete_range",
     "delete_before",
@@ -90,6 +91,11 @@ REQUIRED_BINDING_METHODS = [
 REQUIRED_BINDING_PATTERNS = {
     "append": re.compile(
         r'\{\s*"append"\s*,\s*\(PyCFunction\).*?PyTimelog_append\s*,\s*'
+        r'METH_FASTCALL\s*\|\s*METH_KEYWORDS',
+        re.DOTALL,
+    ),
+    "bulk_append": re.compile(
+        r'\{\s*"bulk_append"\s*,\s*\(PyCFunction\).*?PyTimelog_bulk_append\s*,\s*'
         r'METH_FASTCALL\s*\|\s*METH_KEYWORDS',
         re.DOTALL,
     ),

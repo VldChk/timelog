@@ -38,10 +38,22 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - `append(obj, ts=...)`
 - `append(ts, obj)`
 - `extend([(ts, obj), ...], mostly_ordered=..., insert_on_error=...)`
+- `bulk_append(timestamps, objects, mostly_ordered=None)`
 - `log[ts] = obj`
 
 `Contract`
 - On write-path backpressure, `TimelogBusyError` indicates data was accepted by the engine; do not blind-retry append/delete calls.
+- `bulk_append(timestamps, objects)` is the typed-buffer fast path for bulk ingest:
+  `timestamps` must be a contiguous 1-D native-endian int64 buffer (a NumPy `int64`
+  array, `array.array("q")`, or a memoryview of either); `objects` must be a concrete
+  ordered sequence (list/tuple) of the same length. The whole batch is a single
+  all-or-nothing append that respects `min_ts`; `mostly_ordered=None` uses the
+  instance's `mostly_ordered_default`. Rejected inputs raise before any insert:
+  non-native byte order, non-int64 item size or format, multi-dimensional or
+  non-contiguous buffers, length mismatch (`ValueError`); non-buffer timestamps,
+  str/bytes payload containers, generators/iterators/sets as `objects` (`TypeError`).
+  It is an ingest fast path, not a general interop surface: it does not change what
+  `extend()` accepts, and a `TimelogBusyError` still means the records WERE committed.
 
 ## Read API
 
