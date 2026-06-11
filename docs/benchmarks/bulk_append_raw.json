@@ -1,0 +1,1 @@
+{"bulk_append_ns_per_record": 113.297, "bulk_vs_extend": 3.506, "bulk_vs_per_append": 2.225, "extend_ns_per_record": 397.233, "n": 200000, "non_native_endian_behavior": {"accepted": false, "error": "bulk_append() timestamps must be native byte order (byteswap the array first)", "error_type": "ValueError"}, "per_append_ns_per_record": 252.09}
