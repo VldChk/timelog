@@ -2076,9 +2076,12 @@ error_stream:
  *
  * Free-threaded safety: `objects` is snapshotted with PySequence_Tuple()
  * before any borrowed-item access, so concurrent mutation of a caller-owned
- * list cannot tear reads (the copy runs under the list's own per-object
- * lock on free-threaded builds). All later item reads go through our owned
- * tuple.
+ * list cannot tear reads. For exact lists the copy is a single
+ * critical-section snapshot (PyList_AsTuple under the list's per-object
+ * lock on free-threaded builds); for other sequences PySequence_Tuple
+ * falls back to itemwise iteration, which is memory-safe via owned
+ * references but not an atomic point-in-time copy. All later item reads
+ * go through our owned tuple.
  *===========================================================================*/
 
 #if !defined(PY_BIG_ENDIAN) || !defined(PY_LITTLE_ENDIAN)
@@ -2206,6 +2209,19 @@ PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
     Py_buffer ts_view;
     if (PyObject_GetBuffer(ts_obj, &ts_view,
                            PyBUF_FORMAT | PyBUF_C_CONTIGUOUS) < 0) {
+        /* The most likely user mistake is passing a plain list/tuple of
+         * ints; CPython's generic "a bytes-like object is required" gives
+         * no remedy, so replace it with an actionable message — but ONLY
+         * for objects with no buffer protocol at all. Real buffer producers
+         * (e.g. a strided numpy view) raise accurate errors of their own. */
+        if (!PyObject_CheckBuffer(ts_obj)) {
+            PyErr_Format(PyExc_TypeError,
+                "bulk_append() timestamps must be an int64 buffer "
+                "(e.g. numpy int64 array or array.array('q')), not %.80s; "
+                "build one with array.array('q', ts) or "
+                "np.asarray(ts, dtype=np.int64), or use extend()",
+                Py_TYPE(ts_obj)->tp_name);
+        }
         Py_DECREF(seq);
         return NULL;
     }
@@ -2289,6 +2305,14 @@ PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
         PyObject* dflt = PyObject_GetAttrString((PyObject*)self,
                                                 "_mostly_ordered_default");
         if (dflt == NULL) {
+            /* Only a missing attribute (raw _CTimelog) is expected; anything
+             * else (MemoryError, a raising facade property) must propagate,
+             * not be silently swallowed. */
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                PyBuffer_Release(&ts_view);
+                Py_DECREF(seq);
+                return NULL;
+            }
             PyErr_Clear();
         } else {
             mostly_ordered = PyObject_IsTrue(dflt);

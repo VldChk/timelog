@@ -168,7 +168,7 @@ v1.3 hot-path improvements (pinned A/B vs the v1.2 baseline, Linux x86_64, Pytho
 median of 5; raw artifacts in `docs/benchmarks/` and `ideas-lab/verification/`):
 
 - `append(obj)` folded into C: `4.39x` faster (`append(ts, obj)`: `3.39x`)
-- Query/delete call dispatch (`METH_FASTCALL`): `1.15x-1.36x` faster across 9 methods
+- The 9 `METH_FASTCALL`-converted query/delete methods: `1.15x-1.36x` faster (dispatch plus related v1.3 changes)
 - Size-gated branchless binary search: `1.93x-4.98x` faster at gated sizes (5 seams)
 - New `bulk_append`: `113 ns/record` (`3.5x` vs `extend`, `2.2x` vs the folded `append`)
 

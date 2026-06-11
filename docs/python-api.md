@@ -50,8 +50,10 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
   all-or-nothing append that respects `min_ts`; `mostly_ordered=None` uses the
   instance's `mostly_ordered_default`. Rejected inputs raise before any insert:
   non-native byte order, non-int64 item size or format, multi-dimensional or
-  non-contiguous buffers, length mismatch (`ValueError`); non-buffer timestamps,
-  str/bytes payload containers, generators/iterators/sets as `objects` (`TypeError`).
+  misaligned buffers, length mismatch (`ValueError`); non-contiguous buffers
+  (`ValueError` or `BufferError`, depending on the buffer producer); non-buffer
+  timestamps, str/bytes payload containers, generators/iterators/sets as
+  `objects` (`TypeError`).
   It is an ingest fast path, not a general interop surface: it does not change what
   `extend()` accepts, and a `TimelogBusyError` still means the records WERE committed.
 

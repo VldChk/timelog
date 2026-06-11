@@ -521,7 +521,7 @@ bindings/cpython/src/              # CPython extension (_timelog): py_timelog, p
 bindings/cpython/tests/            # C-level binding tests (embedded Python)
 python/timelog/                    # Pure Python facade (_api.py + __init__.py)
 python/tests/                      # Python facade tests (pytest)
-lab/                               # Resilience lab: oracle-driven concurrency/property harness
+lab/                               # Resilience lab (LOCAL/untracked): oracle-driven concurrency/property harness
 demo/ci/                           # CI helper scripts (static phase checks, compat baseline runner)
 benchmarks/                        # Benchmark harnesses (see docs/PERFORMANCE_METHODOLOGY.md)
 ```
@@ -668,7 +668,17 @@ All critical and high-priority issues have been resolved:
 - New test surfaces: `test_subinterpreters.py`, `test_free_threading.py`,
   `test_freethreaded_stress.py`; static phase checker `demo/ci/check_layer_a_static.py`
 
-Test coverage: 480 C core tests + 114 Python facade tests passing, verified with ASan/UBSan.
+**v1.3 additions (June 2026):**
+- **`bulk_append(timestamps, objects)`**: typed-buffer C ingest fast path on the binding
+  (native-endian int64 buffer + parallel sequence; single all-or-nothing `tl_append_batch`;
+  see `docs/python-api.md` and `docs/benchmarks/bulk_append.md`)
+- **Shared-memview wrapper leak fixed** (`core/src/delta/tl_memview.c`): the wrapper struct
+  leaked 152 bytes per shared memview since the snapshot cache landed; CI's pure-C sanitizer
+  leg now runs LeakSanitizer (`.lsan-suppressions` covers two by-design misuse tests)
+
+Test coverage: ~485 C core tests (497 in Debug/ASan builds, which add debug-only suites) +
+~236 Python facade tests collected, verified with ASan/UBSan+LSan. Counts drift as suites
+grow — treat `ctest`/`pytest --collect-only` as the source of truth.
 
 ---
 
@@ -749,10 +759,12 @@ python3 demo/ci/check_docs_consistency.py    # docs/code consistency
 
 ### Resilience Lab (differential + property suite)
 
-`lab/` holds an oracle-driven concurrency/property harness (~100+ scenarios across
-3.13 / 3.14t / TSan): `lab/run_lab.py` is the entry point, `lab/harness.py` +
-`lab/oracle.py` + `lab/generators.py` the machinery, `lab/CONCURRENCY_CONTRACT.md`
-the contract under test. See `lab/RESILIENCE_REPORT.md` for the latest results.
+`lab/` is a LOCAL, UNTRACKED oracle-driven concurrency/property harness (~100+ scenarios
+across 3.13 / 3.14t / TSan) maintained outside the repository — it exists on the
+maintainer's machine, not in git checkouts. When present: `lab/run_lab.py` is the entry
+point, `lab/harness.py` + `lab/oracle.py` + `lab/generators.py` the machinery,
+`lab/CONCURRENCY_CONTRACT.md` the contract under test, `lab/RESILIENCE_REPORT.md` the
+latest results. Preserved lab run summaries live in `ideas-lab/verification/`.
 
 ### CMake Options
 

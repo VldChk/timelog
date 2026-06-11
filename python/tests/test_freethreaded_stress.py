@@ -613,4 +613,12 @@ class TestBulkAppendFreeThreaded:
             thread.join()
         log.flush()
         assert len(log) == inserted
+        # Read every stored payload back: forces INCREF + type access on each
+        # handle, turning a missing-snapshot UAF (dangling pointer to a freed
+        # mutator float) into a deterministic failure even without ASan.
+        seen = 0
+        for _, obj in log[0:10**12]:
+            assert isinstance(obj, (int, float))
+            seen += 1
+        assert seen == inserted
         log.close()

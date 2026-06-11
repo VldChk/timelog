@@ -11,6 +11,11 @@ import pytest
 
 from timelog import Timelog, TimelogBusyError
 
+try:  # numpy gates ONLY the dtype/endianness class below, never the module:
+    import numpy as np  # the array.array-based contract tests must always run
+except ImportError:  # pragma: no cover - exercised on numpy-less CI legs
+    np = None
+
 NATIVE_IS_LE = sys.byteorder == "little"
 
 
@@ -57,18 +62,15 @@ class TestBulkAppendBasics:
         del log  # finalizer must clean up without errors
 
 
+@pytest.mark.skipif(np is None, reason="numpy not installed")
 class TestBulkAppendNumpy:
-    np = pytest.importorskip("numpy")
-
     def test_native_int64(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         log.bulk_append(np.array([1, 2, 3], dtype=np.int64), ["a", "b", "c"])
         assert list(log[0:10]) == [(1, "a"), (2, "b"), (3, "c")]
         log.close()
 
     def test_byteswapped_rejected(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         swapped = np.array([1, 2], dtype=np.int64).byteswap().view(
             np.dtype(np.int64).newbyteorder())
@@ -78,28 +80,24 @@ class TestBulkAppendNumpy:
         log.close()
 
     def test_float64_rejected(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         with pytest.raises((ValueError, TypeError)):
             log.bulk_append(np.array([1.0, 2.0]), ["a", "b"])
         log.close()
 
     def test_int32_rejected(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         with pytest.raises(ValueError, match="8-byte|int64"):
             log.bulk_append(np.array([1, 2], dtype=np.int32), ["a", "b"])
         log.close()
 
     def test_2d_rejected(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         with pytest.raises(ValueError, match="1-D"):
             log.bulk_append(np.zeros((2, 2), dtype=np.int64), ["a", "b"])
         log.close()
 
     def test_noncontiguous_rejected(self):
-        np = self.np
         log = Timelog(maintenance="disabled")
         strided = np.arange(10, dtype=np.int64)[::2]
         with pytest.raises((ValueError, BufferError)):

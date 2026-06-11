@@ -10,8 +10,10 @@ fast path (closes the C2 "patch-only provenance" gap from `ideas-lab/AUDIT_REPOR
 - Replay:
   `taskset -c 2 env PYTHONPATH=python python3 ideas-lab/experiments/C2-bulk/rerun/bench_bulk_append.py > docs/benchmarks/bulk_append_raw.json`
 - Raw artifact: `docs/benchmarks/bulk_append_raw.json` (committed alongside this file).
-- Source tree: branch `release/v1.3`, commit `adc9c6f` (bulk_append implementation
-  commit; benchmark run on the working tree at that commit).
+- Source tree: branch `release/v1.3`, tree at `adc9c6f` (contains the bulk_append
+  implementation commit `6f9ca8f`; benchmark run on the working tree at that commit,
+  which predates the later alignment-guard branch — one extra predictable branch
+  per call, no re-run warranted).
 - Host: AMD Ryzen AI 7 PRO 350, Linux, pinned to core 2 via `taskset`.
 - Python: CPython 3.13.12 (GCC 13.3.0), release build of `_timelog`
   (no sanitizers), staged extension `python/timelog/_timelog.cpython-313-x86_64-linux-gnu.so`.
