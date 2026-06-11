@@ -519,3 +519,98 @@ class TestFinalizationAndReopen:
         assert log_ref() is None, (
             "Unclosed Timelog was not collected — refcount cycle leak?"
         )
+
+
+# ---------------------------------------------------------------------------
+# bulk_append under true parallelism
+# ---------------------------------------------------------------------------
+
+
+class TestBulkAppendFreeThreaded:
+    """bulk_append (single writer, externally serialized) vs parallel readers,
+    plus concurrent mutation of the caller-owned source list (the
+    PySequence_Tuple snapshot must make that harmless)."""
+
+    def test_bulk_append_with_concurrent_readers(self, compat_runtime) -> None:
+        import array
+
+        from timelog import Timelog
+
+        batches = _iters(compat_runtime.short_stress, full=50, quick=8)
+        log = Timelog(maintenance="background")
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    for _ in log[0:10**9]:
+                        pass
+                except BaseException as exc:  # snapshot reads must never error
+                    errors.append(exc)
+                    return
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for t in threads:
+            t.start()
+        try:
+            for batch in range(batches):
+                base = batch * 1000
+                log.bulk_append(
+                    array.array("q", range(base, base + 1000)),
+                    list(range(base, base + 1000)),
+                )
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        assert errors == []
+        log.flush()
+        assert len(log) == batches * 1000
+        log.close()
+
+    def test_bulk_append_with_concurrent_source_mutation(
+        self, compat_runtime
+    ) -> None:
+        import array
+
+        from timelog import Timelog
+
+        rounds = _iters(compat_runtime.short_stress, full=200, quick=20)
+        log = Timelog(maintenance="disabled")
+        stop = threading.Event()
+        source: list[object] = list(range(1000))
+
+        def mutator() -> None:
+            rng = random.Random(1234)
+            while not stop.is_set():
+                idx = rng.randrange(1000)
+                source[idx] = rng.random()
+                if rng.random() < 0.01:
+                    source.append(rng.random())
+                    del source[rng.randrange(len(source))]
+
+        thread = threading.Thread(target=mutator)
+        thread.start()
+        inserted = 0
+        try:
+            for round_no in range(rounds):
+                # Snapshot len/list pair under our control: bulk_append itself
+                # tuple-snapshots `payload`, so torn reads must be impossible
+                # even though `source` churns concurrently.
+                payload = source
+                ts = array.array("q", range(round_no * 2000, round_no * 2000 + len(payload)))
+                try:
+                    log.bulk_append(ts, payload)
+                    inserted += len(ts)
+                except ValueError:
+                    # Length mismatch is acceptable if the mutator resized
+                    # between our len() capture inside array construction and
+                    # the call; nothing may be inserted in that case.
+                    pass
+        finally:
+            stop.set()
+            thread.join()
+        log.flush()
+        assert len(log) == inserted
+        log.close()

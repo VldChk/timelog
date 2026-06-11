@@ -440,3 +440,50 @@ def test_subinterpreter_maintenance_finalize_subprocess(
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == ["ok", 64]
+
+
+def test_subinterpreter_bulk_append(compat_runtime, compat_package_root):
+    interpreters = compat_runtime.require_subinterpreters()
+
+    result_queue = interpreters.create_queue()
+    interp = interpreters.create()
+    try:
+        interp.prepare_main(
+            package_root=compat_package_root,
+            result_queue=result_queue,
+        )
+        try:
+            _exec(
+                interp,
+                """
+                import array
+                import sys
+
+                if package_root:
+                    sys.path.insert(0, package_root)
+
+                try:
+                    from timelog import Timelog
+
+                    log = Timelog(maintenance="disabled")
+                    log.bulk_append(
+                        array.array("q", range(100)), list(range(100))
+                    )
+                    count = len(log)
+                    at_fifty = log[50]
+                    log.close()
+
+                    result_queue.put(("ok", count, at_fifty))
+                except Exception as exc:
+                    result_queue.put(("error", type(exc).__name__, str(exc)))
+                """
+            )
+        except interpreters.ExecutionFailed as exc:
+            raise AssertionError(f"unexpected interpreter execution failure: {exc}") from exc
+
+        payload = result_queue.get(timeout=5.0)
+        assert payload[0] == "ok", payload
+        assert payload[1] == 100
+        assert tuple(payload[2]) == (50,)
+    finally:
+        interp.close()
