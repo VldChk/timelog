@@ -205,8 +205,10 @@ class TestFastcallConcurrency:
             except Exception as e:  # pragma: no cover
                 errors.append(repr(e))
 
+        # Keep the documented single-writer contract: readers race with one
+        # mutating thread, but multiple writers do not share the instance.
         threads = [threading.Thread(target=reader, args=(k,)) for k in range(6)] + \
-                  [threading.Thread(target=writer) for _ in range(2)]
+                  [threading.Thread(target=writer)]
         for t in threads:
             t.start()
         time.sleep(2.0 if gil_off else 0.8)

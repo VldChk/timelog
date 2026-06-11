@@ -90,6 +90,27 @@ message(STATUS "Python3 found: ${Python3_EXECUTABLE}")
 message(STATUS "Python3 include: ${Python3_INCLUDE_DIRS}")
 message(STATUS "Python3 libraries: ${Python3_LIBRARIES}")
 
+set(TIMELOG_PY_GIL_DISABLED 0)
+if(Python3_EXECUTABLE)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c
+                "import sysconfig; print(1 if sysconfig.get_config_var('Py_GIL_DISABLED') else 0)"
+        RESULT_VARIABLE _timelog_py_gil_disabled_rc
+        OUTPUT_VARIABLE _timelog_py_gil_disabled_out
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_timelog_py_gil_disabled_rc EQUAL 0 AND
+       _timelog_py_gil_disabled_out STREQUAL "1")
+        set(TIMELOG_PY_GIL_DISABLED 1)
+    endif()
+endif()
+
+if(TIMELOG_PY_GIL_DISABLED)
+    add_compile_definitions(Py_GIL_DISABLED=1)
+    message(STATUS "Python3 free-threaded build detected: defining Py_GIL_DISABLED=1 for CPython bindings")
+endif()
+
 # Ensure embedded-Python test executables can locate the Python runtime DLL.
 if(WIN32)
     set(_PYTHON_RUNTIME_DLL_RELEASE "")
@@ -276,12 +297,6 @@ if(TIMELOG_BUILD_PY_TESTS)
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
         )
-        target_link_options(test_py_handle PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_handle PRIVATE
-            -fsanitize=address,undefined
-        )
     endif()
 
     # =========================================================================
@@ -333,12 +348,6 @@ if(TIMELOG_BUILD_PY_TESTS)
         target_compile_options(test_py_timelog PRIVATE
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
-        )
-        target_link_options(test_py_timelog PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_timelog PRIVATE
-            -fsanitize=address,undefined
         )
     endif()
 
@@ -393,12 +402,6 @@ if(TIMELOG_BUILD_PY_TESTS)
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
         )
-        target_link_options(test_py_iter PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_iter PRIVATE
-            -fsanitize=address,undefined
-        )
     endif()
 
     # =========================================================================
@@ -450,12 +453,6 @@ if(TIMELOG_BUILD_PY_TESTS)
         target_compile_options(test_py_span PRIVATE
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
-        )
-        target_link_options(test_py_span PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_span PRIVATE
-            -fsanitize=address,undefined
         )
     endif()
 
@@ -509,12 +506,6 @@ if(TIMELOG_BUILD_PY_TESTS)
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
         )
-        target_link_options(test_py_maint_b5 PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_maint_b5 PRIVATE
-            -fsanitize=address,undefined
-        )
     endif()
 
     # =========================================================================
@@ -564,12 +555,6 @@ if(TIMELOG_BUILD_PY_TESTS)
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
         )
-        target_link_options(test_py_errors PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_errors PRIVATE
-            -fsanitize=address,undefined
-        )
     endif()
 
     # =========================================================================
@@ -607,12 +592,6 @@ if(TIMELOG_BUILD_PY_TESTS)
         target_compile_options(test_py_module PRIVATE
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
-        )
-        target_link_options(test_py_module PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_module PRIVATE
-            -fsanitize=address,undefined
         )
     endif()
 
@@ -665,12 +644,6 @@ if(TIMELOG_BUILD_PY_TESTS)
         target_compile_options(test_py_module_exec PRIVATE
             -Wall -Wextra -Wpedantic
             -Wno-unused-parameter
-        )
-        target_link_options(test_py_module_exec PRIVATE
-            -fsanitize=address,undefined
-        )
-        target_compile_options(test_py_module_exec PRIVATE
-            -fsanitize=address,undefined
         )
     endif()
 

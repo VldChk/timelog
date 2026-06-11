@@ -559,6 +559,40 @@ class TestPageSpanBuffers:
                 except ValueError:
                     pass
 
+    def test_objects_view_operations_raise_after_parent_span_close(self):
+        """A lazy objects view is invalid once its parent PageSpan is closed."""
+        from timelog import Timelog
+
+        log = Timelog(maintenance="disabled")
+        span_iter = span = objects_view = objects_iter = None
+        try:
+            log.extend([(i, f"v{i}") for i in range(4)])
+            log.flush()
+            span_iter = log.views(0, 4)
+            span = next(span_iter)
+            objects_view = span.objects()
+            objects_iter = iter(objects_view)
+
+            assert len(objects_view) == 4
+            assert objects_view[0] == "v0"
+
+            span.close()
+
+            for operation in (
+                lambda: len(objects_view),
+                lambda: objects_view[0],
+                objects_view.copy,
+                lambda: next(objects_iter),
+            ):
+                with pytest.raises(ValueError, match="PageSpan is closed"):
+                    operation()
+        finally:
+            if span is not None:
+                span.close()
+            if span_iter is not None:
+                span_iter.close()
+            log.close()
+
 
 # =============================================================================
 # Category 9: Weakrefs

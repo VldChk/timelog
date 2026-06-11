@@ -168,15 +168,16 @@ typedef struct {
      * hot path BEFORE core_lock, so both fields are atomic: the writer stores
      * min_ts_floor then has_min_ts_floor (release); the append reader loads
      * has_min_ts_floor (acquire) then min_ts_floor, so it never observes the
-     * flag set against a torn/stale bound.
+     * flag set against a torn bound. Lifecycle/reopen races are outside the
+     * public serialization contract below.
      *
      * PyTimelog_init deliberately does NOT reset these: fresh tp_alloc memory
      * is already zeroed (no guard), and on reopen the facade re-applies the
      * floor via _set_min_ts_floor(). Resetting here would briefly expose a
-     * fail-OPEN window (guard absent) if an append raced a reopen; leaving the
-     * prior floor in place keeps that (single-writer-contract-excluded) race
-     * fail-SAFE, matching the pre-fold facade where the Python `_min_ts` slot
-     * retained its value across super().__init__().
+     * no-guard window if an append raced a reopen; leaving the prior floor
+     * preserves the pre-fold facade's persistent `_min_ts` slot until the new
+     * floor is applied. Writes racing lifecycle/reopen are outside the public
+     * single-writer/lifecycle serialization contract.
      */
     _Atomic(int) has_min_ts_floor;
     _Atomic(long long) min_ts_floor;

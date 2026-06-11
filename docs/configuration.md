@@ -51,7 +51,8 @@ non-overlapping-window discipline, which are fixed.
 
 ### Measured trade-off (saved experiments; directional, not contractual)
 
-Knob matrix — *steady workload, N=400k, 3 paired-seed medians* (internal compaction benchmark):
+Knob matrix — *steady workload, N=400k, 3 paired-seed medians* (internal compaction benchmark; see
+[the benchmark artifact](benchmarks/max_delta_segments.md)):
 
 | `max_delta_segments` | write-amp (segment re-merge **proxy**, not bytes) | compaction CPU | point read p50 |
 |---|---|---|---|
@@ -100,13 +101,13 @@ Raising `max_delta_segments` above the number of L0 segments your workload ever 
 
 - `delete_debt_threshold` (when > 0): delete / TTL-driven compaction still runs and drains the L0 backlog
   as a side effect; and
-- an explicit `compact()` call, which compacts regardless of the knob.
+- an explicit `compact()` call, which requests compaction regardless of the knob.
 
 The genuine trap is therefore a **delete-free workload that relies solely on the automatic trigger and never
 calls `compact()`** — there, L0 (and read-amplification) grow unbounded. In the benchmark, setting
 `max_delta_segments = 32` against a workload that only ever produced 16 L0 segments compacted *zero* times →
 5.3× slower reads. In manual mode (`maintenance="disabled"`) the automatic trigger never runs at all — you
-must call `flush()`/`compact()` (or step maintenance) yourself.
+must call `flush()`/`compact()` and then drive `maint_step()` until the requested work is complete.
 
 ### Not a space / delete lever
 

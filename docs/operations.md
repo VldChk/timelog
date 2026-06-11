@@ -5,6 +5,8 @@
 `Contract`
 - `close()` is not a synchronization barrier for in-flight API calls; caller must ensure exclusive access for close.
 - `flush()` before `close()` if you need active/sealed writes materialized into immutable segments.
+- Explicit `close()` can raise while active iterators, `PageSpan` instances, memoryview exports, or other snapshot pins are still alive. Release readers and buffer exports before closing.
+- Scope-style usage (`log = Timelog()`) is supported. If the object is collected without explicit close, finalization auto-closes as a best-effort cleanup path.
 
 ## Maintenance Modes
 

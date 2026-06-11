@@ -12,8 +12,12 @@
  *
  * Thread Safety:
  * - Single-writer model: external synchronization required for writes
- * - GIL released only for: flush, compact, stop_maintenance, close
- * - All write operations hold GIL throughout
+ * - CPython entry points require an attached thread state; on free-threaded
+ *   builds there may be no process-wide GIL.
+ * - Core calls are serialized by core_lock and mutable Python-object fields use
+ *   per-object critical sections / atomics where they can race.
+ * - Long-running core maintenance/flush/close paths may detach the thread
+ *   state around engine work after preserving Python lifetimes.
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -338,17 +342,52 @@ static int tl_py_coerce_ts(PyObject* x, long long* out)
  * portable C11 timespec_get(TIME_UTC) (works on Linux/macOS/Windows). The clock
  * is non-negative, so integer division == floor (matching Python's //).
  */
-static long long tl_py_now_ts(const PyTimelog* self)
+static long long tl_py_floor_div_ll(long long value, long long divisor)
 {
-    struct timespec tsp;
-    timespec_get(&tsp, TIME_UTC);
-    long long ns = (long long)tsp.tv_sec * 1000000000LL + (long long)tsp.tv_nsec;
-    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
-        case TL_TIME_S:  return ns / 1000000000LL;
-        case TL_TIME_MS: return ns / 1000000LL;
-        case TL_TIME_US: return ns / 1000LL;
-        case TL_TIME_NS: default: return ns;
+    long long q = value / divisor;
+    long long r = value % divisor;
+    return (r != 0 && value < 0) ? q - 1 : q;
+}
+
+static int tl_py_now_ts(const PyTimelog* self, long long* out)
+{
+    struct timespec tsp = {0, 0};
+    if (timespec_get(&tsp, TIME_UTC) != TIME_UTC) {
+        PyErr_SetString(PyExc_RuntimeError, "failed to read system clock");
+        return -1;
     }
+
+    long double sec_ld = (long double)tsp.tv_sec;
+    if (sec_ld > ((long double)LLONG_MAX / 1000000000.0L) ||
+        sec_ld < ((long double)LLONG_MIN / 1000000000.0L)) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+
+    long long sec = (long long)tsp.tv_sec;
+    long long ns;
+    if (sec > 0 &&
+        sec > (LLONG_MAX - (long long)tsp.tv_nsec) / 1000000000LL) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+    if (sec < 0 &&
+        sec < (LLONG_MIN + (long long)tsp.tv_nsec) / 1000000000LL) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+    ns = sec * 1000000000LL + (long long)tsp.tv_nsec;
+
+    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
+        case TL_TIME_S:  *out = tl_py_floor_div_ll(ns, 1000000000LL); break;
+        case TL_TIME_MS: *out = tl_py_floor_div_ll(ns, 1000000LL); break;
+        case TL_TIME_US: *out = tl_py_floor_div_ll(ns, 1000LL); break;
+        case TL_TIME_NS: default: *out = ns; break;
+    }
+    return 0;
 }
 
 /**
@@ -453,7 +492,8 @@ tl_py_core_call_strict(PyTimelog* self, tl_py_core_call_fn fn, tl_status_t* out_
 
     Py_BEGIN_ALLOW_THREADS
     *out_status = fn(self->tl);
-    /* Release core_lock before GIL reacquire to prevent ABBA deadlock. */
+    /* Release core_lock before re-attaching the thread state to prevent an
+     * ABBA deadlock on GIL builds. */
     PyThread_release_lock(self->core_lock);
     Py_END_ALLOW_THREADS
 
@@ -473,9 +513,9 @@ tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
         Py_BEGIN_ALLOW_THREADS
         st = fn(self->tl);
         /*
-         * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-         * deadlock: Thread A holds core_lock + wants GIL, Thread B
-         * holds GIL + wants core_lock.
+         * Release core_lock BEFORE re-attaching the thread state to prevent
+         * ABBA deadlock on GIL builds: Thread A holds core_lock + wants the
+         * GIL, Thread B holds the GIL + wants core_lock.
          */
         PyThread_release_lock(self->core_lock);
         Py_END_ALLOW_THREADS
@@ -1298,9 +1338,10 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     /* Deliberately do NOT reset the min_ts floor here. Fresh tp_alloc memory is
      * already zeroed (no guard); on reopen the facade re-applies the floor via
      * _set_min_ts_floor() as the sole authority. Resetting here would briefly
-     * expose a fail-OPEN window (guard absent) if an append raced a reopen;
-     * leaving the prior floor keeps that contract-excluded race fail-SAFE,
-     * matching the pre-fold facade's persistent `_min_ts` slot. */
+     * expose a no-guard window if an append raced a reopen. Leaving the prior
+     * floor preserves the pre-fold facade's persistent `_min_ts` slot until the
+     * new floor is applied. Writes racing lifecycle/reopen are outside the
+     * public single-writer/lifecycle serialization contract. */
 
     /* tl_open() auto-starts maintenance in background mode. */
 
@@ -1553,22 +1594,56 @@ static PyObject*
 PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs,
                  PyObject* kwnames)
 {
-    CHECK_CLOSED(self);
-
     /* Folded facade append: 3 signatures (idea 3).
      *   append(obj)          -> auto-timestamp from the wall clock
      *   append(obj, ts=X)    -> explicit keyword timestamp
      *   append(ts, obj)      -> legacy 2-positional
-     * Matches the (now-deleted) Python override exactly, including: a ts= kw is
-     * IGNORED when 2 positional are given; the only accepted kw is 'ts'. */
+     * Matches the (now-deleted) Python override, including: ts=None means
+     * auto-timestamp; a ts= kw is IGNORED when the object is provided via the
+     * second positional/obj_or_none path; and the old exposed parameter names
+     * obj_or_ts / obj_or_none remain accepted for compatibility. */
     Py_ssize_t n = PyVectorcall_NARGS(nargs);
     Py_ssize_t nkw = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
 
-    PyObject* ts_kw = NULL;   /* borrowed value of ts=, if present */
+    PyObject* obj_or_ts = NULL;     /* borrowed */
+    PyObject* obj_or_none = NULL;   /* borrowed, NULL means sentinel */
+    PyObject* ts_kw = NULL;         /* borrowed value of ts=, if present */
+
+    if (n > 2) {
+        PyErr_Format(PyExc_TypeError,
+            "append() takes 1 or 2 positional arguments but %zd were given", n);
+        return NULL;
+    }
+    if (n >= 1) {
+        obj_or_ts = args[0];
+    }
+    if (n == 2) {
+        obj_or_none = args[1];
+    }
+
     for (Py_ssize_t i = 0; i < nkw; i++) {
         PyObject* name = PyTuple_GET_ITEM(kwnames, i);
         if (PyUnicode_CompareWithASCIIString(name, "ts") == 0) {
+            if (ts_kw != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for keyword argument 'ts'");
+                return NULL;
+            }
             ts_kw = args[n + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "obj_or_ts") == 0) {
+            if (obj_or_ts != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for argument 'obj_or_ts'");
+                return NULL;
+            }
+            obj_or_ts = args[n + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "obj_or_none") == 0) {
+            if (obj_or_none != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for argument 'obj_or_none'");
+                return NULL;
+            }
+            obj_or_none = args[n + i];
         } else {
             PyErr_Format(PyExc_TypeError,
                 "append() got an unexpected keyword argument '%S'", name);
@@ -1578,30 +1653,35 @@ PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs,
 
     long long ts_ll;
     PyObject* obj;
-    if (n == 1) {
-        obj = args[0];
-        if (ts_kw != NULL) {                      /* append(obj, ts=X) */
+    if (obj_or_ts == NULL) {
+        PyErr_SetString(PyExc_TypeError,
+            "append() missing required argument 'obj_or_ts'");
+        return NULL;
+    }
+
+    if (obj_or_none == NULL) {
+        obj = obj_or_ts;
+        if (ts_kw != NULL && ts_kw != Py_None) {   /* append(obj, ts=X) */
             if (tl_py_coerce_ts(ts_kw, &ts_ll) < 0) {
                 return NULL;
             }
-        } else {                                  /* append(obj) -> auto-timestamp */
-            ts_ll = tl_py_now_ts(self);
+        } else {                                  /* append(obj) or append(obj, ts=None) */
+            if (tl_py_now_ts(self, &ts_ll) < 0) {
+                return NULL;
+            }
         }
-    } else if (n == 2) {                           /* append(ts, obj); ts= kw ignored, like the facade */
-        if (tl_py_coerce_ts(args[0], &ts_ll) < 0) {
+    } else {                                       /* append(ts, obj); ts= kw ignored, like the facade */
+        if (tl_py_coerce_ts(obj_or_ts, &ts_ll) < 0) {
             return NULL;
         }
-        obj = args[1];
-    } else {
-        PyErr_Format(PyExc_TypeError,
-            "append() takes 1 or 2 positional arguments but %zd were given", n);
-        return NULL;
+        obj = obj_or_none;
     }
 
     /* min_ts floor guard (single source of truth; matches facade _check_min_ts).
      * Atomic acquire-load with flag-before-value ordering, paired with the
-     * release stores in _set_min_ts_floor, so a concurrent reopen can never
-     * expose the flag set against a torn/stale bound. */
+     * release stores in _set_min_ts_floor, so append never observes the flag set
+     * against a torn bound. Lifecycle/reopen still require external
+     * serialization against concurrent writers. */
     if (atomic_load_explicit(&self->has_min_ts_floor, memory_order_acquire)) {
         long long floor = atomic_load_explicit(&self->min_ts_floor,
                                                 memory_order_acquire);
@@ -1617,6 +1697,10 @@ PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs,
     if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
         return NULL;
     }
+
+    /* Preserve the old facade ordering: Python argument binding/coercion and
+     * the min_ts guard ran before super().append() observed closed state. */
+    CHECK_CLOSED(self);
 
     /* INCREF object (engine-owned reference) */
     Py_INCREF(obj);
@@ -2721,7 +2805,8 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
 
-    /* Precompute remaining count (GIL released for long computation). */
+    /* Precompute remaining count with the thread state detached for the long
+     * core computation. */
     {
         tl_ts_t count_t1, count_t2;
         int count_unbounded;
@@ -3062,6 +3147,8 @@ static PyGetSetDef PyTimelog_getset[] = {
 static PyMethodDef PyTimelog_methods[] = {
     {"append", (PyCFunction)(void(*)(void))PyTimelog_append,
      METH_FASTCALL | METH_KEYWORDS,
+     "append($self, obj_or_ts, obj_or_none=None, *, ts=None)\n"
+     "--\n\n"
      "append(obj) | append(obj, ts=X) | append(ts, obj) -> None\n\n"
      "Append a record. With one positional arg and no ts, the timestamp is\n"
      "taken from the wall clock (scaled by time_unit). 'ts' may be given as a\n"

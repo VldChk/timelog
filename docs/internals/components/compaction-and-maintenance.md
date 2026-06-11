@@ -21,8 +21,9 @@ Sources:
 ## Tuning: `max_delta_segments` (the tiering↔leveling dial)
 
 `tl_compact_needed()` requests compaction when **either** the L0 segment count reaches
-`max_delta_segments` **or** delete-debt reaches `delete_debt_threshold`; an explicit `tl_compact()` runs a
-compaction regardless of either. `max_delta_segments` (default 8) is the tiering↔leveling dial: lower
+`max_delta_segments` **or** delete-debt reaches `delete_debt_threshold`; an explicit `tl_compact()` requests
+compaction regardless of either. The background worker or manual `tl_maint_step()` call performs the merge.
+`max_delta_segments` (default 8) is the tiering↔leveling dial: lower
 collapses the overlapping L0 tier into leveled L1 eagerly (low read fan-in, high write-amp + compaction
 CPU); higher lets L0 accumulate (cheap writes, higher read fan-in). It controls the *eagerness of L0
 collapse only* — the L0→L1 merge and L1 non-overlap discipline are invariant.

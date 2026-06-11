@@ -550,9 +550,11 @@ Build distinct wheels with explicit support tiers:
 
 - free-threaded builds currently require separate wheels;
 - the free-threaded build does not support the limited C API / stable ABI;
-- Windows free-threaded wheels need `Py_GIL_DISABLED=1` defined explicitly
-  when building extension sources; publish them only after that path is gated
-  in CI.
+- every free-threaded wheel build must compile extension sources with
+  `Py_GIL_DISABLED=1` so CPython critical-section macros are active. The CMake
+  binding build detects `sysconfig.get_config_var("Py_GIL_DISABLED")` from the
+  selected interpreter and defines this automatically; publish a platform only
+  after that path is gated in CI.
 
 ### Suggested build policy
 
@@ -716,8 +718,9 @@ Build distinct wheels with explicit support tiers:
   - regular 3.14
   - free-threaded 3.14
   - subinterpreter suite on 3.14
-- before enabling Windows free-threaded wheels, define `Py_GIL_DISABLED=1`
-  for extension builds and add the matching CI leg.
+- require the binding build to propagate `Py_GIL_DISABLED=1` for every
+  free-threaded interpreter, and add a matching CI leg before enabling any new
+  free-threaded platform.
 
 ### Acceptance criteria
 

@@ -94,9 +94,10 @@ class Timelog(_CTimelog):
 
     Thread Safety:
         Single-writer API contract. Multiple-thread *writes* on a single
-        Timelog instance require external serialization. Iterators are
-        snapshot-based and safe for concurrent reads from independent
-        threads.
+        Timelog instance require external serialization. Lifecycle calls
+        (``close()``, ``reopen()``, and ``configure()``) must also be externally
+        serialized against all other users of the same instance. Iterators are
+        snapshot-based and safe for concurrent reads from independent threads.
 
         Supported builds:
             * Regular CPython 3.12-3.14 (single interpreter).
@@ -106,7 +107,10 @@ class Timelog(_CTimelog):
     Warning:
         ``close()`` drops unflushed records. Call ``flush()`` first to
         materialize pending writes. Call ``close()`` for deterministic
-        cleanup.
+        cleanup; release active iterators, PageSpans, object views, and
+        memoryview exports before closing because they hold snapshot pins.
+        If explicit ``close()`` is omitted, collection auto-closes the log
+        as a best-effort cleanup path.
 
     Example::
 
@@ -222,7 +226,7 @@ class Timelog(_CTimelog):
     def _min_ts(self):
         # Single source of truth lives in C (self._min_ts_floor()); this
         # read-only property keeps _check_min_ts/extend/slicing readers working.
-        return self._min_ts_floor()
+        return _CTimelog._min_ts_floor(self)
 
     def __init__(self, *, min_ts=None, mostly_ordered_default=True, **kwargs):
         if not isinstance(mostly_ordered_default, bool):
@@ -230,7 +234,7 @@ class Timelog(_CTimelog):
         min_ts_val = None if min_ts is None else _coerce_ts(min_ts)
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_ordered_default
-        self._set_min_ts_floor(min_ts_val)
+        _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 
@@ -251,7 +255,7 @@ class Timelog(_CTimelog):
 
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_default
-        self._set_min_ts_floor(min_ts_val)
+        _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 
@@ -303,17 +307,22 @@ class Timelog(_CTimelog):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # These underscore helpers are not subclass extension points. Write paths
+    # dispatch through Timelog.* explicitly so append(), extend(), and
+    # __setitem__ share the same C-owned min_ts floor semantics.
+
     def _check_min_ts(self, ts: int) -> None:
         """Raise ValueError if ts is below the min_ts guard."""
-        if self._min_ts is not None and ts < self._min_ts:
+        min_ts = _CTimelog._min_ts_floor(self)
+        if min_ts is not None and ts < min_ts:
             raise ValueError(
-                f"timestamp {ts} is below min_ts boundary ({self._min_ts})"
+                f"timestamp {ts} is below min_ts boundary ({min_ts})"
             )
 
     def _coerce_and_guard(self, ts):
         """Coerce ts and apply min_ts guard."""
         ts = _coerce_ts(ts)
-        self._check_min_ts(ts)
+        Timelog._check_min_ts(self, ts)
         return ts
 
     def _filtered_pairs(self, iterable):
@@ -324,7 +333,7 @@ class Timelog(_CTimelog):
             except (TypeError, ValueError) as exc:
                 raise ValueError("extend() expects (ts, obj) pairs") from exc
             try:
-                ts = self._coerce_and_guard(ts)
+                ts = Timelog._coerce_and_guard(self, ts)
             except (TypeError, OverflowError):
                 continue
             yield (ts, obj)
@@ -367,7 +376,7 @@ class Timelog(_CTimelog):
                 pairs = list(zip(ts_or_iterable, objects, strict=True))
                 normalized = []
                 for ts_val, obj in pairs:
-                    ts = self._coerce_and_guard(ts_val)
+                    ts = Timelog._coerce_and_guard(self, ts_val)
                     normalized.append((ts, obj))
                 super().extend(normalized, mostly_ordered=mostly_ordered)
                 return
@@ -382,7 +391,7 @@ class Timelog(_CTimelog):
             def gen():
                 for ts_val, obj in zip(ts_or_iterable, objects, strict=True):
                     try:
-                        ts = self._coerce_and_guard(ts_val)
+                        ts = Timelog._coerce_and_guard(self, ts_val)
                     except (TypeError, OverflowError):
                         continue
                     yield (ts, obj)
@@ -403,18 +412,18 @@ class Timelog(_CTimelog):
                     ts_val, obj = item
                 except Exception as exc:
                     raise ValueError("extend() expects (ts, obj) pairs") from exc
-                ts = self._coerce_and_guard(ts_val)
+                ts = Timelog._coerce_and_guard(self, ts_val)
                 normalized.append((ts, obj))
             super().extend(normalized, mostly_ordered=mostly_ordered)
             return
 
         # insert_on_error=True: streaming with skip
-        super().extend(self._filtered_pairs(ts_or_iterable),
+        super().extend(Timelog._filtered_pairs(self, ts_or_iterable),
                        mostly_ordered=mostly_ordered)
 
     def __setitem__(self, ts, obj):
         """Insert a record: ``log[ts] = obj``."""
-        ts = self._coerce_and_guard(ts)
+        ts = Timelog._coerce_and_guard(self, ts)
         super().append(ts, obj)
 
     # ------------------------------------------------------------------

@@ -16,7 +16,9 @@
  *
  * Lifetime:
  *   The view holds a strong reference to its parent PageSpan.
- *   The PageSpan must remain open for the view to function.
+ *   The PageSpan must remain open for the view to function; after parent
+ *   close, view operations raise ValueError rather than silently appearing
+ *   empty.
  *
  * See: docs/internals/components/storage-and-manifest.md
  */

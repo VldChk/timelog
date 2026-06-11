@@ -129,11 +129,55 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
  *       window. Do NOT generalize this to other tl_* calls that may block.
  *===========================================================================*/
 
+#ifndef TL_PY_TSAN_ENABLED
+#  if defined(__has_feature)
+#    if __has_feature(thread_sanitizer)
+#      define TL_PY_TSAN_ENABLED 1
+#    endif
+#  endif
+#  if !defined(TL_PY_TSAN_ENABLED) && defined(__SANITIZE_THREAD__)
+#    define TL_PY_TSAN_ENABLED 1
+#  endif
+#  if !defined(TL_PY_TSAN_ENABLED)
+#    define TL_PY_TSAN_ENABLED 0
+#  endif
+#endif
+
+#if TL_PY_TSAN_ENABLED
+/* CPython critical sections live in libpython, which local/CI pyenv builds may
+ * not compile with TSan. Mirror those synchronization edges so TSan can see the
+ * protection around Timelog extension-object fields. */
+void __tsan_acquire(void* addr);
+void __tsan_release(void* addr);
+#define TL_PY_TSAN_ACQUIRE(addr) __tsan_acquire((void*)(addr))
+#define TL_PY_TSAN_RELEASE(addr) __tsan_release((void*)(addr))
+#else
+#define TL_PY_TSAN_ACQUIRE(addr) ((void)(addr))
+#define TL_PY_TSAN_RELEASE(addr) ((void)(addr))
+#endif
+
 #if PY_VERSION_HEX >= 0x030D0000
-#define TL_PY_OBJ_LOCK(obj)   Py_BEGIN_CRITICAL_SECTION((PyObject*)(obj))
-#define TL_PY_OBJ_UNLOCK()    Py_END_CRITICAL_SECTION()
-#define TL_PY_OBJ_LOCK2(a, b) Py_BEGIN_CRITICAL_SECTION2((PyObject*)(a), (PyObject*)(b))
-#define TL_PY_OBJ_UNLOCK2()   Py_END_CRITICAL_SECTION2()
+#define TL_PY_OBJ_LOCK(obj)                                           \
+    {                                                                 \
+        PyObject* tl_py_cs_obj__ = (PyObject*)(obj);                  \
+        Py_BEGIN_CRITICAL_SECTION(tl_py_cs_obj__);                    \
+        TL_PY_TSAN_ACQUIRE(tl_py_cs_obj__)
+#define TL_PY_OBJ_UNLOCK()                                            \
+        TL_PY_TSAN_RELEASE(tl_py_cs_obj__);                           \
+        Py_END_CRITICAL_SECTION();                                    \
+    }
+#define TL_PY_OBJ_LOCK2(a, b)                                         \
+    {                                                                 \
+        PyObject* tl_py_cs_obj1__ = (PyObject*)(a);                   \
+        PyObject* tl_py_cs_obj2__ = (PyObject*)(b);                   \
+        Py_BEGIN_CRITICAL_SECTION2(tl_py_cs_obj1__, tl_py_cs_obj2__); \
+        TL_PY_TSAN_ACQUIRE(tl_py_cs_obj1__);                          \
+        TL_PY_TSAN_ACQUIRE(tl_py_cs_obj2__)
+#define TL_PY_OBJ_UNLOCK2()                                           \
+        TL_PY_TSAN_RELEASE(tl_py_cs_obj2__);                          \
+        TL_PY_TSAN_RELEASE(tl_py_cs_obj1__);                          \
+        Py_END_CRITICAL_SECTION2();                                   \
+    }
 #else
 /* GIL-serialized fallback. (void) casts suppress unused-arg warnings. */
 #define TL_PY_OBJ_LOCK(obj)   do { (void)(obj);

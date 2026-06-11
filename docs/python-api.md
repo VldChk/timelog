@@ -27,6 +27,9 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
+- `close()` can raise while active iterators, `PageSpan` objects, memoryview exports, or other snapshot pins are still alive. Release those readers first, then close again.
+- Lifecycle calls (`close()`, `reopen()`, `configure()`) are not synchronization barriers. Serialize them externally against append/query users of the same instance.
+- Non-context-manager usage (`log = Timelog()`) is supported. If explicit `close()` is omitted, the finalizer auto-closes on collection as a best-effort cleanup path.
 - Live `Timelog` objects keep using their originating module state across manual reload/reimport of `timelog._timelog`.
 
 ## Write API
@@ -68,3 +71,4 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Implementation note`
 - Views expose physical storage spans and are not a semantic replacement for tombstone-filtered logical iterators.
+- `PageSpan.objects()` returns a lazy view tied to the parent span. Once the parent `PageSpan` is closed, indexing, iteration, `len()`, and `copy()` on the view raise `ValueError`.

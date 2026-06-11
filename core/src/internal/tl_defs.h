@@ -36,15 +36,17 @@ typedef uint64_t tl_seq_t;
 /* Branchless binary-search size gate.
  *
  * The core lower/upper-bound searches use a branchless (cmov) power-of-two-step
- * form that is 2.3-5x faster than the branchy loop for in-cache, page/memtable-
- * sized arrays. On very large arrays (measured crossover ~1-2M elements) the
- * branchy form wins instead, because branch speculation prefetches both children
- * and hides DRAM latency. Since memtable_max_bytes / target_page_bytes have no
- * upper bound, a searched array CAN exceed that crossover under bulk-ingest
- * config; above this gate we fall back to the branchy form so the change is
- * NEVER a regression at any configured size. 2^18 = 262144 keeps a wide margin
- * below the crossover while covering all default-config searches (default page
- * ~4090 records, default memtable ~65536 records). */
+ * form below this size and the old branchy loop above it. The shipped advisory
+ * microbenchmark exercises the five changed seams directly; it shows material
+ * wins at the gated sizes, while large-size fallback timings should be treated
+ * as near-parity rather than a hard CI threshold because host noise and call
+ * shape dominate there. On very large arrays, the branchy form can win because
+ * branch speculation prefetches both children and hides DRAM latency. Since
+ * memtable_max_bytes / target_page_bytes have no upper bound, a searched array
+ * can exceed that crossover under bulk-ingest config; above this gate we
+ * conservatively fall back to the old branchy form. 2^18 = 262144 keeps the
+ * branchless path on default-config searches (default page ~4090 records,
+ * default memtable ~65536 records) while avoiding known large-array slowdowns. */
 #define TL_LOWER_BOUND_BRANCHLESS_MAX     ((size_t)1 << 18)  /* 262144 */
 
 /* OOO run sizing (internal defaults) */
