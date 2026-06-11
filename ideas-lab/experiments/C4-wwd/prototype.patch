@@ -1,0 +1,184 @@
+diff --git a/core/src/maint/tl_compaction.c b/core/src/maint/tl_compaction.c
+index 6ade422..ed01b50 100644
+--- a/core/src/maint/tl_compaction.c
++++ b/core/src/maint/tl_compaction.c
+@@ -79,6 +79,10 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx) {
+     ctx->input_l1 = NULL;
+     ctx->input_l1_len = 0;
+ 
++    tl__free(ctx->alloc, ctx->dropped_l1);
++    ctx->dropped_l1 = NULL;
++    ctx->dropped_l1_count = 0;
++
+     /* Release pinned base manifest */
+     if (ctx->base_manifest != NULL) {
+         tl_manifest_release(ctx->base_manifest);
+@@ -971,6 +975,88 @@ static tl_status_t tl__build_residual_tombstones(tl_compact_ctx_t* ctx) {
+     return TL_OK;
+ }
+ 
++/*===========================================================================
++ * Whole-Window Drop (C4-wwd)
++ *===========================================================================*/
++
++/**
++ * Is the L1 segment's entire window fully covered by a clipped tombstone
++ * that physically deletes every record it could contain?
++ *
++ * A window [window_start, window_end) is wholly deleted iff a SINGLE
++ * canonical clipped tombstone interval [s, e) satisfies:
++ *   - s <= window_start, and
++ *   - e >= window_end (or the interval is unbounded), and
++ *   - that interval's max_seq > seg->applied_seq.
++ *
++ * The canonical tombstone set is sorted, non-overlapping and non-adjacent,
++ * so full coverage of a contiguous window can only come from one interval
++ * (two non-adjacent intervals always leave a hole). The seq check mirrors
++ * the per-record merge filter (tomb_seq > watermark): a tombstone with
++ * max_seq <= applied_seq was already reconciled against these records at
++ * build time, so any survivor is permanently live and MUST NOT be dropped.
++ *
++ * Returns true only when EVERY record in the window would be filtered out
++ * by the k-way merge, making the merge of this segment pure waste.
++ */
++static bool tl__l1_window_fully_deleted(const tl_segment_t* seg,
++                                         const tl_intervals_t* tombs_clipped) {
++    /* Unbounded windows are only ever the final L1 segment and can extend
++     * to +inf; conservatively never whole-drop them (an unbounded covering
++     * tombstone is already handled record-by-record and is rare). */
++    if (seg->window_end_unbounded) {
++        return false;
++    }
++
++    size_t n = tl_intervals_len(tombs_clipped);
++    for (size_t i = 0; i < n; i++) {
++        const tl_interval_t* iv = tl_intervals_get(tombs_clipped, i);
++
++        /* Intervals are sorted by start; once start > window_start no later
++         * interval can cover window_start either. */
++        if (iv->start > seg->window_start) {
++            return false;
++        }
++
++        bool covers_end = iv->end_unbounded || (iv->end >= seg->window_end);
++        if (iv->start <= seg->window_start && covers_end) {
++            /* Window contained in this single interval. Drop only if the
++             * tombstone dominates the segment watermark. */
++            return iv->max_seq > seg->applied_seq;
++        }
++
++        /* iv->start <= window_start but it does not reach window_end. Because
++         * intervals are non-overlapping and non-adjacent, the next interval
++         * (if any) starts strictly after iv->end, leaving a hole inside the
++         * window: no full coverage possible. */
++        return false;
++    }
++    return false;
++}
++
++/**
++ * Flat-scan a whole-window-dropped L1 segment, enqueuing every record to
++ * the deferred-drop list so on_drop_handle fires after publish. The segment
++ * is removed from the manifest at publish; this preserves handle cleanup
++ * parity with the per-record merge drop path.
++ *
++ * Caller guarantees ctx->on_drop_handle != NULL (no scan needed otherwise).
++ */
++static tl_status_t tl__drop_whole_window(tl_compact_ctx_t* ctx,
++                                         tl_segment_t* seg) {
++    tl_segment_iter_t it;
++    tl_segment_iter_init(&it, seg, TL_TS_MIN, 0, true);  /* [TL_TS_MIN, +inf) */
++
++    tl_record_t rec;
++    while (tl_segment_iter_next(&it, &rec) == TL_OK) {
++        tl_status_t st = tl__push_dropped_record(ctx, rec.ts, rec.handle);
++        if (st != TL_OK) {
++            return st;
++        }
++    }
++    return TL_OK;
++}
++
+ /*===========================================================================
+  * Merge
+  *===========================================================================*/
+@@ -1049,9 +1135,40 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
+         }
+     }
+ 
++    /* Whole-window drop (C4-wwd): identify selected L1 segments whose entire
++     * window is physically deleted by the clipped tombstone set. Such
++     * segments are removed from the manifest on publish (already handled by
++     * the unconditional remove_l1 loop) WITHOUT being read by the merge: the
++     * merge would otherwise filter every one of their records out and emit
++     * nothing for those windows. We still flat-scan them to fire the drop
++     * callback so the CPython binding releases each payload, preserving
++     * handle-cleanup parity with the per-record merge path. */
++    if (ctx->input_l1_len > 0) {
++        ctx->dropped_l1 = (bool*)tl__calloc(ctx->alloc, ctx->input_l1_len,
++                                            sizeof(bool));
++        if (ctx->dropped_l1 == NULL) {
++            return TL_ENOMEM;
++        }
++        for (size_t i = 0; i < ctx->input_l1_len; i++) {
++            if (tl__l1_window_fully_deleted(ctx->input_l1[i],
++                                            &ctx->tombs_clipped)) {
++                ctx->dropped_l1[i] = true;
++                ctx->dropped_l1_count++;
++                if (ctx->on_drop_handle != NULL) {
++                    st = tl__drop_whole_window(ctx, ctx->input_l1[i]);
++                    if (st != TL_OK) {
++                        return st;
++                    }
++                }
++            }
++        }
++    }
++
+     /* Build segment iterators for K-way merge (direct, not via
+-     * tl_kmerge_iter_t which is tied to the query plan). */
+-    size_t total_inputs = ctx->input_l0_len + ctx->input_l1_len;
++     * tl_kmerge_iter_t which is tied to the query plan). Whole-window-dropped
++     * L1 segments are excluded from the merge. */
++    size_t total_inputs = ctx->input_l0_len +
++                          (ctx->input_l1_len - ctx->dropped_l1_count);
+ 
+     /* tie_break_key is uint32_t. */
+     if (total_inputs > UINT32_MAX) {
+@@ -1084,11 +1201,15 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
+         iter_idx++;
+     }
+     for (size_t i = 0; i < ctx->input_l1_len; i++) {
++        if (ctx->dropped_l1 != NULL && ctx->dropped_l1[i]) {
++            continue;  /* Whole-window dropped: excluded from merge. */
++        }
+         tl_segment_iter_init(&iters[iter_idx], ctx->input_l1[i],
+                               TL_TS_MIN, 0, true);
+         watermarks[iter_idx] = tl_segment_applied_seq(ctx->input_l1[i]);
+         iter_idx++;
+     }
++    TL_ASSERT(iter_idx == total_inputs);
+ 
+     /* Build heap for K-way merge */
+     tl_heap_t heap;
+diff --git a/core/src/maint/tl_compaction.h b/core/src/maint/tl_compaction.h
+index fed39e3..58c9f81 100644
+--- a/core/src/maint/tl_compaction.h
++++ b/core/src/maint/tl_compaction.h
+@@ -85,6 +85,16 @@ typedef struct tl_compact_ctx {
+     tl_segment_t**      input_l1;        /* Selected L1 segments */
+     size_t              input_l1_len;
+ 
++    /* Whole-window-drop optimization (C4-wwd):
++     * Parallel to input_l1[]. dropped_l1[i] is true when input_l1[i]'s
++     * entire window is fully covered by a clipped tombstone whose seq
++     * dominates the segment's applied_seq. Such segments are removed from
++     * the manifest on publish WITHOUT being fed to the k-way merge / page
++     * builder; their records are still flat-scanned to fire on_drop_handle.
++     * NULL when no input L1 segments were selected. */
++    bool*               dropped_l1;
++    size_t              dropped_l1_count; /* Number of true entries */
++
+     /* Manifest snapshot at selection time */
+     tl_manifest_t*      base_manifest;   /* Pinned base manifest */
+     tl_snapshot_t*      snapshot;        /* Pinned snapshot (for tombs + seq) */

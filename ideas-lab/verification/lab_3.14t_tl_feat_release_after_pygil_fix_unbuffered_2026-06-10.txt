@@ -1,0 +1,125 @@
+==============================================================================
+TIMELOG RESILIENCE LAB
+==============================================================================
+  python       : 3.14.3  (GIL_DISABLED=1)
+  timelog      : 1.2.0
+  platform     : Linux-6.17.0-29-generic-x86_64-with-glibc2.39
+  scenarios    : 112
+------------------------------------------------------------------------------
+  [PASS] analytics      tumbling_windows_partition_complete        cases=1         0.94s
+  [PASS] analytics      sliding_windows_monotone_counts            cases=1         0.56s
+  [PASS] analytics      downsample_bucket_sums                     cases=1         0.10s
+  [PASS] analytics      rolling_retention_window                   cases=1         6.17s
+  [PASS] analytics      since_until_equivalence                    cases=1         0.67s
+  [PASS] asyncio        cooperative_producers_consumers            cases=1         0.10s
+  [PASS] asyncio        to_thread_concurrent_appends               cases=1         0.08s
+  [PASS] asyncio        async_ttl_cache                            cases=1         0.06s
+  [PASS] asyncio        gather_concurrent_reads                    cases=1         0.63s
+  [PASS] backend_extra  circuit_breaker_sliding_failure_windows    cases=1         0.02s
+  [PASS] backend_extra  dsa_interval_sweep_resource_load           cases=1         0.05s
+  [PASS] backend_extra  web_request_log_processing                 cases=1         0.11s
+  [PASS] backend_extra  non_context_manager_auto_close_lifetime    cases=1         0.13s
+  [PASS] cache_ttl      sliding_window_eviction                    cases=1         0.21s
+  [PASS] cache_ttl      reinsert_into_evicted_range                cases=1         0.00s
+  [PASS] cache_ttl      ttl_window_count_accuracy                  cases=1         0.00s
+  [PASS] cache_ttl      burst_idle_evict_cycles                    cases=15        0.01s
+  [PASS] cache_ttl      overlapping_evictions                      cases=1         0.01s
+  [PASS] cache_ttl      random_ttl_workload                        cases=20        0.09s
+  [PASS] concurrency    concurrent_appends_distinct_ranges         cases=1         0.42s
+  [PASS] concurrency    concurrent_appends_overlapping_ts          cases=1         0.27s
+  [PASS] concurrency    readers_vs_writer_snapshot_consistency     cases=1         0.12s
+  [PASS] concurrency    readers_vs_deleter_no_crash                cases=1         0.03s
+  [PASS] concurrency    close_during_concurrent_mutation           cases=1         0.00s
+  [PASS] concurrency    many_concurrent_iterators                  cases=1         0.02s
+  [PASS] config_matrix  maint_disabled                             cases=6         0.03s
+  [PASS] config_matrix  maint_background                           cases=6         0.03s
+  [PASS] config_matrix  busy_raise                                 cases=6         0.03s
+  [PASS] config_matrix  busy_silent                                cases=6         0.03s
+  [PASS] config_matrix  busy_flush                                 cases=6         0.03s
+  [PASS] config_matrix  tiny_memtable                              cases=6         0.03s
+  [PASS] config_matrix  small_memtable                             cases=6         0.03s
+  [PASS] config_matrix  tiny_pages                                 cases=6         0.03s
+  [PASS] config_matrix  sealed_runs_1                              cases=6         0.03s
+  [PASS] config_matrix  sealed_runs_8                              cases=6         0.02s
+  [PASS] config_matrix  mostly_ordered_on                          cases=6         0.02s
+  [PASS] config_matrix  mostly_ordered_off                         cases=6         0.03s
+  [PASS] config_matrix  bg_tiny_memtable                           cases=6         0.03s
+  [PASS] config_matrix  bg_busy_flush                              cases=6         0.03s
+  [PASS] config_matrix  for_bulk_ingest_like                       cases=6         0.03s
+  [PASS] config_matrix  for_streaming_like                         cases=6         0.02s
+  [PASS] distributed    multi_node_clock_skew_merge                cases=10        0.62s
+  [PASS] distributed    late_arrival_into_processed_window         cases=1         0.00s
+  [PASS] distributed    at_least_once_duplicates_preserved         cases=8         0.25s
+  [PASS] distributed    partition_replay_interleave                cases=1         0.09s
+  [PASS] distributed    tombstone_then_late_event_survives         cases=1         0.01s
+  [PASS] distributed    dedup_last_write_wins_pattern              cases=1         0.00s
+  [PASS] edge           extreme_timestamp_boundaries               cases=1         0.00s
+  [PASS] edge           empty_ranges_are_noops                     cases=1         0.00s
+  [PASS] edge           inverted_ranges_raise                      cases=1         0.00s
+  [PASS] edge           single_record                              cases=1         0.00s
+  [PASS] edge           all_identical_timestamp_mass_ties          cases=1         0.08s
+  [PASS] edge           fully_reversed_ingestion                   cases=1         0.08s
+  [PASS] edge           overlapping_and_adjacent_tombstones        cases=1         0.00s
+  [PASS] edge           delete_everything_then_rebuild             cases=1         0.00s
+  [PASS] edge           delete_reinsert_churn                      cases=15        0.03s
+  [PASS] edge           huge_gaps_sparse                           cases=1         0.04s
+  [PASS] event_sourcing append_only_full_replay                    cases=1         0.35s
+  [PASS] event_sourcing snapshot_isolation_under_mutation          cases=1         0.00s
+  [PASS] event_sourcing compaction_preserves_all_data              cases=10        3.17s
+  [PASS] event_sourcing audit_trail_point_in_time                  cases=1         0.02s
+  [PASS] event_sourcing metrics_last_value_and_retention           cases=1         0.76s
+  [PASS] event_sourcing alert_threshold_scan                       cases=1         0.11s
+  [PASS] hft            monotonic_tick_stream_range_scans          cases=1         1.69s
+  [PASS] hft            out_of_order_ticks_jitter                  cases=10        0.46s
+  [PASS] hft            vwap_window_value_correctness              cases=1         0.09s
+  [PASS] hft            point_in_time_book_reconstruction          cases=1         1.63s
+  [PASS] hft            backpressure_busy_policy_no_loss           cases=3         0.36s
+  [PASS] hft            l2_updates_dense_same_ts                   cases=1         0.03s
+  [PASS] iot            multi_device_periodic_telemetry            cases=8         0.35s
+  [PASS] iot            backfill_then_live_tail                    cases=1         1.96s
+  [PASS] iot            high_cardinality_devices_window_filter     cases=1         0.28s
+  [PASS] iot            late_sensor_into_retained_window           cases=1         0.02s
+  [PASS] iot            rolling_retention_high_rate                cases=1        17.45s
+  [PASS] iot            sparse_gappy_signal                        cases=1         0.01s
+  [PASS] lifecycle      context_manager_closes                     cases=1         0.00s
+  [PASS] lifecycle      double_close_is_safe                       cases=1         0.00s
+  [PASS] lifecycle      close_refused_with_active_iterator         cases=1         0.02s
+  [PASS] lifecycle      gc_collects_unclosed                       cases=1         0.02s
+  [PASS] lifecycle      reopen_starts_fresh                        cases=1         0.00s
+  [PASS] lifecycle      many_short_lived_logs                      cases=500       0.14s
+  [PASS] lifecycle      interleaved_open_logs                      cases=6         0.00s
+  [PASS] lifecycle_concurrent close_vs_iter_pin_three_thread             cases=20        0.02s
+  [PASS] lifecycle_concurrent pagespan_mv_close_three_thread             cases=15        0.02s
+  [PASS] lifecycle_concurrent gc_during_heavy_mutation                   cases=5         2.08s
+  [PASS] lifecycle_concurrent concurrent_reopen_raises_cleanly           cases=25        0.01s
+  [PASS] lifecycle_concurrent maintenance_toggle_during_writes           cases=1         0.00s
+  [PASS] lifecycle_concurrent subinterpreter_shutdown_unclosed           cases=10        0.51s
+  [PASS] lifecycle_concurrent worker_on_drop_no_leaks                    cases=10        0.32s
+  [PASS] lifecycle_concurrent asyncio_to_thread_close                    cases=8         0.02s
+  [PASS] observability  structured_log_severity_filter             cases=1         0.23s
+  [PASS] observability  log_tail_pagination_no_dup_or_skip         cases=1         0.31s
+  [PASS] observability  distributed_trace_spans                    cases=1         0.04s
+  [PASS] observability  metrics_scrape_windows                     cases=1         0.28s
+  [PASS] observability  log_rotation_retention                     cases=1         0.37s
+  [PASS] observability  error_burst_detection                      cases=1         0.05s
+  [PASS] product        ohlcv_candle_aggregation                   cases=1         0.10s
+  [PASS] product        leaderboard_time_decay_window              cases=1         0.06s
+  [PASS] product        feature_flag_point_in_time                 cases=1         0.08s
+  [PASS] product        chat_timeline_pagination                   cases=1         0.04s
+  [PASS] product        ab_test_event_funnel                       cases=1         0.10s
+  [PASS] product        zerocopy_pagespan_value_fidelity           cases=1         0.04s
+  [PASS] product        zerocopy_numpy_timestamps                  cases=1         0.02s
+  [PASS] product        views_physical_vs_logical_contract         cases=1         0.00s
+  [PASS] property       full_differential_disabled                 cases=500       2.06s
+  [PASS] property       full_differential_background               cases=400       1.23s
+  [PASS] property       clustered_ties_heavy                       cases=400       1.08s
+  [PASS] property       boundary_timestamps                        cases=400       0.98s
+  [PASS] property       wide_domain                                cases=300       0.76s
+  [PASS] rate_limit     sliding_window_counter_accuracy            cases=1         1.53s
+  [PASS] rate_limit     windowed_with_pruning                      cases=1         1.12s
+  [PASS] rate_limit     per_key_quota_scan                         cases=1         0.03s
+------------------------------------------------------------------------------
+  TOTAL: 112 passed, 0 failed, 0 skipped (of 112) | 2867 cases | 54.9s wall
+==============================================================================
+Report written to lab/REPORT_3.14t_tl_feat_release_after_pygil_fix_unbuffered.md
+LAB_EXIT=0

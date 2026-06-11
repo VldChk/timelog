@@ -1,0 +1,51 @@
+cwd: /home/vldvhk/Documents/tl-feat-perf
+build command: cmake --build build-rel --target bench_search_lower_bound -j 4
+run command: taskset -c 0 build-rel/bench_search_lower_bound
+result: exit 0, no correctness mismatches, 1 advisory timing warning
+
+stderr:
+WARNING: recvec_lower gated search 246.00 ns is >5% slower than branchy 222.82 ns at n=1048576
+sink=0 warnings=1
+
+stdout:
+seam                   n            branchy_ns     gated_ns  gated/by
+record_lower           256               29.08         6.75     4.31x
+recvec_lower           256               31.73         6.72     4.73x
+recvec_upper           256               31.40         6.78     4.63x
+page_lower             256               31.52         6.33     4.98x
+page_upper             256               29.04         6.44     4.51x
+record_lower           4096              48.64        13.27     3.67x
+recvec_lower           4096              51.35        13.12     3.91x
+recvec_upper           4096              51.51        13.22     3.90x
+page_lower             4096              50.56        11.15     4.54x
+page_upper             4096              46.46        11.07     4.20x
+record_lower           65535             81.27        28.37     2.87x
+recvec_lower           65535             83.92        29.25     2.87x
+recvec_upper           65535             84.34        38.71     2.18x
+page_lower             65535             80.27        23.31     3.44x
+page_upper             65535             75.51        23.95     3.15x
+record_lower           262144           112.52        58.37     1.93x
+recvec_lower           262144           116.00        52.74     2.20x
+recvec_upper           262144           116.66        55.87     2.09x
+page_lower             262144           106.86        44.25     2.42x
+page_upper             262144           102.10        44.61     2.29x
+record_lower           262145           107.90       107.28     1.01x
+recvec_lower           262145           112.10       116.65     0.96x
+recvec_upper           262145           111.70       115.78     0.96x
+page_lower             262145           108.12       105.37     1.03x
+page_upper             262145           102.58       107.07     0.96x
+record_lower           1048576          185.58       180.76     1.03x
+recvec_lower           1048576          222.82       246.00     0.91x
+recvec_upper           1048576          227.09       197.21     1.15x
+page_lower             1048576          140.19       136.66     1.03x
+page_upper             1048576          134.89       138.49     0.97x
+record_lower           2097152          288.07       290.64     0.99x
+recvec_lower           2097152          296.36       290.06     1.02x
+recvec_upper           2097152          294.10       290.90     1.01x
+page_lower             2097152          182.68       187.75     0.97x
+page_upper             2097152          182.54       181.08     1.01x
+record_lower           8388608          435.23       442.07     0.98x
+recvec_lower           8388608          429.20       438.91     0.98x
+recvec_upper           8388608          442.15       436.27     1.01x
+page_lower             8388608          372.98       374.56     1.00x
+page_upper             8388608          368.85       370.38     1.00x

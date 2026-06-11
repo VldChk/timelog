@@ -1,0 +1,45 @@
+TSAN_LIB=/usr/lib/llvm-19/lib/clang/19/lib/linux/libclang_rt.tsan-x86_64.so
+SUPPRESSIONS=/tmp/timelog-clang19-tsan.supp
+SUPPRESSION: race:_PyObjectStack_Pop
+SUPPRESSION: race:_PyObjectStackChunk_New
+SUPPRESSION: race:merge_queued_objects
+SUPPRESSION: race:_Py_brc_merge_refcounts
+FLAGS_CHECK:
+build-tsan-clang19-ft/CMakeFiles/timelog.dir/flags.make:C_FLAGS = -O2 -g -DNDEBUG -fsanitize=thread -std=c17 -fPIC -Wall -Wextra -Wpedantic -Wno-unused-parameter -fvisibility=hidden -Werror
+build-tsan-clang19-ft/bindings/cpython/CMakeFiles/_timelog.dir/flags.make:C_DEFINES = -DPy_GIL_DISABLED=1 -D_POSIX_C_SOURCE=200809L -D_timelog_EXPORTS
+build-tsan-clang19-ft/bindings/cpython/CMakeFiles/_timelog.dir/flags.make:C_FLAGS = -O2 -g -DNDEBUG -fsanitize=thread -std=c17 -fPIC -Wall -Wextra -Wpedantic -Wno-unused-parameter -fvisibility=hidden -Werror -Wno-error
+SYMBOL_CHECK:
+                 U PyCriticalSection2_Begin
+                 U PyCriticalSection2_End
+                 U PyCriticalSection_Begin
+                 U PyCriticalSection_End
+                 U __tsan_acquire
+                 U __tsan_release
+COMMAND=LD_PRELOAD=$TSAN_LIB PYTHON_GIL=0 PYTHONPATH=python TIMELOG_SHORT_STRESS=1 pytest focused free-threaded suite after Py_GIL_DISABLED and TSan critical-section annotations
+........PYTEST_EXIT=66
+TSAN_LOGS:
+-rw-rw---- 1 vldvhk vldvhk 1957 Jun 10 09:02 /tmp/timelog-clang19-tsan-supp3.3554653
+
+==== /tmp/timelog-clang19-tsan-supp3.3554653 ====
+==================
+WARNING: ThreadSanitizer: data race (pid=3554653)
+  Read of size 8 at 0x7fffb8050208 by thread T60:
+    #0 memcpy <null> (libclang_rt.tsan-x86_64.so+0x63682) (BuildId: 08e36420fec1e230829f7828f9810d0df6c234ca)
+    #1 memcpy /usr/include/x86_64-linux-gnu/bits/string_fortified.h:29:10 (libpython3.14t.so.1.0+0x176349) (BuildId: c63952f8b2b9c205efa0a5ac334d05419c29a4d9)
+    #2 dictresize.isra.0 /tmp/python-build.20260419155511.238118/Python-3.14.3/Objects/dictobject.c:2091:17 (libpython3.14t.so.1.0+0x176349)
+
+  Previous write of size 8 at 0x7fffb8050208 by thread T56:
+    #0 memset <null> (libclang_rt.tsan-x86_64.so+0x63451) (BuildId: 08e36420fec1e230829f7828f9810d0df6c234ca)
+    #1 memset /usr/include/x86_64-linux-gnu/bits/string_fortified.h:59:10 (libpython3.14t.so.1.0+0x1733e2) (BuildId: c63952f8b2b9c205efa0a5ac334d05419c29a4d9)
+    #2 new_keys_object.isra.0 /tmp/python-build.20260419155511.238118/Python-3.14.3/Objects/dictobject.c:807:5 (libpython3.14t.so.1.0+0x1733e2)
+
+  Thread T60 'Thread-58 (read' (tid=3554860, running) created by main thread at:
+    #0 pthread_create <null> (libclang_rt.tsan-x86_64.so+0x67ee5) (BuildId: 08e36420fec1e230829f7828f9810d0df6c234ca)
+    #1 do_start_joinable_thread.constprop.0 /tmp/python-build.20260419155511.238118/Python-3.14.3/Python/thread_pthread.h:289:14 (libpython3.14t.so.1.0+0x336a06) (BuildId: c63952f8b2b9c205efa0a5ac334d05419c29a4d9)
+
+  Thread T56 'Thread-54 (read' (tid=3554856, running) created by main thread at:
+    #0 pthread_create <null> (libclang_rt.tsan-x86_64.so+0x67ee5) (BuildId: 08e36420fec1e230829f7828f9810d0df6c234ca)
+    #1 do_start_joinable_thread.constprop.0 /tmp/python-build.20260419155511.238118/Python-3.14.3/Python/thread_pthread.h:289:14 (libpython3.14t.so.1.0+0x336a06) (BuildId: c63952f8b2b9c205efa0a5ac334d05419c29a4d9)
+
+SUMMARY: ThreadSanitizer: data race /usr/include/x86_64-linux-gnu/bits/string_fortified.h:29:10 in memcpy
+==================

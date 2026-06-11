@@ -1,0 +1,62 @@
+{
+  "config": {
+    "n": 3000000,
+    "seed": 777,
+    "period": 0.1,
+    "flush_every": 25000,
+    "trigger": 8,
+    "python": "3.13.12"
+  },
+  "results": [
+    {
+      "csv": "ideas-lab/experiments/C7-mem/ab_seed777/glibc.csv",
+      "n_samples": 146,
+      "peak_rss_mb": 701.89,
+      "final_rss_mb": 423.52,
+      "rss_at_ingest_done_mb": 692.26,
+      "rss_at_delete_done_mb": 692.26,
+      "rss_after_trim_mb": 663.7,
+      "rss_after_close_mb": 281.66,
+      "ingest_rss_slope_mb_per_s": 56.3429,
+      "ingest_tracemalloc_slope_mb_per_s": 8.9516,
+      "alloc": "glibc",
+      "note": "stock glibc malloc",
+      "wall_s": 14.7
+    },
+    {
+      "csv": "ideas-lab/experiments/C7-mem/ab_seed777/arena2.csv",
+      "n_samples": 147,
+      "peak_rss_mb": 701.19,
+      "final_rss_mb": 421.51,
+      "rss_at_ingest_done_mb": 692.26,
+      "rss_at_delete_done_mb": 692.26,
+      "rss_after_trim_mb": 663.69,
+      "rss_after_close_mb": 281.66,
+      "ingest_rss_slope_mb_per_s": 55.0232,
+      "ingest_tracemalloc_slope_mb_per_s": 8.7334,
+      "alloc": "arena2",
+      "note": "glibc, MALLOC_ARENA_MAX=2",
+      "wall_s": 14.8
+    },
+    {
+      "csv": "ideas-lab/experiments/C7-mem/ab_seed777/mimalloc.csv",
+      "n_samples": 137,
+      "peak_rss_mb": 616.14,
+      "final_rss_mb": 361.14,
+      "rss_at_ingest_done_mb": 616.14,
+      "rss_at_delete_done_mb": 616.14,
+      "rss_after_trim_mb": 615.66,
+      "rss_after_close_mb": 184.16,
+      "ingest_rss_slope_mb_per_s": 51.841,
+      "ingest_tracemalloc_slope_mb_per_s": 9.3089,
+      "alloc": "mimalloc",
+      "note": "mimalloc preload /home/vldvhk/Documents/timelog/ideas-lab/harness/libmimalloc.so",
+      "wall_s": 13.8
+    },
+    {
+      "alloc": "jemalloc",
+      "note": "UNAVAILABLE: no shared libjemalloc.so found",
+      "skipped": true
+    }
+  ]
+}

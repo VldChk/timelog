@@ -1,0 +1,16 @@
+# C4-gran: prototype.patch is intentionally EMPTY.
+#
+# The candidate seam for granular per-window compaction
+# (config.max_compaction_windows and config.compaction_target_bytes) already
+# exists in the codebase:
+#   core/src/maint/tl_compaction.c  tl__compact_select_greedy()  (lines ~582-654)
+#   bounds L0 input selection by output-window span; tl__compact_select_l1()
+#   then pulls only L1 segments overlapping that bounded range.
+# No core source change was required to enable the cap. This experiment measures
+# whether that existing knob is enough for wide-OOO RSS; RESULT.md records that
+# it is not a production-ready fix by itself.
+#
+# Measurement artifacts in this dir:
+#   peak_rss_c.c   - C-level peak/live RSS harness (no Python baseline noise)
+#   peak_rss_lab.py- Python-level harness (Timelog facade)
+#   sweep.sh       - cap sweep {0,2,4,8} driver

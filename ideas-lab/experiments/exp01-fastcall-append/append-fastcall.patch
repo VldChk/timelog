@@ -1,0 +1,41 @@
+diff --git a/bindings/cpython/src/py_timelog.c b/bindings/cpython/src/py_timelog.c
+index e6a0ed4..2dd0dc9 100644
+--- a/bindings/cpython/src/py_timelog.c
++++ b/bindings/cpython/src/py_timelog.c
+@@ -1469,15 +1469,23 @@ PyTimelog_clear(PyTimelog* self)
+  *===========================================================================*/
+ 
+ static PyObject*
+-PyTimelog_append(PyTimelog* self, PyObject* args)
++PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
+ {
+     CHECK_CLOSED(self);
+ 
+-    long long ts_ll;
+-    PyObject* obj;
+-    if (!PyArg_ParseTuple(args, "LO", &ts_ll, &obj)) {
++    /* FASTCALL (vectorcall) entry: args is a raw PyObject* array — no tuple is
++     * built by the caller and no PyArg_ParseTuple is needed. Equivalent semantics
++     * to the previous METH_VARARGS "LO" parse. (ideas-lab exp01) */
++    if (nargs != 2) {
++        PyErr_Format(PyExc_TypeError,
++                     "append() takes exactly 2 arguments (%zd given)", nargs);
++        return NULL;
++    }
++    long long ts_ll = PyLong_AsLongLong(args[0]);
++    if (ts_ll == -1 && PyErr_Occurred()) {
+         return NULL;
+     }
++    PyObject* obj = args[1];
+ 
+     /* Validate timestamp range */
+     if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
+@@ -2836,7 +2844,7 @@ static PyGetSetDef PyTimelog_getset[] = {
+  *===========================================================================*/
+ 
+ static PyMethodDef PyTimelog_methods[] = {
+-    {"append", (PyCFunction)PyTimelog_append, METH_VARARGS,
++    {"append", (PyCFunction)(void(*)(void))PyTimelog_append, METH_FASTCALL,
+      "append(ts, obj) -> None\n\n"
+      "Append a record at timestamp ts with payload obj.\n\n"
+      "Note: TimelogBusyError means the record WAS committed; do not retry."},

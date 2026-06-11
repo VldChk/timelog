@@ -1,0 +1,418 @@
+diff --git a/bindings/cpython/include/timelogpy/arrow_c_data.h b/bindings/cpython/include/timelogpy/arrow_c_data.h
+new file mode 100644
+index 0000000..cb9c16a
+--- /dev/null
++++ b/bindings/cpython/include/timelogpy/arrow_c_data.h
+@@ -0,0 +1,74 @@
++/**
++ * @file arrow_c_data.h
++ * @brief Apache Arrow C Data Interface struct definitions (ABI-stable).
++ *
++ * These two structs (ArrowSchema, ArrowArray) plus their release callbacks
++ * are the Arrow C Data Interface — a stable, dependency-free ABI for sharing
++ * columnar data across language/library boundaries with zero copy.
++ *
++ * Spec: https://arrow.apache.org/docs/format/CDataInterface.html
++ *
++ * We hand-roll these here (rather than vendoring nanoarrow) because the
++ * export path is a single non-nullable int64 column: the full ABI fits in a
++ * few dozen lines and adds no build dependency.
++ *
++ * IMPORTANT: This header MUST match the canonical Arrow definitions byte-for-
++ * byte (field order, types). The struct layout is part of the ABI contract.
++ */
++
++#ifndef TL_PY_ARROW_C_DATA_H
++#define TL_PY_ARROW_C_DATA_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifndef ARROW_C_DATA_INTERFACE
++#define ARROW_C_DATA_INTERFACE
++
++#define ARROW_FLAG_DICTIONARY_ORDERED 1
++#define ARROW_FLAG_NULLABLE 2
++#define ARROW_FLAG_MAP_KEYS_SORTED 4
++
++struct ArrowSchema {
++    /* Array type description */
++    const char* format;
++    const char* name;
++    const char* metadata;
++    int64_t flags;
++    int64_t n_children;
++    struct ArrowSchema** children;
++    struct ArrowSchema* dictionary;
++
++    /* Release callback */
++    void (*release)(struct ArrowSchema*);
++    /* Opaque producer-specific data */
++    void* private_data;
++};
++
++struct ArrowArray {
++    /* Array data description */
++    int64_t length;
++    int64_t null_count;
++    int64_t offset;
++    int64_t n_buffers;
++    int64_t n_children;
++    const void** buffers;
++    struct ArrowArray** children;
++    struct ArrowArray* dictionary;
++
++    /* Release callback */
++    void (*release)(struct ArrowArray*);
++    /* Opaque producer-specific data */
++    void* private_data;
++};
++
++#endif /* ARROW_C_DATA_INTERFACE */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* TL_PY_ARROW_C_DATA_H */
+diff --git a/bindings/cpython/src/py_span.c b/bindings/cpython/src/py_span.c
+index 8d248e5..0bb604f 100644
+--- a/bindings/cpython/src/py_span.c
++++ b/bindings/cpython/src/py_span.c
+@@ -16,6 +16,7 @@
+ #include "timelogpy/py_span_objects.h"
+ #include "timelogpy/py_handle.h"
+ #include "timelogpy/py_timelog.h"
++#include "timelogpy/arrow_c_data.h"
+ 
+ /*===========================================================================
+  * Forward Declarations
+@@ -297,6 +298,310 @@ static void pagespan_releasebuffer(PyObject* exporter, Py_buffer* view)
+     TL_PY_OBJ_UNLOCK();
+ }
+ 
++/*===========================================================================
++ * Arrow C Data Interface (PyCapsule export)
++ *
++ * Exposes the page's ts[] column as a non-nullable int64 Arrow array,
++ * zero-copy. Consumers (pyarrow, polars, ...) import via the dunder
++ * protocol __arrow_c_array__/__arrow_c_schema__.
++ *
++ * Only ts[] is exported. h[] holds encoded PyObject* pointers and is unsafe
++ * to expose as a numeric column.
++ *
++ * Lifetime: the exported ArrowArray pins the span exactly like a buffer
++ * export — INCREF(self) + exports++ under the critical section, mirrored by
++ * DECREF(self) + exports-- in the release callback. It also takes an explicit
++ * incref on the core owner so the ts[] page memory stays valid for the full
++ * lifetime of the Arrow array even if the span is force-detached. close() is
++ * blocked while an Arrow array is live (exports > 0), matching memoryview.
++ *===========================================================================*/
++
++/* Arrow format string for int64. Must outlive the schema (static storage). */
++static const char* PAGESPAN_ARROW_FORMAT = "l";  /* int64 */
++
++/* private_data carried by the exported ArrowArray. */
++typedef struct {
++    PyPageSpan* span;             /* strong ref; balances exports++/INCREF */
++    tl_pagespan_owner_t* owner;   /* explicit pin on page memory */
++    const void* buffers[2];       /* [0]=NULL validity, [1]=ts data */
++} tl_arrow_array_pd_t;
++
++/* ArrowSchema.release: free producer-owned schema fields. */
++static void pagespan_arrow_schema_release(struct ArrowSchema* schema)
++{
++    if (schema == NULL || schema->release == NULL) {
++        return;
++    }
++    /* format/name/metadata are static or NULL; nothing to free there.
++     * No children/dictionary for a primitive int64 column. */
++    schema->release = NULL;  /* mark released (idempotent) */
++}
++
++/* ArrowArray.release: drop the span pin + owner pin, free private_data. */
++static void pagespan_arrow_array_release(struct ArrowArray* array)
++{
++    if (array == NULL || array->release == NULL) {
++        return;
++    }
++    tl_arrow_array_pd_t* pd = (tl_arrow_array_pd_t*)array->private_data;
++    array->release = NULL;  /* mark released BEFORE running Python (idempotent) */
++
++    if (pd != NULL) {
++        PyPageSpan* span = pd->span;
++        tl_pagespan_owner_t* owner = pd->owner;
++
++        /* Decrement the export count under the span's critical section,
++         * mirroring pagespan_releasebuffer. Requires a live strong ref to
++         * span, which pd holds. */
++        if (span != NULL) {
++            TL_PY_OBJ_LOCK(span);
++            if (span->exports > 0) {
++                span->exports--;
++            }
++            TL_PY_OBJ_UNLOCK();
++        }
++
++        /* Drop the explicit owner pin (page memory). Safe outside CS. */
++        if (owner != NULL) {
++            tl_pagespan_owner_decref(owner);
++        }
++
++        /* Drop the strong span ref. May run span dealloc (which is now
++         * unblocked since exports was decremented). Preserve exception
++         * state in case release runs during exception unwinding. */
++        if (span != NULL) {
++            PyObject *exc_type, *exc_value, *exc_tb;
++            PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
++            Py_DECREF((PyObject*)span);
++            PyErr_Restore(exc_type, exc_value, exc_tb);
++        }
++
++        PyMem_Free(pd);
++    }
++    array->private_data = NULL;
++}
++
++/* PyCapsule destructor for "arrow_schema". Calls embedded release if armed. */
++static void pagespan_arrow_schema_capsule_destructor(PyObject* capsule)
++{
++    struct ArrowSchema* schema =
++        (struct ArrowSchema*)PyCapsule_GetPointer(capsule, "arrow_schema");
++    if (schema == NULL) {
++        PyErr_Clear();  /* capsule name mismatch or already invalid */
++        return;
++    }
++    if (schema->release != NULL) {
++        schema->release(schema);
++    }
++    PyMem_Free(schema);
++}
++
++/* PyCapsule destructor for "arrow_array". Calls embedded release if armed. */
++static void pagespan_arrow_array_capsule_destructor(PyObject* capsule)
++{
++    struct ArrowArray* array =
++        (struct ArrowArray*)PyCapsule_GetPointer(capsule, "arrow_array");
++    if (array == NULL) {
++        PyErr_Clear();
++        return;
++    }
++    if (array->release != NULL) {
++        array->release(array);
++    }
++    PyMem_Free(array);
++}
++
++/* Build the ArrowSchema capsule for a non-nullable int64 column. */
++static PyObject* pagespan_build_schema_capsule(void)
++{
++    struct ArrowSchema* schema =
++        (struct ArrowSchema*)PyMem_Calloc(1, sizeof(struct ArrowSchema));
++    if (schema == NULL) {
++        return PyErr_NoMemory();
++    }
++    schema->format = PAGESPAN_ARROW_FORMAT;  /* "l" = int64 */
++    schema->name = NULL;
++    schema->metadata = NULL;
++    schema->flags = 0;  /* non-nullable: ARROW_FLAG_NULLABLE NOT set */
++    schema->n_children = 0;
++    schema->children = NULL;
++    schema->dictionary = NULL;
++    schema->private_data = NULL;
++    schema->release = pagespan_arrow_schema_release;
++
++    PyObject* capsule = PyCapsule_New(
++        schema, "arrow_schema", pagespan_arrow_schema_capsule_destructor);
++    if (capsule == NULL) {
++        /* Capsule creation failed: free schema directly (no destructor ran). */
++        PyMem_Free(schema);
++        return NULL;
++    }
++    return capsule;
++}
++
++static PyObject* PyPageSpan_arrow_c_schema(PyPageSpan* self, PyObject* noargs)
++{
++    (void)noargs;
++
++    int closed;
++    TL_PY_OBJ_LOCK(self);
++    closed = self->closed;
++    TL_PY_OBJ_UNLOCK();
++
++    if (closed) {
++        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
++        return NULL;
++    }
++    return pagespan_build_schema_capsule();
++}
++
++/*
++ * __arrow_c_array__(requested_schema=None) -> (schema_capsule, array_capsule)
++ *
++ * Exports ts[] as a zero-copy non-nullable int64 Arrow array.
++ */
++static PyObject* PyPageSpan_arrow_c_array(PyPageSpan* self,
++                                          PyObject* args, PyObject* kwargs)
++{
++    /* Accept and ignore requested_schema per the Arrow protocol: we only ever
++     * produce int64, so we never need to cast. */
++    static char* kwlist[] = {"requested_schema", NULL};
++    PyObject* requested_schema = Py_None;
++    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:__arrow_c_array__",
++                                     kwlist, &requested_schema)) {
++        return NULL;
++    }
++
++    /* Phase 1: validate + pin under the critical section.
++     * err codes: 0 ok, 1 closed, 2 no-buffer.
++     * (self->len is uint32_t, so it always fits in Arrow's int64 length.) */
++    int err = 0;
++    int64_t n = 0;
++    const void* ts_local = NULL;
++    tl_pagespan_owner_t* owner = NULL;
++
++    TL_PY_OBJ_LOCK(self);
++    if (self->closed) {
++        err = 1;
++    } else if (self->owner == NULL || self->ts == NULL) {
++        err = 2;
++    } else {
++        n = (int64_t)self->len;
++        ts_local = (const void*)self->ts;
++        owner = self->owner;
++        /* Pin: explicit owner incref (page memory) + buffer-export discipline
++         * (INCREF self, exports++) so close() is blocked while live. */
++        tl_pagespan_owner_incref(owner);
++        Py_INCREF((PyObject*)self);
++        self->exports++;
++    }
++    TL_PY_OBJ_UNLOCK();
++
++    if (err == 1) {
++        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
++        return NULL;
++    }
++    if (err == 2) {
++        PyErr_SetString(PyExc_RuntimeError,
++            "PageSpan has no underlying buffer");
++        return NULL;
++    }
++
++    /* Phase 2: build the capsules. Exactly ONE owner of the Phase-1 pin
++     * exists at all times. `pin_consumed` becomes 1 once the pin has been
++     * transferred into an armed ArrowArray.release (whether via the capsule
++     * destructor or a manual release() call), so the fail epilogue never
++     * double-drops it. */
++    PyObject* schema_capsule = NULL;
++    PyObject* array_capsule = NULL;
++    PyObject* result = NULL;
++    struct ArrowArray* array = NULL;
++    tl_arrow_array_pd_t* pd = NULL;
++    int pin_consumed = 0;
++
++    schema_capsule = pagespan_build_schema_capsule();
++    if (schema_capsule == NULL) {
++        goto fail;
++    }
++
++    pd = (tl_arrow_array_pd_t*)PyMem_Calloc(1, sizeof(tl_arrow_array_pd_t));
++    if (pd == NULL) {
++        PyErr_NoMemory();
++        goto fail;
++    }
++    /* pd records the pin holders; ownership of the pin transfers to the
++     * ArrowArray once its release callback is armed below. */
++    pd->span = self;
++    pd->owner = owner;
++    pd->buffers[0] = NULL;       /* validity bitmap: none (non-nullable) */
++    pd->buffers[1] = ts_local;   /* int64 data buffer (zero-copy) */
++
++    array = (struct ArrowArray*)PyMem_Calloc(1, sizeof(struct ArrowArray));
++    if (array == NULL) {
++        PyErr_NoMemory();
++        goto fail;
++    }
++    array->length = n;
++    array->null_count = 0;
++    array->offset = 0;
++    array->n_buffers = 2;        /* validity (NULL) + data */
++    array->n_children = 0;
++    array->buffers = pd->buffers;
++    array->children = NULL;
++    array->dictionary = NULL;
++    array->private_data = pd;
++    array->release = pagespan_arrow_array_release;
++    /* The armed release now owns pd and the Phase-1 pin. */
++    pd = NULL;
++    pin_consumed = 1;
++
++    array_capsule = PyCapsule_New(
++        array, "arrow_array", pagespan_arrow_array_capsule_destructor);
++    if (array_capsule == NULL) {
++        goto fail;  /* fail epilogue runs array->release -> drops pin */
++    }
++    /* array_capsule now owns `array`; its destructor runs release. */
++    array = NULL;
++
++    result = PyTuple_Pack(2, schema_capsule, array_capsule);
++    if (result == NULL) {
++        goto fail;
++    }
++    Py_DECREF(schema_capsule);
++    Py_DECREF(array_capsule);
++    return result;
++
++fail:
++    /* Tear down in dependency order. The pin is dropped exactly once:
++     *  - via array_capsule's destructor (DECREF below), or
++     *  - via a manual array->release() if the capsule was never created, or
++     *  - via the explicit unpin block if the pin was never consumed. */
++    Py_XDECREF(schema_capsule);
++    if (array_capsule != NULL) {
++        Py_DECREF(array_capsule);   /* runs release -> drops pin */
++    } else {
++        if (array != NULL) {
++            if (array->release != NULL) {
++                array->release(array);  /* drops pin (pin_consumed already 1) */
++            }
++            PyMem_Free(array);
++        }
++        if (pd != NULL) {
++            PyMem_Free(pd);  /* pin not yet consumed; freed below */
++        }
++        if (!pin_consumed) {
++            TL_PY_OBJ_LOCK(self);
++            if (self->exports > 0) {
++                self->exports--;
++            }
++            TL_PY_OBJ_UNLOCK();
++            tl_pagespan_owner_decref(owner);
++            Py_DECREF((PyObject*)self);
++        }
++    }
++    return NULL;
++}
++
+ /*===========================================================================
+  * Methods
+  *===========================================================================*/
+@@ -522,6 +827,14 @@ static PyMethodDef PyPageSpan_methods[] = {
+     {"copy_timestamps", (PyCFunction)PyPageSpan_copy_timestamps, METH_NOARGS,
+      "copy_timestamps() -> list[int]\n\n"
+      "Return a copy of timestamps as a Python list."},
++    {"__arrow_c_schema__", (PyCFunction)PyPageSpan_arrow_c_schema, METH_NOARGS,
++     "__arrow_c_schema__() -> PyCapsule\n\n"
++     "Arrow C Data Interface: export the int64 timestamp column schema."},
++    {"__arrow_c_array__", (PyCFunction)PyPageSpan_arrow_c_array,
++     METH_VARARGS | METH_KEYWORDS,
++     "__arrow_c_array__(requested_schema=None) -> (schema_capsule, array_capsule)\n\n"
++     "Arrow C Data Interface: zero-copy export of timestamps as a\n"
++     "non-nullable int64 Arrow array."},
+     {"__enter__", (PyCFunction)PyPageSpan_enter, METH_NOARGS,
+      "Context manager entry."},
+     {"__exit__", (PyCFunction)PyPageSpan_exit, METH_VARARGS,

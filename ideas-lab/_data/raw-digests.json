@@ -1,0 +1,1570 @@
+{
+  "summary": "Digest 34 unique .ideas/ docs into structured Timelog-relevant idea atoms",
+  "agentCount": 12,
+  "logs": [
+    "Digested 34 docs; 176 raw idea atoms"
+  ],
+  "result": {
+    "count": 34,
+    "digests": [
+      {
+        "doc_id": "doc_1",
+        "one_line_gist": "Microbenchmark harness to measure per-call overhead of PyObject_Call (tuple-building) vs. vectorcall calling convention.",
+        "relevance": "core",
+        "relevance_reason": "Timelog is a CPython C-extension that may invoke Python callables in tight loops (handle returns, user callbacks). Vectorcall directly reduces per-call overhead in the hot path, and this harness quantifies the benefit.",
+        "primary_theme": "vectorcall",
+        "themes": [
+          "vectorcall",
+          "c-api-binding",
+          "profiling"
+        ],
+        "near_dup_signature": "vectorcall vs pyobject_call microbenchmark",
+        "ideas": [
+          {
+            "statement": "Implement vectorcall (tp_vectorcall_offset) on callable-returning paths in the extension",
+            "detail": "Doc shows PyObject_Vectorcall avoids tuple allocation per invocation. Timelog's handle-return codepath or any user-callback invocation benefits directly if called in tight loops (benchmarked via doc's harness).",
+            "timelog_applicability": "Timelog's C extension when invoking Python callables; any hot-path callback (e.g., during range query result streaming)",
+            "claimed_benefit": "Reduces per-call nanosecond overhead, significant for high-frequency callback invocation"
+          },
+          {
+            "statement": "Profile current calling convention (PyObject_Call vs vectorcall) in Timelog's callback-heavy ops",
+            "detail": "Doc provides a copy-paste C harness (bench_compare) that measures nanoseconds per call across different argument counts. Sweep nargs ∈ {0,1,2,4,8,16} and use large iteration counts for stable per-call baseline.",
+            "timelog_applicability": "Timelog's Python C API boundary where handles/timestamps are returned to user callables; any range-query result streaming",
+            "claimed_benefit": "Quantifies exact nanosecond savings; determines if vectorcall refactor is worthwhile for your call frequency"
+          },
+          {
+            "statement": "Measure vectorcall breakeven point (arg count) for Timelog's typical callback signatures",
+            "detail": "Doc notes smaller nargs (0-2) may not win vs tuple overhead; larger nargs show bigger wins. Timelog should test its actual callback shape (timestamp, handle, context?) to know if vectorcall investment pays off.",
+            "timelog_applicability": "Timelog's C extension callback protocol signature design (how many args does a typical callback take?)",
+            "claimed_benefit": "Informs whether vectorcall is worth the code complexity for Timelog's specific calling patterns"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_2",
+        "one_line_gist": "Distributed replica reconciliation via Merkle trees: hashing data ranges to detect and transfer only divergent subsets.",
+        "relevance": "irrelevant",
+        "relevance_reason": "Timelog is a single-process, in-memory LSM time-index with no replication, distribution, or network I/O. Merkle tree anti-entropy repair applies only to multi-node data consistency. Tombstone/GC mechanics in Timelog are orthogonal (range tombstones for delete_range, not replica sync).",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm",
+          "tombstones-deletes"
+        ],
+        "near_dup_signature": "merkle tree anti-entropy replica repair cassandra dynamo",
+        "ideas": [
+          {
+            "statement": "Do not apply Merkle tree reconciliation to Timelog",
+            "detail": "Doc describes replica sync for distributed systems (Cassandra, Dynamo). Timelog is single-process, in-memory; no inter-node sync needed. Tombstone GC in Timelog is unrelated (applies to single-node compaction).",
+            "timelog_applicability": "none/generic",
+            "claimed_benefit": "none; no transfer to single-process in-memory design"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_3",
+        "one_line_gist": "CPython memory management (pymalloc, freelists, arenas, allocator choice) and profiling techniques (tracemalloc, memray, heaptrack).",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog is in-memory and performs heavy allocation (memtable, sealed runs, L0/L1). Doc's allocator tuning (MALLOC_ARENA_MAX, pymalloc vs malloc, freelist behavior) and profiling tools (tracemalloc, memray) could help diagnose RSS bloat if Timelog's custom lock-free allocators interact unexpectedly with CPython's default memory management.",
+        "primary_theme": "memory-allocator",
+        "themes": [
+          "memory-allocator",
+          "profiling"
+        ],
+        "near_dup_signature": "cpython pymalloc memory fragmentation allocator tuning",
+        "ideas": [
+          {
+            "statement": "Profile Timelog's memory layout (Python object freelists vs C arena pools) during long-running ingest/compaction",
+            "detail": "Doc shows tracemalloc tracks Python allocations; memray captures native heap. Timelog's handles are stored as PyObject* in C; freelist accumulation or arena fragmentation could inflate RSS without obvious GC evidence.",
+            "timelog_applicability": "Timelog's long-lived process memory profiling; diagnosing RSS growth under sustained append/compaction workloads",
+            "claimed_benefit": "Reveals if freelists (handles, memtable nodes) are leaking memory or if arena fragmentation masks true allocation size"
+          },
+          {
+            "statement": "Experiment with MALLOC_ARENA_MAX tuning for Timelog's background maintenance worker",
+            "detail": "Doc notes per-thread arenas in glibc can bloat RSS; MALLOC_ARENA_MAX=2 limits arena count. Timelog's background compaction worker may spawn threads; limiting arenas could reduce memory overhead.",
+            "timelog_applicability": "Timelog's background maintenance worker configuration; multi-threaded or multi-process ingest",
+            "claimed_benefit": "Reduces per-thread malloc arena fragmentation, potentially lowering RSS in sustained workloads"
+          },
+          {
+            "statement": "Use memray flamegraphs to identify allocator hotspots in Timelog's C extension",
+            "detail": "Doc provides: `memray run -o run.bin timelog_benchmark.py && memray flamegraph run.bin`. Shows native heap allocation call stacks; Timelog's arena pool carving, Treiber stack node allocation, or memtable index growth become visible.",
+            "timelog_applicability": "Timelog's development/CI profiling step; identifying which C functions (append, compaction, sealing) dominate memory allocation",
+            "claimed_benefit": "Precisely locates memory bottlenecks without guesswork; informs allocator redesign if needed"
+          },
+          {
+            "statement": "Measure CPython freelist growth during sustained Timelog append/query workload",
+            "detail": "Doc shows per-type freelists (list, dict, frames, etc.) remain resident even after del; in a long-running process, these accumulate. Timelog returning many temporary tuples or dicts during range queries could inflate freelist memory.",
+            "timelog_applicability": "Timelog's range query return path; any Python-side result tuples or intermediate container creation during iteration",
+            "claimed_benefit": "Quantifies whether range-query result materialization (tuple/list building) causes freelist fragmentation; informs zero-copy design choices"
+          },
+          {
+            "statement": "Consider PYTHONMALLOC=malloc for Timelog's container (production) if pymalloc fragmentation occurs",
+            "detail": "Doc shows PYTHONMALLOC=malloc disables CPython's small-object allocator; defers all allocation to system malloc. Useful if pymalloc's arena/pool carving causes pathological fragmentation in Timelog's workload.",
+            "timelog_applicability": "Timelog's deployment/container configuration; only if RSS bloat traced to pymalloc arena fragmentation",
+            "claimed_benefit": "Switches allocator strategy; may reduce RSS if pymalloc's fixed-size pools create fragmentation"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_4",
+        "one_line_gist": "HPy handle lifecycle model and PyCapsule thread-safety for safe subinterpreter/free-threading extensions.",
+        "relevance": "core",
+        "relevance_reason": "Timelog explicitly supports subinterpreters (3.12+) and free-threading (3.14t, Py_MOD_GIL_NOT_USED). Doc warns about raw PyObject* globals and unsafe capsule sharing across interpreters—directly applicable to Timelog's C17 extension architecture since it currently stores handles (PyObject* encoded in uint64).",
+        "primary_theme": "free-threading-gil",
+        "themes": [
+          "free-threading-gil",
+          "subinterpreters",
+          "c-api-binding"
+        ],
+        "near_dup_signature": "HPy handle safety subinterpreters PyCapsule thread-safety",
+        "ideas": [
+          {
+            "statement": "Avoid module-scope PyObject* globals in the extension and use interpreter-local storage instead",
+            "detail": "Doc warns that raw module-scope PyObject* pointers break across subinterpreters and are not thread-safe. HPy's guidance is to use HPyField for stored fields and HPyGlobal for interpreter-scoped globals, with short-lived handles (HPy) for transient values.",
+            "timelog_applicability": "timelog module initialization and any module-level state (e.g., cached type objects, singletons); currently likely using PyObject* for module state that must be interpreter-local",
+            "claimed_benefit": "Prevents memory corruption, crashes, and data leaks when the same module is imported in multiple subinterpreters or used with free-threading"
+          },
+          {
+            "statement": "Never share raw Timelog capsules (or opaque handle pointers) between interpreters",
+            "detail": "Doc cites GitHub issue #145563 showing PyCapsule is not thread-safe at the C-API level; simultaneous reads/writes can race. Subinterpreters must never receive raw object pointers from another interpreter.",
+            "timelog_applicability": "If Timelog instance capsules are serialized, pickled, or passed via IPC channels across subinterpreters, or if any internal opaque handles are exposed, they must be validated/rejected on cross-interpreter import",
+            "claimed_benefit": "Avoids use-after-free, double-free, or undefined behavior when capsules/opaque pointers are reused in a different interpreter context"
+          },
+          {
+            "statement": "Validate finalizers and refcounted objects are safe under interpreter switching",
+            "detail": "Doc emphasizes that finalizers (e.g., __del__) and refcount operations must respect interpreter boundaries. HPy's handle model ensures this; raw C API does not.",
+            "timelog_applicability": "Timelog's refcounted manifests and retired-handle Treiber stack; any finalizer logic or destructor must not assume it runs in the same interpreter that created the object",
+            "claimed_benefit": "Prevents crashes and memory leaks when objects cross interpreter boundaries or are garbage-collected in a different interpreter than they were allocated"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_5",
+        "one_line_gist": "Ready-to-paste pytest harness and CI template for testing C extensions against Python 3.12+ subinterpreters and HPy ABI.",
+        "relevance": "core",
+        "relevance_reason": "Timelog explicitly supports subinterpreters and free-threading. Doc provides a complete, copy-paste test harness (test_subinterpreters_timelog.py), CI YAML (GitHub Actions), and Timelog-specific assertions (seqlock isolation, PageSpan buffer protocol safety, background worker per-interpreter defaults). Directly applicable to Timelog's test suite and CI.",
+        "primary_theme": "testing",
+        "themes": [
+          "testing",
+          "subinterpreters",
+          "free-threading-gil",
+          "ci-benchmarking"
+        ],
+        "near_dup_signature": "subinterpreter pytest harness CI matrix HPy ABI",
+        "ideas": [
+          {
+            "statement": "Add pytest tests for interpreter isolation (test_isolation_smoke) to verify Timelog module state does not leak across subinterpreters",
+            "detail": "Doc provides ready-to-paste code that imports timelog in N=4 subinterpreters concurrently, creates independent Timelog() instances, appends/queries in each, and asserts no cross-leakage. Uses interpreters.create/run/destroy from stdlib 3.12+.",
+            "timelog_applicability": "tests/test_subinterpreters_timelog.py::test_isolation_smoke; verify module-level caches, type caches, and any global state are per-interpreter",
+            "claimed_benefit": "Catches module-scope PyObject* globals and cross-interpreter pollution early, before shipping; required for 3.12+ compatibility claim"
+          },
+          {
+            "statement": "Add pytest test for capsule/opaque-handle cross-interpreter refusal (test_capsule_cross_interp_refusal)",
+            "detail": "Doc provides test code that creates a Timelog in interpreter A, tries to pass it to B via repr/pickle, and asserts a safe error (TypeError/ValueError) not UB. Validates that raw Timelog pointers cannot leak across interpreters.",
+            "timelog_applicability": "tests/test_subinterpreters_timelog.py::test_capsule_cross_interp_refusal; apply to Timelog instance capsules and any opaque C pointers",
+            "claimed_benefit": "Prevents use-after-free and memory corruption if user code accidentally tries to pickle/share Timelog instances across interpreters"
+          },
+          {
+            "statement": "Add pytest test for GC/finalizer isolation (test_gc_finalizer_isolation)",
+            "detail": "Doc provides test code that stores objects with __del__ in interpreter A's Timelog instance, forces GC in B, and asserts no finalizers from A run in B and no cross-interpreter crashes.",
+            "timelog_applicability": "tests/test_subinterpreters_timelog.py::test_gc_finalizer_isolation; validate Timelog's refcounted manifests and finalizers respect interpreter boundaries",
+            "claimed_benefit": "Ensures Timelog's destructor/cleanup code does not crash when called in a different interpreter than the one that created the object"
+          },
+          {
+            "statement": "Add pytest stress test for create/destroy cycles (test_create_destroy_stress) across subinterpreters",
+            "detail": "Doc provides test loop: create subinterpreter → import/init Timelog → simple ops → close, repeated 300+ times to catch lifetime bugs, leaks, and handle exhaustion.",
+            "timelog_applicability": "tests/test_subinterpreters_timelog.py::test_create_destroy_stress; run 300+ cycles of subinterpreter create/Timelog init/destroy to catch refcount leaks",
+            "claimed_benefit": "Surfaces cumulative leaks, handle exhaustion, and edge cases in interpreter cleanup that only manifest after many cycles"
+          },
+          {
+            "statement": "Wire HPy Universal ABI and HPY_DEBUG=1 modes into CI matrix and local builds",
+            "detail": "Doc outlines HPy CI job: pip install hpy, set HPY_ABI=universal, set HPY_DEBUG=1, re-run test suite. HPy debug mode catches handle misuse and leaks early; Universal ABI ensures forward compatibility.",
+            "timelog_applicability": "CI: add job with env HPY_ABI=universal; add HPY_DEBUG=1 job to catch HPy handle violations; build harness updates to support optional HPy variant",
+            "claimed_benefit": "Ensures extension is forward-compatible with non-CPython runtimes (PyPy, GraalVM) and catches handle/lifetime bugs that CPython native ABI misses"
+          },
+          {
+            "statement": "Add Timelog-specific subinterpreter assertions: seqlock isolation, PageSpan buffer protocol, background worker per-interpreter defaults",
+            "detail": "Doc suggests: check seqlock/view_seq is interpreter-local, validate PageSpan buffer export/import fails cleanly across interpreters, verify background worker defaults are per-interpreter.",
+            "timelog_applicability": "tests/test_subinterpreters_timelog.py; add assertions for seqlock/manifest isolation, PageSpan buffer protocol safety, background worker thread binding",
+            "claimed_benefit": "Prevents silent data corruption or race conditions in seqlock reads, buffer protocol misuse, and background maintenance threads bound to wrong interpreter"
+          },
+          {
+            "statement": "Add GitHub Actions CI job matrix: CPython 3.12, 3.13, 3.14 (if available), +/- GIL",
+            "detail": "Doc provides YAML template; matrix includes py versions, Linux+macOS, CPython ABI and HPy Universal modes, with sanitizers (asan/ubsan) on native builds.",
+            "timelog_applicability": "CI: extend .github/workflows to include 3.12/3.13/3.14 with separate free-threading (3.14 -X gil=0) job; run test_subinterpreters_timelog.py",
+            "claimed_benefit": "Validates Timelog works on all supported Python versions and free-threading builds before release; catches version-specific bugs early"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_6",
+        "one_line_gist": "Runbook and measurement methodology to benchmark leveled vs universal compaction on LSM workloads (read/write/space amplification).",
+        "relevance": "core",
+        "relevance_reason": "Timelog is an in-memory LSM with memtable → L0 → L1 architecture and currently uses leveled compaction. The measurement *technique* (HDR histograms, WA = bytes_written/bytes_ingested, SA = space_used/logical_bytes, paired seed repeats) applies directly. Doc also includes Timelog-specific tuning cues (append-heavy keys, L0 fan-out, range queries).",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm",
+          "profiling",
+          "query-iterator"
+        ],
+        "near_dup_signature": "leveled universal compaction LSM read-write-space amplification measurement",
+        "ideas": [
+          {
+            "statement": "Measure p95/p99 read latency, write amplification, and space amplification across compaction styles using HDR histograms and paired RNG seeds",
+            "detail": "Doc prescribes: run 5 paired repeats per variant with distinct seeds; collect HDR histograms for point lookups and range scans; compute WA = compaction_bytes_written / bytes_ingested; compute SA = space_used / logical_bytes; report mean + 95% CI.",
+            "timelog_applicability": "Add benchmark suite to measure Timelog's compaction trade-offs: p50/p95/p99 for range queries [t1,t2), record compaction bytes and manifest size per run, compute WA and SA metrics",
+            "claimed_benefit": "Quantifies the actual impact of leveled vs universal compaction on tail latency and resource usage; enables data-driven default choice and per-workload tuning"
+          },
+          {
+            "statement": "Define three Timelog-realistic workloads: steady append (10k/s), bursty (1M writes in 30s), and mixed read/write (90/10 at 50k ops/s)",
+            "detail": "Doc specifies: A) Steady append 10k/s, 1-4 KB records, warmup 5m + measure 10m; B) Bursty 1M writes in ~30s then idle 5m; C) Mixed 90% reads / 10% writes @ 50k ops/s with same seed distribution across variants.",
+            "timelog_applicability": "Create benchmark harnesses for Timelog: steady append of timestamp/handle pairs at 10k/s, bursty ingest, and mixed range-query + append (simulating real time-series workload)",
+            "claimed_benefit": "Isolates compaction behavior under different access patterns; bursty load exposes p99 spikes that leveled/universal trade-off reveals; mixed workload is closest to production use"
+          },
+          {
+            "statement": "Decision rubric: prefer compaction style that reduces WA by ≥5% AND keeps p95 latency within 3% AND p99 within 2× baseline SLO",
+            "detail": "Doc prescribes: if Universal cuts WA meaningfully but violates p99 SLO on mixed workload, reject for prod (or scope to bulk-ingest windows only). Production-biased: tail latency (p99) trumps WA savings.",
+            "timelog_applicability": "Timelog: apply rubric to choose between leveled (current) and universal; if Universal wins WA on steady/bursty but trips p99 on mixed read/append, keep Leveled for prod default",
+            "claimed_benefit": "Prevents shipping a compaction strategy that optimizes WA at the cost of user-facing tail latency regressions; enables safe experimentation with universal on specific workloads"
+          },
+          {
+            "statement": "Tune max_bytes_for_level_base (leveled) or size_ratio (universal) to trade WA vs read stalls",
+            "detail": "Doc suggests: leveled → raise max_bytes_for_level_base to ease WA (at cost of L0/L1 overlap and read stalls); universal → tune size_ratio (merge aggressiveness) and stop_style to limit long merges spiking p99.",
+            "timelog_applicability": "Timelog: if leveled chosen, tune L1 window size (fixed time windows) and L0 trigger to balance write throughput vs read tail spikes; if universal, tune merge trigger size ratio",
+            "claimed_benefit": "Enables fine-grained control over WA/SA/latency trade-offs without recompiling; allows per-workload config in production"
+          },
+          {
+            "statement": "Record experiment metadata (knobs, git SHA, seed) and metrics to structured format (experiment.json, CSV, Parquet) for reproducibility",
+            "detail": "Doc prescribes: emit experiment.json per run (all knobs + git SHA + seed); export metrics to CSV/Parquet per run; archive SST/LOG metadata and level summaries.",
+            "timelog_applicability": "Timelog benchmark harness: record (compaction_style, L0_trigger, L1_window_size, memtable_bytes, workload, seed) to experiment.json; emit metrics.parquet with p50/p95/p99, WA, SA, stalls per seed/workload",
+            "claimed_benefit": "Enables reproducible, auditable comparisons; allows reanalysis and trend tracking across commits; supports sharing results with team"
+          },
+          {
+            "statement": "Pin CPU frequency, isolate compaction threads, clear OS cache, reach steady state before measuring to reduce measurement noise",
+            "detail": "Doc prescribes: pin CPU frequency profile; isolate compaction threads to avoid interference; clear OS cache between runs or run long enough to reach steady state.",
+            "timelog_applicability": "Timelog: for in-memory LSM, isolation is less critical than disk-based LSM, but still important: pin memtable flush/compaction threads to dedicated cores, allow warmup before measurement window",
+            "claimed_benefit": "Reduces noise in measurements; makes paired deltas vs baseline meaningful; enables confident decisions on sub-5% improvements"
+          },
+          {
+            "statement": "Timelog-specific: measure L0 file trigger impact and monitor read tail spikes during wide L0 fan-out merges",
+            "detail": "Doc notes: append-heavy time keys + half-open range queries mean L0 overlap is costly; wide L0 fan-out shows up as read tail spikes during merges. Keep L0 trigger modest to preserve predictable point-lookup latency.",
+            "timelog_applicability": "Timelog: benchmark p99 read latency vs L0_file_num_compaction_trigger; identify threshold where L0 overlap degrades tail latency; set conservative default (e.g., 4-8 files) to avoid fan-out explosions",
+            "claimed_benefit": "Timelog's append-heavy, range-query pattern is sensitive to L0 overlap; tuning L0 trigger can cut p99 latency without hurting throughput"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_7",
+        "one_line_gist": "Modernize Timelog's CPython C extension for subinterpreter safety, HPy compatibility, and future-proof ABI stability.",
+        "relevance": "core",
+        "relevance_reason": "Timelog is a hand-written CPython C-API extension already targeting free-threading and subinterpreters; this doc provides a concrete 8-pass migration strategy to eliminate process globals, adopt HPy handles, and ensure thread/interpreter safety. Directly addresses Timelog's stated design constraints.",
+        "primary_theme": "hpy",
+        "themes": [
+          "hpy",
+          "free-threading-gil",
+          "subinterpreters",
+          "c-api-binding",
+          "testing"
+        ],
+        "near_dup_signature": "HPy migration subinterpreters free-threading C extension",
+        "ideas": [
+          {
+            "statement": "Create a module state struct and migrate all process-global mutable state into per-interpreter fields via multiphase init.",
+            "detail": "Replace static globals (g_*, error objects, type caches, stats) with fields on a TLState struct; expose via HPyModuleState. Convert to multiphase init (Py_mod_create/Py_mod_exec) to create one state per interpreter.",
+            "timelog_applicability": "timelog module init and all global stats/error/type objects (e.g., TimelogRuntime, Stats, ErrorHandles)",
+            "claimed_benefit": "Enables safe subinterpreter isolation; eliminates cross-interp state corruption and leakage on interpreter shutdown."
+          },
+          {
+            "statement": "Adopt HPy handles (HPy type) to replace PyObject* borrowing with explicit HPy_Dup and HPy_Close discipline.",
+            "detail": "Switch PyObject* to HPy in public-facing functions; replace borrowed/steal semantics with explicit open/close pairs; wrap common patterns (HPyErr_SetFromErrnoWithFilename, HPyDict_New, etc.); use HPY_ASSERT_CLOSED in debug builds.",
+            "timelog_applicability": "All Python-facing C methods (append, range_query, delete_range, compaction callbacks) and error handling paths",
+            "claimed_benefit": "Refcount leaks become compile-time errors; removes footguns; enables future HPy universal wheels for PyPy/GraalVM."
+          },
+          {
+            "statement": "Convert custom types from static singletons to heap types created and stored as HPyField in module state.",
+            "detail": "Replace static PyTypeObject definitions with HPyType_FromSpec called at module exec time; store handle in TLState via HPyField_Store. Build constants/strings at exec time, not import time statically.",
+            "timelog_applicability": "TimelogType (if exposed) and any internal type objects; avoid static heap type instances",
+            "claimed_benefit": "Enables true multi-interpreter compatibility; each interpreter gets its own type instance with independent method caches."
+          },
+          {
+            "statement": "Replace ad-hoc TLS (thread-local caches) with C11 TSS or Py_tss_t.",
+            "detail": "Audit any thread-local buffers/caches (e.g., per-thread iterator state from buffer protocol); switch from hidden static thread locals to explicit Py_tss_t or C11 tss_t with proper cleanup on thread exit.",
+            "timelog_applicability": "Per-thread iterator buffers (PageSpan iteration state) and per-thread query scratch space",
+            "claimed_benefit": "Portable TLS that respects subinterpreter boundaries; easier debugging and cleanup on thread exit."
+          },
+          {
+            "statement": "Harden concurrency by replacing hidden atomics on PyObject fields with C11 atomics on owned C structs.",
+            "detail": "For any seqlock or refcount-like counters (queries_total, compaction stats), use _Atomic uint64_t with explicit memory_order flags (relaxed for perf counters, release/acquire for manifest updates). Keep GIL boundaries honest: long C ops use ALLOW_THREADS; reacquire only for Python callbacks.",
+            "timelog_applicability": "Seqlock on manifest (already present); atomic stats counters; manifest refcount handoff to retired-handle Treiber stack",
+            "claimed_benefit": "Memory safety under concurrent subinterpreters; portable to free-threading; no undefined behavior from implicit atomicity assumptions."
+          },
+          {
+            "statement": "Create a module state inventory document (globals.md) enumerating every global/static variable with lifetime and sharing intent.",
+            "detail": "For each global/static (C scalars, structs, singletons, caches, tombstone stats, error sentinels, file-scope and function-local statics): record type, whether mutated, whether per-interp or module-local, whether needs TSS, whether can move to HPyGlobal. Deliverable: a table guiding step-by-step refactor.",
+            "timelog_applicability": "Pre-refactor audit of timelog C17 codebase (timelog.c, runtime.c, manifest.c, etc.)",
+            "claimed_benefit": "No hidden globals missed during migration; forces explicit decision on sharing model for each piece of state."
+          },
+          {
+            "statement": "Build with -fsanitize=address,undefined and run full test matrix (unit + microbench + stress readers/writer) before and after HPy migration.",
+            "detail": "Use ASan/UBSan on Linux/macOS; MSVC ASan on Windows. Run unit tests, invariant checks, microbench suite (insert/range/point/compact), and stress tests with concurrent readers/writer to catch memory leaks and undefined behavior early.",
+            "timelog_applicability": "Timelog C17 build system; existing GTest + benchmark suite in timelog_tests and bench_timelog",
+            "claimed_benefit": "Catches refcount leaks, use-after-free, and memory corruption before production; sanitizer output guides fixes."
+          },
+          {
+            "statement": "Add subinterpreter test suite spawning N concurrent interpreters with reader/writer workloads and invariant checks.",
+            "detail": "Tests that spawn subinterpreters, import timelog in each, run concurrent append/range/delete_range ops, verify no cross-talk or leaks, stress rapid create/destroy interpreters with background compaction, and use fault injection (abort compaction, flip seqlock sleeps, assert invariants).",
+            "timelog_applicability": "New test suite in timelog_tests (Python/C++); can reuse existing reader/writer stress generators",
+            "claimed_benefit": "Proves correctness under subinterpreters; catches finalization order bugs and interpreter teardown leaks."
+          },
+          {
+            "statement": "Migrate CI to cibuildwheel and produce abi3 + (optional) HPy universal wheels across CPython 3.9–3.14+ and free-threaded 3.14.",
+            "detail": "Use cibuildwheel for Linux manylinux/musllinux, macOS x86_64/arm64, Windows x64. Build matrix: CPython 3.9→3.13 + 3.14 free-threaded. Target abi3 (no PyThreadState* pokes, no private headers) or HPy hybrid. Ship both so users get speed + reach.",
+            "timelog_applicability": "timelog-lib packaging and PyPI distribution; CI pipeline (.github/workflows)",
+            "claimed_benefit": "Users can pip-install wheels on any platform without compiler; abi3 wheels remain compatible across CPython minor versions; HPy universal extends to PyPy."
+          },
+          {
+            "statement": "Run perf microbench before and after HPy conversion to ensure handle discipline doesn't regress hot loops.",
+            "detail": "Capture p50/p95 latency and throughput for insert, range, point, compact on same machine. Accept ≤1–2% overhead for correctness/safety; flag any >5% regression for investigation (e.g., excess handle opens/closes in tight loop).",
+            "timelog_applicability": "Timelog's append(), range_query(), delete_range(), and compaction hot paths; benchmark suite output comparison",
+            "claimed_benefit": "HPy adoption proven not to hurt performance-critical ops; justifies migration to teams sensitive to latency."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_8",
+        "one_line_gist": "Explain CPython's pymalloc arena behavior and strategies to avoid arena pinning when Python objects are created in tight loops.",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog's C17 core does not rely on pymalloc for LSM operations; memory is allocated via its own allocators (likely mmap or malloc-backed). However, techniques transfer to Timelog's Python binding surface: buffer reuse, homogeneous data shapes, batch iteration, and phase-based workloads can prevent temporary Python wrapper objects from pinning arenas during compaction/publish. The document is not core to the time-index algorithm itself but offers practical patterns for binding code.",
+        "primary_theme": "memory-allocator",
+        "themes": [
+          "memory-allocator",
+          "python-interop"
+        ],
+        "near_dup_signature": "CPython pymalloc arena pinning RSS memory release",
+        "ideas": [
+          {
+            "statement": "Avoid mixing long-lived objects with short-lived churn of many sizes; phase workloads so arenas can empty completely between phases.",
+            "detail": "Don't build, use, then destroy objects of varying sizes in the same phase. Instead, batch allocations by lifetime and size class; for heavy workloads, consider a fork/exec or worker process model where each phase (flush → compact → publish) exits cleanly so the OS reclaims all memory deterministically.",
+            "timelog_applicability": "Timelog compaction threads and batch publishing: temporary Python wrappers created during iterate-and-emit should be dropped in one go before next phase",
+            "claimed_benefit": "Deterministic RSS drop between ETL/compaction phases; avoids arena fragmentation that keeps RSS high."
+          },
+          {
+            "statement": "Prefer buffer reuse and homogeneous data layouts over per-item Python object creation in hot loops.",
+            "detail": "Use bytearray/memoryview/NumPy buffers and reuse them. Build size-homogeneous data structures (e.g., reuse small tuples/struct-like objects). Avoid creating many different-sized temporaries in tight paths.",
+            "timelog_applicability": "Python binding surface: emit (timestamp, handle) pairs as views over preallocated pages (PageSpan) instead of per-row tuple creation",
+            "claimed_benefit": "Fewer small objects pinned to arenas; faster iteration and lower memory footprint for large result sets."
+          },
+          {
+            "statement": "Use sys.getallocatorsname() and PYTHONMALLOC env var to diagnose allocator behavior; prefer tracemalloc over RSS-only measurement.",
+            "detail": "Call sys.getallocatorsname() (3.12+) to see which allocator serves a size; set PYTHONMALLOC=malloc or =debug to debug allocator issues. Run tracemalloc to see Python heap specifically (not total RSS); use objgraph/gc.get_referrers() to find pins.",
+            "timelog_applicability": "Profiling and diagnosis of Timelog's Python binding layer when RSS doesn't drop as expected",
+            "claimed_benefit": "Faster root-cause analysis; separates Python arena pinning from other RSS growth causes."
+          },
+          {
+            "statement": "Break reference cycles and tame object graphs to prevent arenas from staying alive; use weakref and context managers.",
+            "detail": "Cycles keep objects—and their arenas—alive longer. Keep graphs simple, break cycles, use context managers to scope lifetime, and consider weakref to avoid holding strong references that pin arenas.",
+            "timelog_applicability": "Query result iterators and compaction callback chains: avoid circular references between manifest, run, and iterator wrappers",
+            "claimed_benefit": "Faster arena reclaim; fewer objects alive simultaneously; cleaner garbage collection."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_9",
+        "one_line_gist": "Tactical 3-step plan to validate Phase-2 compaction policy changes, document pointer encoding, and push a small well-tested refactor with CI improvements.",
+        "relevance": "core",
+        "relevance_reason": "Directly addresses Timelog's ongoing compaction work. The three steps are immediately actionable: (1) Run sanitizer-backed test suite on window-bounding/rebase-publish/reshape changes to surface regressions; (2) Freeze pointer-encoding (handle bit layout, tag/gen/ptr-or-idx) in an LLD with test matrix and perf budget; (3) Push a surgical refactor (e.g., extract select_L0_windows, add fuzz test, add CI OOO-heavy seed job). All steps tie back to Timelog's HLD.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "testing",
+          "profiling"
+        ],
+        "near_dup_signature": "compaction testing pointer encoding LLD benchmark sanitizer",
+        "ideas": [
+          {
+            "statement": "Run full test suite with -fsanitize=address,undefined on Phase-2 compaction changes; capture bench deltas (p50/p95 latency, throughput) with commit hash.",
+            "detail": "Clean build with ASan/UBSan. Run unit tests (--gtest_filter=\"Compaction*:*Rebase*:*Reshape*\"), microbench with warmup + 5 iters on insert/range/point/compact. Annotate any deltas ≥5% or correctness flags with env (CPU, build flags), commit hash, before/after table, notes on OOO mix/L0 span correlation.",
+            "timelog_applicability": "timelog_tests and bench_timelog targets; existing CMake build with ENABLE_ASAN flag; compaction counters (window_bound_exceeded, rebase_publish_*, reshape_compactions_total)",
+            "claimed_benefit": "Early detection of regressions from window-bounding/rebase-publish/reshape; perf deltas justified by correctness wins."
+          },
+          {
+            "statement": "Draft a 1-page Low-Level Design (LLD) document for handle pointer encoding, freezing its invariants, atomicity rules, and portability guarantees.",
+            "detail": "Include context (CPython handle as uint64_t encoding PyObject*), problem (bits/align assumptions, decode cost), proposal (layout diagram e.g. [tag:2 | gen:14 | ptr_or_idx:48], tag meanings, seqlock epoch invariants), ABI/compat (manifest deserialization, feature flags), test matrix (clang/gcc/msvc × asan/ubsan/tsan × release/relwithdebinfo × CPython 3.12/3.13/3.14-free-threaded), hot paths (insert/range/point/compact/retired-queue), fault injection (forced mis-tag, bad decode, overflow), and perf budget (+0–1% on point lookup; 0% on range).",
+            "timelog_applicability": "docs/LLD-pointer-encoding.md (new doc); handle encoding in timelog.c and runtime.h; manifest serialization format",
+            "claimed_benefit": "Freezes handle encoding ABI; enables future C extension changes without fear of incompatibility; serves as ground truth for new developers."
+          },
+          {
+            "statement": "Extract select_L0_windows() into its own translation unit with pure inputs/outputs and add fuzz test for overlapping boundaries.",
+            "detail": "Move window-selection logic to a separate .c file with clear function signature (input: window grid + L0 runs; output: selected run indices). Add fuzz test that randomly varies boundaries and verifies correctness invariants (no double-selection, no gaps).",
+            "timelog_applicability": "timelog C17 codebase; compaction/select_L0_windows() logic; GTest fuzz test suite",
+            "claimed_benefit": "Easier to reason about and test; fuzz-tested against boundary bugs; can be reused/optimized without affecting manifest logic."
+          },
+          {
+            "statement": "Add a CI job that runs OOO-heavy seed (e.g., --ooo_ratio=0.3) and uploads metrics.json artifact for historical tracking.",
+            "detail": "Create a new CI step that runs bench_timelog with high out-of-order ratio, captures counters (window_bound_exceeded, insert latency p50/p95, compaction time, L0 span), and uploads metrics.json as a workflow artifact for trend analysis.",
+            "timelog_applicability": "CI pipeline (.github/workflows); bench_timelog with --ooo_ratio flag; metrics collection/upload",
+            "claimed_benefit": "Continuous monitoring of OOO performance; early warning if Phase-2 changes degrade OOO-heavy workloads; trend data for capacity planning."
+          },
+          {
+            "statement": "Push a small, well-tested refactor with a PR description that ties back to the HLD, links the LLD, pastes bench deltas, and documents risk/rollback.",
+            "detail": "Select one surgical change (e.g., extract select_L0_windows or add CI job). Write PR body: Problem → micro-change → invariant strengthened. Link LLD and paste bench deltas table with commit hash. Note risk & rollback (e.g., guarded by TL_ENABLE_WINDOW_BOUNDING flag; trivial revert if regression detected).",
+            "timelog_applicability": "GitHub PR/commit process for Timelog; documentation in PR body",
+            "claimed_benefit": "Clear motivation and traceability; easy to review and rollback; builds confidence in Phase-2 completion."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_10",
+        "one_line_gist": "GitHub Actions workflow for continuous CI/CD benchmarking of Timelog across Python ABIs and versions, with perf profiling and flamegraph capture.",
+        "relevance": "core",
+        "relevance_reason": "Directly applicable to Timelog's in-memory C extension. The workflow exercises real append/delete/range ops, compares ABI binding strategies (pyo3/hpy/vectorcall), captures CPU flamegraphs and RSS snapshots—all directly transfer to tuning Timelog's performance regressions and ABI trade-offs.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "profiling",
+          "vectorcall"
+        ],
+        "near_dup_signature": "GitHub Actions CI benchmarking matrix across Python versions and ABI bindings",
+        "ideas": [
+          {
+            "statement": "Create a matrix-driven GitHub Actions workflow that benchmarks Timelog across multiple Python versions (3.11, 3.12, 3.13) and ABI bindings (pyo3, hpy-hybrid, vectorcall).",
+            "detail": "The workflow runs canonical scenarios (point_read, small_range_scan, ttl_purge), captures bench JSON with timing and RSS snapshots, records Linux perf data, and generates Brendan-Gregg flamegraphs for instant triage. Scales to 5M element datasets with configurable run counts.",
+            "timelog_applicability": "Directly in Timelog CI/CD; exercises core.append(ts,handle), range(t1,t2), delete_range(t1,t2), and optional compact() paths.",
+            "claimed_benefit": "Continuous regression detection across ABIs and Python versions; flamegraph output enables rapid identification of bottlenecks in C extension binding layer vs. algorithmic hotspots."
+          },
+          {
+            "statement": "Emit per-scenario latency percentiles (P50, P90, P99) and resource metrics (space amplification, write amplification) from benchmark harness.",
+            "detail": "The bench harness records elapsed time and RSS per scenario/run, then derives P50/P90/P99 and standard deviation in histogram.csv. RSS snapshots before/after populate/compact track memory overhead. Bench JSON includes scenario name, run count, dataset size, elapsed seconds, build time, peak RSS, and operation-specific metadata.",
+            "timelog_applicability": "Timelog perf monitoring; directly informs space amp (resident_bytes / peak_bytes) and write amp calculations, crucial for tuning memtable/L0/L1 layouts.",
+            "claimed_benefit": "Quantitative SLA tracking: P99 stability across runs signals algorithm/ABI robustness; RSS delta reveals compaction or memtable overhead changes."
+          },
+          {
+            "statement": "Run a fast nightly baseline (cron job) and full artifact upload on PR merges to establish performance regression baseline.",
+            "detail": "Workflow includes schedule trigger (cron '17 2 * * *' for nightly) plus pull_request and push triggers. Each run uploads bench.json, histogram.csv, perf.data, flamegraph.svg, and RSS snapshots as GitHub Actions artifacts, tagged by ABI/Python version and commit SHA.",
+            "timelog_applicability": "Timelog CI hygiene; nightly baselines allow bisection of regressions to commit granularity; artifact retention enables historical trend analysis.",
+            "claimed_benefit": "Historical performance database; enables before/after comparison on each merge without manual re-runs."
+          },
+          {
+            "statement": "Include a lightweight 'smoke' job that runs point reads only on PRs for faster feedback, deferring full profiling to main branch.",
+            "detail": "Optional job `quick-smoke` appends 200K elements, runs point reads, and asserts non-null lookups—completes in ~30s on PR vs. 60+ minutes for full matrix. Fail-fast matrix avoids spinning CI if smoke fails.",
+            "timelog_applicability": "Timelog PR workflows; trades precision for feedback speed on pre-merge validation.",
+            "claimed_benefit": "Faster PR merge cycles; catches catastrophic failures before full suite runs."
+          },
+          {
+            "statement": "Make build, scenario, and dataset size configurable via environment variables to support on-demand scaling without workflow edits.",
+            "detail": "TL_SCENARIOS, TL_RUNS, TL_DATASET_SIZE, TL_SEED, TL_RSS_SNAPSHOT_FILE are set in env block; harness reads via os.getenv with defaults. Allows tuning dataset size (5M baseline) up/down to balance CI time vs. load intensity.",
+            "timelog_applicability": "Timelog CI resource management; enables lighter CI runs for fast PRs and heavier runs for experimental branches.",
+            "claimed_benefit": "Operational flexibility without hardcoding CI parameters; supports both fast signal and deep profiling modes."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_11",
+        "one_line_gist": "Structured LSM tuning playbook proposing a minimal 8-cell matrix sweep over memtable size and tombstone canonicalization to determine optimal settings for write amplification and read tails.",
+        "relevance": "core",
+        "relevance_reason": "Directly applicable to Timelog's memtable-L0-L1 architecture with range tombstones. The matrix (4 memtable sizes × 2 canon modes) and workload patterns (delete-storm, mixed 80/15/5) map onto Timelog's design constraints: single writer, concurrent readers, range tombstones, and window-bounded compaction. The interpretation rules translate directly to tuning knobs already present (TW_window, level_multiplier).",
+        "primary_theme": "tombstones-deletes",
+        "themes": [
+          "tombstones-deletes",
+          "query-iterator",
+          "memory-allocator"
+        ],
+        "near_dup_signature": "LSM tuning matrix: memtable size and tombstone canonicalization sweep",
+        "ideas": [
+          {
+            "statement": "Design and run a factorial experiment sweeping memtable_size {16, 32, 64, 128 MiB} × tombstone_canonicalization {off, on} to isolate impact on write/read amplification.",
+            "detail": "Each of 8 cells runs two workload classes: delete-storm (1:1 inserts/deletes with overlapping range tombstones over 5–30% keyspace) and mixed (80/15/5 inserts/point-reads/range-reads with reinserts after deletions). Warm up for 2–3 memtable flushes before measurement. Record P50/P95/P99 latencies for point lookup, short range, medium range.",
+            "timelog_applicability": "Timelog parameter tuning; directly exercises memtable size (determines flush cadence), L0 span (windows crossed), and tombstone health metrics.",
+            "claimed_benefit": "Quantifies trade-off between flush frequency (fewer via larger memtable) and L0 read amplification (worse via overlapping runs); identifies sweet spot for delete-heavy workloads."
+          },
+          {
+            "statement": "Measure reclaim lag (time from tombstone creation to data absence in queries/segments post-compaction) and residual tombstone count per level to quantify delete efficiency.",
+            "detail": "Track: time-to-reclaim from tombstone insertion to when affected data is no longer visible after compaction consolidation; residual tombstone count per L0/L1/cold level at steady state. These metrics isolate whether canonicalization speeds reclamation without leaving orphaned metadata.",
+            "timelog_applicability": "Timelog delete correctness and cleanup; crucial for TTL and range-delete workloads. Residual count tracks compaction consolidation quality.",
+            "claimed_benefit": "Ensures deletion is complete; long reclaim lag signals compaction bottleneck or tombstone fragmentation; high residual count indicates ineffective coalescing."
+          },
+          {
+            "statement": "Expose CLI flags for memtable_size, tombstone_canonicalize, max_compaction_windows, and reshape_cooldown_max to parameterize sweeps.",
+            "detail": "Flags allow sweep harness to invoke benchmarks with different settings without recompilation: `timelog bench --memtable_size 64MiB --tombstone_canonicalize on --report out/result.json`. Enables rapid iteration across the matrix.",
+            "timelog_applicability": "Timelog CLI and benchmarking infrastructure; allows reproducible parameter sweeps via simple flag variations.",
+            "claimed_benefit": "Operational agility: sweeps become one-liners; results are reproducible and scriptable."
+          },
+          {
+            "statement": "Emit metrics counters: compaction_cpu_core_seconds_total, reshape_compactions_total, window_bound_exceeded_total, rebase_publish_{success,fallback,conflict}_total, tombstone_reclaim_lag_seconds{p50,p95,p99}, reads_*_latency_ms{p50,p95,p99}, space_amp_ratio, write_amp_ratio.",
+            "detail": "Metrics instrument compaction activity (CPU, reshape frequency, window overflow), snapshot rebase health (seqlock conflicts), delete reclamation delays, and amplification ratios. Enable correlation between setting changes and operational outcomes.",
+            "timelog_applicability": "Timelog observability; these counters are instrumentation points already hinted at in Phase-2 notes. Generate per-scenario histograms for interpretation rules.",
+            "claimed_benefit": "Quantitative decision-making: interpretation rules become: 'enable canonicalization if P99 range improves ≥15% AND compaction CPU increases ≤20%', rather than guess-work."
+          },
+          {
+            "statement": "Apply decision rules: enable tombstone canonicalization if P99 range improves ≥15% AND compaction CPU increases ≤20%, or if reclaim lag drops ≥30% with no worse than +10% space amp.",
+            "detail": "Three conditions for enabling canon: (1) read tail improvement ≥15% + CPU increase ≤20%; (2) reclaim lag drop ≥30% with space amp increase ≤10%; (3) L0 overlap reduction ≥25% (windows crossed). Disable if all three are true: P99 change <10% AND (compaction CPU rises >30% OR ingest throughput drops >10%) AND reclaim lag improvement <15%.",
+            "timelog_applicability": "Timelog feature flag: decide whether to enable canonicalization codepath based on these thresholds applied to benchmark results.",
+            "claimed_benefit": "Removes ambiguity; decision is objective, not subjective; enables A/B testing of canonicalization without manual interpretation."
+          },
+          {
+            "statement": "Increase memtable_size when flush count is high, write amp >3×, P50 writes jittery, and L0 span stays bounded; decrease when P99 reads degrade >20%, L0→L1 fan-in maxes out, or reshape triggers frequently.",
+            "detail": "Decision rules for memtable sizing: upsize if write pressure is high but read performance stable (L0 span near 1–2 windows); downsize if reads suffer or compaction destabilizes. Target end-state: P95/P99 range-reads stable, L0 span near 1–2 windows, compaction CPU stable ±15%, space amp ≤1.6× (mixed) / ≤2.0× (delete-storm).",
+            "timelog_applicability": "Timelog parameter tuning; memtable_size is the primary control for write amp vs. read amp trade-off in your architecture.",
+            "claimed_benefit": "Quantified tuning rules prevent local optima; achieved targets are realistic bounds informed by LSM literature."
+          },
+          {
+            "statement": "For follow-up tuning, sweep TW_window {5m, 10m, 20m} × level_multiplier {4, 8} if read amplification or retention edge cases persist after memtable/canon sweep.",
+            "detail": "Secondary sweep fixes tail latency or retention anomalies after primary sweep completes. Increasing TW_window reduces compactions but prolongs reclaim (opposite trade-off); increasing level_multiplier lowers compaction frequency but may worsen point/range tails. Keep memtable_size and canon settings fixed from primary sweep.",
+            "timelog_applicability": "Timelog Phase-2 knobs (time-window, level_multiplier) allow window size and promotion policy tuning after primary LSM parameters are fixed.",
+            "claimed_benefit": "Phased approach: tune write/delete amplification first, then optimize retention/read tail via secondary knobs without re-running primary matrix."
+          },
+          {
+            "statement": "Include sanity checks: reinsertion correctness after overlapping tombstones (point and small range), snapshot-consistent reads under continuous compaction (concurrent readers + rebase_publish counter), reshape stability (cooldown_max prevents oscillation).",
+            "detail": "Validation workloads: insert, delete overlapping ranges, re-insert in different order, verify query results; concurrent reader hammer test while compaction runs, count rebase_publish_* conflicts; check reshape_compactions_total doesn't spike (indicates cooldown_max is too permissive).",
+            "timelog_applicability": "Timelog correctness regression testing; validates that parameter tuning doesn't introduce anomalies in delete semantics or snapshot consistency.",
+            "claimed_benefit": "Catches silent correctness regressions (e.g., wrong tombstone semantics under high churn) that benchmark metrics alone miss."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_12",
+        "one_line_gist": "LSM compaction strategies reference (STCS/LCS/TWCS/hybrid) with recommendations for Timelog's window-bounded, time-aware, append-heavy architecture.",
+        "relevance": "core",
+        "relevance_reason": "Directly addresses Timelog's compaction strategy choice. The hybrid time-aware leveled approach aligns with Timelog's already-implemented adaptive window grid and non-overlap L1 layout. Recommendations for window hotness, deletion-driven micro-merges, and cross-window read optimization are directly transferable to Phase-2 compaction tuning.",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm",
+          "tombstones-deletes",
+          "query-iterator"
+        ],
+        "near_dup_signature": "LSM compaction strategies (STCS/LCS/TWCS) mapped to Timelog's time-windowed constraints",
+        "ideas": [
+          {
+            "statement": "Adopt a time-aware leveled hybrid strategy: keep recent/hot windows leveled (non-overlapping, narrow) and age cold data into a read-optimized last level with less frequent recompaction.",
+            "detail": "Recent windows maintain one SST per key-range (leveled) for tight read tails on fresh data. Older windows migrate to time-windowed tiering (drop whole files at TTL). This preserves read benefits of leveling for hot ranges while avoiding repeated recompaction of cold data. Fits Timelog's L1 non-overlap + adaptive window grid design.",
+            "timelog_applicability": "Timelog Phase-2 compaction; directly maps to L1 window-level consolidation policy. Small recent windows stay leveled; older windows can be merged less aggressively.",
+            "claimed_benefit": "Balances read latency for fresh data (leveled tails) with write efficiency for retention-driven churn (time-windowed drops); avoids pathological recompaction of historical data."
+          },
+          {
+            "statement": "For tight read SLAs on recent windows, keep window size small (bounded L0 fan-in) so hot window range queries touch ≤O(1–2) runs, then level those windows aggressively.",
+            "detail": "Window size determines L0 overlap scope. Small windows (e.g., 5–10 minutes) bound the number of runs a query must scan. Pair with aggressive leveling (flatten L0 faster for recent windows) to achieve predictable P99 tails. Trade-off: more files, but each query sees fewer files.",
+            "timelog_applicability": "Timelog L1 window configuration; TW_window parameter controls this directly. Smaller window → more windows, but tighter read SLA per window.",
+            "claimed_benefit": "Predictable tail latency for recent queries (logs/metrics use case); avoids pathological cross-window fan-in."
+          },
+          {
+            "statement": "If ingestion throughput is the bottleneck, start with size-tiered compaction within each window, then selectively level hot windows once they cool.",
+            "detail": "Let each time window accumulate multiple runs (STCS-style) until it stops receiving writes (cools), then consolidate to single leveled SST. Avoids paying leveling cost on hot windows. Requires per-window hotness tracking and selective compaction policies.",
+            "timelog_applicability": "Timelog L0→L1 promotion; tune compaction frequency per window based on observed write rate (cache hotness) rather than age alone.",
+            "claimed_benefit": "Reduces write amplification during heavy ingest; read amplification grows only for cooled windows (less critical for retention workloads)."
+          },
+          {
+            "statement": "For retention/TTL-heavy workloads (metrics/logs style), align file boundaries with retention horizon so entire files drop at TTL without per-entry tombstone consolidation.",
+            "detail": "Pure TWCS: files span exactly one retention window (e.g., 24 hours). Expired files are dropped via manifest deletion, no compaction needed. Reduces CPU cost of delete processing. Combine with hot-window leveling: recent data (last N windows) uses leveled strategy, older data uses TWCS.",
+            "timelog_applicability": "Timelog Phase-2 if retention is a primary use case; L1 window alignment with TTL horizon enables zero-compaction file drops.",
+            "claimed_benefit": "Cheap expiry: O(1) manifest update instead of O(N) compaction; space amplification becomes predictable."
+          },
+          {
+            "statement": "Keep delete-driven micro-merges scoped to affected windows only; avoid global write amplification when range tombstones are concentrated.",
+            "detail": "When a delete_range spans windows [t1, t2), compact only those affected windows. Don't trigger full L0→L1 consolidation. Pair with tombstone canonicalization to coalesce overlapping deletes before micro-merge, reducing fan-in.",
+            "timelog_applicability": "Timelog delete_range semantics; window-bounded selection already limits compaction scope. Extend to only compact windows in the delete span.",
+            "claimed_benefit": "Write amplification stays O(affected_windows) instead of O(all_levels); delete storms don't stall ingest."
+          },
+          {
+            "statement": "Periodically re-index/coalesce tombstones per window, then let expiry or reshape compaction reclaim space predictably.",
+            "detail": "After a burst of deletes, compact a single window to consolidate tombstones (coalesce overlaps) without touching other windows. Later, regular reshape compaction or TTL expiry removes data. Ensures tombstone count doesn't accumulate across levels.",
+            "timelog_applicability": "Timelog tombstone maintenance; fits into background maintenance worker. Per-window tombstone reindex is cheaper than full compaction.",
+            "claimed_benefit": "Prevents tombstone explosion; reclaim lag becomes predictable (next reshape/TTL for that window)."
+          },
+          {
+            "statement": "For cross-window range reads common in your workload (e.g., [now-Δ, now)), bias compactor to keep last N windows extra clean (leveled, fewer files).",
+            "detail": "Detect if most queries span recent N windows. Increase leveling frequency for those windows; deprioritize cold windows. Implement via compaction priority queue: recent windows get higher score.",
+            "timelog_applicability": "Timelog query patterns; if range(t1, t2) queries are common with t2 ≈ now, tune compaction priority to favor recent windows.",
+            "claimed_benefit": "Hot query path sees fewer files; reduces per-window I/O (or in-memory traversal) for common [now-Δ, now) scans."
+          },
+          {
+            "statement": "Decision matrix: tight read tails on fresh data → time-aware leveled (small recent windows); massive ingest, batched reads → size-tiered per window + optional leveling on cooldown; heavy TTL/retention → TWCS (or hybrid TWCS cold + leveled hot); delete storms → tombstone-first canonicalization + targeted window merges.",
+            "detail": "Four decision paths based on primary bottleneck: read SLA → recent-window leveling; write throughput → per-window STCS; retention churn → TWCS; delete churn → canonicalization + micro-merge. Pick one primary strategy, optionally combine with hybrid for dual concerns.",
+            "timelog_applicability": "Timelog Phase-2 strategy selection; aligns with Timelog's existing constraints (append-heavy, single-writer, time-windowed L1).",
+            "claimed_benefit": "Decision framework: avoids one-size-fits-all; lets operators pick strategy matching their SLA (latency vs. throughput vs. retention)."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_13",
+        "one_line_gist": "Practical playbook for batching Python→C micro-operations to amortize call overhead via contiguous buffers and zero-copy memoryview.",
+        "relevance": "core",
+        "relevance_reason": "Timelog already uses buffer protocol (PageSpan) and releases GIL for native loops. Doc explicitly recommends concrete APIs (scan_many, hash_pages) for range retrieval and compaction hot paths, directly applicable to existing C17 extension.",
+        "primary_theme": "buffer-protocol",
+        "themes": [
+          "buffer-protocol",
+          "c-api-binding",
+          "api-design"
+        ],
+        "near_dup_signature": "batching python c operations memoryview zero-copy",
+        "ideas": [
+          {
+            "statement": "Expose scan_many(pagespan: memoryview, ranges: memoryview[int64,int64], out_idx: memoryview[int64]) → int API for range queries",
+            "detail": "Instead of per-item scan(range) calls from Python, batch multiple ranges in a single native call over contiguous buffers. Native code tight-loops over fence checks and merges with GIL released, then returns indices in preallocated output buffer.",
+            "timelog_applicability": "Range query hot path in iterators and compaction (merge scanning across memtable + L0 + L1); replaces individual range() calls with batched variant.",
+            "claimed_benefit": "Amortize 100–400ns per-call overhead across many items; expect ≥30–50% p95 latency reduction when per-item native work < 1–2µs (typical for fence checks in Timelog)."
+          },
+          {
+            "statement": "Expose hash_pages(pagespan: memoryview, out_u64: memoryview[uint64]) → int for bulk hashing of page boundaries or fence blocks",
+            "detail": "Batch hash computations over multiple pages or fence blocks in a single native call; write results to preallocated uint64 array. Useful for integrity checks, bloom filters, or compaction validation.",
+            "timelog_applicability": "Compaction phase validation, fence block integrity verification, or optional bloom-filter seeding for L1 window boundaries.",
+            "claimed_benefit": "Reduces overhead when hashing many small objects (e.g., per-page checksums); amortizes per-call cost."
+          },
+          {
+            "statement": "Sweep batch sizes (8, 16, 32, 64, 128) and adopt smallest size meeting ≥30–50% p95 latency reduction and throughput improvement",
+            "detail": "Run perf benchmarks on scan_many and hash_pages with different batch sizes; plot latency and ops/sec, pick the sweet spot (often 8–64 for CPU-bound micro-ops).",
+            "timelog_applicability": "Iterator/compaction batched APIs; establish batch-size heuristic for range query fan-out.",
+            "claimed_benefit": "Ensures minimal overhead while maintaining practical batch efficiency; data-driven tuning."
+          },
+          {
+            "statement": "Keep per-item API (scan(range), hash_single) as thin shims for tests and docs, but route production code through batched variants",
+            "detail": "Wrap per-item function inside the batched function (e.g., scan_many calls scan internally for a single item). Maintains readability and testability without duplication.",
+            "timelog_applicability": "Timelog's public API surface; test utilities and documentation examples can use simple per-item calls while iterators/compaction use _many internally.",
+            "claimed_benefit": "Preserves ergonomics and backward compatibility while enabling fast path adoption in performance-critical code."
+          },
+          {
+            "statement": "Release GIL around native batch loop; reacquire only for Python API calls outside the loop",
+            "detail": "Use Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS wrapper around the tight native loop; do not touch Python objects inside the loop.",
+            "timelog_applicability": "Timelog's C17 extension already does this for long ops; ensure batched APIs maintain the pattern (GIL released for the entire batch, not per-item).",
+            "claimed_benefit": "Allows concurrent Python threads to run while native batch processes; critical for multi-threaded Timelog users (especially with free-threading in 3.14t)."
+          },
+          {
+            "statement": "Validate input bounds, alignment, and sizes once per batch call, not per item",
+            "detail": "Check memoryview extents, offsets, and alignment once at the batch entry point; trust valid inputs in the tight loop.",
+            "timelog_applicability": "scan_many, hash_pages validation; check range count, buffer sizes, and alignment up-front.",
+            "claimed_benefit": "Removes per-item validation overhead; modern CPUs reward tight inner loops without branches."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_14",
+        "one_line_gist": "Deterministic memory testing harness combining OS RSS sampling and tracemalloc to isolate Python leaks from native allocator fragmentation, with CI gate rules.",
+        "relevance": "core",
+        "relevance_reason": "Directly applicable to Timelog's in-memory C extension. Doc offers reproducible diagnostic method to detect Python-level ref leaks, C-side fragmentation (critical for long-lived in-memory store), and allocator behavior. Fits Phase 2 testing requirements.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "testing",
+          "memory-allocator",
+          "profiling"
+        ],
+        "near_dup_signature": "memory leak detection rss tracemalloc ci gates",
+        "ideas": [
+          {
+            "statement": "Implement two-process memory probe harness (monitor + worker) sampling RSS and tracemalloc in parallel",
+            "detail": "Monitor process spawns worker as separate process group, samples /proc/[pid]/statm (RSS) and tracemalloc snapshots every 0.25s (tunable), writes CSV (t_s, rss_b, tmalloc_b, top_frames). Allows clean separation and avoids monitor overhead contaminating results.",
+            "timelog_applicability": "Timelog's test suite; worker runs compaction + range query workload (e.g., 2M inserts with periodic range scans), monitor collects baseline for regression testing.",
+            "claimed_benefit": "Reproducible memory profiling; decouples observer from observed; CSV output enables trend analysis and CI gating."
+          },
+          {
+            "statement": "Differentiate Python-level leaks (tracemalloc ↑, RSS ↑) from native/fragmentation leaks (tracemalloc flat, RSS ↑) via pattern matching",
+            "detail": "Compute linear regression slopes for last ¼ of samples: slope_tm (tracemalloc bytes/sec), slope_rss (RSS bytes/sec). Categorize by slope patterns: both rising = Python leak; only RSS rising + tracemalloc stable = native/fragmentation.",
+            "timelog_applicability": "Timelog's background worker and memtable/compaction stress; immediately identifies whether leaks are in Python bindings or C-side allocator.",
+            "claimed_benefit": "Fast root-cause triage: narrows debugging scope (Python objects vs malloc arenas)."
+          },
+          {
+            "statement": "Gate CI on Python-leak threshold (slope_tm > 5e4 B/s ≥15s window → fail) and native-fragmentation threshold (slope_tm ≤ 1e4 AND slope_rss > 2e5 B/s → fail)",
+            "detail": "Compute slopes from CSV via simple linear fit; fail if thresholds crossed. Allows ±20% variance on noisy CI builders; pin golden CSV for baseline.",
+            "timelog_applicability": "GitHub Actions or local test gate; prevents regressions in Timelog's memory behavior across releases.",
+            "claimed_benefit": "Automated memory regression detection without manual sampling; fast feedback loop."
+          },
+          {
+            "statement": "Detect allocator spikes (stepwise RSS jumps ≥3 steps > 8 MiB within test window) to identify bulk buffer allocations or compaction batch effects",
+            "detail": "Diff consecutive RSS samples; flag when ≥3 diffs exceed 8 MiB threshold. Useful for understanding when large allocations occur (e.g., L0 memrun buffer, compaction output buffer).",
+            "timelog_applicability": "Timelog's memtable sealing + L0 compaction; correlates spikes with known high-water-mark events.",
+            "claimed_benefit": "Pinpoints allocator sensitivity to batch sizes and window parameters; guides tuning."
+          },
+          {
+            "statement": "Extract top-K tracemalloc frames per sample in compact 'file:line:size;...' format for CSV column (e.g., TOPK=10)",
+            "detail": "Use tracemalloc.take_snapshot().statistics('traceback'); format as semicolon-joined 'basename:lineno:size' tuples. Keeps CSV readable while capturing allocation hotspots.",
+            "timelog_applicability": "Timelog test harness; review top_frames column to identify which C extension or Python code allocates.",
+            "claimed_benefit": "Lightweight profiling; no extra overhead compared to full flamegraph; integrates naturally with CSV."
+          },
+          {
+            "statement": "Use Memray sampling/profiling on the same scenario for richer heap growth timeline correlating Python + native stacks",
+            "detail": "Run worker under Memray (or other native profiler) to see native allocations and call stacks alongside Python allocations, triangulating the exact source.",
+            "timelog_applicability": "Deep investigation phase: when CI gates fail, use Memray to drill into specific allocation source in Timelog's C code.",
+            "claimed_benefit": "Complements CSV data with flame graphs and native call stacks; faster root cause."
+          },
+          {
+            "statement": "Toggle allocator via LD_PRELOAD (jemalloc, mimalloc) or PYTHONMALLOC env var to isolate glibc/pymalloc fragmentation from app logic",
+            "detail": "Run same worker under different allocators (glibc malloc, jemalloc, mimalloc) and compare CSV slopes and jumps. If slopes improve under jemalloc, fragmentation is allocator-related; if unchanged, app is leaking.",
+            "timelog_applicability": "Timelog's memory tuning; test allocator sensitivity before investing in app-level pooling or refactor.",
+            "claimed_benefit": "Quickly exonerates or implicates allocator; guides optimization priority."
+          },
+          {
+            "statement": "Tune jemalloc with background threads and tcache limits (e.g., MALLOC_CONF=dirty_decay_ms:1000,background_thread:true,tcache_max:32768) to reduce RSS creep",
+            "detail": "Reduce jemalloc's background arena growth by tuning decay time, enabling background threads, and capping thread-local cache size.",
+            "timelog_applicability": "Timelog's optional integration step if glibc/pymalloc fragmentation is identified; trade throughput for memory footprint.",
+            "claimed_benefit": "Reduces allocator-driven RSS inflation; especially useful for long-running Timelog services."
+          },
+          {
+            "statement": "Reduce MALLOC_ARENA_MAX (e.g., 2–4 instead of default) if many threads inflate glibc arenas",
+            "detail": "Glibc allocates per-thread arenas; multi-threaded Timelog with many threads can cause RSS creep even without app leaks. Capping arenas forces sharing and reduces memory overhead.",
+            "timelog_applicability": "Timelog with free-threading (3.14t) or subinterpreter workloads; reduce arena count if per-thread overhead is visible in CSV.",
+            "claimed_benefit": "Mitigates multi-threaded allocator overhead without code changes."
+          },
+          {
+            "statement": "Verify zero-copy read surfaces (PageSpan) don't prolong object lifetimes; audit retired-queue Py_DECREF timing",
+            "detail": "Review Timelog's PageSpan consumer code to ensure borrowed references don't outlive the page; check that retired handle queue decreffs in timely fashion.",
+            "timelog_applicability": "Timelog's buffer protocol implementation; ensure memoryview consumers don't hold dangling refs.",
+            "claimed_benefit": "Prevents memory leaks from zero-copy API misuse; critical for long-running consumers."
+          },
+          {
+            "statement": "Cap L0 span / batch sizes and window-bounded compaction to limit peak memory during compaction phases",
+            "detail": "Limit concurrent memrun sealing and L0 compaction batch size to prevent spike in simultaneously-live output buffers.",
+            "timelog_applicability": "Timelog's Phase 2 window-reshaped compaction; relate CSV spikes to batch size parameters, tune accordingly.",
+            "claimed_benefit": "Predictable memory footprint even under heavy compaction load; eases resource planning."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_15",
+        "one_line_gist": "LSM compaction ROI framework: treat each compaction as an investment decision gated by cost/benefit ratio, with tunable capacity ratio and concurrency knobs.",
+        "relevance": "core",
+        "relevance_reason": "Timelog is an in-memory LSM with background compaction worker. Paper-backed ROI model directly applies to deciding when/whether to compact in the worker. Doc proposes per-task cost metering and short-horizon benefit prediction, fitting Timelog's adaptive window grid and background maintenance.",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm",
+          "api-design"
+        ],
+        "near_dup_signature": "lsm compaction roi cost benefit decision adaptive",
+        "ideas": [
+          {
+            "statement": "Implement per-compaction ROI gate: meter task cost (bytes_read + bytes_written, CPU-secs) and estimate benefit (predicted p95 read latency drop)",
+            "detail": "For each candidate compaction task: measure/estimate I/O and CPU cost in real time; predict future read amplification reduction (fewer runs at queried levels → fewer binary searches → lower p95). Compute ROI = (baseline_p95 - p95_with_compaction) / compaction_cpu_secs; run only if ROI > threshold τ.",
+            "timelog_applicability": "Timelog's background worker loop; gate L0→L1 merges and L1 reshapes based on predicted read benefit vs. immediate compaction cost.",
+            "claimed_benefit": "Avoids wasteful compactions that don't improve reads; maximizes CPU allocation to high-ROI tasks; adapts to workload (Zipfian reads vs. uniform)."
+          },
+          {
+            "statement": "Estimate cost (now): meter bytes_read + bytes_written and wall-time CPU-secs per candidate compaction task",
+            "detail": "Instrument compaction tasks to log bytes touched in input runs and output runs, plus CPU time consumed. Store in per-task metrics struct.",
+            "timelog_applicability": "Timelog's C17 worker loop; add counters for memrun merge input/output byte counts and task duration.",
+            "claimed_benefit": "Real-time observability of compaction cost; enables per-task cost model validation."
+          },
+          {
+            "statement": "Estimate benefit (future): model fewer runs at queried levels → (lookup cost * run count) reduction → Δp95 proxy; refine with rolling outcome log",
+            "detail": "Quick model: if compaction merges N runs into 1, estimated speedup ≈ (N-1) * cost_per_run_lookup. Over a lookahead horizon, p95 stays reduced until new runs overlap again. Log actual outcomes (p95 before/after) to refine model coefficients online.",
+            "timelog_applicability": "Timelog's L0→L1 and L1 reshape decisions; estimate run count reduction and predict p95 gain using fence-check cost (cheap: 1–2µs per run in Timelog).",
+            "claimed_benefit": "Lightweight benefit prediction (no simulation); adapts to actual Timelog costs as model trains; enables proactive compaction (trigger before p95 degrades)."
+          },
+          {
+            "statement": "Gate compaction by ROI > τ and back-pressure on write-stall risk; surface ROI histogram and decision metrics in telemetry",
+            "detail": "Skip compaction tasks with ROI ≤ τ; also skip if write stalls approaching SLO risk. Export decision reasons (ROI too low, write-stall risk) and ROI percentiles (p50, p95, p99) to metrics.",
+            "timelog_applicability": "Timelog's telemetry; track compaction decision histogram (taken, skipped_low_roi, skipped_stall_risk), p95 outcome per decision bucket.",
+            "claimed_benefit": "Validates ROI model in production; guides τ tuning; exposes allocator-driven write stall coupling."
+          },
+          {
+            "statement": "Tune capacity ratio T (fan-out per level) and max_background_compactions via small sweep: T ∈ {2, 4, 10}, concurrency ∈ {1, 4} on pinned-core box",
+            "detail": "Run db_bench-style Zipfian read/write mix mirroring Timelog's hot-window access; sweep (T, concurrency) pairs; collect p95 read latency, cumulative compaction CPU, write stalls. Choose pair maximizing ROI while staying under p95 SLO.",
+            "timelog_applicability": "Timelog's tuning phase; set T and background worker thread pool size based on read/write/space amplification trade-off empirically.",
+            "claimed_benefit": "Data-driven parameter selection; avoids over-compaction or under-compaction; portable to different workloads (tunable τ)."
+          },
+          {
+            "statement": "Sketch per-task metrics struct: bytes_in, bytes_out, cpu_sec, wall_time, compaction_type (L0→L1, L1_reshape) for C17 worker",
+            "detail": "Define a lightweight task result struct carrying cost and outcome; log to ringbuffer or emit as telemetry event.",
+            "timelog_applicability": "Timelog's C extension; add task_metrics to compaction_task_t or similar.",
+            "claimed_benefit": "Centralizes cost tracking; feeds ROI model; enables post-hoc analysis of decision quality."
+          },
+          {
+            "statement": "Monitor compaction fan-out and file/run alignment to detect wasted work (amplification); incorporate into benefit estimate refinement",
+            "detail": "Track actual bytes overwritten during compaction; if high, optimize alignment or batch size. Use outcome feedback to adjust benefit model (e.g., if p95 doesn't improve as predicted, revisit cost coefficients).",
+            "timelog_applicability": "Timelog's memrun + L1 window structure; log bytes_rewritten / bytes_total for each task; correlate with p95 outcomes.",
+            "claimed_benefit": "Closes feedback loop; catches misaligned assumptions in ROI model; drives incremental refinement."
+          },
+          {
+            "statement": "Pin τ (ROI threshold) conservatively (e.g., τ = 0.5 µs/B or dimension-neutral ROI > 1.0), then tune downward only if SLO violated",
+            "detail": "Start with high threshold to ensure only high-ROI compactions run; if p95 creeps up, lower τ slightly and re-test. Avoid over-tuning; τ is workload-dependent.",
+            "timelog_applicability": "Timelog's background worker config parameter; expose τ as tunable; default conservative.",
+            "claimed_benefit": "Safe initial behavior; prevents over-compaction waste; enables user-driven tuning."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_16",
+        "one_line_gist": "Measure break-even thresholds for batching vs per-row FFI and prove zero-copy via Arrow C Data Interface pointer identity.",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog uses hand-written CPython C-API, not Rust/Arrow, so Arrow-specific patterns don't apply. However, the general FFI overhead measurement and break-even framework (N_break = t_overhead / t_saved_per_element) transfers to any C-extension boundary. The pointer-identity and checksum verification techniques are generic patterns applicable to Timelog's buffer protocol exports (PageSpan).",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "c-api-binding",
+          "buffer-protocol"
+        ],
+        "near_dup_signature": "FFI batching break-even and zero-copy measurement",
+        "ideas": [
+          {
+            "statement": "Measure FFI overhead and per-element savings to compute break-even batch size",
+            "detail": "Establish N_break = t_overhead / t_saved_per_element by timing minimal FFI calls (≥1000 iterations) and benchmarking copy bandwidth for element size. Use this to decide when to batch vs per-row.",
+            "timelog_applicability": "Query and append hot paths; measure cost of CPython boundary crossing vs memcpy savings when exporting PageSpan or range results",
+            "claimed_benefit": "Avoid per-row FFI overhead when batch size is too small; skip zero-copy overhead when batching is cheaper"
+          },
+          {
+            "statement": "Implement pointer-identity validation for zero-copy buffer exports",
+            "detail": "Use ctypes or capsule inspection to compare buffer addresses on producer (C extension) and consumer (Python) side. Match guarantees zero-copy handoff without expensive SHA checksums.",
+            "timelog_applicability": "PageSpan buffer protocol exports; validate that timestamp array views are truly aliasing the internal LSM buffer, not copies",
+            "claimed_benefit": "Prove zero-copy at the C-extension boundary without performance cost; catch unintended copies during development"
+          },
+          {
+            "statement": "Attach xxhash64 checksum in side-metadata for zero-copy integrity",
+            "detail": "Producer computes fast xxhash64 over payload; consumer maps memoryview/NumPy array, recomputes xxhash64, compares. Pointer match + checksum match ⇒ zero-copy + integrity without expensive SHA.",
+            "timelog_applicability": "For PageSpan or range-query exports, attach fast checksum to prove both zero-copy and buffer stability across seqlock reads",
+            "claimed_benefit": "Low-cost integrity check for zero-copy buffer handoffs; detects silent buffer corruption or unintended copies"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_17",
+        "one_line_gist": "Auto-tune LSM compaction modes (conservative vs aggressive) based on live p99 latency, write amplification, and L0 backlog signals with hysteresis.",
+        "relevance": "core",
+        "relevance_reason": "Timelog's architecture (memtable → sealed memruns → L0 → L1 with fixed time windows) is LSM-style. The project already has a background maintenance worker; the doc's adaptive mode-switching (based on read latency, write amplification, and L0 file count), hysteresis, and rate-limiting are directly applicable to tuning Timelog's compaction aggressiveness. The signals and controller logic map onto Timelog's existing metrics.",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm"
+        ],
+        "near_dup_signature": "LSM auto-tuning via latency and write-amp signals",
+        "ideas": [
+          {
+            "statement": "Monitor p99 read latency and compare to 5-minute baseline to detect latency spikes",
+            "detail": "Compute rolling 5-minute EMA of p99 latency; trigger conservative mode if p99_now > 1.15 × p99_baseline_5m. Use short baselines (5-10m) to distinguish real degradation from noise.",
+            "timelog_applicability": "Timelog's range-query and point-lookup latencies in background monitoring; track p99 of range_query calls and detect when L0 backlog causes tail-latency bloat",
+            "claimed_benefit": "Detect when aggressive compaction is harming read latency; switch to protective mode before user-facing tail-latency degrades"
+          },
+          {
+            "statement": "Monitor write amplification (WA) proxy as compaction_bytes_written / user_write_bytes",
+            "detail": "Compute rolling 1–5 minute window ratio. Trigger aggressive mode if WA_now > 1.07 × WA_baseline and latency is stable. Use longer baseline (15m) for WA to avoid jitter.",
+            "timelog_applicability": "Timelog append → compaction ratio; track bytes written to L1 vs bytes appended to memtable. Detect unnecessary rewrites during low-load periods.",
+            "claimed_benefit": "Reduce unnecessary compaction work when write amplification is high but latency is healthy; prioritize efficiency over speed"
+          },
+          {
+            "statement": "Track L0 file count or compaction_bytes_pending as backlog signal",
+            "detail": "Use L0 file count (simple, deterministic) or compaction_bytes_pending (flow-aware). Trigger conservative mode if backlog > threshold (e.g., L0 files > 10 or pending > 2–3× minute-ingest).",
+            "timelog_applicability": "Timelog L0 memrun count; track sealed memruns awaiting compaction. Emergency trigger if L0 exceeds ~32–40 files.",
+            "claimed_benefit": "Prevent L0 explosion and associated read amplification; catch compaction lag before it cascades"
+          },
+          {
+            "statement": "Implement conservative mode: throttle compaction I/O, prefer larger target file sizes, delay L0 merges",
+            "detail": "When triggered (p99 spike + backlog high), apply: rate-limit compaction bytes/sec, increase target_file_size (fewer, fatter outputs), cap L0→L1 merge frequency. Keep parallelism modest.",
+            "timelog_applicability": "Timelog background compaction worker; dynamically adjust target window size for L1 outputs, throttle compaction thread frequency, defer merge timing",
+            "claimed_benefit": "Reduce compaction-induced latency spikes and GIL contention during read-heavy periods"
+          },
+          {
+            "statement": "Implement aggressive mode: increase compaction threads, align outputs, prefer tiered merges",
+            "detail": "When triggered (WA high + latency stable), apply: bump compaction parallelism (bounded), size-align runs to reduce rewrite churn, use universal/tiered merge strategies. Bump max_bytes_for_level_base if applicable.",
+            "timelog_applicability": "Timelog background worker; increase frequency of L0→L1 compaction, batch multiple sealed memruns into larger L1 windows, reduce total number of compaction passes",
+            "claimed_benefit": "Reduce write amplification during low-latency periods; smooth out future merges by front-loading work"
+          },
+          {
+            "statement": "Apply hysteresis and mode dwell time to prevent flapping",
+            "detail": "Enforce ≥5–10 minute dwell per mode before allowing a switch. Use token bucket (≤6 mode switches/day) to prevent thrashing. Revert to 'normal' if both signals quiet for 10–15 minutes.",
+            "timelog_applicability": "Timelog compaction controller; track last mode switch time, limit switches per day, avoid oscillation between conservative/aggressive",
+            "claimed_benefit": "Prevent mode thrashing and jitter; allow system to settle after each mode change before re-evaluating"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_18",
+        "one_line_gist": "Use CPython's vectorcall (PEP 590) fast calling convention to avoid tuple/dict allocation overhead in hot C-extension call paths.",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog is a hand-written C-extension with hot paths (append, range_query, constructors). Vectorcall (PEP 590) is a CPython optimization for fast calling conventions, but only applies to methods/functions that are called repeatedly from Python. Timelog's core operations are already in C; vectorcall would only help if Timelog exposes Python-callable methods that are called frequently in tight loops (e.g., repeated constructor calls). Requires call-site profiling to identify bottlenecks. Generic C-API optimization, moderately transferable.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "c-api-binding"
+        ],
+        "near_dup_signature": "vectorcall vs pyobject_call microbenchmark",
+        "ideas": [
+          {
+            "statement": "Profile Timelog callable hot paths to identify candidates for vectorcall adoption",
+            "detail": "Use Python's perf_counter or cProfile to measure time spent in repeated method calls (e.g., range_query, append, constructors in tight loops). If call overhead is >5% of total, consider vectorcall.",
+            "timelog_applicability": "Benchmark range_query() or append() repeated 100k+ times in a loop; measure if tuple/dict allocation is visible in profile",
+            "claimed_benefit": "Identify whether vectorcall optimization is worthwhile before implementation effort"
+          },
+          {
+            "statement": "Implement vectorcall slot on hot Timelog types (e.g., Index constructor, range_query)",
+            "detail": "Set tp_call = PyVectorcall_Call, Py_TPFLAGS_HAVE_VECTORCALL, and fill vectorcall slot with fast function accepting (PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames). Avoid tuple/dict allocation.",
+            "timelog_applicability": "Index.__init__() if called repeatedly; range_query() if result consumer calls it in tight loop; append() if exposed as callable method",
+            "claimed_benefit": "20–50% improvement on hot constructor/method calls by avoiding temporary tuple/dict allocation"
+          },
+          {
+            "statement": "Inline vectorcall calls to avoid PyObject_Call trampoline in C-extension hot loops",
+            "detail": "Use PyObject_Vectorcall() directly (not PyObject_Call) when calling Python callables from C in tight loops. Pass contiguous C array of args, NULL for kwnames if unused.",
+            "timelog_applicability": "Timelog's internal C code that calls Python callbacks (e.g., handle resolution, custom comparators); avoid tuple boxing on each iteration",
+            "claimed_benefit": "Reduce FFI allocation churn in callback loops; amortize vectorcall savings across many calls"
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_20",
+        "one_line_gist": "Design and implement a CI microbenchmark harness to guard vectorcall, HPy ABI variants, and buffer protocol performance across Python versions.",
+        "relevance": "core",
+        "relevance_reason": "Timelog already uses vectorcall (METH_FASTCALL), exposes PageSpan buffers via buffer protocol, and supports free-threading. A dedicated perf-gate harness directly prevents regressions in these hot paths and validates zero-copy claims. This is directly applicable to Timelog's C-API surface.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "vectorcall",
+          "buffer-protocol",
+          "c-api-binding",
+          "hpy"
+        ],
+        "near_dup_signature": "cpython vectorcall hpy buffer protocol microbenchmark ci",
+        "ideas": [
+          {
+            "statement": "Implement three-microkernel benchmark suite: call-through latency, argument marshalling, and buffer protocol zero-copy verification",
+            "detail": "Measure Python→C call overhead (with/without kwargs), arg marshalling for int/float/str/bytes/buffer types, and zero-copy Py_buffer read/write scans. Run under single-thread, multi-thread (GIL/no-GIL), and multi-interpreter variants.",
+            "timelog_applicability": "Timelog's append(ts, handle), range_query, and PageSpan buffer accessors are hot paths; these microkernels directly test them.",
+            "claimed_benefit": "Catch regressions from refactors to argument parsing, keyword handling, and subinterpreter safety; prove zero-copy on all builds."
+          },
+          {
+            "statement": "Build CI matrix for CPython vectorcall, HPy Hybrid, and HPy Universal ABIs across Python 3.11–3.13",
+            "detail": "Emit JSON artifacts (p50, p95, p99, stdev) per scenario; store baseline on main; fail PR if p95/p99 regress > X% threshold. Include concurrency variants (N threads, N subinterpreters).",
+            "timelog_applicability": "Timelog's free-threading and subinterpreter claims need validation; a perf gate ensures future changes don't break these guarantees.",
+            "claimed_benefit": "Automated detection of performance regressions; confidence in free-threaded and subinterpreter safety; quantified ABI overhead."
+          },
+          {
+            "statement": "Guard zero-copy buffer reads via Py_buffer contiguous scan (64–256 KB) vs copy-in fallback",
+            "detail": "Explicitly time contiguous PageSpan reads through Py_buffer protocol vs explicit copy-in paths; verify addresses/lengths match to confirm true zero-copy.",
+            "timelog_applicability": "Timelog's PageSpan is exposed via buffer protocol for lock-free reads; this guards against accidental per-element boxing or copy regressions.",
+            "claimed_benefit": "Quantifies zero-copy performance; detects buffer protocol usage regressions; validates lock-free read optimization."
+          },
+          {
+            "statement": "Adopt vectorcall (METH_FASTCALL | METH_KEYWORDS) consistently across hot entry points if not already done",
+            "detail": "Use vectorcallfunc for Python-callable methods with variable args; ensure tp_call remains consistent. Document in README.",
+            "timelog_applicability": "Timelog's range_query, append, and other hot methods should use vectorcall to minimize call overhead.",
+            "claimed_benefit": "Reduces Python→C call overhead; ensures consistency with HPy Universal when ported."
+          },
+          {
+            "statement": "Add HPy Hybrid and Universal builds to CI to measure ABI overhead and portability readiness",
+            "detail": "Build the same benchmark entry points in HPy Hybrid (best for staged porting) and Universal (best for portability). Compare latency to CPython vectorcall baseline.",
+            "timelog_applicability": "Prepares Timelog for cross-Python support (PyPy, GraalPy) and validates that HPy migration won't introduce unexpected overhead.",
+            "claimed_benefit": "Quantifies HPy cost/benefit; proves portability readiness; guides HPy migration prioritization."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_21",
+        "one_line_gist": "Three-phase migration plan to port a C extension from CPython API to HPy for subinterpreter and free-threaded Python support.",
+        "relevance": "core",
+        "relevance_reason": "Timelog claims Py_MOD_GIL_NOT_USED and subinterpreter support but was hand-written for CPython C-API. This migration path is concrete and actionable: inventory hot call sites (append, range_query), introduce HPy hybrid build, and refactor global state (manifest pointers, tombstone registry) into HPy module state. Each step directly strengthens subinterpreter and free-threading guarantees.",
+        "primary_theme": "free-threading-gil",
+        "themes": [
+          "free-threading-gil",
+          "subinterpreters",
+          "hpy",
+          "c-api-binding",
+          "api-design"
+        ],
+        "near_dup_signature": "hpy porting subinterpreters free-threaded state migration",
+        "ideas": [
+          {
+            "statement": "Inventory Timelog's hot call-sites and audit for global C state, METH_VARARGS usage, and non-interpreter-safe caches",
+            "detail": "Identify all PyObject_Call* wrappers, METH_VARARGS/METH_KEYWORDS methods, and custom tp_call. Flag process-global manifests, error sentinels, and tombstone registries. Prioritize by call frequency (append, range_query first).",
+            "timelog_applicability": "Timelog's manifest (seqlock, refcounted), tombstone registry (Treiber stack), and retired-handle stack are likely global; these must move to HPy module state.",
+            "claimed_benefit": "Uncovers hidden global state blocking subinterpreter safety; prioritizes migration work; validates free-threading claims."
+          },
+          {
+            "statement": "Enable HPy hybrid/legacy build mode in CMake; port one hot method (e.g., range_query) to HPy to validate toolchain and CI",
+            "detail": "Add HPy build glue (CMake rules, HPyDef_METH, HPyGlobal initialization). Keep CPython API path alive. Port a single method to HPy using HPy's porting example as template. Validate that hybrid build produces both CPython and HPy artifacts.",
+            "timelog_applicability": "Timelog's build is CMake-based; adding HPy hybrid support is a contained, low-risk first step before full migration.",
+            "claimed_benefit": "Proves HPy toolchain works in repo; catches integration issues early; unblocks staged per-method porting."
+          },
+          {
+            "statement": "Refactor manifest, tombstone registry, and error sentinels from process-global to per-interpreter HPy module state + HPyGlobal",
+            "detail": "Replace `static` C pointers and global arrays with HPy module state containers (via multi-phase init). Use HPyGlobal for long-lived Python objects (exceptions, sentinel handles). Add explicit locks only where absolutely necessary (e.g., manifest seqlock moves to module state, not global).",
+            "timelog_applicability": "Timelog's manifest seqlock, Treiber tombstone stack, and retired-handle registry are currently shared across interpreters; moving to module state is the core blocker for subinterpreter safety.",
+            "claimed_benefit": "Enables true subinterpreter isolation; unblocks free-threaded Python; allows multiple Timelog instances per process without interference."
+          },
+          {
+            "statement": "Audit and convert METH_VARARGS/METH_KEYWORDS hot paths to vectorcall during HPy migration",
+            "detail": "Where you retain CPython API, prefer METH_FASTCALL | METH_KEYWORDS and vectorcallfunc. When porting to HPy, use HPy equivalent (HPyDef_METH with proper signatures). Ensure tp_call remains consistent.",
+            "timelog_applicability": "Timelog's append, range_query, and delete_range should already use vectorcall; verify during inventory, fix if found.",
+            "claimed_benefit": "Reduces call overhead while porting; ensures performance consistency between CPython and HPy builds."
+          },
+          {
+            "statement": "Validate subinterpreter safety by testing append/range_query/delete_range across multiple interpreters in CI",
+            "detail": "Add a CI test that spawns N subinterpreters, each with its own Timelog module instance, and runs concurrent operations (appends, queries, compactions). Verify no cross-interpreter state leaks or corruption.",
+            "timelog_applicability": "Core validation for Timelog's claimed subinterpreter support; catches module state isolation bugs before release.",
+            "claimed_benefit": "Proves subinterpreter safety; detects hidden globals; prevents future regressions."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_22",
+        "one_line_gist": "Generic primer on zero-copy I/O and in-place buffer techniques using memoryview, readinto, mmap, and the buffer protocol.",
+        "relevance": "irrelevant",
+        "relevance_reason": "This document focuses entirely on file I/O, socket I/O, and stream processing (readinto, mmap, BytesIO). Timelog is an in-memory LSM index with NO disk I/O, no network I/O, no file operations. While Timelog uses the buffer protocol (PageSpan), it already does so for in-memory zero-copy access, not for I/O. The readinto/mmap/text-mode/compression gotchas are off-stack. The buffer protocol concept is already integrated; the I/O patterns (streaming, readinto loops, mmap file slicing) do not transfer.",
+        "primary_theme": "OFF-TOPIC",
+        "themes": [
+          "OFF-TOPIC"
+        ],
+        "near_dup_signature": "zero-copy i/o memoryview readinto mmap file socket streaming",
+        "ideas": [
+          {
+            "statement": "No actionable ideas for Timelog; document scope (file/socket I/O, streaming) does not apply to in-memory LSM.",
+            "detail": "All code examples use file/socket operations (f.readinto, sock.recv_into, mmap on files, BytesIO, compressed streams, JSON parsing). Timelog has no I/O path; everything is append/query/compact in memory.",
+            "timelog_applicability": "none/generic",
+            "claimed_benefit": "N/A—document is out-of-scope for Timelog's architecture."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_24",
+        "one_line_gist": "Apache Arrow C Data Interface + buffer protocol for zero-copy interchange between C extensions and Python libraries (NumPy/Polars/Pandas).",
+        "relevance": "core",
+        "relevance_reason": "Timelog already exports PageSpan pages via buffer protocol. Arrow C Data/Stream interfaces directly extend this to zero-copy streaming of sealed pages (L0/L1 windows) to downstream consumers. The technique maps onto Timelog's existing SoA layout and lock-free page access.",
+        "primary_theme": "buffer-protocol",
+        "themes": [
+          "buffer-protocol",
+          "numpy-interop",
+          "c-api-binding"
+        ],
+        "near_dup_signature": "arrow c data interface zero copy interchange",
+        "ideas": [
+          {
+            "statement": "Expose sealed memrun pages as ArrowArray structs via C Data Interface",
+            "detail": "Fill ArrowSchema/ArrowArray for each sealed page's (ts, handle) columns with proper release callbacks to manage lifetime. Timelog's PageSpan already has contiguous typed buffers ideal for Arrow export.",
+            "timelog_applicability": "memrun sealed pages, L0/L1 window export path",
+            "claimed_benefit": "Consumers (NumPy/Polars) read page data zero-copy without boxing; eliminates per-row Python object construction overhead."
+          },
+          {
+            "statement": "Implement ArrowArrayStream interface over L0/L1 windows for streaming batches",
+            "detail": "Provide get_next callbacks that yield ArrowArray batches from non-overlapping L1 time windows or L0 pages, one batch per call. Release semantics must ensure pages stay alive until consumer reads.",
+            "timelog_applicability": "range_query streaming iterator, L0/L1 window interface",
+            "claimed_benefit": "Downstream libraries iterate without materializing full result set; memory-efficient for large queries."
+          },
+          {
+            "statement": "Expose buffer protocol on ArrowArray-exported pages for NumPy frombuffer",
+            "detail": "Ensure exported ArrowArrays maintain PEP 3118 compliance so Python can call numpy.frombuffer() directly on (ts, handle) columns without copying.",
+            "timelog_applicability": "PageSpan buffer protocol integration, timestamp/handle access paths",
+            "claimed_benefit": "NumPy analytics on timestamps/handles avoid intermediate array construction; matches existing PageSpan API pattern."
+          },
+          {
+            "statement": "Document Arrow export lifetime contract (one-time release) in timelog C extension",
+            "detail": "Provide clear contract that ArrowArray release() must be called exactly once by consumer, pinning pages until released. Build asserts to catch double-free or premature page reuse.",
+            "timelog_applicability": "memrun lifecycle, page retention semantics",
+            "claimed_benefit": "Prevents subtle lifetime bugs; enables safe zero-copy hand-off to Python without refcount churn."
+          },
+          {
+            "statement": "Use nanoarrow helpers for ArrowSchema/ArrowArray init if available",
+            "detail": "If integrating Arrow support, leverage nanoarrow C utilities to initialize and fill ArrowArray/ArrowSchema structs rather than hand-coding FFI to reduce bugs.",
+            "timelog_applicability": "Arrow export plumbing, schema definition",
+            "claimed_benefit": "Reduces boilerplate and lifetime-management bugs in Arrow FFI layer."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_26",
+        "one_line_gist": "Batching patterns for Python↔C extension APIs to amortize call overhead and avoid per-item boxing.",
+        "relevance": "core",
+        "relevance_reason": "Timelog's current API likely includes per-item calls (e.g., append one pair, query one range). Batching directly applies to bulk_append, range_read_into, and bulk point-lookup paths. Concrete C-API and buffer-protocol patterns transfer directly to timelog's extension code.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "c-api-binding",
+          "buffer-protocol",
+          "api-design"
+        ],
+        "near_dup_signature": "batching python c extension bulk api overhead amortization",
+        "ideas": [
+          {
+            "statement": "Introduce bulk_append(timestamps, handles) API accepting sequences, returning count",
+            "detail": "Parse sequences of (ts, handle) pairs once in C, bulk-insert into memtable without per-item Python object boxing. Release GIL around native append loop.",
+            "timelog_applicability": "append() path optimization, ingest API",
+            "claimed_benefit": "Eliminates per-append frame overhead and refcount churn; batch ≥16–32 pairs typical break-even."
+          },
+          {
+            "statement": "Expose range_read_into(ts1, ts2, out_buf) that fills caller-provided buffer in-place",
+            "detail": "Accept a writable memoryview/bytearray for results; write (ts, handle) pairs into it without allocating. Use PyBUF_WRITABLE to ensure caller controls lifetime.",
+            "timelog_applicability": "range_query path, result materialization",
+            "claimed_benefit": "Zero allocations in hot path; caller reuses buffers across queries; avoids Python object boxing."
+          },
+          {
+            "statement": "Return memoryview or array.array('Q') instead of lists of Python ints",
+            "detail": "For bulk point-lookup (e.g., bulk_get_handles), fill a typed native buffer and return array.array('Q') or memoryview view, not a list of Python int objects.",
+            "timelog_applicability": "point-lookup batching, result return format",
+            "claimed_benefit": "Consumers iterate native memory without per-element unboxing; NumPy/Polars views remain zero-copy."
+          },
+          {
+            "statement": "Batch size = ceil(call_overhead / per_elem_native_cost); expose batch_size kwarg",
+            "detail": "Default to power-of-two batches (64–128). Allow caller to override via kwarg; auto-tune if needed. Document tuning rule so users don't send N=1 lists.",
+            "timelog_applicability": "API parameter design, bulk_* method signatures",
+            "claimed_benefit": "Guides users toward optimal batching; amortizes Python call overhead proportional to work."
+          },
+          {
+            "statement": "Collect failure indices (not per-item exceptions) and raise once or return bitmap",
+            "detail": "If bulk_append/bulk_get encounters failures, gather indices and raise a single exception or return a failure bitmap, not N exceptions.",
+            "timelog_applicability": "error handling in batched APIs",
+            "claimed_benefit": "Avoids N exception-raise/catch cycles; faster error path for corrupted batches."
+          },
+          {
+            "statement": "Release GIL around native loop in bulk C functions; reacquire only for C-API touches",
+            "detail": "Surround the inner loop over N items with Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS. Reacquire only if parsing individual items requires C-API.",
+            "timelog_applicability": "bulk_append, bulk_get, range_read_into implementations",
+            "claimed_benefit": "Other threads can run native code concurrently; improves free-threading throughput."
+          },
+          {
+            "statement": "Define fixed endianness/format in bulk API (e.g., '<Q' for little-endian uint64)",
+            "detail": "Document that bulk_* functions always return/consume int64/uint64 in a fixed byte order (e.g., '<Q' for little-endian). Enforce in tests.",
+            "timelog_applicability": "bulk API specification, cross-platform compatibility",
+            "claimed_benefit": "Eliminates per-item coercion overhead; ensures consistent wire format."
+          },
+          {
+            "statement": "Provide A/B microbench template for users to validate speedup on their workload",
+            "detail": "Include a simple Python benchmark in docs that compares per-item vs. bulk API; users can run on real workloads to confirm break-even batch size.",
+            "timelog_applicability": "API documentation, user guidance",
+            "claimed_benefit": "Users understand trade-offs and can tune batch size for their hardware."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_27",
+        "one_line_gist": "CI tests to catch silent copies and broken writability on structured dtypes in C/HPy wheels.",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog uses simple (int64, uint64) dtypes, not record arrays, so the structured dtype focus is less directly applicable. However, the pointer-stability and writable-buffer test pattern transfers: verify that exported buffers remain zero-copy and writable across CPython/HPy flavors. Useful once Timelog publishes multi-flavor wheels.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "buffer-protocol",
+          "testing"
+        ],
+        "near_dup_signature": "ci test pointer stability writable buffer structured dtype",
+        "ideas": [
+          {
+            "statement": "Add pointer-equality + mutation test for exported buffers across CPython/HPy wheels",
+            "detail": "Compare the data pointer exposed by timelog's buffer protocol with NumPy's __array_interface__['data'], mutate via one side, hash both to verify same underlying storage.",
+            "timelog_applicability": "buffer protocol export validation, multi-wheel CI",
+            "claimed_benefit": "Catches hidden copies introduced by extension updates or HPy/ABI changes; validates zero-copy claim."
+          },
+          {
+            "statement": "Add writable buffer protocol test in CI matrix (CPython C-API, HPy-ABI, HPy-universal)",
+            "detail": "For each wheel flavor, create a writable memoryview of a PageSpan export and perform in-place mutations; assert that read-only flags are False and mutations stick.",
+            "timelog_applicability": "multi-flavor wheel testing, buffer protocol compliance",
+            "claimed_benefit": "Ensures writability contract is preserved across HPy variants; fails fast on buffer protocol regressions."
+          },
+          {
+            "statement": "Build assertions in timelog C code to detect double-free or premature page reuse",
+            "detail": "If exporting pages via buffer protocol, add debug-mode asserts that pages stay pinned until release; flag any access after release or double-release.",
+            "timelog_applicability": "page lifecycle validation, memrun refcount safety",
+            "claimed_benefit": "Catches lifetime bugs early in development; prevents silent data corruption."
+          },
+          {
+            "statement": "Define CI matrix covering CPython C-API, HPy-ABI, HPy-universal for structured pointer tests",
+            "detail": "Adapt the example GitHub Actions matrix (doc_27 lines 103–114) to run pointer/writable tests on all timelog wheel flavors; fail-fast on any mismatch.",
+            "timelog_applicability": "GitHub Actions CI workflow, wheel build matrix",
+            "claimed_benefit": "Detects flavor-specific regressions (e.g., HPy universal mode breaks zero-copy); ensures wheel consistency."
+          },
+          {
+            "statement": "Use ctypes.addressof() + memoryview to extract native buffer pointers for comparison",
+            "detail": "Leverage ctypes.c_char.from_buffer() to get a raw pointer from a memoryview of a timelog export, compare with NumPy's __array_interface__['data'][0].",
+            "timelog_applicability": "buffer protocol pointer validation",
+            "claimed_benefit": "Portable, pure-Python way to validate pointer equality without ctypes pain; minimal test dependencies."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_28",
+        "one_line_gist": "Practical microbench harness to evaluate whether migrating a C extension from native C-API to HPy (CPython-ABI or Universal mode) maintains acceptable performance.",
+        "relevance": "tangential",
+        "relevance_reason": "HPy offers an alternative C-API surface but Timelog already uses hand-written CPython C-API with tight control over refcounting and free-threading. Migration would require rewriting the extension layer; the *technique* (comparative microbenchmarking with p50/p95 gates) transfers, but the stdlib C-API vs HPy tradeoff is not core to Timelog's in-memory LSM design. The harness itself (CPU pinning, percentile measurements, 3 independent runs) is generic benchmarking practice.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "c-api-binding",
+          "ci-benchmarking"
+        ],
+        "near_dup_signature": "HPy vs CPython C-API performance microbench comparison",
+        "ideas": [
+          {
+            "statement": "Establish HPy migration decision gates (p50 ≤5% C-API overhead for CPython-ABI, p50 ≤12% for Universal).",
+            "detail": "Doc defines rubric: CPython-ABI acceptable if p50 ≤5% and p95 ≤10% overhead vs native C-API; Universal acceptable if p50 ≤12% and p95 ≤20% for batch size B where amortization breaks even. Requires identical code paths and three independent runs with median-of-3 gating.",
+            "timelog_applicability": "none/generic",
+            "claimed_benefit": "Provides objective decision threshold to avoid \"always migrate\" or \"never evaluate\" bias when considering HPy adoption."
+          },
+          {
+            "statement": "Implement CPU pinning and turbo-disable in extension benchmarks to minimize variance.",
+            "detail": "Doc prescribes os.sched_setaffinity(0, {0}) on Linux for single CPU, disable turbo if possible, warm up allocators/branch predictors, and measure p50/p95/p99 latencies across many iterations and batch sizes.",
+            "timelog_applicability": "ci-benchmarking",
+            "claimed_benefit": "Reduces noise in microbench results, making performance regressions/improvements statistically defensible."
+          },
+          {
+            "statement": "Design CI harness to test three variant backends (native C-API, HPy CPython-ABI, HPy Universal) side-by-side.",
+            "detail": "Load three module builds via separate imports; run identical Python driver against each; measure p50/p95/p99 across batches (1, 4, 32, 256); report CSV table and compute deltas from baseline.",
+            "timelog_applicability": "ci-benchmarking",
+            "claimed_benefit": "Enables objective comparison of future C-API alternatives without breaking existing native C-API path."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_29",
+        "one_line_gist": "Mental model and harness for optimizing Python→C extension call patterns: choosing between per-key vectorcall, bulk batching, and GIL release based on amortized per-item cost.",
+        "relevance": "core",
+        "relevance_reason": "Timelog's C extension already implements vectorcall (implicit in tight C loops) and has GIL release in background compaction work. The doc directly addresses the core tradeoff: call overhead vs native work cost. Timelog's range queries, append batching, and delete_range operations are exactly where vectorcall/batch/GIL decisions matter. The formula and measurement harness are directly actionable on Timelog's hot paths (append, range_query, delete_range).",
+        "primary_theme": "vectorcall",
+        "themes": [
+          "vectorcall",
+          "c-api-binding",
+          "free-threading-gil"
+        ],
+        "near_dup_signature": "vectorcall vs bulk vs GIL-release call amortization",
+        "ideas": [
+          {
+            "statement": "Implement per-key vectorcall for tiny per-item work (append single timestamp-handle pair).",
+            "detail": "When native_work_per_item << marshal+call_overhead, use vectorcall (pass PyObject*const *args directly, no tuple/dict allocations) and keep GIL held. Avoids per-iteration GIL ping-pong. Doc shows vectorcall reduces call_overhead and fixed_marshal cost.",
+            "timelog_applicability": "append(ts, handle) fast path",
+            "claimed_benefit": "Reduces per-call overhead for single-item appends; vectorcall eliminates tuple/dict allocation on hot path."
+          },
+          {
+            "statement": "Implement bulk API (one call with many items) for range queries and batch deletes to amortize call overhead.",
+            "detail": "For moderate-sized batches, a single call with array of keys/timestamps lets the GIL-held section process all items at once. Formula: amortized_per_item ≈ native_cost + per_item_marshal + (call_overhead + fixed_marshal) / B. Larger B shrinks the fraction.",
+            "timelog_applicability": "range_query([t1, t2), keys), delete_range(t1, t2) bulk paths",
+            "claimed_benefit": "Reduces amortized per-item cost by amortizing fixed call overhead and marshal across batch size."
+          },
+          {
+            "statement": "Release GIL in bulk compaction/merge loops where native_work_per_item >> call overhead.",
+            "detail": "Wrap heavy section with Py_BEGIN_ALLOW_THREADS/Py_END_ALLOW_THREADS. Avoids per-iteration GIL acquisition; enables true parallelism on multi-core. Doc warns: only worth it for long loops (millions of items) where GIL acquire/release is amortized.",
+            "timelog_applicability": "background compaction worker merge loops, multi-threaded LSM run merges",
+            "claimed_benefit": "Unlocks true parallelism on multi-core for expensive LSM compaction passes; avoids GIL ping-pong on per-row operations."
+          },
+          {
+            "statement": "Measure per-call, bulk, and GIL-released variants side-by-side using amortized per-item latency metric.",
+            "detail": "Harness calls fn once per item (vectorcall), fn once per batch (bulk), and optionally GIL-released version of bulk; reports per-item nanosecond cost. Formula: amortized_per_item = (t1 - t0) / (reps * len(items)).",
+            "timelog_applicability": "profiling hot paths (append, range_query, delete_range, compaction)",
+            "claimed_benefit": "Objective data on which calling convention wins at different batch sizes and work scales."
+          },
+          {
+            "statement": "Use vectorcall internally in bulk API to balance flexibility and overhead.",
+            "detail": "Doc recommends starting with single bulk API and implementing vectorcall internally (via tp_vectorcall slot). Add per-key fast path only if profiling confirms wins for tiny work. Allows caller to choose but implementation reuses vectorcall infra.",
+            "timelog_applicability": "C extension method dispatch in timelog module",
+            "claimed_benefit": "Reduces code duplication and dispatch branching; lets API evolve without rewriting C stubs."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_30",
+        "one_line_gist": "Drop-in CompactDetector class using EWMAs and CUSUM to auto-emit compaction start/stop events in Timelog's background worker with anti-thrash hysteresis.",
+        "relevance": "core",
+        "relevance_reason": "Doc is explicitly written for Timelog. CompactDetector addresses Timelog's background maintenance worker directly, tracking tail growth and write skew to trigger compaction only when pressure is sustained (CUSUM detects upward shift, not noise). This is actionable as a drop-in replacement/enhancement to Timelog's existing compaction triggering logic. The EWMA + CUSUM + hysteresis pattern is Timelog-specific LSM maintenance, not generic.",
+        "primary_theme": "compaction-lsm",
+        "themes": [
+          "compaction-lsm",
+          "query-iterator"
+        ],
+        "near_dup_signature": "EWMA+CUSUM compaction trigger detector for LSM tail growth",
+        "ideas": [
+          {
+            "statement": "Adopt EWMA-based tail growth tracking (log scale) to detect sustained memtable expansion.",
+            "detail": "Track tail_len with EWMA on log(tail_len); alpha=0.15 gives ~6-step reaction time. Log scale captures multiplicative growth; e.g., doubling tail is same signal regardless of absolute size. Feeds into CUSUM for drift detection.",
+            "timelog_applicability": "background worker memtable/sealed-memrun monitoring",
+            "claimed_benefit": "Detects sustained growth trends while ignoring transient spikes; log scale makes signal agnostic to absolute size."
+          },
+          {
+            "statement": "Implement per-key write skew detection via Herfindahl-Hirschman Index normalized concentration metric.",
+            "detail": "Track last 2048 appended keys in sliding window; compute HHI = sum(p_i^2) where p_i = count/total. Normalize to [0,1]. EWMA with alpha=0.10. Detects when writes concentrate on few hot keys (skew→1.0) vs uniform distribution (skew→0.0).",
+            "timelog_applicability": "background worker per-key write pattern monitoring",
+            "claimed_benefit": "Detects hot-key bursts that may benefit from targeted compaction windows; enables skew-aware tuning."
+          },
+          {
+            "statement": "Use CUSUM on log(tail_len) with drift allowance (k) and dual thresholds (h_start, h_stop) for hysteresis.",
+            "detail": "CUSUM tracks gpos = max(0, gpos + x - k) and gneg = min(0, gneg + x + k). Emit compact_start when gpos ≥ h_start (default 0.25); emit compact_stop when gpos ≤ h_stop (default 0.08) and min_compact_ns (default 2s) elapsed. Reset accumulators on stop to avoid immediate re-trigger.",
+            "timelog_applicability": "background worker compaction state machine",
+            "claimed_benefit": "Reduces false positives from transient load spikes; ensures compaction runs for minimum duration to amortize setup cost; prevents thrashing."
+          },
+          {
+            "statement": "Couple write skew into CUSUM signal with optional boost factor (default 1.0 + 0.35*ew_skew).",
+            "detail": "Modify CUSUM input to gpos, gneg = _cusum((lx - ew_tail) * boost) where boost = 1.0 + 0.35 * ew_skew. Skew boost is optional; increases compaction urgency when hot keys detected, tunable via config.",
+            "timelog_applicability": "background worker compaction triggering logic",
+            "claimed_benefit": "Prioritizes compaction when writes are skewed; can prevent tail growth from concentrating on few keys."
+          },
+          {
+            "statement": "Propose compaction windows backward-anchored from current time, capped to max_windows (default 4).",
+            "detail": "On compact_start event, emit list of (start_ns, end_ns) windows. Each window is window_ns (default 5s) wide. Walk backward k=max_windows times: window_i = [now - (i+1)*window_ns, now - i*window_ns]. Allows concurrent window compaction without overlap.",
+            "timelog_applicability": "background worker window selection for LSM L1 compaction",
+            "claimed_benefit": "Bounds concurrent compaction work; prevents unbounded resource consumption during sustained write bursts."
+          },
+          {
+            "statement": "Wire CompactDetector.step() into append hot path or background timer to feed tail_len and write key.",
+            "detail": "Call det.step(tail_len=current_tail_bytes(), key=last_write_key(), now_ns=time.time_ns()) after each append or on a timer. Yields event dict with type='compact_start'|'compact_stop', ts_ns, windows (for start), skew, gpos.",
+            "timelog_applicability": "integration point in background worker's append monitoring or timer callback",
+            "claimed_benefit": "Minimal overhead (O(1) EWMAs, O(skew_window) Counter for HHI); can run frequently without stalling appends."
+          },
+          {
+            "statement": "Expose DetectorConfig for tuning reaction speed vs flap resistance without code changes.",
+            "detail": "Config fields: alpha_tail (0.15), alpha_skew (0.10), cusum_k (0.02), cusum_h (0.25), cusum_l (0.08), min_compact_ns (2s), cooldown_ns (1s), max_windows (4), window_ns (5s). Guidance: faster reaction = ↑alpha_tail, ↓cusum_h; less flapping = ↑min_compact_ns, ↑cusum_h, ↓cusum_l.",
+            "timelog_applicability": "background worker configuration and tuning",
+            "claimed_benefit": "Decouples detector logic from operational tuning; enables production A/B testing and per-workload customization."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_31",
+        "one_line_gist": "Decision framework for choosing between in-process Velox (zero-copy, low-latency) and Arrow Flight/IPC (multi-language, networked) for columnar data execution.",
+        "relevance": "tangential",
+        "relevance_reason": "Timelog has existing buffer-protocol zero-copy for timestamp pages and could expose range queries via Arrow vectors, but only if analytical compute (aggregations, filters) is added. Currently Timelog is pure storage (no Velox-like execution). Relevant technique: zero-copy Arrow buffers from LSM pages; irrelevant: the heavy operator focus (Flight RPC, process isolation, multi-language clients) is not Timelog's near-term path.",
+        "primary_theme": "buffer-protocol",
+        "themes": [
+          "buffer-protocol",
+          "api-design",
+          "numpy-interop"
+        ],
+        "near_dup_signature": "velox in-process vs arrow flight rpc decision",
+        "ideas": [
+          {
+            "statement": "Expose zero-copy Arrow vector adapters for timestamp and handle pages to enable downstream analytical engines",
+            "detail": "Create thin Arrow Int64/Timestamp array wrappers over Timelog's SoA ts[] and handle[] pages, pinned by seqlock snapshots. Allows zero-copy handoff to Velox or other vectorized engines without copying.",
+            "timelog_applicability": "query path: range-query results could vend Arrow RecordBatches for external consumption",
+            "claimed_benefit": "Enable analytical clients (Python, Rust) to consume query results without per-row boxing or memcpy; reuse existing page-pinning infrastructure."
+          },
+          {
+            "statement": "Document buffer lifetime and ownership rules for Arrow columns exported from Timelog",
+            "detail": "Pinning semantics: Arrow buffers valid only within a snapshot/seqlock read-side view; on snapshot release, buffers must not be accessed. Ref-count Timelog's page pins against external Arrow consumers.",
+            "timelog_applicability": "api-design: Python binding layer that wraps range_query results",
+            "claimed_benefit": "Prevent use-after-free and undefined behavior when Arrow consumers try to access pages after snapshot release or compaction invalidates them."
+          },
+          {
+            "statement": "Offer two read APIs: in-proc callback (for fused analytics) and streaming Arrow Flight (for external/remote consumers)",
+            "detail": "Ultra-low-latency path: iterate results in C, invoke user callbacks for aggregation. External path: batch range results into Arrow RecordBatches, stream via Flight. Separate code paths avoid coupling.",
+            "timelog_applicability": "range_query and snapshot APIs; future analytics integration",
+            "claimed_benefit": "Support both latency-sensitive internal services (no Flight overhead) and decoupled external consumers (clear separation, rolling deploys)."
+          },
+          {
+            "statement": "Set a minimum batch size heuristic for queries based on FFI call overhead vs. throughput",
+            "detail": "Small point lookups (1-10 rows) have high per-element FFI overhead; coalesce or batch upstream. Large range queries (1000+) amortize overhead. Enforce via range-query guards or hints.",
+            "timelog_applicability": "range_query interface; query planning",
+            "claimed_benefit": "Prevent pathological queries (1000s of tiny FFI calls) from bogging down real-time paths; guide users toward efficient batch sizes."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_32",
+        "one_line_gist": "Benchmarking checklist for Arrow FFI round-trip latency, memcpy cost, Flight handshake, and zero-copy validation to quantify overhead and guide deployment decisions.",
+        "relevance": "core",
+        "relevance_reason": "Timelog Python bindings already use FFI (cpython C-API extension); zero-copy timestamp pages rely on buffer protocol; range_query results may be marshalled to Arrow. Directly applicable: measure FFI call latency (append, range_query), validate zero-copy for PageSpan buffers, quantify any memcpy when converting handles to Python objects. CI benchmarking to detect regressions is actionable.",
+        "primary_theme": "ci-benchmarking",
+        "themes": [
+          "ci-benchmarking",
+          "profiling",
+          "buffer-protocol"
+        ],
+        "near_dup_signature": "ffi roundtrip and arrow flight microbenchmark harness",
+        "ideas": [
+          {
+            "statement": "Add FFI round-trip latency microbench for hot paths (append, range_query) to CI",
+            "detail": "Time per-call append(ts, handle) and range_query(t1, t2) p50/p95/p99 in µs; baseline: low hundreds for tiny batch append, <1ms for range_query. Log to JSON; fail if p95 drifts >20% over 7-day baseline or exceeds fixed floor.",
+            "timelog_applicability": "ci-benchmarking: append and range_query ops in hot-path CI",
+            "claimed_benefit": "Detect performance regressions early (e.g., snapshot locking contention, GIL thrashing); validate that free-threading and seqlock changes don't regress latency."
+          },
+          {
+            "statement": "Validate zero-copy for timestamp PageSpan buffers via pointer identity and refcount checks",
+            "detail": "After range_query returns a PageSpan, assert that the buffer's base address is unchanged and CPython refcount is not inflated (no hidden copy). Log pointer identity before/after FFI boundary.",
+            "timelog_applicability": "buffer-protocol: PageSpan / timestamp pages returned from range_query",
+            "claimed_benefit": "Confirm zero-copy guarantee holds; catch hidden copies from slicing offsets or deferred marshalling that would negate buffer-protocol benefit."
+          },
+          {
+            "statement": "Measure memcpy cost for handle-to-PyObject conversion in range_query results",
+            "detail": "If range_query must copy handles into a Python list/array, time the memcpy and report GB/s. Separately measure pointer-fixup overhead if handles encode addresses that need relocation.",
+            "timelog_applicability": "range_query result marshalling: handle array -> Python sequence",
+            "claimed_benefit": "Quantify cost of handle materialization; justify if refactoring to return lazy iterators or raw bytes would reduce overhead."
+          },
+          {
+            "statement": "Set minimum batch size guards based on measured FFI overhead and throughput knee",
+            "detail": "Run benchmark sweep: append/range_query for batch sizes 1, 8, 64, 512, 4096. Identify the 'knee' where per-element latency bottoms out and throughput plateaus. Emit warning if caller submits query with predicted cost below knee.",
+            "timelog_applicability": "range_query and append: batch size recommendations; optional runtime guards",
+            "claimed_benefit": "Guide users away from pathological tiny-batch queries; auto-coalesce or batch-fold when beneficial."
+          },
+          {
+            "statement": "Add daily smoke and weekly full CI benchmarks with CPU pinning and thermal isolation",
+            "detail": "Daily: quick p50/p95/p99 check on 5 hot-path ops (append, range_query, delete_range, compaction latency, snapshot overhead). Weekly: full sweep with GC warmup, CPU governor pinned, NUMA topology logged; baseline against 7-day rolling median.",
+            "timelog_applicability": "ci-benchmarking: Timelog's full hot-path suite",
+            "claimed_benefit": "Catch thermal throttling, frequency scaling, and GC interference masking real regressions; lock in performance contracts."
+          },
+          {
+            "statement": "Log GIL overhead explicitly for free-threading path (per-interpreter sub-threads vs. single-threaded append)",
+            "detail": "Benchmark append latency on 1 thread vs. N subinterpreters (3.14t free-threading); log GIL-disabled µs vs. GIL-enabled. Detect if free-threading code path adds unexpected overhead (e.g., atomic CAS spin on memtable head lock).",
+            "timelog_applicability": "free-threading-gil: append performance under free-threading",
+            "claimed_benefit": "Validate that free-threading + no-GIL mode does not regress latency vs. traditional GIL; catch contention hotspots."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_33",
+        "one_line_gist": "Academic paper (RESYSTANCE) showing io_uring + eBPF can reduce LSM compaction overhead by ~50% by moving read I/O logic into the kernel, cutting syscalls and kernel-user transitions.",
+        "relevance": "irrelevant",
+        "relevance_reason": "Timelog is purely in-memory (no disk I/O, no NVMe syscalls, no io_uring or eBPF applicability). RESYSTANCE targets disk-based LSM (RocksDB) where compaction read syscalls dominate. Timelog's compaction operates on sealed memruns (in memory), background worker manages L0/L1 merges in-process, no kernel-space I/O. Technique transfer is zero: io_uring is for async disk reads; eBPF is for kernel-space filtering—neither apply to in-memory vectorized ops.",
+        "primary_theme": "OFF-TOPIC",
+        "themes": [
+          "OFF-TOPIC",
+          "compaction-lsm"
+        ],
+        "near_dup_signature": "io_uring ebpf lsm tree compaction syscall reduction",
+        "ideas": []
+      },
+      {
+        "doc_id": "doc_34",
+        "one_line_gist": "Comparison of storage engine paradigms (TSM, RocksDB, LSM variants, in-memory SSTable engines) with go-to metrics for performance evaluation.",
+        "relevance": "tangential",
+        "relevance_reason": "Doc provides context on LSM design patterns and metrics frameworks relevant to understanding Timelog's in-memory LSM architecture (memtable + sealed runs + L0/L1 compaction). However, doc focuses on disk-persisted engines (InfluxDB TSM, RocksDB), on-disk SSTables, and retention policies. Timelog is purely in-memory with no I/O. Transfer value is in compaction patterns and query latency thinking, not storage efficiency or disk tuning.",
+        "primary_theme": "memory-allocator",
+        "themes": [
+          "compaction-lsm",
+          "ci-benchmarking",
+          "query-iterator"
+        ],
+        "near_dup_signature": "LSM variants storage engines time series metrics throughput latency",
+        "ideas": [
+          {
+            "statement": "Adopt sustained write throughput (events/sec) under varied cardinality as the go-to metric for Timelog's ingest path",
+            "detail": "Doc cites InfluxDB's TSM as needing high ingest tracking under varied cardinality. Timelog's append(ts, handle) O(1) path and memtable ring buffer are cardinality-sensitive when handles span many unique PyObject* encodings.",
+            "timelog_applicability": "core: Timelog ingest benchmarking should track events/sec sensitivity to the number of distinct handles (cardinality variance), especially during memtable overflow.",
+            "claimed_benefit": "Early detection of cardinality-induced slowdowns in the hot append path; guides memtable sizing and OOO mini-LSM tuning."
+          },
+          {
+            "statement": "Track tail read latency (p99) under mixed workloads as a performance diagnostic for query hot paths",
+            "detail": "Doc identifies tail latency as RocksDB's key metric under mixed read/write contention. Timelog's lock-free read snapshot and per-interpreter GIL subinterpreters create similar contention scenarios.",
+            "timelog_applicability": "core: Timelog's range queries and PageSpan buffer reads should be benchmarked at p99 latency when simultaneous appends are in flight, especially under background maintenance worker.",
+            "claimed_benefit": "Exposes tail pathologies (seqlock retries, cache misses, lock contention) that batch metrics hide; guides snapshot implementation tuning."
+          },
+          {
+            "statement": "Monitor query latency (p50/p99) for recent data as the signature metric for in-memory cache hit rates",
+            "detail": "Doc identifies in-memory SSTable engines as optimizing for hot-window throughput and observes latency dominance when RAM is the bottleneck. Timelog's active memtable + sealed runs are the in-memory hot window.",
+            "timelog_applicability": "core: Timelog should measure p50/p99 latency for range queries [t1, t2) when the query window maps entirely into the active memtable vs. spanning into sealed runs and L0/L1 layers.",
+            "claimed_benefit": "Quantifies the cost of querying cold layers (compacted L1) vs. hot memtable; informs window sizing and promotion thresholds."
+          },
+          {
+            "statement": "Use storage efficiency (bytes per point) as a secondary metric to monitor compaction overhead and tombstone accumulation",
+            "detail": "Doc cites compact LSM variants tuning for storage efficiency under compaction. Timelog's delete_range tombstones accumulate until a compaction boundary; measuring bytes per (ts, handle) pair reveals GC pressure.",
+            "timelog_applicability": "tangential: Timelog is in-memory and does not persist, but per-point memory footprint (including tombstone records) can be tracked to detect bloat before it impacts GC or memory limits.",
+            "claimed_benefit": "Prevents silent memory bloat from tombstone accumulation; flags when compaction frequency is too low."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_35",
+        "one_line_gist": "Practical CPython C-API binding patterns: minimal hot-path wrappers, buffer protocol for bulk data, and standalone C benchmarking harnesses.",
+        "relevance": "core",
+        "relevance_reason": "Doc provides three directly applicable patterns for Timelog's hand-written C extension: (1) exception-safe minimal hot-path wrappers match Timelog's append/range_query design; (2) buffer protocol / memoryview for bulk zero-copy data access is already used (PageSpan), and the doc reinforces best practices; (3) standalone C benchmarking without FFI overhead is exactly how Timelog's ingest and query performance should be isolated from interpreter noise.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "buffer-protocol",
+          "ci-benchmarking",
+          "api-design"
+        ],
+        "near_dup_signature": "CPython C API bindings hot path wrappers buffer protocol memoryview benchmarking",
+        "ideas": [
+          {
+            "statement": "Keep hot-path C wrappers minimal, returning early on errors, with immediate refcount/exception audits",
+            "detail": "Doc emphasizes tiny, well-defined C surfaces for frequently-called functions (fast_sum example) with early error returns and audited DECREF paths to avoid leaks. Example shows PyArg_ParseTuple, immediate PyObject_GetIter error check, inline iteration with Py_DECREF on each item.",
+            "timelog_applicability": "core: Timelog's append(ts, handle) and range_query(t1, t2) entry points should be structured as minimal wrappers around pure-C implementations, with zero error handling above the C boundary.",
+            "claimed_benefit": "Reduces refcount leaks, eliminates exception-safety overhead, and makes profiling/auditing tractable; competitive with builtin speed."
+          },
+          {
+            "statement": "Prefer PyObject_GetBuffer with buffer protocol over per-element PyObject conversions for bulk timestamp/handle arrays",
+            "detail": "Doc demonstrates Py_buffer with PyBUF_CONTIG_RO | PyBUF_FORMAT, format checking ('f' for float32), and zero-copy iteration. Notes that NumPy arrays and memoryview support this natively. Emphasizes avoiding boxing/unboxing each element.",
+            "timelog_applicability": "core: Timelog already uses buffer protocol (PageSpan) for zero-copy timestamp reads. This doc confirms the pattern is correct and extends it: bulk append from a NumPy array or memoryview should use PyObject_GetBuffer, not per-element conversions.",
+            "claimed_benefit": "Enables O(1) append of batched (ts, handle) pairs from NumPy arrays without per-element Python object creation; aligns with Timelog's zero-copy philosophy."
+          },
+          {
+            "statement": "Structure C extensions with shared inner C routines callable from both Python wrappers and standalone C benchmarks",
+            "detail": "Doc shows separating pure-C `inner_sum_f32(const float* data, size_t n)` from Python binding, then linking a standalone C harness against the same object file. Eliminates FFI overhead and Python-level noise from microbenchmarks.",
+            "timelog_applicability": "core: Timelog's append and range_query implementations should expose inner-C routines (e.g., `timelog_append_inner(memtable* m, int64_t ts, uint64_t handle)`) that a standalone C harness can benchmark without Python dispatch overhead.",
+            "claimed_benefit": "Isolates binding overhead from core algorithm performance; reveals true LSM operation costs; enables tuning (memtable size, compaction thresholds, window grid) without interpreter noise."
+          },
+          {
+            "statement": "Build C extensions with -O3 -fno-exceptions -fvisibility=hidden (or MSVC equivalents) and -march=native for dev benchmarks",
+            "detail": "Doc checklist recommends aggressive optimization flags for extension wheels/dev builds; -O3 for speed, -fno-exceptions to avoid EH overhead, -fvisibility=hidden to reduce symbol table, -march=native for local tuning (not portable wheels).",
+            "timelog_applicability": "core: Timelog's setup.py/pyproject.toml build configuration should apply these flags to the C extension module, especially -march=native for benchmarking CI to expose true hardware performance.",
+            "claimed_benefit": "Eliminates compiler-level optimization gaps; ensures benchmarks reflect realistic production code speed; simplifies perf regression detection."
+          },
+          {
+            "statement": "Add pytest test cases run under PYTHONMALLOC=debug and PYTHONWARNDEFAULTENCODING=1 for safety",
+            "detail": "Doc checklist item: run tests under debug memory allocator and encoding warnings to catch subtle refcount/string-handling bugs.",
+            "timelog_applicability": "tangential: Timelog's test suite (if using pytest) should adopt these environment settings for CI to catch malloc/refcount issues early. Less critical if using pure C testing, but valuable as a safety net.",
+            "claimed_benefit": "Catches off-by-one refcount bugs, malloc corruption, and encoding issues that escape static analysis; reduces production failures."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_36",
+        "one_line_gist": "Explanation of vectorcall as a CPython calling convention for C extensions that eliminates argument tuple packing overhead, not a Python-level optimization.",
+        "relevance": "core",
+        "relevance_reason": "Doc directly addresses when and how to use vectorcall in C extensions. Timelog is a hand-written C extension with hot-path callables (append, range_query, iterators). The doc's core message—vectorcall is relevant for C-extension callables and eliminates tuple allocation overhead—applies directly. The final section explicitly names Timelog's context: zero-copy reads + tight memory layout + lock-free reads, and suggests vectorcall as the same philosophy applied to call overhead.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "api-design",
+          "vectorcall"
+        ],
+        "near_dup_signature": "vectorcall C extension calling convention argument packing overhead",
+        "ideas": [
+          {
+            "statement": "Implement tp_vectorcall_offset on hot-path callable types (e.g., Iterator, RangeQueryResult) to eliminate tuple/dict allocation per call",
+            "detail": "Doc explains vectorcall as a CPython ABI exposed via tp_vectorcall_offset for types or function slots. Shows signature `myfunc_vectorcall(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames)` where args is a raw pointer array, bypassing tuple creation.",
+            "timelog_applicability": "core: If Timelog exposes range_query iterators or callable query results as types, implementing tp_vectorcall_offset (or PyCFunction_FastCallWithKeywords for functions) removes tuple creation on repeated calls in tight Python loops.",
+            "claimed_benefit": "Eliminates argument marshaling overhead for frequently-called hot paths (e.g., iterator.next()); makes API speed competitive with builtins."
+          },
+          {
+            "statement": "Profile existing hot-path callables to quantify whether vectorcall overhead is a real bottleneck before implementing",
+            "detail": "Doc emphasizes that vectorcall is 'not a hint you give the interpreter' but a protocol you implement when you are the callee. It warns against premature optimization and suggests concrete measurement first.",
+            "timelog_applicability": "core: Timelog should profile the cost of Python→C boundary crossing for append and range_query (with Py_buffer marshaling cost) before committing to vectorcall refactors. Measure call count and time-per-call under realistic loads.",
+            "claimed_benefit": "Avoids complexity (vectorcall hardens maintenance burden) for marginal gains; focuses effort on real bottlenecks."
+          },
+          {
+            "statement": "Keep vectorcall implementation aligned with Timelog's zero-copy and lock-free philosophy: remove unnecessary intermediate objects",
+            "detail": "Doc final section: 'Vectorcall is the same philosophy applied to call overhead: remove unnecessary intermediate objects.' Timelog already does zero-copy reads, tight memory layout, lock-free-ish reads; vectorcall extends this to the call boundary.",
+            "timelog_applicability": "core: When considering vectorcall, frame it as a consistency principle: if Timelog avoids per-element boxing in bulk operations, avoid per-call tuple boxing in hot-path APIs.",
+            "claimed_benefit": "Coherent API design philosophy; easier to justify and maintain vectorcall code as a logical extension of existing optimization strategy."
+          },
+          {
+            "statement": "Avoid vectorcall for cold-path or low-cardinality callables; prioritize hot-path iterators and batch operations",
+            "detail": "Doc emphasizes that vectorcall 'often isn't worth complexity everywhere'. Context matters: high-frequency calls benefit; low-frequency calls incur maintenance burden for minimal gain.",
+            "timelog_applicability": "core: If Timelog considers vectorcall, apply it narrowly: e.g., Iterator.__next__() in tight loops, or bulk query result iteration. Skip it for low-frequency management calls (compact(), snapshot(), etc.).",
+            "claimed_benefit": "Keeps codebase maintainable; focuses optimization effort on calls that actually move the needle in end-to-end benchmarks."
+          }
+        ]
+      },
+      {
+        "doc_id": "doc_37",
+        "one_line_gist": "C API performance primer: you don't get faster calls from pure Python, only from moving the loop boundary into C and reducing per-operation overhead.",
+        "relevance": "core",
+        "relevance_reason": "Timelog's entire architecture is predicated on this principle: loop placement in C, batch operations (memtable append, range query compaction), and refcounted zero-copy handles to avoid per-operation boundary crossing. The mental model directly validates design choices already implemented.",
+        "primary_theme": "c-api-binding",
+        "themes": [
+          "c-api-binding",
+          "api-design",
+          "profiling"
+        ],
+        "near_dup_signature": "C API performance boundary crossing vs batching",
+        "ideas": [
+          {
+            "statement": "Verify that range-query loops are entirely in C, not per-element Python boundary crossings.",
+            "detail": "The doc explains the cost is crossing the Python↔C boundary per operation, not the cost of the operation itself. Range queries in Timelog should process all matching (ts, handle) pairs in a single C loop, not yield to Python per row.",
+            "timelog_applicability": "query_iterator: ensure range_query method returns an iterator that materializes results in C, not a generator that re-enters C per item.",
+            "claimed_benefit": "Avoid billion-per-second boundary crossings for large result sets; makes range queries scale linearly with result size, not super-linearly."
+          },
+          {
+            "statement": "Ensure append(ts, handle) does not create temporary PyObject allocations for memtable inserts.",
+            "detail": "Doc emphasizes that 'object creation' is a major cost. Each memtable insert should accept a raw int64/uint64 pair and store directly without wrapping in PyLong, PyTuple, or intermediate containers.",
+            "timelog_applicability": "core memtable append() path; handle encoding/decoding if it creates temporary objects",
+            "claimed_benefit": "O(1) append cost remains truly constant; avoid hidden O(n) cost from temporary object pools."
+          },
+          {
+            "statement": "Use buffer protocol (PageSpan) to expose timestamp arrays without per-element boxing.",
+            "detail": "Doc's principle: 'stay in bytes as long as possible'. PageSpan already exposes raw int64[] to Python as a buffer object, avoiding float()/PyLong_FromLongLong per timestamp read.",
+            "timelog_applicability": "PageSpan buffer protocol; any timestamp materialization path",
+            "claimed_benefit": "Zero-copy timestamp access; read 1M timestamps without 1M object allocations."
+          },
+          {
+            "statement": "Profile handle refcounting to ensure Treiber-stack retired-handle recycling does not thrash the allocator.",
+            "detail": "Doc: 'reduce object creation' is the key lever. Timelog's free-threaded refcounted handle pool should avoid allocator pressure from creating/freeing many small refcount containers per cycle.",
+            "timelog_applicability": "retired-handle stack and refcount management in compaction/snapshot",
+            "claimed_benefit": "Steady-state memory overhead; avoid fragmentation that would slow later appends/queries."
+          },
+          {
+            "statement": "Confirm delete_range tombstone marking does not re-enter Python per tombstone applied.",
+            "detail": "Batch operation in C: the doc's thesis is 'do many operations per call'. Range deletion should mark all affected entries (in memtable, sealed runs, L1 windows) in a single C loop, not per-delete callback to Python.",
+            "timelog_applicability": "delete_range compaction/marking logic",
+            "claimed_benefit": "O(1) delete_range call; linear time to mark all affected entries, not super-linear from boundary crossing."
+          },
+          {
+            "statement": "Ensure snapshot seqlock reads do not mandate full memtable copy; use refcounted references instead.",
+            "detail": "Doc's principle: avoid creating temporary containers. Snapshots should reference the active memtable with a refcount bump, not copy all entries. Compaction clears old runs after their refcount drops.",
+            "timelog_applicability": "snapshot acquisition and manifest refcounting",
+            "claimed_benefit": "O(1) snapshot latency; no O(n) memtable copy on every query."
+          }
+        ]
+      }
+    ]
+  }
+}

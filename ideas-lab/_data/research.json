@@ -1,0 +1,760 @@
+{
+  "summary": "Web-research PEPs + modern CPython + in-memory algorithmics to extend the Timelog idea space",
+  "agentCount": 5,
+  "logs": [
+    "Research done: 5/5 strands, 40 findings, 30 new ideas"
+  ],
+  "result": {
+    "strands": [
+      {
+        "strand": "vectorcall-fastcall",
+        "key_findings": [
+          {
+            "topic": "METH_FASTCALL is the correct mechanism for Timelog's methods (not full tp_vectorcall)",
+            "finding": "For C methods on a type (like PyTimelog.append/range/since/...), the right lever is the METH_FASTCALL flag on the PyMethodDef, NOT implementing a custom vectorcallfunc via tp_vectorcall_offset. METH_FASTCALL has signature `PyObject *f(PyObject *self, PyObject *const *args, Py_ssize_t nargs)`; METH_FASTCALL|METH_KEYWORDS adds a 4th `PyObject *kwnames` tuple param with kwarg values packed in args[] after positionals. CPython routes `obj.method(...)` through the method-descriptor's own vectorcall wrapper, so flipping the flag eliminates the per-call args-tuple allocation that PyArg_ParseTuple consumes today. tp_vectorcall_offset/Py_TPFLAGS_HAVE_VECTORCALL is only for making instances themselves callable (i.e. `obj(...)`), which Timelog does not need.",
+            "timelog_relevance": "Confirms the concrete change: keep the method table in py_timelog.c, just switch the 10 hot methods from METH_VARARGS to METH_FASTCALL and rewrite their arg-parse. No new callable type, no tp_call/tp_vectorcall work.",
+            "citations": [
+              "https://docs.python.org/3/c-api/structures.html",
+              "https://docs.python.org/3/c-api/call.html"
+            ]
+          },
+          {
+            "topic": "Stable-ABI / version availability of METH_FASTCALL",
+            "finding": "METH_FASTCALL is part of the stable ABI since 3.7 (re-confirmed 3.10); METH_FASTCALL|METH_KEYWORDS since 3.7; METH_METHOD|METH_FASTCALL|METH_KEYWORDS (adds defining_class, type PyCMethod) since 3.9. The typedefs PyCFunctionFast and PyCFunctionFastWithKeywords joined the stable ABI in 3.13. vectorcallfunc, PyVectorcall_NARGS, PY_VECTORCALL_ARGUMENTS_OFFSET, PyVectorcall_Call entered the stable ABI in 3.12 (added 3.8). The docs do NOT mark METH_FASTCALL as limited-API-restricted. All Python versions Timelog targets (3.11-3.14t) fully support METH_FASTCALL.",
+            "timelog_relevance": "No version-gating needed across Timelog's 3.11-3.14t support matrix; the flag and the FASTCALL function types are safe to use unconditionally.",
+            "citations": [
+              "https://docs.python.org/3/c-api/structures.html",
+              "https://docs.python.org/3.14/c-api/structures.html",
+              "https://docs.python.org/3/c-api/call.html"
+            ]
+          },
+          {
+            "topic": "Measured per-call overhead: METH_VARARGS vs METH_FASTCALL",
+            "finding": "Concrete published numbers: (1) Victor Stinner, CPython 2017Q1 — struct.pack(\"i\",1) went 119ns -> 76.8ns = 1.56x faster (-42.2ns) purely from METH_FASTCALL; deque methods 1.10x-1.24x faster (d.index 1.24x, insert 1.18x). (2) rogerbinns/python-fastcall micro-benchmark of a method with 3 positional + 3 keyword args: 3.12rc1 varargs 158ns vs fastcall 22ns (~7x); 3.11.4 156 vs 22; 3.10.12 139 vs 30 — the gap widened in newer CPython because the interpreter's call path is vectorcall-native. (3) PyTorch issue #49476 measured ~15ns saved per call switching to METH_FASTCALL. For a 2-positional method like append(ts,obj), expect roughly 15-45ns saved per call from skipping the temp-tuple alloc + PyArg_ParseTuple tuple walk.",
+            "timelog_relevance": "At Timelog append/query throughputs (90K-290K+ ops/s where each op is a Python->C call), a 20-40ns/call cut is a measurable single-digit-to-double-digit percent win on call-bound microbenchmarks; biggest relative win is on the cheapest methods (next_ts/prev_ts/point, 1 int arg) where parse overhead is the largest fraction of total cost.",
+            "citations": [
+              "https://vstinner.github.io/contrib-cpython-2017q1.html",
+              "https://github.com/rogerbinns/python-fastcall",
+              "https://github.com/pytorch/pytorch/issues/49476"
+            ]
+          },
+          {
+            "topic": "Argument parsing for FASTCALL without a tuple (the hard part)",
+            "finding": "The friction historically: METH_FASTCALL has no public PyArg_ParseTupleAndKeywords equivalent — the args are already a C array, so for positional-only signatures you just index args[0..nargs-1] and convert each scalar by hand (e.g. PyLong_AsLongLong) after a manual nargs check; no public 'parse the array' helper was needed for simple cases. For keyword-bearing signatures the only parser was the private/undocumented _PyArg_ParseStack / _PyArg_ParseStackAndKeywords, which was removed from the public surface. NEW in Jan 2026: CPython issue #144175 (closed) + PR #144283 add a public `PyArg_ParseArray()` to parse a FASTCALL args array directly — the long-missing public stable parser for METH_FASTCALL. Until that ships in a release Timelog can target, the pragmatic approach is hand-rolled per-arg conversion (Timelog's signatures are tiny: 1-2 ints, or 1 int + 1 PyObject).",
+            "timelog_relevance": "Timelog's hot methods are positional-only with 1-2 trivial args, so the FASTCALL rewrite needs NO complex parser: just `if (nargs != 2) raise; ts = PyLong_AsLongLong(args[0]); obj = args[1];`. The keyword-taking methods (extend, page_spans) can stay METH_VARARGS|METH_KEYWORDS or move to METH_FASTCALL|METH_KEYWORDS later once PyArg_ParseArray lands.",
+            "citations": [
+              "https://github.com/python/cpython/issues/144175",
+              "https://bugs.python.org/issue39347",
+              "https://discuss.python.org/t/propose-that-argument-clinic-only-uses-public-python-apis-to-make-it-easier-to-use-outside-cpython/16557"
+            ]
+          },
+          {
+            "topic": "Argument Clinic: can it auto-generate FASTCALL parsers, and is it usable outside CPython?",
+            "finding": "Argument Clinic CAN auto-generate METH_FASTCALL (and METH_FASTCALL|METH_KEYWORDS) parsing boilerplate and is what CPython itself uses to FASTCALL-ify stdlib C code. BUT it is officially documented as internal to CPython: 'not supported for files outside CPython, and no guarantees are made re backwards compatibility.' Historically its generated code called private functions (_PyArg_ParseStackAndKeywords). Progress: as of Python 3.13 the generated code uses the public limited-API PyArg_ParseTupleAndKeywords() instead of private functions, and there is an active proposal (discuss.python.org/t/16557) to make Clinic emit only public APIs so third parties can use it. Today it is usable-at-your-own-risk for an external extension but not a stable dependency.",
+            "timelog_relevance": "Not recommended as a build-time dependency for Timelog (it's a hand-written C-API project that values stability). Hand-write the FASTCALL parsing for the ~10 methods instead; it's a few lines each given the trivial signatures.",
+            "citations": [
+              "https://devguide.python.org/development-tools/clinic/",
+              "https://bugs.python.org/issue39347",
+              "https://vstinner.github.io/status-limited-c-api-march-2024.html",
+              "https://discuss.python.org/t/propose-that-argument-clinic-only-uses-public-python-apis-to-make-it-easier-to-use-outside-cpython/16557"
+            ]
+          },
+          {
+            "topic": "Free-threading / subinterpreter caveats of vectorcall/FASTCALL",
+            "finding": "Two real caveats. (1) Heap types never inherit the vectorcall protocol because heap types can be mutated at runtime (this is why a custom tp_vectorcall on PyTimelog instances would be fragile) — but METH_FASTCALL method descriptors are unaffected, so the recommended path sidesteps this entirely. (2) The FASTCALL/vectorcall args[] array holds BORROWED references owned by the caller and is valid only for the duration of the call; the callee must not store pointers into it beyond the call, and under PY_VECTORCALL_ARGUMENTS_OFFSET must restore args[-1] before returning. CPython bug #127065 (operator.methodcaller not thread-safe / not re-entrant) is a concrete free-threading hazard caused by mishandling a reusable vectorcall args buffer across threads. A correctly-written METH_FASTCALL method that only reads args[i] during the call and INCREFs anything it keeps (Timelog already INCREFs the stored handle in append) is free-threading- and subinterpreter-safe.",
+            "timelog_relevance": "Timelog's free-threaded (3.14t) and per-interpreter-GIL builds remain correct after the switch as long as the new code reads args[i] only during the call and keeps the existing Py_INCREF(obj) before storing the handle. No new locking needed; the change is orthogonal to the seqlock/Treiber/critical-section machinery.",
+            "citations": [
+              "https://peps.python.org/pep-0590/",
+              "https://docs.python.org/3/c-api/call.html",
+              "https://github.com/python/cpython/issues/127065"
+            ]
+          },
+          {
+            "topic": "Timelog's non-hot Python entry points are already tuple-free",
+            "finding": "METH_O (single object arg) and METH_NOARGS (zero args) are BOTH tuple-free conventions — no temp tuple is allocated, no PyArg_ParseTuple needed. Timelog already uses tp_iternext for iteration (PyTimelogIter_iternext, the optimal zero-overhead slot, not a method call), next_batch is METH_O, and close/view/__enter__ are METH_NOARGS. So the iterator hot path is already as fast as the calling convention allows; the remaining overhead there is in the body, not the call boundary.",
+            "timelog_relevance": "Confirms the FASTCALL opportunity is exactly the 10 METH_VARARGS methods (append/range/since/until/point/equal/next_ts/prev_ts/delete_range/delete_before) in py_timelog.c; the iterator and single-arg methods need no change.",
+            "citations": [
+              "https://docs.python.org/3.14/c-api/structures.html"
+            ]
+          }
+        ],
+        "new_ideas": [
+          {
+            "statement": "Convert the 10 positional-only METH_VARARGS hot methods in bindings/cpython/src/py_timelog.c (append, range, since, until, point, equal, next_ts, prev_ts, delete_range, delete_before) to METH_FASTCALL, replacing PyArg_ParseTuple(\"L\"/\"LL\"/\"LO\") with a manual nargs check + per-arg PyLong_AsLongLong / direct args[i] read. Keep extend/page_spans on METH_VARARGS|METH_KEYWORDS for now.",
+            "rationale": "These are exactly the call-boundary-bound methods; ground truth confirms none use FASTCALL yet. Their signatures are trivial (1-2 ints, or int+PyObject) so parsing is a few lines with no parser dependency. Measured precedent (struct.pack -42ns/1.56x; rogerbinns 7x for kwargs; PyTorch ~15ns) predicts a 15-45ns/call cut, largest in relative terms for the 1-int methods (next_ts/prev_ts/point) where parse cost dominates. The iterator and METH_O/METH_NOARGS methods already need no change.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://docs.python.org/3/c-api/structures.html",
+              "https://vstinner.github.io/contrib-cpython-2017q1.html",
+              "https://github.com/rogerbinns/python-fastcall"
+            ]
+          },
+          {
+            "statement": "Add a calling-convention microbenchmark to the perf harness that times append(ts,obj) and next_ts(ts) before/after the FASTCALL switch on 3.13 AND 3.14t (free-threaded), reporting ns/call with the args-tuple-alloc count from tracemalloc or sys.getallocatedblocks delta to prove the temp-tuple elimination.",
+            "rationale": "The win is a constant per-call factor that only shows up in a call-bound micro-benchmark, not the existing throughput macro-benchmarks (which are dominated by k-way merge / memtable work). Without an isolated microbench the regression/improvement is invisible. Measuring on 3.14t specifically guards the free-threading path where the args[] borrowing contract matters. This extends the existing .ideas perf-harness notes with a FASTCALL-specific, allocation-counting assertion they lack.",
+            "effort": "medium",
+            "confidence": "high",
+            "citations": [
+              "https://vstinner.github.io/contrib-cpython-2017q1.html",
+              "https://github.com/rogerbinns/python-fastcall"
+            ]
+          },
+          {
+            "statement": "Do NOT implement a custom tp_vectorcall_offset/Py_TPFLAGS_HAVE_VECTORCALL on PyTimelog instances; explicitly document in py_timelog.c that the FASTCALL win comes from the method descriptors, because PyTimelog is a heap type (PyType_FromModuleAndSpec) and heap types never inherit vectorcall.",
+            "rationale": "A naive reading of 'use vectorcall' could lead to wiring tp_vectorcall_offset, which is wrong here: (a) Timelog instances aren't meant to be callable, and (b) heap types never inherit vectorcall and lose Py_TPFLAGS_HAVE_VECTORCALL on __call__ reassignment, so it would be fragile under subclassing (Py_TPFLAGS_BASETYPE is set). This corrects a trap latent in the generic .ideas notes that say 'register via tp_vectorcall_offset'.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://docs.python.org/3/c-api/call.html",
+              "https://peps.python.org/pep-0590/"
+            ]
+          },
+          {
+            "statement": "Defer the keyword-taking methods (extend, page_spans/views) to METH_FASTCALL|METH_KEYWORDS only after the public PyArg_ParseArray() API (CPython PR #144283, merged Jan 2026) ships in a release Timelog can require, and gate that path behind a Python-version #if; until then leave them on METH_VARARGS|METH_KEYWORDS.",
+            "rationale": "Keyword parsing under FASTCALL is the genuinely hard part with no stable public helper historically (only the removed private _PyArg_ParseStackAndKeywords, or unsupported Argument Clinic). PyArg_ParseArray() is brand-new (Jan 2026) and not yet in a shipped release, so adopting it now would require a min-version bump or a private API. The positional-only methods capture ~all the realizable win at near-zero risk; kwargs methods are lower-frequency (bulk extend, page_spans setup) so the call-overhead win there is marginal anyway.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://github.com/python/cpython/issues/144175",
+              "https://github.com/python/cpython/issues/127065"
+            ]
+          },
+          {
+            "statement": "In the new FASTCALL append(), read args[1] (the PyObject) as a borrowed ref and keep the existing Py_INCREF(obj) BEFORE handle-encode/store; add a one-line comment that args[] is caller-owned/borrowed and must not be retained past the call except via the INCREF, citing the methodcaller free-threading bug.",
+            "rationale": "The single correctness-sensitive spot in the migration. The args[] array under vectorcall/FASTCALL holds borrowed references valid only for the call duration; Timelog's append stores the handle (a uint64 encoding the PyObject*) past the call, which is only safe because of the existing Py_INCREF. Making this explicit prevents a future refactor from dropping the INCREF and creating a use-after-free that would be especially nasty under 3.14t free-threading (cf. CPython #127065). This is a concrete, file-level safety note absent from the generic notes.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://github.com/python/cpython/issues/127065",
+              "https://peps.python.org/pep-0590/",
+              "https://docs.python.org/3/c-api/call.html"
+            ]
+          }
+        ],
+        "corrections": [
+          "The .ideas notes repeatedly frame Timelog's binding choices around PyO3/Rust and HPy (e.g. doc_13/doc_20/doc_25 'Choosing your binding: Raw C-API vs HPy vs PyO3', doc_20's CI matrix abi=[pyo3, hpy-hybrid, vectorcall]). Per ground truth Timelog is a hand-written CPython C-API extension — PyO3/HPy are not in play and the 'vectorcall' axis is just a flag on the existing C methods, not a separate binding backend.",
+          "doc_36 says vectorcall is registered 'via tp_vectorcall_offset (for types)'. For Timelog's case (speeding up obj.method(...) calls on a heap type) this is the WRONG mechanism — the correct lever is the METH_FASTCALL flag on the PyMethodDef. tp_vectorcall_offset is only for making instances themselves callable, and heap types never inherit it.",
+          "The notes treat vectorcall as an abstract 'philosophy' (doc_36 'remove unnecessary intermediate objects') and a benchmark-harness topic (doc_1, doc_10, doc_20, doc_29) but never identify the concrete, ready change: 10 named METH_VARARGS methods in py_timelog.c that can flip to METH_FASTCALL today. The opportunity is more specific and lower-effort than the notes imply.",
+          "The notes are silent on the new public PyArg_ParseArray() FASTCALL parser (CPython issue #144175 / PR #144283, Jan 2026) and on Argument Clinic's 3.13 move to public PyArg_ParseTupleAndKeywords — both materially change the 'kwargs under FASTCALL is hard' calculus the older generic advice assumed.",
+          "doc_20's perf CI uses Python [3.11, 3.12, 3.13] and ubuntu-22.04; it omits 3.14t (free-threaded), which is exactly where the vectorcall args[]-borrowing/reentrancy caveat must be validated for Timelog's gil-free build."
+        ]
+      },
+      {
+        "strand": "buffer-arrow-interop",
+        "key_findings": [
+          {
+            "topic": "Arrow PyCapsule Interface (the modern, idiomatic export path)",
+            "finding": "The current idiomatic way to vend Arrow C Data Interface data from Python is the Arrow PyCapsule Interface: three dunder methods __arrow_c_schema__(self) (returns a PyCapsule named 'arrow_schema'), __arrow_c_array__(self, requested_schema=None) (returns a (schema_capsule, array_capsule) tuple named 'arrow_schema'/'arrow_array'), and __arrow_c_stream__(self, requested_schema=None) (returns one PyCapsule named 'arrow_array_stream'). Each capsule MUST carry a destructor that invokes the embedded ArrowSchema/ArrowArray/ArrowArrayStream release callback if non-null, so a never-consumed capsule does not leak. Capsules are single-use: a consumer moves the data and nulls the release callback. This supersedes the older raw-integer/_export_to_c approach mentioned in the .ideas notes.",
+            "timelog_relevance": "This is what PageSpan (bindings/cpython/src/py_span.c) should grow as a SECOND export surface alongside its existing PEP 3118 bf_getbuffer. Implement __arrow_c_array__ returning ts[] as an int64 column; the array capsule's release callback is the natural home to drop the pagespan owner pin (mirrors the existing pagespan_detach_locked refcount logic), giving correct lifetime without exports++ bookkeeping.",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html"
+            ]
+          },
+          {
+            "topic": "Arrow C Data Interface struct + int64 buffer layout",
+            "finding": "A non-nullable int64 primitive array uses n_buffers=2: buffers[0] is the validity/null bitmap (MAY be NULL when null_count==0), buffers[1] is the contiguous int64 data. Format strings: 'l' = int64, 'L' = uint64. ArrowArray fields: length, null_count, offset, n_buffers, n_children, buffers (const void**), children, dictionary, release (void(*)(ArrowArray*)), private_data. Buffer alignment to the primitive type is recommended but not required. Producer installs release on both ArrowSchema and ArrowArray; consumer calls it exactly once.",
+            "timelog_relevance": "Timelog's ts[] is always non-null and contiguous int64, so the export is the simplest possible Arrow case: 2 buffers, buffers[0]=NULL, null_count=0, format 'l'. private_data should hold the pagespan owner pin; release() drops it. No validity bitmap to allocate. This is essentially zero marshalling cost.",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CDataInterface.html"
+            ]
+          },
+          {
+            "topic": "Consumer library version support for PyCapsule protocol",
+            "finding": "PyArrow >= 15 accepts any object implementing the dunders in pa.array()/pa.table()/pa.record_batch(). Polars >= 1.3 both implements and consumes the protocol (pl.DataFrame.__arrow_c_stream__, and pl.from_arrow / construction consume it) with zero-copy for supported types and no hard pyarrow dependency. pandas supports EXPORT (__arrow_c_stream__ on DataFrame/Series) but import-side consumption was still in development (pandas issue #59631). DuckDB also consumes it. A known trap: each __arrow_c_stream__ call must produce a FRESH, independent stream — DuckDB shipped a bug (#17084) where the second call failed because the stream was one-shot.",
+            "timelog_relevance": "Confirms the protocol reaches numpy(via pyarrow)/polars/pandas/pyarrow today. The 'fresh stream per call' rule is a direct constraint on a Timelog __arrow_c_stream__ over L0/L1 windows: it must re-acquire a snapshot and build a new ArrowArrayStream each call (re-running tl_snapshot_acquire), never hand back a cursor that's already been consumed. Document this in the python-binding-architecture component doc.",
+            "citations": [
+              "https://github.com/apache/arrow/issues/39195",
+              "https://docs.pola.rs/user-guide/misc/arrow/",
+              "https://github.com/duckdb/duckdb/issues/17084",
+              "https://github.com/pandas-dev/pandas/issues/59631"
+            ]
+          },
+          {
+            "topic": "PEP 688 (__buffer__ / collections.abc.Buffer, 3.12+)",
+            "finding": "PEP 688 is Final (approved 2023-03-07, Python 3.12+). It adds Python-level __buffer__(self, flags)->memoryview and __release_buffer__(self, buffer) special methods, the collections.abc.Buffer ABC (also types.Buffer) for type annotations, and inspect.BufferFlags. Crucially it does NOT modify the C-level buffer protocol (PEP 3118 / bf_getbuffer); it merely wraps the existing C slots so pure-Python objects and type checkers can participate.",
+            "timelog_relevance": "Zero C work required for Timelog: PageSpan's existing bf_getbuffer slot already satisfies collections.abc.Buffer. The only actionable item is to annotate the Python facade (python/timelog/_api.py) with collections.abc.Buffer where PageSpan is returned, so static type checkers know it's buffer-compatible. Confirms the notes' implicit assumption that the C buffer protocol is unchanged.",
+            "citations": [
+              "https://peps.python.org/pep-0688/"
+            ]
+          },
+          {
+            "topic": "DLPack (__dlpack__) for numpy/torch zero-copy",
+            "finding": "DLPack exchange goes through __dlpack__(self, stream=None, *, max_version=None, dl_device=None, copy=None) plus __dlpack_device__(self)->(device_type, device_id), consumed by numpy.from_dlpack(x, /, *, device=None, copy=None) (the device=/copy= kwargs were added in NumPy 2.x). The current C struct is DLManagedTensorVersioned {DLPackVersion version; void* manager_ctx; void(*deleter)(...); uint64_t flags; DLTensor dl_tensor;}; the legacy DLManagedTensor (no version/flags) is deprecated post-v0.8. The read-only signal is flags & DLPACK_FLAG_BITMASK_READ_ONLY (1<<0). DLTensor carries data, device, ndim, dtype, shape, strides, byte_offset. numpy.from_dlpack is zero-copy by default (copy=None reuses memory; copy=False raises BufferError if a copy would be needed).",
+            "timelog_relevance": "DLPack is the path to hand ts[] to torch/cupy/jax (which do NOT speak PEP 3118) zero-copy. For Timelog, a __dlpack__ on PageSpan would set DLPACK_FLAG_BITMASK_READ_ONLY (ts is immutable after publication), device DLDeviceType=kDLCPU, dtype int64, ndim=1, and put the pagespan owner pin in manager_ctx with deleter dropping it. This is NOT in the .ideas notes at all and is a genuine gap — DLPack covers consumers PEP 3118 cannot reach.",
+            "citations": [
+              "https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h",
+              "https://numpy.org/doc/stable/reference/generated/numpy.from_dlpack.html",
+              "https://dmlc.github.io/dlpack/latest/python_spec.html"
+            ]
+          },
+          {
+            "topic": "PEP 757 (PyLong import/export, 3.14) — NOT the right tool for int64 handles",
+            "finding": "PEP 757 is Final (approved 2024-12-08, Python 3.14). It adds PyLong_Export/PyLong_FreeExport (PyLongExport struct: value int64_t, negative, ndigits, digits), PyLongWriter_Create/Finish/Discard, and PyLong_GetNativeLayout. It is explicitly scoped to ARBITRARY-PRECISION integers (gmpy2/SAGE/python-flint). For small fixed-width int64/uint64 the PEP itself directs you to PyLong_FromUInt64/PyLong_FromInt64 (and the reverse PyLong_AsUInt64/PyLong_AsInt64), which are new in CPython 3.14, part of the Stable ABI since 3.14, and use a status-code calling convention.",
+            "timelog_relevance": "Corrects a likely misread: PEP 757 does NOT speed up Timelog's uint64 handle<->PyObject path. The relevant new APIs are PyLong_FromUInt64/PyLong_AsUInt64 (3.14), but Timelog handles encode PyObject* pointers, not Python ints, so even those don't apply to the handle path. They are only relevant if a future API exposes raw uint64 handles as Python ints.",
+            "citations": [
+              "https://peps.python.org/pep-0757/",
+              "https://docs.python.org/3/c-api/long.html",
+              "https://github.com/python/cpython/issues/120389"
+            ]
+          },
+          {
+            "topic": "numpy.frombuffer requirements (the already-working path)",
+            "finding": "numpy.frombuffer(buffer, dtype=float64, count=-1, offset=0) requires an object exposing the PEP 3118 buffer protocol and returns a zero-copy VIEW into the original memory. When the source buffer is read-only (Py_buffer.readonly=1), the resulting ndarray is read-only; writes raise. dtype/count/offset let you reinterpret; it treats the buffer as 1-D.",
+            "timelog_relevance": "Timelog already supports this TODAY via PageSpan's bf_getbuffer (format 'q'/int64, readonly=1): np.frombuffer(memoryview(span), dtype=np.int64) is zero-copy and correctly read-only. This is the baseline that Arrow/DLPack extend (PEP 3118 reaches numpy/pandas-via-numpy but not polars-native/torch/jax).",
+            "citations": [
+              "https://numpy.org/doc/stable/reference/generated/numpy.frombuffer.html"
+            ]
+          },
+          {
+            "topic": "nanoarrow for a hand-written C extension",
+            "finding": "apache/arrow-nanoarrow is a 2-file (nanoarrow.c + nanoarrow.h), zero-dependency, vendor-by-copy C library (~few hundred KB compiled) providing helpers to build/fill ArrowSchema, ArrowArray, and ArrowArrayStream and to enforce the release-callback semantics. It is explicitly intended to be copied/vendored (dist/ bundle) rather than linked as a heavy dependency, which is exactly the model for a project that does NOT want a libarrow dependency.",
+            "timelog_relevance": "Because Timelog is a hand-written C-API extension with no libarrow dependency, nanoarrow is the right way to implement __arrow_c_array__/__arrow_c_stream__ without hand-rolling the FFI structs and release-callback edge cases. Vendor nanoarrow.c/.h under bindings/cpython/ (or a new bindings/cpython/third_party/) and wire it into the existing CMake. Keeps the binary self-contained.",
+            "citations": [
+              "https://github.com/apache/arrow-nanoarrow",
+              "https://arrow.apache.org/nanoarrow/latest/index.html"
+            ]
+          }
+        ],
+        "new_ideas": [
+          {
+            "statement": "Add __arrow_c_array__ to PyPageSpan (bindings/cpython/src/py_span.c) exporting ts[] as a non-nullable int64 Arrow column, using vendored nanoarrow; put the pagespan owner pin in ArrowArray.private_data and drop it in the release callback.",
+            "rationale": "ts[] is already a contiguous, immutable, non-null int64 array — the trivial Arrow case (2 buffers, buffers[0]=NULL, null_count=0, format 'l'). This unlocks zero-copy pl.from_arrow(span)/pa.array(span) for Polars >=1.3 and PyArrow >=15 with no extra copy. The Arrow array's release callback is a cleaner lifetime anchor than the current exports++/releasebuffer pairing because Arrow's single-consumer move semantics map exactly to a one-shot pin drop. Not in .ideas notes as a concrete PageSpan method (notes only describe the abstract C Data Interface).",
+            "effort": "medium",
+            "confidence": "high",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html",
+              "https://arrow.apache.org/docs/format/CDataInterface.html",
+              "https://github.com/apache/arrow-nanoarrow"
+            ]
+          },
+          {
+            "statement": "Add __arrow_c_stream__ to a span-iterator type that re-acquires a fresh snapshot per call and yields one ArrowArray (RecordBatch) per page/segment across L0/L1, so a whole query range streams into Polars/DuckDB zero-copy without one big materialization.",
+            "rationale": "Timelog's query path is already a k-way merge producing page-sized spans; an ArrowArrayStream is the natural Python surface for 'all events in [t1,t2)'. The DuckDB #17084 bug proves the hard rule: each __arrow_c_stream__ call MUST build a brand-new, independent stream (fresh tl_snapshot_acquire), never a consumed cursor. Implementing this correctly (snapshot per call, page-at-a-time get_next, pin held until stream release) is a distinctive, Timelog-specific design beyond generic notes.",
+            "effort": "high",
+            "confidence": "high",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CStreamInterface.html",
+              "https://github.com/duckdb/duckdb/issues/17084",
+              "https://docs.pola.rs/user-guide/misc/arrow/"
+            ]
+          },
+          {
+            "statement": "Add __dlpack__/__dlpack_device__ to PyPageSpan returning a DLManagedTensorVersioned over ts[] with DLPACK_FLAG_BITMASK_READ_ONLY set, kDLCPU device, int64 dtype, ndim=1, and the owner pin in manager_ctx (dropped in deleter).",
+            "rationale": "PEP 3118 reaches numpy/pandas but NOT torch/jax/cupy, which speak only DLPack. Setting the READ_ONLY flag matches Timelog's immutability-after-publication invariant and makes np.from_dlpack/torch.from_dlpack produce a correctly read-only view. Use the versioned struct (legacy DLManagedTensor is deprecated post-0.8) and honor max_version negotiation. Completely absent from the .ideas notes, which only cover Arrow + PEP 3118.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://github.com/dmlc/dlpack/blob/main/include/dlpack/dlpack.h",
+              "https://numpy.org/doc/stable/reference/generated/numpy.from_dlpack.html",
+              "https://dmlc.github.io/dlpack/latest/python_spec.html"
+            ]
+          },
+          {
+            "statement": "Do NOT attempt to vend h[] (the uint64 handle array) as a zero-copy Arrow/DLPack/buffer column; keep handles behind the existing objects() materialization path, and only Arrow-export ts[] (plus optionally an int64 row-index column).",
+            "rationale": "h[] values are encoded PyObject* handles (py_handle.c), not semantically meaningful integers — exporting them as an int64 column would leak raw pointer bits and have no analytic meaning, and consumers could not safely INCREF them. The correct zero-copy column is ts[]; payloads must stay opaque and decode through tl_py_handle_decode under the span critical section. This is a Timelog-specific safety boundary the generic 'export ts[]/h[] as Arrow columns' note in doc_24.md gets WRONG.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CDataInterface.html"
+            ]
+          },
+          {
+            "statement": "Centralize the buffer/Arrow/DLPack pin-and-release logic into one core helper (e.g. tl_pagespan_owner_acquire_for_export / _release) in the core pagespan owner, and have all three export surfaces (bf_getbuffer, __arrow_c_array__, __dlpack__) route through it instead of each re-implementing exports++ / pin bookkeeping.",
+            "rationale": "Three independent export paths each holding a snapshot pin is a UAF/leak surface if they diverge. A single acquire/release that the PEP 3118 releasebuffer, the Arrow array release callback, and the DLPack deleter all call keeps the lifetime contract in one place and one critical section, consistent with the existing collect-under-lock/execute-outside-lock discipline in CLAUDE.md. This consolidation idea is not in the notes.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html"
+            ]
+          },
+          {
+            "statement": "Annotate the Python facade (python/timelog/_api.py) PageSpan return types with collections.abc.Buffer (PEP 688) and add a pytest that asserts isinstance(span, collections.abc.Buffer) on 3.12+, gating Arrow/DLPack tests on pyarrow>=15 / polars>=1.3 / numpy>=2 availability.",
+            "rationale": "PEP 688 makes buffer support type-checkable with zero C changes; advertising it improves the public API surface for static analysis. Pairing it with version-gated interop tests (pyarrow>=15, polars>=1.3, numpy>=2 for from_dlpack copy=/device=) locks in the zero-copy contract in CI. Concrete, facade-level, and not in the notes.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://peps.python.org/pep-0688/",
+              "https://github.com/apache/arrow/issues/39195",
+              "https://numpy.org/doc/stable/reference/generated/numpy.from_dlpack.html"
+            ]
+          }
+        ],
+        "corrections": [
+          "doc_24.md says to export each page's ts[] AND h[] as Arrow columns ('Your PageSpan/SoA pages map cleanly to Arrow columns (ts[], h[], ...)'). This is wrong for h[]: handles are encoded PyObject* pointers (py_handle.c), not meaningful int64 data, and cannot be safely vended zero-copy as a numeric Arrow/DLPack column. Only ts[] is a valid zero-copy column; payloads must stay opaque behind objects()/tl_py_handle_decode.",
+          "The .ideas notes (doc_24.md) describe the Arrow C Data Interface only via raw ArrowSchema/ArrowArray/ArrowArrayStream FFI structs. They predate / omit the now-idiomatic Arrow PyCapsule Interface (__arrow_c_array__/__arrow_c_schema__/__arrow_c_stream__ dunders, PyCapsule names 'arrow_array'/'arrow_schema'/'arrow_array_stream'), which is what PyArrow>=15 and Polars>=1.3 actually consume and is the recommended export surface today.",
+          "The notes contain NO mention of DLPack (__dlpack__/__dlpack_device__, DLManagedTensorVersioned, DLPACK_FLAG_BITMASK_READ_ONLY). For torch/jax/cupy interop — which do not implement PEP 3118 — DLPack is the only zero-copy route, so this is a real gap in the idea space, not a nuance.",
+          "The notes (and the research-strand framing) imply PEP 757 might help fast int<->PyLong for handles. Correction: PEP 757 is scoped to arbitrary-precision bignums (gmpy2/SAGE); for fixed-width uint64 the relevant new 3.14 APIs are PyLong_FromUInt64/PyLong_AsUInt64, and even those do not apply to Timelog handles since handles encode PyObject* pointers rather than integer values.",
+          "doc_24.md frames consumer support generically ('polars.from_arrow is typically zero-copy'); current concrete version floors are now known and should be pinned: PyArrow>=15, Polars>=1.3, pandas export-only (import in progress), numpy>=2 for from_dlpack copy=/device= kwargs."
+        ]
+      },
+      {
+        "strand": "freethreading-subinterp-packaging",
+        "key_findings": [
+          {
+            "topic": "PEP 779 — free-threading is officially supported in 3.14 (Phase II)",
+            "finding": "PEP 779 is FINAL (Steering Council accepted 2025-06-16). It moves free-threaded CPython to Phase II = 'officially supported, still optional' as of Python 3.14; cp314t is no longer 'experimental'. The supported-status bar it set: free-threaded build must be <=15% slower than GIL build on pyperformance and <=20% higher memory (geomean). In 3.14 the single-thread penalty is now ~5-10% (vs the much larger 3.13 penalty), because PEP 659 specializing adaptive interpreter is now enabled under free-threading. Phase III (FT as default) is explicitly UNDEFINED and needs a future PEP.",
+            "timelog_relevance": "Timelog already ships Py_MOD_GIL_NOT_USED + cp314t Linux wheels, so it is correctly positioned for the officially-supported tier. The actionable item is documentation/marketing posture: Timelog can now advertise '3.14 free-threading supported (not experimental)' and should drop any 3.13t-experimental hedging. The .ideas notes that frame FT as '3.14 when available' are now stale — it IS available and final.",
+            "citations": [
+              "https://peps.python.org/pep-0779/",
+              "https://docs.python.org/3/whatsnew/3.14.html",
+              "https://docs.python.org/3/howto/free-threading-python.html"
+            ]
+          },
+          {
+            "topic": "PEP 803 'abi3t' — the Stable ABI does NOT work for free-threaded builds until 3.15",
+            "finding": "Today abi3 (Py_LIMITED_API) is fundamentally incompatible with free-threading: 'Extensions will fail to build for the Stable ABI on free-threaded Python (when both Py_LIMITED_API and Py_GIL_DISABLED are defined).' PEP 803 (Accepted, target Python 3.15) introduces a SEPARATE 'abi3t' variant: new wheel tag abi3t (compressed dual tag 'abi3.abi3t'), files named .abi3t.so, gated by Py_TARGET_ABI3T (auto-set when Py_LIMITED_API+Py_GIL_DISABLED). abi3t makes PyObject/PyVarObject OPAQUE (no embedding PyObject in your structs, must use Py_TYPE() accessors) and REQUIRES the new PyModExport hook (PEP 793) instead of static PyModuleDef. Minimum is 3.15 — no backport to 3.14. Traditional abi3 stays GIL-only; FT interpreters in 3.15+ won't load plain abi3 extensions.",
+            "timelog_relevance": "This kills the .ideas premise that 'abi3 widens your install base' for Timelog as-is. Timelog targets free-threading as a headline feature, so a single abi3 wheel cannot cover both GIL and FT builds today. Recommendation: do NOT chase abi3 now — keep version-specific wheels (current cp312/13/14/14t matrix). abi3t is a future (3.15+, ~2026/2027) option but demands invasive rewrites (opaque PyObject means Timelog's static type structs + embedded ob_base in PyTimelog/PyPageSpan would have to become fully heap-allocated/opaque, plus migrate module.c to PyModExport). Low priority until 3.15 is the minimum supported version.",
+            "citations": [
+              "https://peps.python.org/pep-0803/",
+              "https://peps.python.org/pep-0793/"
+            ]
+          },
+          {
+            "topic": "vectorcall / METH_FASTCALL is in the Stable ABI since 3.12 and unaffected by free-threading",
+            "finding": "PyObject_Vectorcall and PyObject_VectorcallMethod are part of the Stable ABI since Python 3.12. The free-threading C-API docs make NO mention of changes to METH_FASTCALL/vectorcall under free-threading — the calling convention itself is orthogonal to the GIL; you only must protect any internal state the handler touches. Timelog's binding currently uses METH_FASTCALL/vectorcall NOWHERE (confirmed: zero matches in bindings/cpython/src; every hot method is METH_VARARGS + PyArg_ParseTuple). That matches the ground-truth brief: vectorcall is a genuine, un-taken win.",
+            "timelog_relevance": "Adopting METH_FASTCALL|METH_KEYWORDS on the fixed-arity hot methods (append/range/since/until/point/equal/next_ts/prev_ts/delete_range in py_timelog.c) avoids per-call tuple allocation and is fully compatible with both the FT build and (since 3.12) abi3 — so it does not foreclose any future packaging path. It is the single highest-ROI, lowest-risk binding change in this strand.",
+            "citations": [
+              "https://docs.python.org/3/c-api/call.html",
+              "https://docs.python.org/3/c-api/stable.html",
+              "https://docs.python.org/3/howto/free-threading-extensions.html"
+            ]
+          },
+          {
+            "topic": "Buffer protocol (PageSpan) IS Stable-ABI-eligible since 3.11, but Timelog uses static types",
+            "finding": "The Py_buffer struct + all members + PyBuffer_FillInfo are in the Stable ABI since 3.11, and crucially the Py_bf_getbuffer (slot 1) / Py_bf_releasebuffer (slot 2) type slots became available in the Limited API in 3.11 via PyType_FromSpec/heap types (previously disabled by bpo-10181). So a zero-copy buffer-protocol type CAN be built under abi3 — but ONLY as a heap type built with PyType_FromSpec. Timelog's PageSpan and all other types are STATIC type definitions with Py_TPFLAGS_IMMUTABLETYPE (confirmed in py_span.c etc.), not heap types.",
+            "timelog_relevance": "Good news: PageSpan's zero-copy buffer protocol is NOT a blocker for a future abi3/abi3t migration. The blocker is that all Timelog types are static structs. If abi3 ever becomes a goal, the work is converting static type defs -> PyType_FromSpec heap types (which also aligns with PEP 803's opaque-PyObject requirement). Under free-threading specifically, the docs warn the buffer's backing object can be concurrently mutated — Timelog is safe here because PageSpan wraps IMMUTABLE pages, but the close-while-exported guard (exports counter) must be atomic/lock-protected under FT.",
+            "citations": [
+              "https://docs.python.org/3/c-api/buffer.html",
+              "https://github.com/python/cpython/issues/98410",
+              "https://docs.python.org/3/howto/free-threading-extensions.html"
+            ]
+          },
+          {
+            "topic": "Critical sections SUSPEND on blocking — design constraint for Timelog's locks",
+            "finding": "Official FT docs: Py_BEGIN_CRITICAL_SECTION does NOT guarantee exclusive access for its whole duration. If a thread blocks while holding a critical section (acquiring another lock, I/O), the section is temporarily SUSPENDED — its locks are released — then resumed. 'Only the lock(s) of the most recently entered (top-most) critical section are guaranteed held.' You cannot nest critical sections to lock 2 objects; use Py_BEGIN_CRITICAL_SECTION2. For purely-internal (non-PyObject) extension state, the docs recommend PyMutex/standard mutexes over critical sections.",
+            "timelog_relevance": "Directly validates Timelog's LLD layering: per-object TL_PY_OBJ_LOCK (Py_BEGIN_CRITICAL_SECTION, L4) must NOT wrap any code that then blocks on core_lock or PyMutex, or the object lock silently drops. The collect-under-lock/execute-outside-lock rule already in CLAUDE.md is exactly the mitigation. New concrete risk to audit: any path that holds a per-object critical section AND calls into the C core (which can take internal C mutexes) could see the Py-level lock suspended. The seqlock + Treiber stack are correctly built on C atomics/PyMutex, not critical sections — that's the recommended pattern.",
+            "citations": [
+              "https://docs.python.org/3/howto/free-threading-extensions.html",
+              "https://docs.python.org/3/c-api/synchronization.html"
+            ]
+          },
+          {
+            "topic": "mimalloc is the default AND required allocator in free-threaded builds; PyObject_Malloc is reserved for PyObjects",
+            "finding": "In the free-threaded build mimalloc is the default and REQUIRED allocator for PYMEM_DOMAIN_MEM and PYMEM_DOMAIN_OBJ (since 3.13); --disable-gil cannot combine with --without-mimalloc. It uses per-thread heaps so alloc/free proceeds lock-free in most cases. Hard FT rule from the docs: 'only Python objects may be allocated using the object domain, and all Python objects must use that domain' — i.e. do NOT use PyObject_Malloc() for non-PyObject buffers; use PyMem_Malloc(). pymalloc is NOT used in FT builds.",
+            "timelog_relevance": "Timelog already complies: the retired-handle Treiber stack nodes use plain libc malloc() (py_handle.c:575, explicitly commented 'NOT the Python allocator'), and the handle context uses PyMem_Malloc (py_handle.c:364). No PyObject_Malloc misuse exists. Net: no allocator change needed. Worth a one-line note in docs that the FT build's mimalloc per-thread heaps make the existing malloc-for-nodes choice optimal (no domain violation, no global lock). Potential micro-idea: the C core's tl__malloc wrappers could optionally route through mimalloc under FT, but CPython already does this for object memory.",
+            "citations": [
+              "https://docs.python.org/3/howto/free-threading-extensions.html",
+              "https://docs.python.org/3/c-api/memory.html",
+              "https://github.com/python/cpython/issues/112532"
+            ]
+          },
+          {
+            "topic": "cibuildwheel 3.0+: cp314t built by DEFAULT, cp313t needs CIBW_ENABLE",
+            "finding": "In cibuildwheel 3.0, cp314t free-threaded wheels are built BY DEFAULT (FT no longer experimental in 3.14). cp313t still requires CIBW_ENABLE: cpython-freethreading (it is the 'explicitly tested only' experimental tier), and recent cibuildwheel is deprecating/removing the 3.13 FT path + the cpython-freethreading enable flag for 3.14+. FT build identifiers carry the 't' python_tag suffix (cp314t-manylinux_x86_64).",
+            "timelog_relevance": "Timelog's pyproject build line ('cp312-* cp313-* cp314-* cp314t-manylinux_x86_64 cp314t-manylinux_aarch64', 3.13t intentionally omitted) is already aligned with cibuildwheel 3.0 defaults. The cp314t macOS/Windows omission is a documented host-availability gap, not a config error. Actionable: pin a cibuildwheel version >=3.0 in release-pypi.yml and add a PYTHON_GIL=0 import smoke as a wheel test (already present in the cp314t override) so a silently GIL-re-enabled wheel can't pass.",
+            "citations": [
+              "https://cibuildwheel.pypa.io/en/stable/options/",
+              "https://py-free-threading.github.io/ci/",
+              "https://github.com/pypa/cibuildwheel/releases"
+            ]
+          },
+          {
+            "topic": "Borrowed-reference APIs are the main FT refcount hazard; PEP 683 immortalizes types/singletons automatically",
+            "finding": "FT porting guide: the top contention/correctness hazard is borrowed references (PyList_GetItem, etc.) — even Py_NewRef(PyList_GetItem(...)) races because the item can be freed before the incref; use *_GetItemRef variants. PEP 683 (Final, landed 3.12) immortalizes all runtime-global objects automatically: None/True/False, and all static types (PyLong_Type etc.) get _Py_IMMORTAL_REFCNT, so their refcounts are never modified and never cause cross-core cache-line invalidation. Immortalization is internal-only (no stable public _Py_SetImmortal API).",
+            "timelog_relevance": "Two Timelog-specific implications. (1) Audit the binding for borrowed-ref patterns on user-supplied mutable containers in extend()/append() fast paths (py_timelog.c uses PyArg_ParseTuple 'O' which returns borrowed; the handle must be INCREF'd before the value can be dropped by another thread — verify the INCREF happens before any point another thread could DECREF). (2) Timelog's heavy use of a small set of long-lived module-level objects (exception types, the type objects themselves) already benefits from automatic immortalization of static types; no manual action, but a contention micro-opt is to ensure frequently-returned sentinel singletons are module-state immortal-ish (or just module-global) rather than freshly created per call.",
+            "citations": [
+              "https://py-free-threading.github.io/porting-extensions/",
+              "https://peps.python.org/pep-0683/"
+            ]
+          },
+          {
+            "topic": "PEP 793 PyModExport — the new module entry point that abi3t depends on",
+            "finding": "PEP 793 (Accepted, target 3.15) adds a PyModExport_<name> hook returning an array of PyModuleDef_Slot WITHOUT a statically-allocated PyModuleDef/PyObject. Python builds the module via PyModule_FromSlotsAndSpec + PyModule_Exec. This removes the last static PyObject obstacle to one binary working on both GIL and FT builds, and is REQUIRED by PEP 803 abi3t. Used on 3.15+ only.",
+            "timelog_relevance": "Timelog's module.c already uses multi-phase init (Py_mod_exec) with a PyModuleDef + slots including Py_mod_multiple_interpreters=PER_INTERPRETER_GIL_SUPPORTED and Py_mod_gil=Py_MOD_GIL_NOT_USED. PyModExport is a forward-looking simplification, only relevant IF Timelog later pursues abi3t. No action now; flag as a 3.15-era migration item bundled with the static-type->heap-type conversion. The current multiphase setup is already best-practice for 3.12-3.14.",
+            "citations": [
+              "https://peps.python.org/pep-0793/",
+              "https://peps.python.org/pep-0803/"
+            ]
+          }
+        ],
+        "new_ideas": [
+          {
+            "statement": "Convert the 9 fixed-arity hot methods in bindings/cpython/src/py_timelog.c (append, range, since, until, point, equal, next_ts, prev_ts, delete_range) from METH_VARARGS+PyArg_ParseTuple to METH_FASTCALL (and METH_FASTCALL|METH_KEYWORDS where kwargs exist), parsing args directly from the PyObject*const* args/nargs vector.",
+            "rationale": "vectorcall is the un-taken win named in the brief and confirmed unused (zero matches in the binding). It eliminates the per-call argument tuple allocation on Timelog's hottest paths. It is Stable-ABI-safe since 3.12 and orthogonal to free-threading, so it forecloses no packaging path. For point/next_ts/prev_ts (single int64 arg) the saving is proportionally large because the C work is tiny. Land per-method with the existing _i64 overflow-checked extractor reused instead of PyArg_ParseTuple 'L'.",
+            "effort": "medium",
+            "confidence": "high",
+            "citations": [
+              "https://docs.python.org/3/c-api/call.html",
+              "https://docs.python.org/3/c-api/stable.html"
+            ]
+          },
+          {
+            "statement": "Add a dedicated 'import-and-assert-FT' wheel test that, under cp314t with PYTHON_GIL=0, asserts sysconfig Py_GIL_DISABLED==1 AND sys._is_gil_enabled() is False AND timelog imports without re-enabling the GIL — and FAIL the wheel build if the GIL got auto-re-enabled.",
+            "rationale": "Because Py_mod_gil=Py_MOD_GIL_NOT_USED is set, a regression that flips it (or a transitive C dep that lacks the slot) would silently re-enable the runtime GIL and the wheel would still pass functional tests while losing all FT benefit. The repo already has this assertion in sanitizers.yml/compatibility-baseline but NOT as a gating step inside the cibuildwheel test-command for the shipped wheel. Move the assertion into pyproject [[tool.cibuildwheel.overrides]] select='cp314t-*' test so every released FT wheel is verified GIL-free at build time.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://py-free-threading.github.io/ci/",
+              "https://docs.python.org/3/howto/free-threading-python.html"
+            ]
+          },
+          {
+            "statement": "Audit every Py_BEGIN_CRITICAL_SECTION region in the binding (TL_PY_OBJ_LOCK / L4) to confirm none of them call into the C core or acquire core_lock/PyMutex while the section is held, and add a code-comment + a debug assertion guard that flags re-entrant blocking inside a held per-object critical section.",
+            "rationale": "The official FT docs newly clarify that a critical section is SUSPENDED (its lock released) if the thread blocks while holding it — so a per-object lock that wraps a call which then takes core_lock provides ZERO mutual exclusion for the object fields during that window. CLAUDE.md's lock ordering (maint->flush->writer->memtable) and the L1>L2>L4 Python lock layering make this a real, easy-to-introduce footgun. A targeted audit + assert turns a silent correctness hole into a build-time failure.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://docs.python.org/3/howto/free-threading-extensions.html",
+              "https://docs.python.org/3/c-api/synchronization.html"
+            ]
+          },
+          {
+            "statement": "Make PageSpan's 'exports' buffer-export counter and the close-while-exported guard fully atomic (or move them under the existing L4 critical section consistently), and add an FT stress test that races bf_getbuffer/bf_releasebuffer against close() across threads on 3.14t.",
+            "rationale": "Under FT, two threads can call getbuffer/releasebuffer and close concurrently. If 'exports' is a plain int incremented in bf_getbuffer and checked in close, the increment/check is a data race that can let close() proceed while a buffer is live -> use-after-free of the page memory the buffer points at. The brief confirms the buffer protocol is already implemented; this hardens it for the officially-supported FT tier. The pages themselves are immutable so the data is safe, but the lifetime/export bookkeeping is the race.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://docs.python.org/3/howto/free-threading-extensions.html",
+              "https://docs.python.org/3/c-api/buffer.html"
+            ]
+          },
+          {
+            "statement": "Do NOT pursue a plain abi3 single-wheel strategy; instead document an explicit 'abi3t in the 3.15 era' migration note in docs/internals/components/python-binding-architecture.md listing the three prerequisites: (1) static types -> PyType_FromSpec heap types, (2) PyModuleDef -> PyModExport (PEP 793), (3) stop embedding PyObject ob_base directly per opaque-PyObject (PEP 803).",
+            "rationale": "The .ideas notes repeatedly push abi3 as a quick win to 'widen install base', but PEP 803 proves plain abi3 is INCOMPATIBLE with the free-threaded build that Timelog headlines — so a single abi3 wheel cannot serve FT users today. Capturing the real future path (abi3t, 3.15+, behind PyModExport + heap-type conversion) prevents wasted effort and records the precise blockers (Timelog's static IMMUTABLETYPE structs). This is an idea to NOT do something, plus a concrete future checklist.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://peps.python.org/pep-0803/",
+              "https://peps.python.org/pep-0793/",
+              "https://github.com/python/cpython/issues/98410"
+            ]
+          },
+          {
+            "statement": "Add a pyperformance-style single-thread overhead guard to CI that fails if the cp314t (free-threaded) wheel is >15% slower than the cp314 (GIL) wheel on Timelog's own append/range microbench, mirroring PEP 779's official supported-status bar.",
+            "rationale": "PEP 779 codifies <=15% single-thread slowdown as the line CPython itself commits to. Timelog should hold its OWN binding to the same bar, because a poorly-placed lock or refcount-heavy path can blow the single-thread FT budget even when CPython's core stays within it. Tying the gate to the exact PEP-779 threshold gives a principled, citable pass/fail instead of an arbitrary number, and catches regressions where FT correctness fixes accidentally tax the single-thread path.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://peps.python.org/pep-0779/",
+              "https://docs.python.org/3/whatsnew/3.14.html"
+            ]
+          }
+        ],
+        "corrections": [
+          "The .ideas notes (doc_7/doc_19) say to 'Convert module init to multiphase (PEP 489)' as future work — this is ALREADY DONE: module.c uses Py_mod_exec multiphase init with PyModuleDef_Slot, Py_mod_multiple_interpreters=Py_MOD_PER_INTERPRETER_GIL_SUPPORTED, and Py_mod_gil=Py_MOD_GIL_NOT_USED.",
+          "The notes treat free-threading as '3.14 free-threaded when available' / aspirational. As of 2025-06-16 PEP 779 is FINAL and FT is OFFICIALLY SUPPORTED (Phase II) in 3.14, no longer experimental; Timelog already ships cp314t wheels. The framing is outdated.",
+          "The notes (doc_7/doc_19) advise targeting abi3 to 'widen install base / cut user pain'. This is now wrong for Timelog: PEP 803 establishes that plain abi3 is INCOMPATIBLE with free-threaded builds (fails when Py_LIMITED_API+Py_GIL_DISABLED) until the separate abi3t variant arrives in 3.15. A single abi3 wheel cannot serve Timelog's FT users today.",
+          "The notes lean heavily on HPy (doc_4/doc_19/doc_20/doc_21) as the migration vehicle for subinterp/FT/abi safety. Ground truth: Timelog is a hand-written C-API extension and has ALREADY achieved subinterpreter isolation (PER_INTERPRETER_GIL) and FT support (Py_MOD_GIL_NOT_USED) WITHOUT HPy, using PyMutex/Py_BEGIN_CRITICAL_SECTION/Treiber stack/seqlock. HPy is not needed and is not adopted; the HPy-centric plans are moot.",
+          "The notes' CI matrices (doc_10/doc_19/doc_20) list ABI variants 'pyo3, hpy-hybrid, hpy-universal, vectorcall' and Python '3.9->3.13'. Reality: Timelog is not Rust/pyo3 and not HPy; requires-python is >=3.12; the real matrix is cp312/cp313/cp314 + cp314t (Linux), with 3.13t intentionally omitted per pyproject. The doc matrices do not reflect the actual binding or version floor.",
+          "The notes assert 'vectorcall' as if it were an existing build variant of Timelog. Confirmed FALSE: there is zero METH_FASTCALL/vectorcall usage anywhere in bindings/cpython/src; all hot methods are METH_VARARGS + PyArg_ParseTuple. vectorcall is an opportunity, not a shipped feature.",
+          "The notes (doc_19) say cibuildwheel build matrix should include '3.14 free-threaded when available' as conditional. As of cibuildwheel 3.0 cp314t is built BY DEFAULT (no enable flag); only cp313t needs CIBW_ENABLE: cpython-freethreading. The conditional framing is outdated."
+        ]
+      },
+      {
+        "strand": "inmemory-search-merge-simd",
+        "key_findings": [
+          {
+            "topic": "Eytzinger (BFS) layout + branchless + prefetch binary search",
+            "finding": "Khuong & Morin, 'Array Layouts for Comparison-Based Searching' (arXiv:1509.05053): for large n the Eytzinger (BFS) layout 'is usually the fastest' general-purpose layout; their fastest C++ implementations 'use conditional moves to avoid branch mispredictions and prefetching to reduce cache latency' — i.e. the win comes from combining branch-free code + explicit prefetch, NOT from the layout alone. The Algorithmica HPC writeup quantifies it: branchless cmov lower_bound is ~2.5-3x faster than std::lower_bound on in-cache arrays; Eytzinger+prefetch is ~2.5x (small) and ~2x (large/out-of-cache) vs std::lower_bound, with prefetch (__builtin_prefetch(t + k*16), fetching the 16 great-great-grandchildren one cache line ahead, 64-byte aligned) giving 3-4x over the non-prefetched Eytzinger version on large arrays. Eytzinger also enables a fixed-iteration unrolled loop with NO loop-termination branch.",
+            "timelog_relevance": "Directly applies to tl_page_lower_bound/tl_page_upper_bound and tl_record_lower_bound (the branchy lo/hi loop in core/src/storage/tl_page.c and core/src/internal/tl_search.h). With the DEFAULT 64 KiB page (~4096 records, ts[] ~32 KiB = ~512 cache lines), a single depth-~12 binary search touches ~12 cold lines across a 32 KiB span — exactly the out-of-cache-per-page regime where prefetch/Eytzinger win. Note: CLAUDE.md's '~4KB page' model diagram is stale.",
+            "citations": [
+              "https://arxiv.org/abs/1509.05053",
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/"
+            ]
+          },
+          {
+            "topic": "Branchless lower_bound on integers (drop-in, no layout change)",
+            "finding": "mhdm.dev 'Fastest Branchless Binary Search' (sb_lower_bound): a power-of-two-step cmov formulation (first = comp(first[half], value) ? first+(length-half) : first; length=half) measured 33.24 ns vs 61.30 ns for std::lower_bound (avg, ~1.84x; geomean ~1.98x) when the compiler emits cmov. A prefetching variant (sbp_lower_bound) helps only at large/RAM-bound sizes: at 512 MB datasets it drops ~71 ns -> ~26 ns (~2.3x), i.e. prefetch adds ~27% there but ~0% when the array fits in cache. Algorithmica corroborates branchless degrades vs branchy on LARGE arrays unless you add prefetch, because branches let the CPU speculatively prefetch both children.",
+            "timelog_relevance": "This is the lowest-effort, highest-confidence win: rewrite tl_*_lower_bound as a branchless cmov loop, no data-layout change, keeps the sorted SoA ts[] arrays and all existing invariants. For Timelog's per-page search over a 32 KiB ts[] array (not cache-resident across many pages/segments), the branchless form should net ~1.5-2x on the search itself.",
+            "citations": [
+              "https://mhdm.dev/posts/sb_lower_bound/",
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/"
+            ]
+          },
+          {
+            "topic": "Loser/tournament tree vs binary min-heap for k-way merge",
+            "finding": "A binary min-heap does ~2*log2(k) comparisons per output element (sift-down must compare BOTH children at each level to find the smaller before descending), whereas a loser/tournament tree does ~log2(k) (single leaf-to-root pass, one comparison per level) — both O(n log k) but the constant factor halves (Wikipedia k-way merge; corroborated by Aidan Lakshman's loser-tree writeup and the Demuth 1956 origin). Loser trees also have a FIXED leaf-to-root path with no 'which child is smaller' data-dependent branch, friendlier to branch prediction; cost is ~2x the memory (2k vs k slots). Grafana reported 5-12x in Prometheus, but that number is inflated by replacing Go's container/heap interface-dispatch overhead, not the pure algorithm.",
+            "timelog_relevance": "Timelog's read path uses a flat-array binary min-heap (tl_heap_t in core/src/internal/tl_heap.{c,h}) driving tl_kmerge_iter_next via peek + replace_top (replace_top already avoids the pop+push double-sift, so it's the GOOD heap variant). A loser tree would still roughly halve comparison count per record. Honest expectation here (no interface overhead to remove) is modest single-digit-to-~1.5x on merge-bound queries with many sources (large K = memtable + many L0 + L1 segments), NOT Grafana's 5-12x. tl_submerge (delta k-way merge) is a second candidate.",
+            "citations": [
+              "https://en.wikipedia.org/wiki/K-way_merge_algorithm",
+              "https://www.ahl27.com/posts/2024/12/loser-trees-io/",
+              "https://grafana.com/blog/the-loser-tree-data-structure-how-to-optimize-merges-and-make-your-programs-run-faster/"
+            ]
+          },
+          {
+            "topic": "SIMD vectorized search / batch lower_bound (AVX2/AVX-512)",
+            "finding": "Cannizzo 'Fast and Vectorizable Alternative to Binary Search' (arXiv:1506.08620 / FastBinarySearch): an index-based O(1) + vectorized approach reaches throughput 'up to two orders of magnitude larger than the classic binary search'; the repo's benchmarks show ~33x (scalar Direct/DirectFMA) and ~70x (AVX2, ~993 Mops/s) over std::lower_bound — BUT this is THROUGHPUT across MANY independent queries processed in parallel (and the published code targets floating-point keys), not latency of one query. An AVX-512 register holds 8x int64. For a within-block scan, a vectorized linear lower_bound (load 8 int64, _mm512_cmplt, popcount the mask) is a strong replacement for the last 1-2 levels of binary search inside a page.",
+            "timelog_relevance": "Two distinct opportunities: (a) a SIMD batch-search API (search N timestamps at once) for the binding's point/equal/range-start path — large throughput win but needs a new batched entry point; (b) hybrid intra-page search: binary search down to a small window then AVX2/AVX-512 (or GCC/Clang vector extensions, since core is C17 and std::simd is C++26-only) linear-scan the final ~16-64 element block of ts[]. Lands in tl_page.c. Caveat: int64 keys, runtime CPU dispatch needed (AVX-512 not universal).",
+            "citations": [
+              "https://github.com/fabiocannizzo/FastBinarySearch",
+              "https://arxiv.org/pdf/1506.08620",
+              "https://lucisqr.substack.com/p/c26-shipped-a-simd-library-nobody"
+            ]
+          },
+          {
+            "topic": "SIMD merge of two sorted runs (bitonic merge networks)",
+            "finding": "AVX-512 bitonic merge of two equal-length sorted arrays (min/max + shuffle, no branches) is reported >2.94x faster than a traditional scalar merge, sustaining >300M keys/s single-thread (>16B/s parallel) in the merge-sort literature; other AVX-512 sort/merge work reports 2x over Intel IPP and ~5x over quicksort. These apply to merging exactly TWO sorted streams of equal element width.",
+            "timelog_relevance": "Relevant to the binary 2-way portions of compaction/flush merges and potentially the dominant 2-source case of query merge, but Timelog's hot merge is k-way (heap over many sources) and carries a (ts,handle,tie,watermark) tuple, not a bare key — bitonic merge networks operate on keys and don't natively carry the handle/tie payload. Lower confidence for the query path; more applicable to compaction's pairwise sorted-run merges (core/src/maint). Treat as a longer-horizon idea.",
+            "citations": [
+              "https://www.semanticscholar.org/paper/A-Fast-and-Simple-Approach-to-Merge-Sorting-using-Watkins/8705d00ca9085aa1c592f230d9040519263645f6",
+              "https://arxiv.org/html/2409.03970v1"
+            ]
+          },
+          {
+            "topic": "Interpolation search for near-uniform timestamps",
+            "finding": "Interpolation search averages ~O(log log n) comparisons on uniformly-distributed keys vs O(log n) for binary search, but degrades to O(n) worst-case on skewed/clustered data and is branch-heavy with a data-dependent (costly integer divide) probe; cache behavior is unpredictable because probe positions jump non-monotonically. Hybrid 'interpolated binary search' (one interpolation probe to seed, then bounded binary search) is the robust middle ground (ScienceDirect S221509862100046X; MDPI 2024/1394).",
+            "timelog_relevance": "Timestamps in a time-index are often near-uniform within a page, so a single interpolation probe to seed the binary search bounds (then fall back to the existing branchless binary search) could cut depth on hot in-order pages — but it must be guarded against adversarial/bursty timestamp clustering (Timelog explicitly supports OOO + arbitrary ts). Medium-risk; only worth it if benchmarked on real ts distributions. Would land alongside tl_page_lower_bound as an optional seeded variant.",
+            "citations": [
+              "https://en.wikipedia.org/wiki/Interpolation_search",
+              "https://www.sciencedirect.com/science/article/pii/S221509862100046X",
+              "https://www.mdpi.com/2227-7390/12/9/1394"
+            ]
+          },
+          {
+            "topic": "Cache-line / block layout for fence pointers (page catalog)",
+            "finding": "Khuong/Morin and the cache-miss-during-merge literature both conclude that data layout (clustering hot comparison targets into cache lines) frequently beats software prefetching, and that an implicit B-tree / blocked layout that packs the keys compared near the search root into the same cache line minimizes the per-search miss count. For a two-level search (catalog -> page), the first few probes dominate misses.",
+            "timelog_relevance": "tl_page_catalog (core/src/storage/tl_page.h) stores tl_page_meta_t {min_ts,max_ts,count,flags,page*} = 32 bytes per entry, and tl_page_catalog_find_first_ge binary-searches on max_ts. The interleaved AoS layout means a binary search over the catalog pulls a full 32B (only 8B of which, max_ts, is the search key) per probe — only 2 keys per cache line. Splitting the catalog into a separate dense max_ts[] array (SoA) packs 8 keys/line, ~4x fewer cache lines touched during catalog navigation. Low effort, no invariant impact.",
+            "citations": [
+              "https://arxiv.org/abs/1509.05053",
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/"
+            ]
+          }
+        ],
+        "new_ideas": [
+          {
+            "statement": "Replace the branchy lo/hi loops in tl_page_lower_bound, tl_page_upper_bound (core/src/storage/tl_page.c) and tl_record_lower_bound (core/src/internal/tl_search.h) with a branchless power-of-two-step cmov form (sb_lower_bound pattern), keeping sorted SoA ts[] arrays unchanged.",
+            "rationale": "Lowest-risk, no-layout-change, no-invariant-impact win. Measured ~1.8-2x on the search itself when the compiler emits cmov; Timelog's per-page ts[] (~32 KiB for a 64 KiB page) is not cache-resident across many pages/segments, so the branch-misprediction-free form helps. Verify cmov is actually emitted (GCC may need help; clang has -x86-cmov-converter=false) and gate behind a microbenchmark since branchless can lose on huge arrays without prefetch.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://mhdm.dev/posts/sb_lower_bound/",
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/"
+            ]
+          },
+          {
+            "statement": "Split tl_page_catalog from AoS tl_page_meta_t[] into SoA parallel arrays (dense max_ts[] / min_ts[] + a separate page*/meta array), and binary-search the dense max_ts[] in tl_page_catalog_find_first_ge / find_start_ge.",
+            "rationale": "Current 32B-per-entry AoS layout fits only 2 search keys per 64B cache line; a dense int64 max_ts[] fits 8/line, cutting cache lines touched during catalog navigation ~4x. Catalog search is the FIRST step of every segment probe (cold), so it disproportionately drives miss count. No invariant change (sortedness preserved); only touches storage/tl_page.{c,h} and segment iterator build.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://arxiv.org/abs/1509.05053",
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/"
+            ]
+          },
+          {
+            "statement": "Add a hybrid intra-page search: branchless binary search down to a small window (~16-32 records), then an AVX2/AVX-512 vectorized linear lower_bound over the final block of ts[] (load 8 int64, _mm512_cmplt_epi64_mask + popcount), using GCC/Clang vector extensions with runtime CPU dispatch (core is C17, so std::simd C++26 is unavailable).",
+            "rationale": "The last few binary-search levels each touch a fresh cache line for one comparison; a SIMD scan of a contiguous final block amortizes one or two cache lines across 8-16 comparisons and removes the unpredictable terminal branches. Within-block vectorized search is a known DB technique. Effort/risk from runtime dispatch + portability (NEON for ARM wheels) and the int64 width; gate behind capability detection.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://github.com/fabiocannizzo/FastBinarySearch",
+              "https://medium.com/@vaclav.loffelmann/vectorizing-database-operations-with-avx-512-e759ce59abd3"
+            ]
+          },
+          {
+            "statement": "Convert the read-path k-way merge from the binary min-heap (tl_heap_t) to a loser/tournament tree for the merge iterators (tl_merge_iter and tl_submerge), preserving the (ts, tie_break_key, handle, watermark) entry and the existing tie-break ordering.",
+            "rationale": "Halves comparisons per emitted record (~log2(k) vs ~2*log2(k)) and uses a fixed branch-free leaf-to-root update path. Most impactful when K is large (memtable + OOO runs + many L0 + L1 segments). Be honest: Timelog already uses replace_top (no pop+push double-sift) on a flat array (no Go-style interface overhead), so expect single-digit-% to ~1.5x on merge-bound queries, not Grafana's 5-12x. Costs ~2x heap memory and a careful rewrite that must preserve deterministic tie-break + watermark propagation.",
+            "effort": "high",
+            "confidence": "medium",
+            "citations": [
+              "https://en.wikipedia.org/wiki/K-way_merge_algorithm",
+              "https://www.ahl27.com/posts/2024/12/loser-trees-io/"
+            ]
+          },
+          {
+            "statement": "Add a software-prefetch hint at the start of each segment/page merge-source advance: prefetch the next page's ts[] (and the catalog's next max_ts cache line) when a segment iterator crosses a page boundary, since merge consumes pages sequentially and page boundaries are predictable.",
+            "rationale": "Unlike random binary search, the k-way merge walks each source's pages in order, so the next page to be touched is known — a textbook prefetch-friendly pattern. __builtin_prefetch of the upcoming ts[] base hides DRAM latency behind merge comparison work. Very low effort, localized to tl_segment_iter.c page-advance; benefit scales with result size M (range scans) where page transitions dominate.",
+            "effort": "low",
+            "confidence": "medium",
+            "citations": [
+              "https://en.algorithmica.org/hpc/data-structures/binary-search/",
+              "https://mhdm.dev/posts/sb_lower_bound/"
+            ]
+          },
+          {
+            "statement": "Expose a batched/vectorized multi-point search entry point (search N sorted query timestamps against a snapshot in one call) and route the CPython binding's bulk point/equal/range-start operations through it, processing independent searches in SIMD lanes.",
+            "rationale": "The vectorized-search throughput wins (FastBinarySearch: up to ~70x AVX2, 'two orders of magnitude') are realized only across MANY independent queries, not a single lookup — so the win requires a batch API, which Timelog currently lacks (all hot methods are single-query METH_VARARGS). Pairs naturally with the not-yet-done METH_FASTCALL/vectorcall conversion noted in ground truth. Higher effort (new API surface + binding plumbing) and the gain is workload-dependent (only bulk-query users benefit).",
+            "effort": "high",
+            "confidence": "low",
+            "citations": [
+              "https://github.com/fabiocannizzo/FastBinarySearch",
+              "https://arxiv.org/pdf/1506.08620"
+            ]
+          },
+          {
+            "statement": "Add an optional interpolation-seeded binary search variant for in-order pages with near-uniform timestamps: one interpolation probe to narrow [lo,hi), then the existing branchless binary search, guarded by a cheap uniformity check (or only enabled for FULLY_LIVE in-order L1 pages).",
+            "rationale": "Time-index pages are often near-uniform, where interpolation averages ~O(log log n); seeding the bounds can shave binary-search depth on hot pages. Must guard against Timelog's explicit OOO/clustered timestamps which trigger interpolation's O(n) worst case and an expensive integer divide per probe. Only worth shipping if a benchmark on representative ts distributions shows a win; keep the plain branchless path as default.",
+            "effort": "medium",
+            "confidence": "low",
+            "citations": [
+              "https://en.wikipedia.org/wiki/Interpolation_search",
+              "https://www.sciencedirect.com/science/article/pii/S221509862100046X"
+            ]
+          }
+        ],
+        "corrections": [
+          "CLAUDE.md's Page mental model says a Page is a '~4KB memory unit', but the actual default (TL_DEFAULT_TARGET_PAGE_BYTES in core/src/internal/tl_defs.h) is 64 KiB, yielding ~4096 records/page and a ~32 KiB ts[] array (~512 cache lines). This 16x larger page materially changes the search analysis: per-page binary search depth is ~12 and spans far more than one cache line, making Eytzinger/branchless/prefetch/SIMD relevant rather than negligible.",
+          "The .ideas notes (doc_15, doc_30, doc_33) are entirely about COMPACTION POLICY and I/O, not the search/merge query path — this strand is genuinely uncovered by them. doc_33 in particular (RESYSTANCE: io_uring + eBPF kernel-offload of compaction READ syscalls) is inapplicable: Timelog is strictly in-memory with NO disk/syscall I/O, so its ~50% compaction-time / ~99%-fewer-syscalls premise does not exist here.",
+          "Grafana's headline '5-12x faster' loser-tree claim should NOT be cited as the expected Timelog gain: that number largely reflects eliminating Go container/heap interface-dispatch overhead. Timelog already uses a flat-array C heap with replace_top (no pop+push double-sift), so the honest expectation from a loser tree is roughly halving comparison count (constant factor), i.e. single-digit-% to ~1.5x on merge-bound queries.",
+          "Any SIMD recommendation must account for Timelog being C17, not C++: std::simd is C++26 (P1928) and std::experimental::simd is GCC-only TS — so portable SIMD here means GCC/Clang vector extensions or direct x86intrin/NEON intrinsics with runtime CPU dispatch, and AVX-512 cannot be assumed present on target hardware."
+        ]
+      },
+      {
+        "strand": "competitive-positioning",
+        "key_findings": [
+          {
+            "topic": "bisect (stdlib) — the obvious naive competitor",
+            "finding": "The Python 3 stdlib `bisect` docs explicitly warn that insort_left/insort_right (and thus maintaining a sorted list via repeated inserts) are O(n): 'The insort() functions are O(n) because the logarithmic search step is dominated by the linear time insertion step.' So the canonical 'just use a sorted list + bisect' approach for a time index has O(n)-per-append cost. Timelog's documented O(1)-amortized in-order AND out-of-order append (via the OOO mini-LSM) is an asymptotic win for append-heavy streaming, which is exactly the workload bisect-on-a-list degrades on.",
+            "timelog_relevance": "Strongest single talking point: position Timelog as 'bisect that stays O(1) on append'. A direct microbench (append N points in time order, then random range queries) vs bisect.insort would be a clean, defensible headline number. Lands as a benchmark in the repo's bench suite; the append path is core/src/delta/ (memtable + tl_ooorunset).",
+            "citations": [
+              "https://docs.python.org/3/library/bisect.html"
+            ]
+          },
+          {
+            "topic": "numpy ndarray — not safe for concurrent mutation, esp. free-threaded",
+            "finding": "NumPy's official thread-safety page states: 'If two threads simultaneously read from and write to the same array, they will at best produce inconsistent, racey results...'; 'It is also possible to crash the Python interpreter by ... resizing an array while another thread is reading from it'; and for free-threaded builds 'arrays with dtype=np.object_ are not protected by the GIL, creating data races for python objects that are not possible outside free-threaded python.' NumPy's recommendation is to 'focus on read-only access ... or add your own locking.' numpy has no built-in ndarray locking. There is an open bug (numpy #27199) confirming object arrays are not thread-safe in the free-threading build.",
+            "timelog_relevance": "This is Timelog's sharpest differentiator. Timelog ships seqlock snapshot isolation + a Treiber retired-handle stack + Py_BEGIN_CRITICAL_SECTION, and explicitly supports 3.14t free-threading with Py_MOD_GIL_NOT_USED. The competing 'store int64 timestamps in a numpy array and searchsorted' approach is precisely the unsafe-under-concurrency pattern numpy warns against — and Timelog stores opaque PyObject* handles, the exact dtype=object case numpy says is racey under no-GIL. Positioning: 'concurrent readers + writer with zero data races, on free-threaded Python, over arbitrary Python objects.'",
+            "citations": [
+              "https://numpy.org/doc/stable/reference/thread_safety.html",
+              "https://github.com/numpy/numpy/issues/27199"
+            ]
+          },
+          {
+            "topic": "pandas — not thread-safe; and pandas 3.0 (Jan 2026) made Copy-on-Write the DEFAULT",
+            "finding": "pandas docs/issues acknowledge pandas is not 100% thread-safe (issue #2440 'underlying support code is not thread safe', #12420 about concurrent access to distinct DataFrames). Separately, pandas 3.0.0 was released 2026-01-21 and made Copy-on-Write the default: 'any indexing operation ... or any method returning a new DataFrame/Series always behaves as if it were a copy.' pandas 3.0 also defaults strings to a PyArrow-backed dtype.",
+            "timelog_relevance": "Two angles. (1) Concurrency: same unsafe-mutation story as numpy. (2) Trend validation: the whole ecosystem is converging on immutability/copy-semantics (pandas CoW, Arrow immutability) — which is exactly Timelog's snapshot/immutable-after-publication model. Frame Timelog's immutability not as a quirk but as where the ecosystem is already heading; Timelog gives copy-free snapshot reads (no full-frame copy) which CoW does not.",
+            "citations": [
+              "https://pandas.pydata.org/docs/whatsnew/v3.0.0.html",
+              "https://github.com/pandas-dev/pandas/issues/2440",
+              "https://github.com/pandas-dev/pandas/issues/12420"
+            ]
+          },
+          {
+            "topic": "sortedcontainers — the strongest pure-Python rival, but still list-shaped and not concurrency-safe",
+            "finding": "sortedcontainers (SortedList) is pure-Python yet 'fast as C-extensions', exposes irange() for lazy O(log n + k) range scans, and is the de-facto Python sorted-collection. Its docs claim faster-than-linear ops, but it is a single mutable structure with no snapshot isolation and no concurrency contract — concurrent mutation under threads (and especially free-threaded Python) is undefined. Its insert is amortized sub-linear via the list-of-lists design but still copies on the inner list.",
+            "timelog_relevance": "This is the library Timelog is most likely to be benchmarked against by a skeptical reviewer ('why not just SortedList?'). Differentiators to lead with: (a) snapshot isolation / readers-never-block-writers, which SortedList structurally cannot offer; (b) free-threading safety; (c) C-speed zero-copy buffer export of int64 timestamps (PageSpan), which a Python list-of-lists cannot. A head-to-head bench of concurrent reader+writer is where SortedList breaks and Timelog wins; single-thread append/irange may be closer and should be measured honestly.",
+            "citations": [
+              "https://grantjenks.com/docs/sortedcontainers/sortedlist.html",
+              "https://pypi.org/project/sortedcontainers/"
+            ]
+          },
+          {
+            "topic": "PyArrow — immutable columnar, but no in-place append and out-of-process-shaped",
+            "finding": "Arrow arrays/RecordBatches are immutable; you build a new batch or concatenate rather than append in place, and zero-copy slicing/filter exists but `zero_copy_only` raises when a copy would be required. Arrow ships free-threaded wheels from 18.0.0. Arrow is the in-memory format under DuckDB and InfluxDB 3 (DataFusion/FDAP stack).",
+            "timelog_relevance": "Arrow validates Timelog's immutability + zero-copy buffer story (PageSpan implements PEP 3118 over int64 ts arrays, interoperable conceptually with Arrow consumers). Gap to close: Timelog could export an Arrow C Data Interface (ArrowArray/ArrowSchema) view of a snapshot's timestamp columns for true zero-copy handoff to pyarrow/polars/duckdb — that would let Timelog be the *ingest+index* front-end feeding Arrow analytics, instead of competing with them.",
+            "citations": [
+              "https://arrow.apache.org/docs/python/generated/pyarrow.RecordBatch.html",
+              "https://py-free-threading.github.io/tracking/"
+            ]
+          },
+          {
+            "topic": "ArcticDB — the closest direct competitor (Python-first, versioned, append, snapshots)",
+            "finding": "ArcticDB (Man Group) is a Python-first, high-performance time-series DataFrame store with: append(), immutable persistent data structures ('once a version is written it can never be corrupted'), explicit snapshots that pin versions, and time-travel. But it is C++ engine + storage-backed (S3 / LMDB), DataFrame-shaped, and oriented to quant data-science persistence, not an in-process pure-RAM point index.",
+            "timelog_relevance": "ArcticDB is the strongest 'someone already built this' rebuttal and should be cited explicitly in positioning. Differentiation: Timelog is in-process, zero-storage, no-serialization, operates on opaque PyObject* handles (not DataFrames), and targets sub-microsecond per-op latency on hot in-RAM windows rather than versioned bulk frame persistence. Timelog and ArcticDB are complementary, not substitutes — say so.",
+            "citations": [
+              "https://github.com/man-group/ArcticDB",
+              "https://medium.com/arcticdb/time-travel-in-arcticdb-1403fbf00611"
+            ]
+          },
+          {
+            "topic": "QuestDB / InfluxDB 3 / DuckDB — out-of-process columnar SQL engines define the TSDB 'best' bar",
+            "finding": "QuestDB's Dec-2025 TSBS benchmarks claim ~11.36M rows/s ingest (up to 36x InfluxDB) and 21x-130x faster analytical aggregations; QuestDB uses a WAL + out-of-order buffering+sort 3-tier design. InfluxDB 3 (IOx) is the FDAP stack — Flight/DataFusion/Arrow/Parquet in Rust. DuckDB is OLAP-optimized: fast on bulk/zero-copy feeds but explicitly weak on many small INSERT/append calls. TSBS query taxonomy (the de-facto 'what is best' for TSDBs): single-groupby-N-N-N, double-groupby-{1,5,all}, cpu-max-all-{1,8}, high-cpu-{1,all}, lastpoint, groupby-orderby-limit; plus bulk-load rows/s and metrics/s.",
+            "timelog_relevance": "These set the *throughput* bar but are the wrong axis to compete on directly — they are server processes with SQL, network/IPC, and aggregation engines. Timelog's honest positioning is the opposite quadrant: embedded, in-process, no-IPC, per-op latency, arbitrary-object payloads. Borrow TSBS *query shapes* (lastpoint == Timelog point/prev_ts; groupby-orderby-limit == bounded range scan) as a credible vocabulary for Timelog's own benchmark harness, but don't claim to beat QuestDB on rows/s. The relevant metric for Timelog is single-op latency (p50/p99) and concurrent-reader scaling under free-threading, not aggregate ingest.",
+            "citations": [
+              "https://questdb.com/blog/influxdb-vs-questdb-comparison/",
+              "https://github.com/timescale/tsbs",
+              "https://www.infoq.com/articles/timeseries-db-rust/"
+            ]
+          },
+          {
+            "topic": "pyroaring / Roaring bitmaps — the set/range-membership rival",
+            "finding": "pyroaring wraps CRoaring; offers contains_range(start,end) and native bitwise AND/OR/ANDNOT set ops 'up to 900x faster' than alternatives; BitMap64 covers 0..2**64-1. It is excellent for dense/clustered integer *membership* and set algebra, but it is a value-set, not a (timestamp -> payload) map, and ordering/payload retrieval is not its model.",
+            "timelog_relevance": "Useful as a contrast, not a true competitor: roaring answers 'which timestamps exist in [t1,t2)' set-style but does not carry per-timestamp Python-object payloads nor snapshot isolation. If Timelog ever needs fast existence/cardinality over delete-tombstone ranges, a roaring-style compressed bitset is the reference design — potential internal optimization for the tombstone interval set (core/src/internal/intervals), not an external positioning rival.",
+            "citations": [
+              "https://github.com/Ezibenroc/PyRoaringBitMap",
+              "https://roaringbitmap.org/"
+            ]
+          },
+          {
+            "topic": "Free-threading: ship wheels != thread-safe; the ecosystem gap is real",
+            "finding": "Python 3.14 (released 2025-10-07) officially supports the free-threaded build. numpy (>=2.1), pandas (>=2.2.3), pyarrow (>=18.0.0), scipy (>=1.15) all ship free-threaded *wheels* — but shipping a free-threaded wheel only means the extension imports/runs without the GIL; it does NOT make the data structures safe for concurrent mutation (numpy explicitly says so). Free-threaded builds also carry a ~5-10% single-thread overhead in 3.14.",
+            "timelog_relevance": "Crucial nuance to get right in marketing: do NOT claim 'numpy/pandas don't run on free-threaded Python' (false — wheels exist). The accurate, defensible claim is 'numpy/pandas arrays/frames are not safe for concurrent MUTATION under free-threading; Timelog's append+query is.' That is the precise, citable wedge. The benchmark that proves it: N writer threads + M reader threads, measure throughput scaling and correctness — Timelog should scale where a locked numpy/SortedList serializes or races.",
+            "citations": [
+              "https://py-free-threading.github.io/tracking/",
+              "https://numpy.org/doc/stable/reference/thread_safety.html",
+              "https://www.danilchenko.dev/posts/python-314-free-threading/"
+            ]
+          }
+        ],
+        "new_ideas": [
+          {
+            "statement": "Add a published, reproducible 'Timelog vs the obvious alternatives' benchmark page covering exactly four contenders — bisect.insort+list, sortedcontainers.SortedList, numpy int64 array + searchsorted, and pandas DatetimeIndex — across three axes: (a) single-thread append throughput, (b) range-query latency p50/p99, (c) concurrent N-writer/M-reader correctness+throughput on 3.14t. Land it under docs/performance.md + a bench/competitive/ harness.",
+            "rationale": "Every skeptical reviewer's first question is 'why not just bisect / SortedList / numpy?'. The append-O(1) (vs bisect O(n)) and concurrent-mutation-safety (vs numpy/pandas/SortedList) wins are real and citable, but currently unproven in-repo. A single honest table converts hand-waving into evidence and pre-empts the rebuttal. The concurrency axis is where Timelog uniquely wins and nobody else can follow without a rewrite.",
+            "effort": "medium",
+            "confidence": "high",
+            "citations": [
+              "https://docs.python.org/3/library/bisect.html",
+              "https://numpy.org/doc/stable/reference/thread_safety.html"
+            ]
+          },
+          {
+            "statement": "Export a snapshot's timestamp column via the Arrow C Data Interface (ArrowArray/ArrowSchema structs) in addition to the existing PEP-3118 buffer, so a Timelog snapshot can be handed zero-copy to pyarrow/polars/duckdb for aggregation. Implement alongside PageSpan in bindings/cpython/src/py_span.c (new bf_* sibling that fills ArrowArray) gated by capsule name 'arrow_array'.",
+            "rationale": "Reframes the entire competitive story: instead of competing with Arrow/DuckDB/Polars on aggregation (a fight Timelog loses), Timelog becomes the concurrency-safe, append-O(1), snapshot-isolated *ingest+index front-end* that feeds them zero-copy. This turns competitors into downstream consumers and is the unique value no TSDB/dataframe lib offers in-process. PageSpan already proves the zero-copy plumbing exists; ADBC/Arrow CDI is the natural next protocol.",
+            "effort": "medium",
+            "confidence": "medium",
+            "citations": [
+              "https://arrow.apache.org/docs/python/generated/pyarrow.RecordBatch.html"
+            ]
+          },
+          {
+            "statement": "Adopt TSBS-derived query SHAPES as named, documented Timelog query primitives/benchmarks even though Timelog is not a SQL TSDB: 'lastpoint' (already ~prev_ts/point), 'groupby-orderby-limit' (bounded reverse range scan), 'high-cpu/threshold' (range scan + Python predicate). Add these as canonical bench scenarios in the bench suite and map them explicitly to existing methods in docs/performance.md.",
+            "rationale": "TSBS is the industry's shared vocabulary for 'what a time-series engine must do well'. Speaking that language (even while disclaiming the SQL/server scope) makes Timelog legible to anyone who has benchmarked QuestDB/Influx/Timescale, and forces honest coverage of the read patterns that matter (last-point and recent-window scans dominate real TS workloads), not just synthetic full scans.",
+            "effort": "low",
+            "confidence": "medium",
+            "citations": [
+              "https://github.com/timescale/tsbs",
+              "https://questdb.com/blog/influxdb-vs-questdb-comparison/"
+            ]
+          },
+          {
+            "statement": "Write a one-page 'Timelog is not a TSDB' positioning doc (docs/what-is-timelog.md addendum) that explicitly draws the quadrant: in-process vs server, point-handle-map vs columnar-SQL, latency vs throughput, mutation-safe-concurrency vs serialized. Name ArcticDB, QuestDB, DuckDB, sortedcontainers as the reference points and state which quadrant each occupies.",
+            "rationale": "ArcticDB (Python-first, append, immutable versions, snapshots, time-travel) is close enough that 'isn't this just ArcticDB?' is a real risk; QuestDB/Influx own the rows/s headline. Proactively drawing the map — embedded/in-RAM/opaque-object/latency-first — is more credible than implied superiority and prevents the project from being measured on axes it never intended to win (aggregate ingest rows/s, SQL analytics).",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://github.com/man-group/ArcticDB",
+              "https://questdb.com/blog/influxdb-vs-questdb-comparison/"
+            ]
+          },
+          {
+            "statement": "Evaluate a Roaring-bitmap-style compressed representation for the tombstone interval set (core/src/internal/intervals) and for a fast 'exists in [t1,t2)?' / approximate-count fast path, instead of (or alongside) the current sorted non-overlapping interval array.",
+            "rationale": "CRoaring's array/bitmap/run hybrid is the proven state of the art for dense+sparse integer-range membership and set algebra (union/intersect/andnot), exactly the operations tombstone coalescing and delete-debt estimation perform. For workloads with many small deletes, a roaring run-container could cut both memory and the coalescing cost, and give an O(1)-ish range-emptiness probe the current model lacks.",
+            "effort": "high",
+            "confidence": "low",
+            "citations": [
+              "https://roaringbitmap.org/",
+              "https://github.com/Ezibenroc/PyRoaringBitMap"
+            ]
+          },
+          {
+            "statement": "Make the headline competitive claim precise and defensible everywhere in docs/marketing: 'concurrent-mutation-safe time index under free-threaded Python over arbitrary Python objects' — and explicitly NOT 'numpy/pandas don't work without the GIL'. Add a callout in docs/performance.md citing numpy's own thread-safety page.",
+            "rationale": "numpy/pandas/pyarrow DO ship free-threaded wheels (verified), so a 'they don't run' claim is false and would discredit the project. The true, citable wedge is that their arrays/frames are not safe for concurrent mutation (numpy says so in its own docs and tells users to add their own locking). Using numpy's own words as the citation is far stronger than an unqualified speed claim.",
+            "effort": "low",
+            "confidence": "high",
+            "citations": [
+              "https://numpy.org/doc/stable/reference/thread_safety.html",
+              "https://py-free-threading.github.io/tracking/"
+            ]
+          }
+        ],
+        "corrections": [
+          "doc_34.md (the only .ideas note doing competitive paradigm-mapping) is storage-engine-centric (InfluxDB TSM, RocksDB, Cassandra SSTables) and contains NO Python-ecosystem competitors — it entirely omits the actually-most-relevant rivals for 'a time index for Python': bisect, sortedcontainers, numpy/pandas, pyarrow, and ArcticDB. The notes treat Timelog as a TSDB-like engine; the sharper positioning is 'embedded in-process Python data structure', a quadrant doc_34 never considers.",
+          "The .ideas notes repeatedly assume an HPy-vs-CPython-vectorcall and Rust-FFI/Arrow-Flight framing (doc_13/16/20/24/31/32/36/37), implying cross-process or cross-language transport overhead is the competitive battleground. For competitive positioning that is a red herring: Timelog's edge is in-process zero-IPC over PyObject* handles — the Flight/FFI transport comparisons describe a different product shape than the one that actually differentiates Timelog from numpy/SortedList.",
+          "Notes predate pandas 3.0, which shipped 2026-01-21 making Copy-on-Write the default and PyArrow-backed strings default. Any positioning that contrasts Timelog's immutability against 'mutable pandas' is now outdated — pandas itself moved to copy/immutable semantics, so the framing must shift from 'we're immutable, they're not' to 'the ecosystem (pandas CoW, Arrow) converged on our model; we add copy-free snapshots + concurrency safety on top'.",
+          "No .ideas note mentions that numpy/pandas/pyarrow already ship free-threaded wheels (numpy>=2.1, pandas>=2.2.3, pyarrow>=18.0.0). Any positioning that implies competitors 'can't run on no-GIL' would be factually wrong as of 2025-2026; the correct, narrower claim is mutation-concurrency-safety, not runnability."
+        ]
+      }
+    ]
+  }
+}

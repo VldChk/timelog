@@ -1,0 +1,35 @@
+{
+  "pinned_cpu": true,
+  "python": "3.13.12",
+  "module": "/home/vldvhk/Documents/timelog/python/timelog/_timelog.cpython-313-x86_64-linux-gnu.so",
+  "ops": {
+    "append_ts_obj": {
+      "ns_per_op_median": 125.752076,
+      "ns_per_op_min": 122.804166,
+      "ns_per_op_p50": 125.752076,
+      "reps": 5,
+      "iters": 1000000
+    },
+    "point_ts": {
+      "ns_per_op_median": 372.656475,
+      "ns_per_op_min": 368.189259,
+      "ns_per_op_p50": 372.656475,
+      "reps": 5,
+      "iters": 1000000
+    },
+    "next_ts": {
+      "ns_per_op_median": 321.093912,
+      "ns_per_op_min": 317.237223,
+      "ns_per_op_p50": 321.093912,
+      "reps": 5,
+      "iters": 1000000
+    }
+  },
+  "facade_append_obj_ts": {
+    "ns_per_op_median": 307.055113,
+    "ns_per_op_min": 296.323754,
+    "ns_per_op_p50": 307.055113,
+    "reps": 5,
+    "iters": 1000000
+  }
+}

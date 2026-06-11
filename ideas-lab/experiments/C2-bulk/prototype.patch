@@ -1,0 +1,244 @@
+diff --git a/bindings/cpython/src/py_timelog.c b/bindings/cpython/src/py_timelog.c
+index e6a0ed4..de77ddd 100644
+--- a/bindings/cpython/src/py_timelog.c
++++ b/bindings/cpython/src/py_timelog.c
+@@ -45,6 +45,8 @@ static PyObject* PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args));
+ static PyObject* PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args));
+ static PyObject* PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
+ static PyObject* PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
++static PyObject* PyTimelog_bulk_append(PyTimelog* self, PyObject* args,
++                                       PyObject* kwds);
+ static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject* args);
+ static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject* args);
+ static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
+@@ -1840,6 +1842,213 @@ error_stream:
+     return NULL;
+ }
+ 
++/*===========================================================================
++ * PyTimelog_bulk_append
++ *
++ * Typed-buffer bulk append fast path. Accepts:
++ *   - timestamps: a buffer-protocol object of contiguous 1-D int64
++ *     (e.g. numpy int64 array, array.array('q')). Format 'q' or 'l'
++ *     (8-byte signed) are accepted.
++ *   - objects: a sequence (list/tuple/...) of length == len(timestamps).
++ *
++ * The win over extend([(ts, obj), ...]) is skipping per-element Python
++ * tuple construction and PyArg_ParseTuple dispatch: timestamps are read
++ * directly from the contiguous native buffer; objects are fetched by
++ * fast index. Encoding handles + INCREF still requires an attached Python
++ * thread state, so this is a dispatch/unpack win, not a thread-detach win.
++ *
++ * Semantics are stricter than facade extend(): this is a typed-buffer fast
++ * path for concrete sequences, not a generator/coercion/insert_on_error
++ * replacement. TL_EBUSY means all records WERE committed; do NOT rollback
++ * or retry.
++ *===========================================================================*/
++
++static PyObject*
++PyTimelog_bulk_append(PyTimelog* self, PyObject* args, PyObject* kwds)
++{
++    CHECK_CLOSED(self);
++
++    PyObject* ts_obj = NULL;
++    PyObject* objects = NULL;
++    int mostly_ordered = 0;
++    static char* kwlist[] = {"timestamps", "objects", "mostly_ordered", NULL};
++
++    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|p", kwlist,
++                                     &ts_obj, &objects, &mostly_ordered)) {
++        return NULL;
++    }
++
++    /* Acquire a contiguous int64 view over the timestamps buffer. */
++    Py_buffer ts_view;
++    if (PyObject_GetBuffer(ts_obj, &ts_view,
++                           PyBUF_FORMAT | PyBUF_C_CONTIGUOUS) < 0) {
++        return NULL;
++    }
++
++    if (ts_view.ndim != 1) {
++        PyBuffer_Release(&ts_view);
++        PyErr_SetString(PyExc_ValueError,
++            "bulk_append() timestamps must be a 1-D buffer");
++        return NULL;
++    }
++
++    if (ts_view.itemsize != (Py_ssize_t)sizeof(int64_t)) {
++        PyBuffer_Release(&ts_view);
++        PyErr_SetString(PyExc_ValueError,
++            "bulk_append() timestamps must have 8-byte items (int64)");
++        return NULL;
++    }
++
++    /* Validate element format: signed 8-byte integer ('q' or 'l'). The
++     * format string may be NULL when the exporter does not provide one
++     * (treated as unsigned bytes by the protocol). Require an explicit
++     * signed 8-byte code to avoid silently misreading floats/unsigned. */
++    {
++        const char* fmt = ts_view.format;
++        int ok = 0;
++        if (fmt != NULL) {
++            const char* p = fmt;
++            /* Skip a leading byte-order/standard-size modifier if present. */
++            if (*p == '@' || *p == '=' || *p == '<' || *p == '>' || *p == '!') {
++                p++;
++            }
++            /* 'q' = long long, 'l' = long. itemsize already pinned to 8. */
++            if ((p[0] == 'q' || p[0] == 'l') && p[1] == '\0') {
++                ok = 1;
++            }
++        }
++        if (!ok) {
++            PyBuffer_Release(&ts_view);
++            PyErr_SetString(PyExc_ValueError,
++                "bulk_append() timestamps must be int64 "
++                "(buffer format 'q' or 'l')");
++            return NULL;
++        }
++    }
++
++    Py_ssize_t n = ts_view.shape[0];
++
++    /* Fetch objects as a fast sequence (list/tuple). */
++    PyObject* seq = PySequence_Fast(objects,
++        "bulk_append() objects must be a sequence");
++    if (seq == NULL) {
++        PyBuffer_Release(&ts_view);
++        return NULL;
++    }
++
++    Py_ssize_t n_obj = PySequence_Fast_GET_SIZE(seq);
++    if (n_obj != n) {
++        Py_DECREF(seq);
++        PyBuffer_Release(&ts_view);
++        PyErr_Format(PyExc_ValueError,
++            "bulk_append() length mismatch: %zd timestamps, %zd objects",
++            n, n_obj);
++        return NULL;
++    }
++
++    if (n == 0) {
++        Py_DECREF(seq);
++        PyBuffer_Release(&ts_view);
++        Py_RETURN_NONE;
++    }
++
++    if ((size_t)n > SIZE_MAX / sizeof(tl_record_t)) {
++        Py_DECREF(seq);
++        PyBuffer_Release(&ts_view);
++        return PyErr_Format(PyExc_OverflowError, "batch size too large");
++    }
++
++    tl_record_t* records = (tl_record_t*)malloc((size_t)n * sizeof(tl_record_t));
++    PyObject** objs = (PyObject**)malloc((size_t)n * sizeof(PyObject*));
++    if (records == NULL || objs == NULL) {
++        free(records);
++        free(objs);
++        Py_DECREF(seq);
++        PyBuffer_Release(&ts_view);
++        return PyErr_NoMemory();
++    }
++
++    const int64_t* ts_arr = (const int64_t*)ts_view.buf;
++
++    for (Py_ssize_t i = 0; i < n; i++) {
++        long long ts_ll = (long long)ts_arr[i];
++        if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
++            /* Rollback INCREFs done so far. */
++            for (Py_ssize_t j = 0; j < i; j++) {
++                Py_DECREF(objs[j]);
++            }
++            free(records);
++            free(objs);
++            Py_DECREF(seq);
++            PyBuffer_Release(&ts_view);
++            return NULL;
++        }
++
++        PyObject* obj = PySequence_Fast_GET_ITEM(seq, i); /* borrowed */
++        Py_INCREF(obj);
++        objs[i] = obj;
++        records[i].ts = (tl_ts_t)ts_ll;
++        records[i].handle = tl_py_handle_encode(obj);
++    }
++
++    /* The objects buffer is fully captured into records[]/objs[] with owned
++     * references; we no longer need the timestamp buffer view. */
++    PyBuffer_Release(&ts_view);
++
++    {
++        uint32_t flags = mostly_ordered ? TL_APPEND_HINT_MOSTLY_IN_ORDER : 0;
++        tl_status_t st;
++        if (tl_py_lock_checked(self) < 0) {
++            for (Py_ssize_t i = 0; i < n; i++) {
++                Py_DECREF(objs[i]);
++            }
++            free(records);
++            free(objs);
++            Py_DECREF(seq);
++            return NULL;
++        }
++        tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
++        st = tl_append_batch(self->tl, records, (size_t)n, flags);
++        TL_PY_UNLOCK(self);
++
++        if (st == TL_OK || st == TL_EBUSY) {
++            for (Py_ssize_t i = 0; i < n; i++) {
++                (void)tl_py_live_note_insert(hctx, objs[i]);
++            }
++
++            if (st == TL_EBUSY) {
++                if (tl_py_handle_write_ebusy(self,
++                        "Backpressure during bulk insert. "
++                        "All records were committed. "
++                        "Call flush() or wait for background maintenance to relieve.") < 0) {
++                    tl_py_handle_ctx_decref(hctx);
++                    free(records);
++                    free(objs);
++                    Py_DECREF(seq);
++                    return NULL;
++                }
++            }
++
++            free(records);
++            free(objs);
++            Py_DECREF(seq);
++            tl_py_drain_retired(hctx, 0);
++            tl_py_handle_ctx_decref(hctx);
++            Py_RETURN_NONE;
++        }
++
++        /* True failure: rollback INCREFs */
++        for (Py_ssize_t i = 0; i < n; i++) {
++            Py_DECREF(objs[i]);
++        }
++        tl_py_handle_ctx_decref(hctx);
++        free(records);
++        free(objs);
++        Py_DECREF(seq);
++        return TL_PY_RAISE_STATUS(self, st);
++    }
++}
++
+ /*===========================================================================
+  * PyTimelog_delete_range
+  *
+@@ -2850,6 +3058,16 @@ static PyMethodDef PyTimelog_methods[] = {
+      "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
+      "Note: TimelogBusyError means the records WERE committed; do not retry."},
+ 
++    {"bulk_append", (PyCFunction)PyTimelog_bulk_append,
++     METH_VARARGS | METH_KEYWORDS,
++     "bulk_append(timestamps, objects, *, mostly_ordered=False) -> None\n\n"
++     "Fast-path bulk append from a typed int64 timestamp buffer and a\n"
++     "parallel sequence of payload objects.\n\n"
++     "timestamps must be a contiguous 1-D buffer of int64 (e.g. a numpy\n"
++     "int64 array or array.array('q')); objects must be a sequence of the\n"
++     "same length. Performs a single all-or-nothing batch append.\n\n"
++     "Note: TimelogBusyError means the records WERE committed; do not retry."},
++
+     {"delete_range", (PyCFunction)PyTimelog_delete_range, METH_VARARGS,
+      "delete_range(t1, t2) -> None\n\n"
+      "Mark records in [t1, t2) for deletion (tombstone).\n\n"

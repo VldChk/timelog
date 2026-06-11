@@ -1,0 +1,134 @@
+diff --git a/python/tests/test_freethreaded_stress.py b/python/tests/test_freethreaded_stress.py
+index 5cead78..bab8711 100644
+--- a/python/tests/test_freethreaded_stress.py
++++ b/python/tests/test_freethreaded_stress.py
+@@ -338,6 +338,129 @@ class TestMutableObjectStateOverlap:
+         finally:
+             log.close()
+ 
++    @pytest.mark.timeout(180)
++    def test_buffer_export_lifetime_high_contention(self, compat_runtime) -> None:
++        """C6-exports: hammer the close()-vs-buffer-export race.
++
++        Many reader threads continuously memoryview()+release the "current"
++        span while a closer thread swaps in fresh spans and closes the prior
++        one thousands of times. The PageSpan.exports counter and the
++        close-while-exported check are both taken under the per-object
++        critical section (TL_PY_OBJ_LOCK / Py_BEGIN_CRITICAL_SECTION), so the
++        check-closed-then-exports++ and check-exports-then-mark-closed
++        sequences are each atomic w.r.t. each other.
++
++        Contract asserted here:
++          - no crash / no use-after-free (ASan/TSan would catch; here we also
++            validate the exported timestamps stay monotonic while held);
++          - readers never see a spurious BufferError (a read-only export must
++            always succeed unless the span is genuinely closed -> ValueError);
++          - close() correctly raises BufferError iff a buffer is exported.
++
++        This races the export lifetime far harder than the lighter overlap
++        tests above (hundreds of thousands of getbuffer/releasebuffer pairs),
++        so a missing or non-atomic guard would surface as a torn read,
++        BufferError-when-not-exported, or a segfault.
++        """
++        from timelog import Timelog
++
++        n_readers = 6
++        rounds = _iters(compat_runtime.short_stress, full=2_000, quick=200)
++        reads_per_span = _iters(compat_runtime.short_stress, full=120, quick=30)
++
++        lock = threading.Lock()  # guards `current` only, not span internals
++        current: dict[str, object] = {"span": None}
++        errors: list[str] = []
++        checks = {"reads": 0, "clean_close": 0, "busy_close": 0}
++        stop = threading.Event()
++        logs_keepalive: list[object] = []
++
++        def make_span(idx: int):
++            t = Timelog(maintenance="disabled")
++            base = idx * 1000
++            n = 64
++            t.extend([(base + i, base + i) for i in range(n)])
++            t.flush()
++            spans = list(t.views(base, base + n))
++            return t, (spans[0] if spans else None)
++
++        def reader() -> None:
++            while not stop.is_set():
++                with lock:
++                    span = current["span"]
++                if span is None:
++                    continue
++                for _ in range(reads_per_span):
++                    if stop.is_set():
++                        break
++                    try:
++                        mv = memoryview(span)
++                    except ValueError:
++                        break  # span closed between snapshot and getbuffer
++                    except BufferError as exc:
++                        errors.append(f"reader BufferError: {exc!r}")
++                        break
++                    try:
++                        if len(mv) and mv[len(mv) - 1] < mv[0]:
++                            errors.append("torn/non-monotonic exported buffer")
++                        checks["reads"] += 1
++                    finally:
++                        mv.release()
++
++        def closer() -> None:
++            for r in range(rounds):
++                t, span = make_span(r)
++                logs_keepalive.append(t)
++                if span is None:
++                    continue
++                with lock:
++                    old = current["span"]
++                    current["span"] = span
++                if old is not None:
++                    for _ in range(256):
++                        try:
++                            old.close()
++                            checks["clean_close"] += 1
++                            break
++                        except BufferError:
++                            checks["busy_close"] += 1  # correct: buffer live
++                        except BaseException as exc:  # noqa: BLE001
++                            errors.append(f"closer close(): {exc!r}")
++                            break
++            stop.set()
++
++        readers = [threading.Thread(target=reader) for _ in range(n_readers)]
++        cl = threading.Thread(target=closer)
++        try:
++            for th in readers:
++                th.start()
++            cl.start()
++            cl.join(timeout=170)
++            if cl.is_alive():
++                errors.append("closer deadlocked / did not finish")
++            stop.set()
++            for th in readers:
++                th.join(timeout=10)
++
++            assert not errors, f"buffer-export race surfaced: {errors!r}"
++            assert checks["reads"] > 0, "test did no concurrent reads"
++        finally:
++            stop.set()
++            with lock:
++                last = current["span"]
++            if last is not None:
++                for _ in range(1000):
++                    try:
++                        last.close()
++                        break
++                    except BufferError:
++                        time.sleep(0.001)
++            for t in logs_keepalive:
++                try:
++                    t.close()
++                except Exception:  # noqa: BLE001
++                    pass
++
+ 
+ # ---------------------------------------------------------------------------
+ # Drop/drain stress with reentrant __del__
