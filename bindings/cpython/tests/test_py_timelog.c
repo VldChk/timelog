@@ -780,6 +780,65 @@ TEST(extend_mostly_ordered_kw)
     close_and_dealloc(tl);
 }
 
+TEST(bulk_append_basic)
+{
+    /* bulk_append(array.array('q', [1,2,3]), [10,20,30]) inserts 3 records;
+     * a length-mismatched call raises ValueError and inserts nothing. */
+    PyTimelog* tl = create_timelog_default();
+    ASSERT_NOT_NULL(tl);
+
+    PyObject* array_mod = PyImport_ImportModule("array");
+    ASSERT_NOT_NULL(array_mod);
+    PyObject* ts_list = Py_BuildValue("[LLL]", 1LL, 2LL, 3LL);
+    ASSERT_NOT_NULL(ts_list);
+    PyObject* ts_arr = PyObject_CallMethod(array_mod, "array", "sO",
+                                           "q", ts_list);
+    ASSERT_NOT_NULL(ts_arr);
+    PyObject* objs = Py_BuildValue("[iii]", 10, 20, 30);
+    ASSERT_NOT_NULL(objs);
+
+    PyObject* result = PyObject_CallMethod((PyObject*)tl, "bulk_append",
+                                           "OO", ts_arr, objs);
+    ASSERT_NOT_NULL(result);
+    Py_DECREF(result);
+
+    /* Count via range(0, 100). */
+    PyObject* it = PyObject_CallMethod((PyObject*)tl, "range",
+                                       "LL", 0LL, 100LL);
+    ASSERT_NOT_NULL(it);
+    PyObject* iter = PyObject_GetIter(it);
+    ASSERT_NOT_NULL(iter);
+    Py_ssize_t count = 0;
+    PyObject* item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        count++;
+        Py_DECREF(item);
+    }
+    ASSERT(!PyErr_Occurred());
+    ASSERT_EQ(count, 3);
+    Py_DECREF(iter);
+    PyObject* it_closed = PyObject_CallMethod(it, "close", NULL);
+    ASSERT_NOT_NULL(it_closed);
+    Py_DECREF(it_closed);
+    Py_DECREF(it);
+
+    /* Negative: length mismatch -> ValueError, nothing inserted. */
+    PyObject* objs_short = Py_BuildValue("[i]", 99);
+    ASSERT_NOT_NULL(objs_short);
+    PyObject* bad = PyObject_CallMethod((PyObject*)tl, "bulk_append",
+                                        "OO", ts_arr, objs_short);
+    ASSERT(bad == NULL);
+    ASSERT(PyErr_ExceptionMatches(PyExc_ValueError));
+    PyErr_Clear();
+
+    Py_DECREF(objs_short);
+    Py_DECREF(objs);
+    Py_DECREF(ts_arr);
+    Py_DECREF(ts_list);
+    Py_DECREF(array_mod);
+    close_and_dealloc(tl);
+}
+
 TEST(extend_appends_all)
 {
     /* Extend appends all items */
@@ -1657,6 +1716,7 @@ int main(int argc, char* argv[])
     printf("\n[Extend]\n");
     run_extend_empty();
     run_extend_mostly_ordered_kw();
+    run_bulk_append_basic();
     run_extend_appends_all();
     run_extend_generator_streaming();
 
