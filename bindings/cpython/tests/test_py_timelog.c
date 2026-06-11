@@ -831,6 +831,26 @@ TEST(bulk_append_basic)
     ASSERT(PyErr_ExceptionMatches(PyExc_ValueError));
     PyErr_Clear();
 
+    /* Re-count: the failed call must not have inserted anything. */
+    PyObject* it2 = PyObject_CallMethod((PyObject*)tl, "range",
+                                        "LL", 0LL, 100LL);
+    ASSERT_NOT_NULL(it2);
+    PyObject* iter2 = PyObject_GetIter(it2);
+    ASSERT_NOT_NULL(iter2);
+    Py_ssize_t count2 = 0;
+    PyObject* item2;
+    while ((item2 = PyIter_Next(iter2)) != NULL) {
+        count2++;
+        Py_DECREF(item2);
+    }
+    ASSERT(!PyErr_Occurred());
+    ASSERT_EQ(count2, 3);
+    Py_DECREF(iter2);
+    PyObject* it2_closed = PyObject_CallMethod(it2, "close", NULL);
+    ASSERT_NOT_NULL(it2_closed);
+    Py_DECREF(it2_closed);
+    Py_DECREF(it2);
+
     Py_DECREF(objs_short);
     Py_DECREF(objs);
     Py_DECREF(ts_arr);

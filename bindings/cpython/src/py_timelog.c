@@ -2216,6 +2216,18 @@ PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
             "bulk_append() timestamps must be a 1-D buffer");
         return NULL;
     }
+    /* Reading through an int64_t* requires natural alignment; a sliced
+     * byte-buffer cast (e.g. memoryview(bytearray(...))[1:9].cast("q")) can
+     * be 8-byte-itemsize yet misaligned, which is C undefined behavior on
+     * load. Real producers (numpy, array.array) are always aligned. */
+    if (ts_view.len > 0 &&
+        ((uintptr_t)ts_view.buf % _Alignof(int64_t)) != 0) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps buffer must be 8-byte aligned");
+        return NULL;
+    }
     if (ts_view.itemsize != (Py_ssize_t)sizeof(int64_t)) {
         PyBuffer_Release(&ts_view);
         Py_DECREF(seq);

@@ -54,6 +54,15 @@ jobs:
 
       - name: Run pure C tests by group (sanitizers)
         shell: bash
+        # Leak detection is ON for the pure-C leg (no CPython interpreter
+        # noise here). .lsan-suppressions covers only the two
+        # test_snapshot_lifetime misuse tests that leak by design. The Python
+        # legs below keep the global detect_leaks=0 because the interpreter
+        # itself reports leaks. Regression guard for the v1.3 shared-memview
+        # wrapper leak fix (core/src/delta/tl_memview.c).
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.lsan-suppressions
         run: |
           set +e
           python demo/ci/run_core_test_groups.py \

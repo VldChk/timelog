@@ -128,6 +128,21 @@ class TestBulkAppendValidation:
             log.bulk_append(bytearray(b"\x00" * 8), ["a"])
         log.close()
 
+    def test_misaligned_buffer_rejected(self):
+        # A sliced byte-buffer cast passes the itemsize/format checks but its
+        # data pointer is misaligned: reading it as int64_t* would be UB.
+        log = Timelog(maintenance="disabled")
+        misaligned = memoryview(bytearray(17))[1:9].cast("q")
+        assert misaligned.format == "q" and misaligned.itemsize == 8
+        with pytest.raises(ValueError, match="aligned"):
+            log.bulk_append(misaligned, ["x"])
+        assert len(log) == 0
+        # The aligned slice of the same buffer is accepted.
+        aligned = memoryview(bytearray(16))[0:8].cast("q")
+        log.bulk_append(aligned, ["ok"])
+        assert len(log) == 1
+        log.close()
+
     def test_generator_objects_rejected(self):
         log = Timelog(maintenance="disabled")
         with pytest.raises(TypeError, match="sequence"):
