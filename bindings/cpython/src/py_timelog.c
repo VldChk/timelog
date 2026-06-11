@@ -16,8 +16,11 @@
  *   builds there may be no process-wide GIL.
  * - Core calls are serialized by core_lock and mutable Python-object fields use
  *   per-object critical sections / atomics where they can race.
- * - Long-running core maintenance/flush/close paths may detach the thread
- *   state around engine work after preserving Python lifetimes.
+ * - Thread state is detached, releasing a GIL where present, around long
+ *   core calls: flush, compact, maint_step, stop_maintenance, explicit close(),
+ *   and iterator range-count precomputation — after preserving Python
+ *   lifetimes. Finalizer/dealloc cleanup keeps the thread state attached.
+ * - Write operations keep the caller's Python thread state attached throughout
  */
 
 #define PY_SSIZE_T_CLEAN

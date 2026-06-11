@@ -26,9 +26,9 @@ Upgrade the `timelog` CPython binding so that:
 This LLD is intentionally split into two compatibility layers:
 
 - **Layer A: interpreter isolation** — multi-phase init, per-module state, heap types, no process-global Python objects.
-- **Layer B: free-threaded safety** — explicit synchronization for all shared extension state that currently relies on the GIL.
+- **Layer B: free-threaded safety** — explicit synchronization for all shared extension state that previously relied on interpreter-lock serialization.
 
-These two layers should be implemented in sequence. Layer A is necessary for subinterpreters. Layer B is necessary before declaring `Py_mod_gil = Py_MOD_GIL_NOT_USED`.
+These two layers were implemented in sequence. Layer A is necessary for subinterpreters. Layer B is necessary before declaring `Py_mod_gil = Py_MOD_GIL_NOT_USED`, which is now declared after the Layer B synchronization work.
 
 ## 2. Non-goals
 
@@ -45,7 +45,7 @@ The pre-migration codebase had these hard blockers:
 
 ### B1. Single-phase module init and no module state
 
-`module.c` currently builds the module with `PyModule_Create()` and `m_size = -1`.
+Before Layer A, `module.c` built the module with `PyModule_Create()` and `m_size = -1`.
 
 Impact:
 - no per-module state;
@@ -73,12 +73,12 @@ Impact:
 
 ### B4. Pre-Layer-B synchronization invariants
 
-`py_handle.c` now ties retired-object draining and live-tracking operations to the owning interpreter, and the core PageSpan owner refcount is atomic. The binding also releases the GIL around engine operations and uses per-instance `core_lock`, but not all mutable extension state is protected by the object-level synchronization needed for a free-threaded/no-GIL build.
+Before Layer B, `py_handle.c` tied retired-object draining and live-tracking operations to the owning interpreter, and the core PageSpan owner refcount was atomic, but mutable extension-object state still depended on interpreter-lock serialization. Layer B completed the object-level synchronization needed for a free-threaded/no-GIL build.
 
-Impact:
-- free-threaded build correctness is not established;
-- some shared extension state is only accidentally safe today because the GIL serializes access;
-- `views()` / `PageSpan` lifetime no longer depends on interpreter-lock serialization of owner refs, but PageSpan object fields still need object-level critical sections for no-GIL support;
+Layer B resolution:
+- free-threaded build correctness now depends on explicit synchronization rather than interpreter-lock serialization;
+- mutable extension-object state is protected by object-level critical sections and the existing per-instance/core synchronization;
+- `views()` / `PageSpan` lifetime no longer depends on interpreter-lock serialization of owner refs;
 - thread-state and interpreter ownership checks remain required anywhere Python references are drained or released.
 
 ### B5. Public facade and docs must stay phase-accurate
@@ -97,7 +97,7 @@ Impact:
 | Python mode | Import allowed | API usable | Support tier | Parallelism model | Notes |
 |---|---:|---:|---|---|---|
 | CPython 3.12-3.14, normal build | yes | yes | validated compatibility | current single-writer + concurrent reads | keep supporting when CI-covered |
-| CPython 3.14+, isolated subinterpreters | yes | yes | primary target after Layer A | one module object per interpreter | do not declare support until heap types land and no global Python objects remain |
+| CPython 3.14+, isolated subinterpreters | yes | yes | supported after Layer A | one module object per interpreter | heap types and per-module Python state are required |
 | CPython 3.14+, free-threaded build | yes | yes | official target after Layer B | true thread parallelism within interpreter, but still single-writer API | import must not enable the GIL |
 | CPython 3.13t, free-threaded build | optional | optional | experimental only | same as above | build/publish only if explicitly tested |
 
@@ -196,9 +196,9 @@ static struct PyModuleDef timelog_module = {
 - same-module `Py_mod_exec` is explicitly idempotent instead of vaguely "rerunnable";
 - the module slots carry subinterpreter / free-threaded declarations.
 
-Important staging rule:
+Implemented staging rule:
 - after Layer A/Step 4, advertise `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` on CPython 3.12+;
-- do not advertise `Py_MOD_GIL_NOT_USED` until Layer B locking and lifetime work is complete.
+- after Layer B locking and lifetime work, advertise `Py_MOD_GIL_NOT_USED` on supported free-threaded builds.
 
 Here `TIMELOG_ENABLE_*` is pseudocode for rollout gates, not a permanent public macro surface. The real implementation can spell those gates differently, but the declarations themselves must remain phase-gated.
 
@@ -333,7 +333,7 @@ Protects:
 #### L2. `handle_ctx.live_lock` (new)
 
 Purpose:
-- protect the live-handle multiset / hash table, which currently assumes GIL serialization.
+- protect the live-handle multiset / hash table, which previously assumed interpreter-lock serialization.
 
 Protects:
 - `live_entries`
@@ -385,7 +385,7 @@ Implementation:
 
 Rationale:
 - `PageSpan` objects can outlive their iterator and be released independently on different threads;
-- therefore `views()` cannot be considered free-threaded-safe unless this core refcount contract is fixed.
+- therefore `views()` requires the atomic core refcount contract that Layer B now provides.
 
 ### Hard invariant: no Python-executing work under internal locks
 

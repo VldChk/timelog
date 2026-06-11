@@ -21,9 +21,11 @@
  *     - lock-free retired-stack between maintenance thread and drain
  *
  *   Thread states required, not the GIL: Python C-API access requires an
- *   attached thread state on the owning interpreter. The binding releases
- *   the active interpreter's GIL during flush(), compact(),
- *   stop_maintenance(), and close().
+ *   attached thread state on the owning interpreter. The binding detaches
+ *   the active thread state, releasing a GIL where present, around long
+ *   core calls such as flush(), compact(), maint_step(), stop_maintenance(),
+ *   explicit close(), and iterator range-count precomputation. Finalizer
+ *   and dealloc cleanup keep the thread state attached.
  *
  *   Supported builds:
  *     - Regular CPython 3.12-3.14 (single interpreter).

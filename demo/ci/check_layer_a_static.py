@@ -98,6 +98,8 @@ TEXT_RULES = (
             r"|\b(?:called|run|runs|running)\s+with\s+"
             r"(?:the\s+)?(?:CPython\s+)?GIL\s+held\b"
             r"|\bwith\s+(?:the\s+)?(?:CPython\s+)?GIL\s+held\b"
+            r"|\b(?:currently|still)\s+(?:relies|rely|assumes|assume|depends)\s+"
+            r"(?:on\s+)?(?:the\s+)?(?:CPython\s+)?GIL\b"
             r"|\bGIL[- ](?:only|based)\b"
             r")",
             re.IGNORECASE,
@@ -122,6 +124,10 @@ def iter_text_files() -> list[Path]:
         path for path in EXTRA_TEXT_SCAN_FILES
         if path.is_file()
     }
+    files.update(
+        path for path in ROOT.glob("*.md")
+        if path.is_file()
+    )
     files.update(iter_source_files())
     docs_root = ROOT / "docs"
     if docs_root.is_dir():
@@ -133,6 +139,12 @@ def iter_text_files() -> list[Path]:
         files.update(
             path for path in docs_root.rglob("*.md")
             if path.is_file() and plans_root not in path.parents
+        )
+    ideas_root = ROOT / "ideas-lab"
+    if ideas_root.is_dir():
+        files.update(
+            path for path in ideas_root.rglob("*.md")
+            if path.is_file()
         )
     return sorted(files)
 

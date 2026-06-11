@@ -128,7 +128,7 @@
 - Binding test suite is enabled by default via `TIMELOG_BUILD_PY_TESTS` and registered as CTest tests (`py_handle`, `py_timelog`, `py_iter`, `py_span`, `py_maint_b5`, `py_errors`). (`bindings/cpython/CMakeLists.txt:177`, `bindings/cpython/CMakeLists.txt:496`, `bindings/cpython/CMakeLists.txt:501`, `bindings/cpython/CMakeLists.txt:506`, `bindings/cpython/CMakeLists.txt:511`, `bindings/cpython/CMakeLists.txt:516`, `bindings/cpython/CMakeLists.txt:521`)
 - Handle encoding is pointer-cast based with compile-time size assertion and round-trip encode/decode helpers. (`bindings/cpython/include/timelogpy/py_handle.h:49`, `bindings/cpython/include/timelogpy/py_handle.h:55`, `bindings/cpython/include/timelogpy/py_handle.h:64`, `bindings/cpython/include/timelogpy/py_handle.h:74`)
 - Python on-drop callback contract is explicitly no-GIL/no-Python-API on maintenance thread. (`bindings/cpython/include/timelogpy/py_handle.h:16`, `bindings/cpython/include/timelogpy/py_handle.h:219`, `bindings/cpython/include/timelogpy/py_handle.h:221`)
-- The binding explicitly requires the CPython GIL and is marked unsupported on free-threaded/no-GIL builds. (`bindings/cpython/include/timelogpy/py_timelog.h:20`, `bindings/cpython/include/timelogpy/py_timelog.h:21`)
+- The binding supports regular CPython, per-interpreter-GIL subinterpreters, and free-threaded/no-GIL builds. Python C-API work requires an attached thread state on the owning interpreter, not a process-global GIL. (`bindings/cpython/include/timelogpy/py_timelog.h:23`, `bindings/cpython/include/timelogpy/py_timelog.h:29`)
 
 ## `CLAUDE.md` Intent Vs Current Code
 - `CLAUDE.md` documents in-memory/no-disk architecture. (`CLAUDE.md:3`, `CLAUDE.md:4`)

@@ -106,3 +106,13 @@ everything_you_want_to_know_about_timelog.md
 
 # LLVM binary cache
 llvm_bin/
+
+.ideas/
+
+# ideas-lab is a deliverable: keep its reproducibility artifacts visible even
+# though the repo broadly ignores generated JSON/CSV/script files elsewhere.
+ideas-lab/experiments/C4-gran/peak_rss_c
+!ideas-lab/**/*.json
+!ideas-lab/**/*.csv
+!ideas-lab/**/*.jsonl
+!ideas-lab/**/*.sh
