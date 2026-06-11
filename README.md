@@ -117,6 +117,7 @@ Core Python facade surface:
 - Writes:
   - `append(...)`
   - `extend(...)`
+  - `bulk_append(timestamps, objects)` — typed-buffer fast path (NumPy int64 / `array.array("q")`)
   - `log[ts] = obj`
   - `delete(t1, t2)` / `delete(ts)`
   - `cutoff(ts)`
@@ -162,6 +163,14 @@ Flush and compaction bound read fan-out over time.
 Deletes are logical tombstones; physical cleanup is deferred to maintenance.
 
 ## Performance at a Glance
+
+v1.3 hot-path improvements (pinned A/B vs the v1.2 baseline, Linux x86_64, Python `3.13.12`,
+median of 5; raw artifacts in `docs/benchmarks/` and `ideas-lab/verification/`):
+
+- `append(obj)` folded into C: `4.39x` faster (`append(ts, obj)`: `3.39x`)
+- Query/delete call dispatch (`METH_FASTCALL`): `1.15x-1.36x` faster across 9 methods
+- Size-gated branchless binary search: `1.93x-4.98x` faster at gated sizes (5 seams)
+- New `bulk_append`: `113 ns/record` (`3.5x` vs `extend`, `2.2x` vs the folded `append`)
 
 Historical snapshot (`2026-02-15`, Linux x86_64, Python `3.13.12`, dataset `11,550,000` rows):
 

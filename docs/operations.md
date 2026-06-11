@@ -18,12 +18,26 @@
 - Acquire snapshot/iterator for read isolation.
 - Destroy iterators before releasing their snapshot.
 
+## Space Reclaim After Deletes
+
+- Deletes are logical tombstones. Query results respect them immediately; physical
+  memory is reclaimed only when compaction rewrites the affected windows.
+- Compaction is triggered by new L0 segments (continued writes) or by the
+  `delete_debt_threshold` knob. A retention-shaped workload that deletes old data but
+  stops writing into those windows may therefore retain space indefinitely.
+- If reclaim matters for your workload: monitor `stats()["storage"]`
+  (`tombstone_count`, `records_estimate` vs `pages_total`), set
+  `delete_debt_threshold`, and run `compact()` (plus `maint_step()` in disabled mode)
+  after large deletes.
+
 ## Common Failure Patterns
 
 1. Retrying writes after busy: can duplicate records.
 2. Omitting flush before close: drops unflushed records.
 3. Assuming point-delete at `TL_TS_MAX`: not representable via `[ts, ts+1)`.
 4. Treating physical `views()` output as tombstone-filtered logical results.
+5. Expecting deletes alone to shrink memory: reclaim requires compaction over the
+   deleted windows (see "Space Reclaim After Deletes").
 
 ## Operational Checklist
 
