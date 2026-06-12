@@ -331,7 +331,14 @@ class Timelog(_CTimelog):
 
         Skipped rows are reported with a RuntimeWarning after the stream is
         consumed — silent partial ingest in a storage engine is data loss.
+
+        The min_ts floor is snapshotted ONCE per call: it lives in C and is
+        immutable while the instance is open (set only at init/reopen), and
+        a per-item C method call cost ~13% on the 10k-pair extend path
+        (v1.3 perf lab regression gate).
         """
+        floor = _CTimelog._min_ts_floor(self)
+        coerce = _coerce_ts
         skipped = 0
         for item in iterable:
             try:
@@ -339,10 +346,14 @@ class Timelog(_CTimelog):
             except (TypeError, ValueError) as exc:
                 raise ValueError("extend() expects (ts, obj) pairs") from exc
             try:
-                ts = Timelog._coerce_and_guard(self, ts)
+                ts = coerce(ts)
             except (TypeError, OverflowError):
                 skipped += 1
                 continue
+            if floor is not None and ts < floor:
+                raise ValueError(
+                    f"timestamp {ts} is below min_ts boundary ({floor})"
+                )
             yield (ts, obj)
         if skipped:
             self._extend_skipped += skipped
@@ -404,13 +415,19 @@ class Timelog(_CTimelog):
                 except TypeError:
                     pass
             def gen():
+                floor = _CTimelog._min_ts_floor(self)
+                coerce = _coerce_ts
                 skipped = 0
                 for ts_val, obj in zip(ts_or_iterable, objects, strict=True):
                     try:
-                        ts = Timelog._coerce_and_guard(self, ts_val)
+                        ts = coerce(ts_val)
                     except (TypeError, OverflowError):
                         skipped += 1
                         continue
+                    if floor is not None and ts < floor:
+                        raise ValueError(
+                            f"timestamp {ts} is below min_ts boundary ({floor})"
+                        )
                     yield (ts, obj)
                 if skipped:
                     self._extend_skipped += skipped
