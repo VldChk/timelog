@@ -113,6 +113,23 @@ For "first timestamp >= x", use `next_ts(x - 1)` (guard `x > TL_TS_MIN`).
   happens via compaction (see `docs/operations.md`, "Space Reclaim After
   Deletes").
 
+## Presets
+
+- `Timelog.for_streaming(**overrides)` — background maintenance + `busy_policy="flush"`.
+- `Timelog.for_bulk_ingest(**overrides)` — `maintenance="disabled"` + 16 MiB memtable +
+  `busy_policy="flush"`; flush/compact manually after the load.
+- `Timelog.for_low_latency(**overrides)` — small memtable, `sealed_wait_ms=0`,
+  `busy_policy="raise"`.
+
+## Maintenance API
+
+- `flush()` — synchronously seal + materialize all pending writes into segments.
+- `compact()` — request compaction (background worker performs it; in
+  `maintenance="disabled"` follow with `maint_step()`).
+- `maint_step()` — perform one unit of maintenance manually (disabled mode).
+- `start_maintenance()` / `stop_maintenance()` — control the background worker.
+- `maintenance_mode` (property) — `"background"` or `"disabled"`.
+
 ## Introspection
 
 - `stats()` -> nested dict: `storage` / `memtable` / `operational` /
@@ -122,6 +139,12 @@ For "first timestamp >= x", use `next_ts(x - 1)` (guard `x > TL_TS_MIN`).
   instance configuration (`time_unit`, `maintenance`, `busy_policy`,
   `min_ts`, `mostly_ordered_default`) for dashboards.
 - `busy_events` (property) -> cumulative backpressure events.
+- `extend_skipped` (property; also `stats()['operational']['extend_skipped']`) ->
+  total records dropped by `extend(insert_on_error=True)` skips. The
+  RuntimeWarning is deduplicated per call site by Python's warning machinery;
+  this counter is the monitorable signal for recurring drops.
+- `alloc_failures` (property) -> allocation failures in the drop callback
+  (each one is a deliberately leaked object, never a UAF).
 - `min_ts_floor` (property) -> the configured `min_ts` retention floor or
   `None`. Distinct from `min_ts()`, which reports the smallest timestamp in
   the data.

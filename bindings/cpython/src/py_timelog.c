@@ -1548,7 +1548,9 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
     uint64_t pins = pytimelog_close_no_raise(self, 0);
     if (pins != 0) {
         return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE,
-            "Cannot close: %llu active snapshots/iterators",
+            "Cannot close: %llu active reader(s) still pinned "
+            "(iterators, PageSpans, or exported memoryviews); exhaust, "
+            "del, or .close() them, then call close() again",
             (unsigned long long)pins);
     }
 
@@ -3734,6 +3736,8 @@ static PyMethodDef PyTimelog_methods[] = {
      "Each PageSpan exposes a contiguous slice of page timestamps\n"
      "as a read-only memoryview (zero-copy). Use for bulk timestamp\n"
      "access without per-record Python object allocation.\n\n"
+     "Only FLUSHED segments are visible: on a freshly-written log call\n"
+     "flush() first, or this yields nothing while len(log) is non-zero.\n\n"
      "Parameters:\n"
      "  t1: Range start (inclusive)\n"
      "  t2: Range end (exclusive)\n"
