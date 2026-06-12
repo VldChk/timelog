@@ -69,6 +69,17 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
 #define TL_PY_MUTEX_LOCK(m)   PyMutex_Lock(m)
 #define TL_PY_MUTEX_UNLOCK(m) PyMutex_Unlock(m)
 
+/* Non-blocking acquire: succeed only from the fully-unlocked state. This is
+ * exactly PyMutex_Lock's documented inline fast path (cpython/lock.h: CAS
+ * _bits UNLOCKED->LOCKED) minus the parking slow path. Used by tp_traverse,
+ * which must NEVER park: during a free-threaded stop-the-world collection
+ * the lock holder may be a frozen thread that cannot run to release it. */
+static inline int tl_py_mutex_trylock(tl_py_mutex_t* m)
+{
+    uint8_t expected = _Py_UNLOCKED;
+    return _Py_atomic_compare_exchange_uint8(&m->_bits, &expected, _Py_LOCKED);
+}
+
 #else /* PY_VERSION_HEX < 0x030D0000 */
 
 typedef PyThread_type_lock tl_py_mutex_t;
@@ -87,6 +98,11 @@ static inline void tl_py_mutex_deinit(tl_py_mutex_t* m)
 }
 #define TL_PY_MUTEX_LOCK(m)   ((void)PyThread_acquire_lock(*(m), WAIT_LOCK))
 #define TL_PY_MUTEX_UNLOCK(m) PyThread_release_lock(*(m))
+
+static inline int tl_py_mutex_trylock(tl_py_mutex_t* m)
+{
+    return PyThread_acquire_lock(*(m), NOWAIT_LOCK) == PY_LOCK_ACQUIRED;
+}
 
 #endif /* PY_VERSION_HEX */
 

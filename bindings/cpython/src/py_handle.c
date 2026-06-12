@@ -28,6 +28,14 @@
 #include <stdlib.h>   /* malloc, free - NOT Python allocators in on_drop */
 #include <string.h>   /* memset */
 
+#ifdef MS_WINDOWS
+#  include <windows.h>
+static void tl_py_cpu_yield(void) { Sleep(0); }
+#else
+#  include <sched.h>
+static void tl_py_cpu_yield(void) { sched_yield(); }
+#endif
+
 /*===========================================================================
  * Live Handle Tracking (multiset)
  *===========================================================================*/
@@ -37,11 +45,36 @@
 #define TL_PY_LIVE_FULL      1
 #define TL_PY_LIVE_TOMBSTONE 2
 
+/* Entry publication contract (enables the lock-free tp_traverse fallback):
+ *   - publish:   obj/count stores, THEN state -> FULL with release
+ *   - retire:    state -> TOMBSTONE with release, THEN obj/count clears
+ *   - count updates on existing entries are atomic RMW
+ *   - retire stores and the lock-free reader's state loads are seq_cst so
+ *     they order against the seq_cst traverse_readers gates (a reader that
+ *     registers after a drain's gate observed zero is SC-ordered after the
+ *     TOMBSTONE store and must skip the entry)
+ * A reader that observes state==FULL therefore always sees a valid obj
+ * whose strong reference cannot be released concurrently: removals require
+ * live_lock, and every DECREF path gates on traverse_readers (drains defer,
+ * release_all waits). Under-observation (missing an in-flight insert, or
+ * seeing a TOMBSTONE for a not-yet-DECREF'd drop) only over-retains for one
+ * GC cycle — never the unsound over-report direction. */
 struct tl_py_live_entry {
-    PyObject* obj;
-    uint64_t  count;
-    uint8_t   state;
+    PyObject* _Atomic obj;
+    _Atomic(uint64_t) count;
+    _Atomic(uint8_t)  state;
 };
+
+/* Single-allocation table, published via ctx->live_tab (release store).
+ * Resized-out tables are chained on ctx->retired_tables and freed only at
+ * ctx teardown, so a lock-free traverse can keep walking a stale table
+ * safely. Memory cost is bounded by the doubling schedule (< 1x current). */
+struct tl_py_live_table {
+    struct tl_py_live_table* next_retired;
+    size_t                   cap;
+    struct tl_py_live_entry  e[];
+};
+typedef struct tl_py_live_table tl_py_live_table_t;
 
 /*
  * Returns 1 if the current thread has an attached Python thread state that
@@ -139,43 +172,55 @@ static size_t tl_py_live_hash_ptr(const void* ptr)
 
 static tl_status_t tl_py_live_rehash(tl_py_handle_ctx_t* ctx, size_t new_cap)
 {
-    tl_py_live_entry_t* old_entries = ctx->live_entries;
-    size_t old_cap = ctx->live_cap;
+    tl_py_live_table_t* old_tab = atomic_load_explicit(&ctx->live_tab,
+                                                       memory_order_relaxed);
 
-    tl_py_live_entry_t* entries = (tl_py_live_entry_t*)calloc(
-        new_cap, sizeof(*entries));
-    if (entries == NULL) {
+    tl_py_live_table_t* tab = (tl_py_live_table_t*)calloc(
+        1, sizeof(*tab) + new_cap * sizeof(tab->e[0]));
+    if (tab == NULL) {
         return TL_ENOMEM;
     }
+    tab->cap = new_cap;
 
-    ctx->live_entries = entries;
-    ctx->live_cap = new_cap;
-    ctx->live_len = 0;
-    ctx->live_tombstones = 0;
-
-    if (old_entries != NULL) {
-        for (size_t i = 0; i < old_cap; i++) {
-            if (old_entries[i].state == TL_PY_LIVE_FULL) {
-                /* Reinsert */
-                PyObject* obj = old_entries[i].obj;
-                uint64_t count = old_entries[i].count;
-                size_t mask = ctx->live_cap - 1;
+    size_t new_len = 0;
+    if (old_tab != NULL) {
+        for (size_t i = 0; i < old_tab->cap; i++) {
+            if (atomic_load_explicit(&old_tab->e[i].state,
+                                     memory_order_relaxed)
+                    == TL_PY_LIVE_FULL) {
+                /* Reinsert into the not-yet-published table: plain-order
+                 * stores are fine, the release below publishes them all. */
+                PyObject* obj = old_tab->e[i].obj;
+                uint64_t count = atomic_load_explicit(&old_tab->e[i].count,
+                                                      memory_order_relaxed);
+                size_t mask = new_cap - 1;
                 size_t idx = tl_py_live_hash_ptr(obj) & mask;
                 for (;;) {
-                    tl_py_live_entry_t* e = &ctx->live_entries[idx];
-                    if (e->state == TL_PY_LIVE_EMPTY) {
-                        e->state = TL_PY_LIVE_FULL;
+                    tl_py_live_entry_t* e = &tab->e[idx];
+                    if (atomic_load_explicit(&e->state,
+                                             memory_order_relaxed)
+                            == TL_PY_LIVE_EMPTY) {
                         e->obj = obj;
-                        e->count = count;
-                        ctx->live_len++;
+                        atomic_store_explicit(&e->count, count,
+                                              memory_order_relaxed);
+                        atomic_store_explicit(&e->state, TL_PY_LIVE_FULL,
+                                              memory_order_relaxed);
+                        new_len++;
                         break;
                     }
                     idx = (idx + 1) & mask;
                 }
             }
         }
-        free(old_entries);
+        /* A lock-free traverse may still be walking old_tab: never free it
+         * here. Chain it; freed at ctx teardown. */
+        old_tab->next_retired = ctx->retired_tables;
+        ctx->retired_tables = old_tab;
     }
+
+    ctx->live_len = new_len;
+    ctx->live_tombstones = 0;
+    atomic_store_explicit(&ctx->live_tab, tab, memory_order_release);
 
     return TL_OK;
 }
@@ -239,6 +284,23 @@ tl_py_process_retired_list(tl_py_handle_ctx_t* ctx,
             break;
         }
 
+        /* A lock-free tp_traverse walker may hold a borrowed pointer to the
+         * object we are about to release. Defer the remaining DECREFs while
+         * any walker is in flight (re-push and retry on a later drain); the
+         * force/close path may not defer, so it waits — walkers never park,
+         * so the spin is bounded to a short in-place table scan. */
+        if (atomic_load_explicit(&ctx->traverse_readers,
+                                 memory_order_acquire) != 0) {
+            if (!force) {
+                tl_py_retired_push(ctx, list, list_tail);
+                break;
+            }
+            while (atomic_load_explicit(&ctx->traverse_readers,
+                                        memory_order_acquire) != 0) {
+                tl_py_cpu_yield();
+            }
+        }
+
         tl_py_drop_node_t* node = list;
         list = node->next;
         if (list == NULL) {
@@ -246,6 +308,17 @@ tl_py_process_retired_list(tl_py_handle_ctx_t* ctx,
         }
 
         tl_py_live_note_drop(ctx, node->obj);
+
+        /* Second reader gate, AFTER the table drop and BEFORE the DECREF:
+         * closes the check-then-act window where a walker registers right
+         * after the pre-check above. By this point the entry is already
+         * TOMBSTONE'd (release), so a walker registering after this gate
+         * observes the drop and skips; one registered before it is waited
+         * out here. Walkers never park => bounded spin. */
+        while (atomic_load_explicit(&ctx->traverse_readers,
+                                    memory_order_seq_cst) != 0) {
+            tl_py_cpu_yield();
+        }
 
         /* Safe: owning interpreter is attached, object unreachable from
          * Timelog, and this batch was claimed while pins were zero (or force
@@ -297,7 +370,9 @@ tl_py_end_drain(tl_py_handle_ctx_t* ctx)
 
 static tl_status_t tl_py_live_ensure(tl_py_handle_ctx_t* ctx, size_t needed)
 {
-    size_t cap = ctx->live_cap;
+    tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                   memory_order_relaxed);
+    size_t cap = (tab != NULL) ? tab->cap : 0;
     if (cap == 0) {
         size_t init_cap = 64;
         if (init_cap < needed) {
@@ -361,10 +436,11 @@ tl_status_t tl_py_handle_ctx_init(tl_py_handle_ctx_t* ctx,
 
     /* Store configuration (immutable after init) */
     ctx->drain_batch_limit = drain_batch_limit;
-    ctx->live_entries = NULL;
-    ctx->live_cap = 0;
+    atomic_init(&ctx->live_tab, NULL);
+    ctx->retired_tables = NULL;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
+    atomic_init(&ctx->traverse_readers, 0);
     atomic_init(&ctx->live_tracking_failed, 0);
 
     /* On 3.13+ PyMutex is statically zero-initializable and cannot fail;
@@ -487,12 +563,19 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
     }
 #endif
 
-    if (ctx->live_entries != NULL) {
-        free(ctx->live_entries);
+    {
+        tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                       memory_order_relaxed);
+        free(tab);
+        atomic_store_explicit(&ctx->live_tab, NULL, memory_order_relaxed);
+        tl_py_live_table_t* r = ctx->retired_tables;
+        while (r != NULL) {
+            tl_py_live_table_t* next = r->next_retired;
+            free(r);
+            r = next;
+        }
+        ctx->retired_tables = NULL;
     }
-
-    ctx->live_entries = NULL;
-    ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
     atomic_store_explicit(&ctx->live_tracking_failed, 0,
@@ -674,29 +757,35 @@ static tl_status_t tl_py_live_insert_locked(tl_py_handle_ctx_t* ctx, PyObject* o
         return st;
     }
 
-    size_t mask = ctx->live_cap - 1;
+    tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                   memory_order_relaxed);
+    size_t mask = tab->cap - 1;
     size_t idx = tl_py_live_hash_ptr(obj) & mask;
     size_t first_tombstone = (size_t)-1;
 
     for (;;) {
-        tl_py_live_entry_t* e = &ctx->live_entries[idx];
-        if (e->state == TL_PY_LIVE_EMPTY) {
+        tl_py_live_entry_t* e = &tab->e[idx];
+        uint8_t state = atomic_load_explicit(&e->state, memory_order_relaxed);
+        if (state == TL_PY_LIVE_EMPTY) {
             if (first_tombstone != (size_t)-1) {
-                e = &ctx->live_entries[first_tombstone];
+                e = &tab->e[first_tombstone];
                 ctx->live_tombstones--;
             }
-            e->state = TL_PY_LIVE_FULL;
+            /* Publication order for lock-free readers: obj and count are
+             * visible BEFORE state flips to FULL (release). */
             e->obj = obj;
-            e->count = 1;
+            atomic_store_explicit(&e->count, 1, memory_order_relaxed);
+            atomic_store_explicit(&e->state, TL_PY_LIVE_FULL,
+                                  memory_order_release);
             ctx->live_len++;
             return TL_OK;
         }
-        if (e->state == TL_PY_LIVE_TOMBSTONE) {
+        if (state == TL_PY_LIVE_TOMBSTONE) {
             if (first_tombstone == (size_t)-1) {
                 first_tombstone = idx;
             }
         } else if (e->obj == obj) {
-            e->count++;
+            atomic_fetch_add_explicit(&e->count, 1, memory_order_relaxed);
             return TL_OK;
         }
         idx = (idx + 1) & mask;
@@ -705,25 +794,37 @@ static tl_status_t tl_py_live_insert_locked(tl_py_handle_ctx_t* ctx, PyObject* o
 
 static void tl_py_live_drop_locked(tl_py_handle_ctx_t* ctx, PyObject* obj)
 {
-    if (ctx->live_cap == 0) {
+    tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                   memory_order_relaxed);
+    if (tab == NULL || tab->cap == 0) {
         return;
     }
-    size_t mask = ctx->live_cap - 1;
+    size_t mask = tab->cap - 1;
     size_t idx = tl_py_live_hash_ptr(obj) & mask;
 
     for (;;) {
-        tl_py_live_entry_t* e = &ctx->live_entries[idx];
-        if (e->state == TL_PY_LIVE_EMPTY) {
+        tl_py_live_entry_t* e = &tab->e[idx];
+        uint8_t state = atomic_load_explicit(&e->state, memory_order_relaxed);
+        if (state == TL_PY_LIVE_EMPTY) {
             return;
         }
-        if (e->state == TL_PY_LIVE_FULL && e->obj == obj) {
-            if (e->count > 1) {
-                e->count--;
+        if (state == TL_PY_LIVE_FULL && e->obj == obj) {
+            uint64_t count = atomic_load_explicit(&e->count,
+                                                  memory_order_relaxed);
+            if (count > 1) {
+                atomic_store_explicit(&e->count, count - 1,
+                                      memory_order_relaxed);
                 return;
             }
+            /* Retire order for lock-free readers: state leaves FULL
+             * (release) BEFORE obj/count are cleared, so a reader that saw
+             * FULL never observes a wiped obj. The object itself stays
+             * alive past this call: its Py_DECREF is deferred until after
+             * live_lock is released. */
+            atomic_store_explicit(&e->state, TL_PY_LIVE_TOMBSTONE,
+                                  memory_order_seq_cst);
             e->obj = NULL;
-            e->count = 0;
-            e->state = TL_PY_LIVE_TOMBSTONE;
+            atomic_store_explicit(&e->count, 0, memory_order_relaxed);
             ctx->live_len--;
             ctx->live_tombstones++;
             return;
@@ -779,9 +880,13 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
     PyObject** refs = NULL;
     size_t total = 0;
 
-    /* Phase 1: collect strong refs under live_lock; free the table. */
+    /* Phase 1: collect strong refs under live_lock; clear the table.
+     * The table allocation itself is NOT freed here (a lock-free traverse
+     * may be walking it); it is reused, and finally freed at ctx teardown. */
     TL_PY_MUTEX_LOCK(&ctx->live_lock);
-    if (ctx->live_entries == NULL) {
+    tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                   memory_order_relaxed);
+    if (tab == NULL) {
         TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
         return;
     }
@@ -798,10 +903,11 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
     /* Two-pass: count the multiset total (live_len counts distinct
      * entries; total refs = sum of e->count over FULL entries). */
     size_t needed = 0;
-    for (size_t i = 0; i < ctx->live_cap; i++) {
-        tl_py_live_entry_t* e = &ctx->live_entries[i];
-        if (e->state == TL_PY_LIVE_FULL) {
-            needed += (size_t)e->count;
+    for (size_t i = 0; i < tab->cap; i++) {
+        if (atomic_load_explicit(&tab->e[i].state, memory_order_relaxed)
+                == TL_PY_LIVE_FULL) {
+            needed += (size_t)atomic_load_explicit(&tab->e[i].count,
+                                                   memory_order_relaxed);
         }
     }
 
@@ -817,15 +923,13 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
              * anyway; the alternative is deadlock or UAF via __del__. */
             atomic_store_explicit(&ctx->live_tracking_failed, 1,
                                   memory_order_release);
-            for (size_t i = 0; i < ctx->live_cap; i++) {
-                tl_py_live_entry_t* e = &ctx->live_entries[i];
+            for (size_t i = 0; i < tab->cap; i++) {
+                tl_py_live_entry_t* e = &tab->e[i];
+                atomic_store_explicit(&e->state, TL_PY_LIVE_EMPTY,
+                                      memory_order_seq_cst);
                 e->obj = NULL;
-                e->count = 0;
-                e->state = TL_PY_LIVE_EMPTY;
+                atomic_store_explicit(&e->count, 0, memory_order_relaxed);
             }
-            free(ctx->live_entries);
-            ctx->live_entries = NULL;
-            ctx->live_cap = 0;
             ctx->live_len = 0;
             ctx->live_tombstones = 0;
             TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
@@ -838,24 +942,34 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
         }
     }
 
-    for (size_t i = 0; i < ctx->live_cap; i++) {
-        tl_py_live_entry_t* e = &ctx->live_entries[i];
-        if (e->state == TL_PY_LIVE_FULL) {
-            for (uint64_t c = e->count; c > 0; c--) {
+    for (size_t i = 0; i < tab->cap; i++) {
+        tl_py_live_entry_t* e = &tab->e[i];
+        if (atomic_load_explicit(&e->state, memory_order_relaxed)
+                == TL_PY_LIVE_FULL) {
+            uint64_t c = atomic_load_explicit(&e->count,
+                                              memory_order_relaxed);
+            for (; c > 0; c--) {
                 refs[total++] = e->obj;
             }
+            /* Retire order: state leaves FULL before obj is wiped. */
+            atomic_store_explicit(&e->state, TL_PY_LIVE_EMPTY,
+                                  memory_order_seq_cst);
             e->obj = NULL;
-            e->count = 0;
-            e->state = TL_PY_LIVE_EMPTY;
+            atomic_store_explicit(&e->count, 0, memory_order_relaxed);
         }
     }
 
-    free(ctx->live_entries);
-    ctx->live_entries = NULL;
-    ctx->live_cap = 0;
     ctx->live_len = 0;
     ctx->live_tombstones = 0;
     TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
+
+    /* Wait out any in-flight lock-free tp_traverse walker before releasing
+     * the refs it may be borrowing. Walkers never park, so this is a short
+     * bounded spin (close paths are allowed to wait; traverse is not). */
+    while (atomic_load_explicit(&ctx->traverse_readers,
+                                memory_order_seq_cst) != 0) {
+        tl_py_cpu_yield();
+    }
 
     /* Phase 2: Py_DECREF outside live_lock. __del__ may reenter Python
      * freely now that no internal lock is held. */
@@ -867,51 +981,69 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx)
 
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg)
 {
-#ifndef NDEBUG
-    assert(tl_py_attached_to_interp(ctx) &&
-           "tl_py_handle_ctx_traverse requires owning interpreter");
-#endif
     if (ctx == NULL || visit == NULL) {
         return 0;
     }
 
-    PyObject** snap = NULL;
-    size_t snap_n = 0;
+    tl_py_live_table_t* tab = atomic_load_explicit(&ctx->live_tab,
+                                                   memory_order_acquire);
+    if (tab == NULL) {
+        return 0;
+    }
 
-    /* Phase 1: snapshot strong refs under live_lock. A raw pointer snapshot is
-     * not enough under no-GIL: a concurrent drain can drop the last reference
-     * immediately after we unlock, before visit() sees the pointer. */
-    TL_PY_MUTEX_LOCK(&ctx->live_lock);
-    if (ctx->live_entries != NULL && ctx->live_len > 0) {
-        snap = (PyObject**)malloc(ctx->live_len * sizeof(PyObject*));
-        if (snap == NULL) {
-            TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
-            PyErr_NoMemory();
-            return -1;
-        } else {
-            for (size_t i = 0; i < ctx->live_cap; i++) {
-                tl_py_live_entry_t* e = &ctx->live_entries[i];
-                if (e->state == TL_PY_LIVE_FULL && e->obj != NULL) {
-                    Py_INCREF(e->obj);
-                    snap[snap_n++] = e->obj;
+    /* tp_traverse must NEVER park and must NEVER allocate. During a
+     * free-threaded stop-the-world collection, any lock here — live_lock
+     * OR the libc allocator's arena lock inside malloc — can be held by a
+     * FROZEN thread (e.g. a writer parked mid-handoff in
+     * tstate_wait_attach): the GC parking on it while its holder waits for
+     * the GC to finish is the v1.2 production deadlock this function used
+     * to cause.
+     */
+    /* Single path: the registered lock-free walk. No locks (a frozen
+     * holder during a stop-the-world collection can never release), no
+     * malloc (a frozen thread can hold the allocator's arena lock — the
+     * same deadlock through libc), no INCREF, no Python C-API; also valid
+     * without an attached thread state (late-finalization GC).
+     *
+     * Lifetime of the borrowed obj pointers: while traverse_readers != 0,
+     * drains defer their Py_DECREFs and release_all waits, so nothing a
+     * FULL entry names can be freed before we unregister. Registration is
+     * seq_cst and so are the retire-side state stores and our state loads,
+     * so a walker that registers after a drain's reader-gate observed zero
+     * is ordered after the corresponding TOMBSTONE store and skips the
+     * entry. The table is reloaded AFTER registration so a concurrent
+     * rehash cannot strand us on a view whose releases predate it. */
+    atomic_fetch_add_explicit(&ctx->traverse_readers, 1,
+                              memory_order_seq_cst);
+    tab = atomic_load_explicit(&ctx->live_tab, memory_order_acquire);
+    int rc = 0;
+    if (tab != NULL) {
+        for (size_t i = 0; i < tab->cap; i++) {
+            tl_py_live_entry_t* e = &tab->e[i];
+            if (atomic_load_explicit(&e->state, memory_order_seq_cst)
+                    != TL_PY_LIVE_FULL) {
+                continue;
+            }
+            PyObject* obj = atomic_load_explicit(&e->obj,
+                                                 memory_order_relaxed);
+            if (obj == NULL) {
+                continue;
+            }
+            uint64_t c = atomic_load_explicit(&e->count,
+                                              memory_order_relaxed);
+            for (; c > 0; c--) {
+                rc = visit(obj, arg);
+                if (rc != 0) {
+                    break;
                 }
+            }
+            if (rc != 0) {
+                break;
             }
         }
     }
-    TL_PY_MUTEX_UNLOCK(&ctx->live_lock);
-
-    /* Phase 2: visit live snapshot outside live_lock. */
-    int rc = 0;
-    for (size_t i = 0; i < snap_n; i++) {
-        rc = visit(snap[i], arg);
-        if (rc != 0) {
-            break;
-        }
-    }
-    for (size_t i = 0; i < snap_n; i++) {
-        Py_DECREF(snap[i]);
-    }
-    free(snap);
+    atomic_fetch_sub_explicit(&ctx->traverse_readers, 1,
+                              memory_order_seq_cst);
     if (rc != 0) {
         return rc;
     }

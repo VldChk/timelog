@@ -7,6 +7,7 @@ container-protocol dunders, teaching errors, and stats enrichment.
 """
 import array
 import datetime
+import os
 import subprocess
 import sys
 import time
@@ -17,6 +18,21 @@ import pytest
 from timelog import Timelog, TimelogError
 
 
+def _subprocess_env():
+    """Minimal child env, plus sanitizer/runtime passthrough.
+
+    Sanitizer legs stage an instrumented extension and run pytest with
+    LD_PRELOAD; the child must inherit that (and GIL/TSan knobs) or it dies
+    loading the staged module before the behavior under test runs.
+    """
+    env = {"PYTHONPATH": "python", "PATH": "/usr/bin:/bin"}
+    for key in ("LD_PRELOAD", "ASAN_OPTIONS", "TSAN_OPTIONS",
+                "LSAN_OPTIONS", "PYTHON_GIL"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    return env
+
+
 class TestCleanExitSilence:
     def test_abandoned_log_exits_silently(self):
         # The dominant real-world pattern: module-global log, records in,
@@ -24,7 +40,7 @@ class TestCleanExitSilence:
         code = "from timelog import Timelog; log = Timelog(); log[1] = 'x'"
         proc = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
-            env={"PYTHONPATH": "python", "PATH": "/usr/bin:/bin"}, timeout=30,
+            env=_subprocess_env(), timeout=60,
             cwd=__file__.rsplit("/python/tests", 1)[0])
         assert proc.returncode == 0
         assert proc.stderr.strip() == "", f"clean exit printed: {proc.stderr!r}"
@@ -43,7 +59,7 @@ class TestCleanExitSilence:
                 "mv = memoryview(span)\n")
         proc = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
-            env={"PYTHONPATH": "python", "PATH": "/usr/bin:/bin"}, timeout=30,
+            env=_subprocess_env(), timeout=60,
             cwd=__file__.rsplit("/python/tests", 1)[0])
         assert proc.returncode == 0
 

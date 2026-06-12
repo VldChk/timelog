@@ -475,6 +475,24 @@ static tl_py_handle_ctx_t* tl_py_acquire_owned_handle_ctx(PyTimelog* self)
 }
 
 /*
+ * Non-blocking variant for tp_traverse, which must never park: during a
+ * free-threaded stop-the-world collection core_lock can be held by a FROZEN
+ * thread that will only run again after the GC finishes — and the GC cannot
+ * finish while traverse is parked on the lock. Returns NULL when the lock
+ * is contended; the caller under-reports for this GC cycle (over-retention
+ * for one cycle, which is always sound).
+ */
+static tl_py_handle_ctx_t* tl_py_try_acquire_owned_handle_ctx(PyTimelog* self)
+{
+    if (!TL_PY_TRYLOCK(self)) {
+        return NULL;
+    }
+    tl_py_handle_ctx_t* h = tl_py_own_handle_ctx_locked(self);
+    TL_PY_UNLOCK(self);
+    return h;
+}
+
+/*
  * Opportunistic post-core-call drain. Own a handle_ctx reference (so a
  * concurrent close() cannot free it mid-drain), drain retired Python refs
  * best-effort (force=0), then drop the reference. Runs with no lock held:
@@ -1570,7 +1588,11 @@ PyTimelog_traverse(PyTimelog* self, visitproc visit, void* arg)
 {
     Py_VISIT(Py_TYPE(self));
 
-    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    /* MUST be the non-blocking acquire: tp_traverse parking on core_lock
+     * during a stop-the-world collection is a deadlock (the holder may be a
+     * frozen thread). NULL (contended or already closed) => under-report
+     * this cycle, which only over-retains. */
+    tl_py_handle_ctx_t* hctx = tl_py_try_acquire_owned_handle_ctx(self);
     if (hctx == NULL) {
         return 0;
     }

@@ -265,6 +265,17 @@ int tl_py_lock_checked(PyTimelog* self);
         } \
     } while (0)
 
+/**
+ * Non-blocking core_lock acquire. Evaluates to nonzero on success.
+ * Required by tp_traverse: parking on core_lock during a free-threaded
+ * stop-the-world collection deadlocks when the holder is a frozen thread
+ * (it can never run to release; the GC can never finish to unfreeze it).
+ */
+#define TL_PY_TRYLOCK(self) \
+    ((self)->core_lock \
+         ? (PyThread_acquire_lock((self)->core_lock, 0) == 1) \
+         : 1)
+
 #ifdef __cplusplus
 }
 #endif

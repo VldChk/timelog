@@ -335,13 +335,24 @@ Protects:
 Purpose:
 - protect the live-handle multiset / hash table, which previously assumed interpreter-lock serialization.
 
-Protects:
-- `live_entries`
-- `live_cap`
+Protects (mutation):
+- the live table (`live_tab`, a single-allocation hash table published via
+  an atomic pointer; resized-out tables chain on `retired_tables` and are
+  freed only at ctx teardown)
 - `live_len`
 - `live_tombstones`
 - `live_tracking_failed`
-- live-table scans used by traversal / cleanup paths
+- live-table scans used by cleanup paths (`release_all`)
+
+NOT held by `tp_traverse`, which must never park or allocate: during a
+free-threaded stop-the-world collection the holder of live_lock — or of the
+libc allocator's arena lock — can be a frozen thread that only runs again
+after the GC finishes (the v1.3 deadlock fix). Traverse is a single
+registered lock-free walk: retire-side state stores and the walker's state
+loads are seq_cst so they order against the seq_cst `traverse_readers`
+gates; borrowed pointers stay alive because drains defer their `Py_DECREF`s
+(re-push to the retired stack) and `release_all` waits while walkers are
+registered.
 
 Implementation:
 - `PyMutex` or `PyThread_type_lock`
