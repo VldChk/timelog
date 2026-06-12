@@ -43,6 +43,13 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - On write-path backpressure, `TimelogBusyError` indicates data was accepted by the engine; do not blind-retry append/delete calls.
+- `extend(..., insert_on_error=True)` (the default) SKIPS records whose
+  timestamp is type-invalid (e.g. a string or bool) and emits a
+  `RuntimeWarning` with the skip count; pass `insert_on_error=False` to
+  pre-validate the whole batch and insert all-or-nothing. A timestamp below
+  the `min_ts` floor always aborts the whole batch with `ValueError`
+  regardless of `insert_on_error` (floor violations are pre-validated, not
+  skippable).
 - `bulk_append(timestamps, objects)` is the typed-buffer fast path for bulk ingest:
   `timestamps` must be a contiguous 1-D native-endian int64 buffer (a NumPy `int64`
   array, `array.array("q")`, or a memoryview of either); `objects` must be a concrete
@@ -65,8 +72,32 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - `log[:]` -> full iterator
 - `log[ts]` -> list of objects at exact timestamp
 - `at(ts)` -> alias for exact timestamp lookup
+- `ts in log` -> True if any record exists at exactly `ts` (O(log n) point check)
 - `__iter__()` -> full iterator
 - `__len__()` -> tombstone-aware estimated visible count from `stats()`
+
+Named query methods (equivalent to the slice forms, useful when passing
+callables around): `range(t1, t2)`, `since(t1)`, `until(t2)`, `all()`,
+`point(ts)` / `equal(ts)` (iterators over one timestamp's records).
+
+Timestamp navigation: `min_ts()` / `max_ts()` return the smallest/largest
+visible data timestamp or `None` when empty (`max_ts()` is O(n) — prefer
+`stats()["storage"]["max_ts"]` for monitoring); `next_ts(ts)` / `prev_ts(ts)`
+return the nearest strictly-greater / strictly-smaller visible timestamp.
+For "first timestamp >= x", use `next_ts(x - 1)` (guard `x > TL_TS_MIN`).
+
+`Contract`
+- Slices return SINGLE-USE iterators: a second `list(it)` yields `[]`.
+  `len(it)` reports remaining rows without consuming them (and counts down
+  as you iterate). Materialize with `list(...)` if you need re-iteration.
+- Reversed slice bounds follow sequence semantics: `log[100:10]` is an empty
+  iterator (like `lst[100:10] == []`). The explicit `range(t1, t2)` method
+  raises `ValueError` on reversed bounds instead.
+- `reversed(log)` raises `TypeError` (the LSM read path is forward-only);
+  iterate a bounded window and reverse the materialized list, or walk
+  backwards with `prev_ts()`.
+- `log[ts] = obj` APPENDS — it never replaces (multimap semantics). For
+  upsert behavior, `del log[ts]` first.
 
 ## Delete API
 
@@ -78,6 +109,23 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Contract`
 - Point delete at `TL_TS_MAX` is not representable as `[ts, ts+1)` and raises `ValueError`.
+- Deletes are logical and immediate for readers; physical memory reclaim
+  happens via compaction (see `docs/operations.md`, "Space Reclaim After
+  Deletes").
+
+## Introspection
+
+- `stats()` -> nested dict: `storage` / `memtable` / `operational` /
+  `compaction_selection` / `adaptive` / `config`. Empty-log bounds read as
+  `None`; `operational.busy_events` counts write-path backpressure under
+  EVERY `busy_policy` (including `"silent"`); `config` echoes the effective
+  instance configuration (`time_unit`, `maintenance`, `busy_policy`,
+  `min_ts`, `mostly_ordered_default`) for dashboards.
+- `busy_events` (property) -> cumulative backpressure events.
+- `min_ts_floor` (property) -> the configured `min_ts` retention floor or
+  `None`. Distinct from `min_ts()`, which reports the smallest timestamp in
+  the data.
+- `retired_queue_len` (property) -> objects awaiting deferred release.
 
 ## Zero-Copy Views
 
@@ -85,4 +133,6 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 
 `Implementation note`
 - Views expose physical storage spans and are not a semantic replacement for tombstone-filtered logical iterators.
+- Views only see FLUSHED segments: on a freshly-written log, call `flush()`
+  first or `views()` yields nothing while `len(log)` is non-zero.
 - `PageSpan.objects()` returns a lazy view tied to the parent span. Once the parent `PageSpan` is closed, indexing, iteration, `len()`, and `copy()` on the view raise `ValueError`.

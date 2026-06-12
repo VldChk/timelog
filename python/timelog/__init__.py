@@ -326,7 +326,12 @@ class Timelog(_CTimelog):
         return ts
 
     def _filtered_pairs(self, iterable):
-        """Yield (ts, obj) pairs, skipping type/overflow errors but raising on non-pairs and min_ts."""
+        """Yield (ts, obj) pairs, skipping type/overflow errors but raising on non-pairs and min_ts.
+
+        Skipped rows are reported with a RuntimeWarning after the stream is
+        consumed — silent partial ingest in a storage engine is data loss.
+        """
+        skipped = 0
         for item in iterable:
             try:
                 ts, obj = item
@@ -335,8 +340,16 @@ class Timelog(_CTimelog):
             try:
                 ts = Timelog._coerce_and_guard(self, ts)
             except (TypeError, OverflowError):
+                skipped += 1
                 continue
             yield (ts, obj)
+        if skipped:
+            import warnings
+            warnings.warn(
+                f"extend() skipped {skipped} record(s) with invalid "
+                "timestamps (insert_on_error=True); pass "
+                "insert_on_error=False to validate the whole batch instead",
+                RuntimeWarning, stacklevel=3)
 
     # ------------------------------------------------------------------
     # Write path
@@ -389,12 +402,21 @@ class Timelog(_CTimelog):
                 except TypeError:
                     pass
             def gen():
+                skipped = 0
                 for ts_val, obj in zip(ts_or_iterable, objects, strict=True):
                     try:
                         ts = Timelog._coerce_and_guard(self, ts_val)
                     except (TypeError, OverflowError):
+                        skipped += 1
                         continue
                     yield (ts, obj)
+                if skipped:
+                    import warnings
+                    warnings.warn(
+                        f"extend() skipped {skipped} record(s) with invalid "
+                        "timestamps (insert_on_error=True); pass "
+                        "insert_on_error=False to validate the whole batch "
+                        "instead", RuntimeWarning, stacklevel=3)
 
             super().extend(gen(), mostly_ordered=mostly_ordered)
             return
@@ -434,6 +456,71 @@ class Timelog(_CTimelog):
         """Return tombstone-aware record count (takes a fresh snapshot each call)."""
         s = self.stats()
         return int(s["storage"]["records_estimate"])
+
+    def __contains__(self, ts) -> bool:
+        """Return True if any record exists at exactly ``ts`` (O(log n)).
+
+        Without this, Python's fallback would full-scan ``(ts, obj)`` tuples
+        and silently answer False for timestamps that exist.
+        """
+        it = self.point(_coerce_ts(ts))
+        try:
+            return len(it) > 0          # precomputed count; nothing consumed
+        finally:
+            it.close()
+
+    def __reversed__(self):
+        """Descending iteration is not supported by the LSM read path."""
+        raise TypeError(
+            "Timelog does not support reversed(); iterate forward over a "
+            "bounded window instead, e.g. list(log[t1:t2]) and reverse the "
+            "materialized list, or walk back with prev_ts(ts)"
+        )
+
+    def __repr__(self) -> str:
+        try:
+            if self.closed:
+                return f"<{type(self).__name__} closed>"
+            s = self.stats()["storage"]
+            n = int(s["records_estimate"])
+            lo, hi = s["min_ts"], s["max_ts"]
+            span = f" [{lo}..{hi}]" if (lo is not None and hi is not None) else ""
+            return (f"<{type(self).__name__} len~{n} "
+                    f"time_unit={self.time_unit!r}{span}>")
+        except Exception:
+            return object.__repr__(self)
+
+    @property
+    def min_ts_floor(self):
+        """The configured ``min_ts`` retention floor, or None.
+
+        Distinct from ``min_ts()`` (the smallest timestamp currently in the
+        data). Writes below the floor raise ValueError.
+        """
+        return _CTimelog._min_ts_floor(self)
+
+    def stats(self):
+        """Return engine statistics with facade enrichments.
+
+        On top of the C engine's counters: empty-log sentinel bounds are
+        mapped to None, ``operational.busy_events`` counts write-path
+        backpressure under every busy_policy, and ``config`` echoes the
+        effective instance configuration for dashboards/alerting.
+        """
+        s = super().stats()
+        storage = s["storage"]
+        if storage["min_ts"] == TL_TS_MAX and storage["max_ts"] == TL_TS_MIN:
+            storage["min_ts"] = None    # empty-log sentinels
+            storage["max_ts"] = None
+        s["operational"]["busy_events"] = self.busy_events
+        s["config"] = {
+            "time_unit": self.time_unit,
+            "maintenance": self.maintenance_mode,
+            "busy_policy": self.busy_policy,
+            "min_ts": _CTimelog._min_ts_floor(self),
+            "mostly_ordered_default": self._mostly_ordered_default,
+        }
+        return s
 
     # ------------------------------------------------------------------
     # Read path

@@ -461,6 +461,7 @@ void tl_close(tl_timelog_t* tl) {
 /* Forward declaration: the write path requests flushes after dropping
  * writer_mu, but the definition lives with the maintenance plumbing below. */
 static void tl__maint_request_flush(tl_timelog_t* tl);
+static void tl__maint_request_compact(tl_timelog_t* tl);
 
 static void tl__emit_drop_callbacks(tl_timelog_t* tl,
                                     tl_record_t* dropped,
@@ -1161,6 +1162,16 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
     }
 
     TL_UNLOCK_FLUSH(tl);
+
+    /* A user-driven flush publishes L0 segments outside the worker loop, so
+     * nudge the worker if that pushed a compaction trigger over threshold.
+     * Runs after flush_mu is released (lock order: maint_mu -> flush_mu).
+     * The worker's periodic wake-up also re-evaluates triggers now; this
+     * nudge just removes up to maintenance_wakeup_ms of latency. */
+    if (tl->config.maintenance_mode == TL_MAINT_BACKGROUND &&
+        tl_compact_needed(tl)) {
+        tl__maint_request_compact(tl);
+    }
     return TL_OK;
 }
 
@@ -1757,11 +1768,17 @@ static void* tl__maint_worker_entry(void* arg) {
             work |= TL_WORK_FLUSH;
         }
 
-        /* Compaction triggers change only as a result of new L0 segments
-         * appearing, so a heuristic check is meaningful only when we are
-         * about to flush — otherwise the answer cannot have changed since
-         * the previous loop iteration. */
-        if (!(work & TL_WORK_COMPACT_EXPLICIT) && (work & TL_WORK_FLUSH)) {
+        /* Evaluate the compaction heuristic on EVERY wake-up, not only when
+         * this worker is about to flush. Triggers can change without worker
+         * flush activity: a user-called tl_flush() publishes L0 segments
+         * directly, and delete-debt grows from tombstone insertion alone
+         * (delete-heavy retention workloads with no new writes). The check
+         * is cheap (manifest counters + cursor sweep) and runs at most once
+         * per maintenance_wakeup_ms when idle. Previously this was gated on
+         * pending flush work, which let user-flushed L0 grow unboundedly and
+         * left delete_debt_threshold inert on idle instances (v1.3 usability
+         * lab findings). */
+        if (!(work & TL_WORK_COMPACT_EXPLICIT)) {
             if (tl_compact_needed(tl)) {
                 work |= TL_WORK_COMPACT_HEURISTIC;
             }

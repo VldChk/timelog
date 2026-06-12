@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _datetime
 import operator
 from typing import TYPE_CHECKING
 
@@ -25,7 +26,23 @@ def _coerce_ts(x: object) -> int:
     """
     if isinstance(x, bool):
         raise TypeError("timestamp must be int (bool not allowed)")
-    ts = operator.index(x)
+    try:
+        ts = operator.index(x)
+    except TypeError:
+        # The two mistakes every user makes once: teach, don't scold.
+        if isinstance(x, _datetime.datetime):
+            raise TypeError(
+                "timestamps are integers in the log's time_unit; for a "
+                "datetime use e.g. int(dt.timestamp() * 1000) with "
+                "time_unit='ms' (UTC-aware datetimes recommended)"
+            ) from None
+        if isinstance(x, float):
+            raise TypeError(
+                f"timestamps are integers in the log's time_unit, not float "
+                f"({x!r}); use int(x), or a finer time_unit ('us'/'ns') if "
+                "you need sub-unit precision"
+            ) from None
+        raise
     if ts < TL_TS_MIN or ts > TL_TS_MAX:
         raise OverflowError(
             f"timestamp {ts} is outside int64 range [{TL_TS_MIN}, {TL_TS_MAX}]"
@@ -63,4 +80,13 @@ def _slice_to_iter(log: Timelog, s: slice) -> TimelogIter:
     if stop is None:
         return log.since(_coerce_ts(start))
 
-    return log.range(_coerce_ts(start), _coerce_ts(stop))
+    t1 = _coerce_ts(start)
+    t2 = _coerce_ts(stop)
+    if t1 > t2:
+        # Sequence semantics: lst[10:1] == [], and the engine's own
+        # convention says "empty range: t1 >= t2". Explicit range()/delete()
+        # calls still raise on reversed bounds; the slice OPERATOR follows
+        # Python container instincts (e.g. a wall clock stepping backwards
+        # in a now-window loop should not blow up a monitoring endpoint).
+        return log.range(t1, t1)
+    return log.range(t1, t2)

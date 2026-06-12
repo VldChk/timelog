@@ -26,6 +26,32 @@ Sources of truth:
 - `compaction={target_bytes,max_inputs,max_windows}`
 - `adaptive={target_records,min_window,max_window,hysteresis_pct,window_quantum,alpha,warmup_flushes,stale_flushes,failure_backoff_threshold,failure_backoff_pct}`
 
+## Backpressure: `busy_policy`
+
+How write-path backpressure (engine `TL_EBUSY`) is surfaced. In every case
+THE WRITE WAS ACCEPTED — the policy only decides what happens next:
+
+- `busy_policy="raise"` — raise `TimelogBusyError` (do not retry the write;
+  it is already in the log). Right for latency-sensitive callers that want
+  to shed load explicitly.
+- `busy_policy="flush"` — synchronously flush to relieve pressure, then
+  continue. The production default for streaming ingest (`for_streaming`).
+- `busy_policy="silent"` — swallow the signal and continue. Use only with
+  external monitoring: watch `stats()["operational"]["busy_events"]`, which
+  counts backpressure under every policy.
+
+Chronic backpressure means maintenance cannot keep up: lower the ingest
+rate, raise `memtable_max_bytes`/`sealed_max_runs`, or switch to
+`maintenance="disabled"` + periodic manual `flush()` for bulk loads.
+
+## Retention floor: `min_ts`
+
+`Timelog(min_ts=X)` installs a persistent lower bound: writes below `X`
+raise `ValueError`, and the floor is applied as a delete on open. Read it
+back via `log.min_ts_floor` or `stats()["config"]["min_ts"]`. (This is the
+configuration knob; the `min_ts()` METHOD reports the smallest timestamp
+currently visible in the data.)
+
 ## Python Presets
 
 - `for_streaming`: background + flush busy policy.

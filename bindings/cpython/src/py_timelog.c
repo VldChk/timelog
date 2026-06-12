@@ -403,6 +403,11 @@ static int tl_py_now_ts(const PyTimelog* self, long long* out)
  */
 static int tl_py_handle_write_ebusy(PyTimelog* self, const char* msg)
 {
+    /* Count every surfaced write-path EBUSY regardless of policy so
+     * operators can alert on chronic backpressure even under 'silent'
+     * or 'flush' (v1.3 usability lab: stats offered no trace). */
+    atomic_fetch_add_explicit(&self->busy_events, 1, memory_order_relaxed);
+
     if (self->busy_policy == TL_PY_BUSY_RAISE) {
         TL_PY_RAISE_STATUS_FMT(self, TL_EBUSY, "%s", msg);
         return -1;
@@ -1023,6 +1028,8 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
+    /* Fresh engine (init or reopen): backpressure counter starts at zero. */
+    atomic_store_explicit(&self->busy_events, 0, memory_order_relaxed);
 
     /* Apply numeric overrides with range/overflow validation. */
     if (memtable_max_bytes != PY_SSIZE_T_MIN) {
@@ -3474,6 +3481,12 @@ static PyObject* PyTimelog_get_alloc_failures(PyTimelog* self, void* Py_UNUSED(c
     return PyLong_FromUnsignedLongLong(failures);
 }
 
+static PyObject* PyTimelog_get_busy_events(PyTimelog* self, void* Py_UNUSED(closure))
+{
+    uint64_t n = atomic_load_explicit(&self->busy_events, memory_order_relaxed);
+    return PyLong_FromUnsignedLongLong(n);
+}
+
 /*===========================================================================
  * Property Table
  *===========================================================================*/
@@ -3496,6 +3509,10 @@ static PyGetSetDef PyTimelog_getset[] = {
 
     {"alloc_failures", (getter)PyTimelog_get_alloc_failures, NULL,
      "Number of allocation failures in on_drop callback (objects leaked).", NULL},
+
+    {"busy_events", (getter)PyTimelog_get_busy_events, NULL,
+     "Cumulative write-path backpressure (TL_EBUSY) events, counted under "
+     "every busy_policy.", NULL},
 
     {NULL, NULL, NULL, NULL, NULL}
 };

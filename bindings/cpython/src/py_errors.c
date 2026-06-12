@@ -148,15 +148,17 @@ PyObject* TlPy_RaiseFromStateFmt(const tl_py_module_state_t* st,
 #endif
 
     va_start(args, format);
-    n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
+    n = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    if (n >= 0 && (size_t)n < sizeof(buffer) - 64) {
-        const char* status_msg = tl_strerror(status);
-        size_t remaining = sizeof(buffer) - (size_t)n;
-        snprintf(buffer + n, remaining, ": %s", status_msg);
+    /* The formatted message stands alone. The engine status is already
+     * encoded in the exception TYPE; appending ": invalid state" /
+     * ": resource busy" to a complete sentence read like a formatting bug
+     * (v1.3 usability lab, multiple personas). An empty message falls back
+     * to the status text so the exception is never blank. */
+    if (n <= 0 || buffer[0] == '\0') {
+        snprintf(buffer, sizeof(buffer), "%s", tl_strerror(status));
     }
-
     PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
     return NULL;
 }
@@ -189,15 +191,14 @@ PyObject* TlPy_RaiseFromObjectFmt(PyObject* obj,
     }
 
     va_start(args, format);
-    n = vsnprintf(buffer, sizeof(buffer) - 64, format, args);
+    n = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    if (n >= 0 && (size_t)n < sizeof(buffer) - 64) {
-        const char* status_msg = tl_strerror(status);
-        size_t remaining = sizeof(buffer) - (size_t)n;
-        snprintf(buffer + n, remaining, ": %s", status_msg);
+    /* See TlPy_RaiseFromStateFmt: no status-name suffix on custom messages;
+     * empty messages fall back to the status text. */
+    if (n <= 0 || buffer[0] == '\0') {
+        snprintf(buffer, sizeof(buffer), "%s", tl_strerror(status));
     }
-
     PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
     return NULL;
 }

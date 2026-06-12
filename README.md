@@ -103,7 +103,9 @@ Timelog is not:
 - a distributed TSDB,
 - a SQL query engine.
 
-`close()` does not materialize unflushed writes. Call `flush()` first if you need all pending data materialized into immutable segments before shutdown.
+`close()` discards all data — the engine is in-memory, so nothing survives it.
+`flush()` matters while the log is OPEN: it materializes pending writes into
+immutable segments so zero-copy `views()` readers can see them.
 
 ## API Snapshot
 

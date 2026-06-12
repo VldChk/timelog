@@ -92,6 +92,27 @@ static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
     uint64_t pins = atomic_load_explicit(
         (_Atomic(uint64_t)*)&ctx->pins, memory_order_relaxed);
 
+    /* Live-only state during interpreter finalization is the NORMAL path
+     * for the documented no-context-manager usage (module-global log, no
+     * close(), process exiting): the OS reclaims everything and nothing
+     * can leak. Printing a scary WARNING here trips users' log-based
+     * alerting on every deploy (v1.3 usability lab finding), so stay
+     * silent for that case. Pins or undrained retired nodes still warn —
+     * an exported buffer or pending drop outliving teardown is a genuine
+     * anomaly worth surfacing. */
+    int finalizing;
+#if PY_VERSION_HEX >= 0x030D0000
+    finalizing = Py_IsFinalizing();   /* safe without an attached tstate */
+#else
+    /* 3.12: sys.is_finalizing() needs an attached tstate, which this path
+     * by definition lacks. A final destroy with no attached thread state
+     * only occurs during interpreter teardown in practice, so assume it. */
+    finalizing = 1;
+#endif
+    if (finalizing && remaining == NULL && pins == 0) {
+        return;
+    }
+
     if (remaining != NULL || ctx->live_len != 0 || pins != 0) {
         fprintf(stderr,
             "WARNING: tl_py_handle_ctx final destroy skipped Python ref "

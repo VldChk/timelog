@@ -190,6 +190,13 @@ typedef struct {
      */
     tl_py_busy_policy_t busy_policy;
 
+    /**
+     * Cumulative count of write-path TL_EBUSY events, regardless of
+     * busy_policy ('silent'/'flush' otherwise leave backpressure invisible
+     * to operators). Relaxed atomic; read via the busy_events property.
+     */
+    _Atomic(uint64_t) busy_events;
+
 } PyTimelog;
 
 /*===========================================================================
