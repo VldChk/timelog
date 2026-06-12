@@ -368,8 +368,12 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
 
 /**
  * GC traversal helper: visit all Python objects currently referenced by ctx.
- * Must be called on the owning interpreter with an attached Python thread
- * state.
+ *
+ * Single registered lock-free walk: never parks, never allocates, calls no
+ * Python C-API, and is valid WITHOUT an attached thread state (it runs
+ * during late-finalization GC too). Borrowed-pointer lifetime is guaranteed
+ * by the traverse_readers handshake (drains defer Py_DECREFs, release_all
+ * waits). The caller must hold a ctx refcount across the call.
  */
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg);
 

@@ -166,13 +166,17 @@ Deletes are logical tombstones; physical cleanup is deferred to maintenance.
 
 ## Performance at a Glance
 
-v1.3 hot-path improvements (pinned A/B vs the v1.2 baseline, Linux x86_64, Python `3.13.12`,
-median of 5; raw artifacts in `docs/benchmarks/` and `ideas-lab/verification/`):
+v1.3 hot-path improvements (final release-gate A/B vs the v1.2.0 wheel, identical pinned
+harness, Linux x86_64, Python `3.13.12`, median of 5; raw artifacts in `docs/benchmarks/`,
+`ideas-lab/verification/`, and the release-notes appendix):
 
-- `append(obj)` folded into C: `4.39x` faster (`append(ts, obj)`: `3.39x`)
-- The 9 `METH_FASTCALL`-converted query/delete methods: `1.15x-1.36x` faster (dispatch plus related v1.3 changes)
+- `append(obj)` folded into C: `4.3x` faster (`append(ts, obj)`: `3.6x`, `append(obj, ts=...)`: `3.4x`)
+- `point`/`equal` and the `range`/`since`/`until` family: `1.3x-1.6x` faster
+- `extend` (10k-pair batches): `1.21x` faster
 - Size-gated branchless binary search: `1.93x-4.98x` faster at gated sizes (5 seams)
-- New `bulk_append`: `113 ns/record` (`3.5x` vs `extend`, `2.2x` vs the folded `append`)
+- New `bulk_append`: `21.6 ns/record` on repeated 10k batches (`113 ns/record` in a
+  single cold 200k batch); `8.4x` vs `extend` per record in the batched shape
+- Zero regressions: no measured operation is slower than v1.2.0
 
 Historical snapshot (`2026-02-15`, Linux x86_64, Python `3.13.12`, dataset `11,550,000` rows):
 
