@@ -220,7 +220,7 @@ class Timelog(_CTimelog):
         PageSpan: Zero-copy timestamp view.
     """
 
-    __slots__ = ("_mostly_ordered_default",)
+    __slots__ = ("_mostly_ordered_default", "_extend_skipped")
 
     @property
     def _min_ts(self):
@@ -234,6 +234,7 @@ class Timelog(_CTimelog):
         min_ts_val = None if min_ts is None else _coerce_ts(min_ts)
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_ordered_default
+        self._extend_skipped = 0
         _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
@@ -344,6 +345,7 @@ class Timelog(_CTimelog):
                 continue
             yield (ts, obj)
         if skipped:
+            self._extend_skipped += skipped
             import warnings
             warnings.warn(
                 f"extend() skipped {skipped} record(s) with invalid "
@@ -411,6 +413,7 @@ class Timelog(_CTimelog):
                         continue
                     yield (ts, obj)
                 if skipped:
+                    self._extend_skipped += skipped
                     import warnings
                     warnings.warn(
                         f"extend() skipped {skipped} record(s) with invalid "
@@ -491,6 +494,17 @@ class Timelog(_CTimelog):
             return object.__repr__(self)
 
     @property
+    def extend_skipped(self) -> int:
+        """Total records dropped by extend(insert_on_error=True) skips.
+
+        Python's warning machinery deduplicates the RuntimeWarning per call
+        site, so a long-running ingest loop sees it once; this counter (also
+        in ``stats()['operational']['extend_skipped']``) makes recurring
+        drops monitorable.
+        """
+        return self._extend_skipped
+
+    @property
     def min_ts_floor(self):
         """The configured ``min_ts`` retention floor, or None.
 
@@ -513,6 +527,7 @@ class Timelog(_CTimelog):
             storage["min_ts"] = None    # empty-log sentinels
             storage["max_ts"] = None
         s["operational"]["busy_events"] = self.busy_events
+        s["operational"]["extend_skipped"] = self._extend_skipped
         s["config"] = {
             "time_unit": self.time_unit,
             "maintenance": self.maintenance_mode,

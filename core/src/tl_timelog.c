@@ -1122,20 +1122,37 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
      * sealed memrun. Repeat until both the active run and the sealed queue
      * are empty, so on return all data is durably in segments. */
     for (;;) {
+        tl_record_t* seal_dropped = NULL;
+        size_t seal_dropped_len = 0;
+
         TL_LOCK_WRITER(tl);
         bool need_seal = !tl_memtable_is_active_empty(&tl->memtable);
         if (need_seal) {
-            st = tl_memtable_seal(&tl->memtable,
-                                   &tl->memtable_mu,
-                                   NULL,
-                                   tl->op_seq);
+            /* MUST be the drop-collecting seal: sealing applies the active
+             * tombstone set, physically eliding covered memtable records.
+             * The non-collecting variant silently discarded their handles
+             * here, permanently leaking the bound Python payloads under the
+             * natural retention order cutoff() -> flush() (records that
+             * never reached a segment have no other drop path). v1.2 bug,
+             * found by the v1.3 usability lab's TTL-cache persona. */
+            st = tl_memtable_seal_ex(&tl->memtable,
+                                     &tl->memtable_mu,
+                                     NULL,
+                                     tl->op_seq,
+                                     &seal_dropped,
+                                     &seal_dropped_len);
             if (st != TL_OK && st != TL_EBUSY) {
                 TL_UNLOCK_WRITER(tl);
+                tl__emit_drop_callbacks(tl, seal_dropped, seal_dropped_len);
                 TL_UNLOCK_FLUSH(tl);
                 return st;
             }
         }
         TL_UNLOCK_WRITER(tl);
+
+        /* Fire outside writer_mu (callbacks are engine-lock-free by
+         * contract: the binding only mallocs + pushes a lock-free node). */
+        tl__emit_drop_callbacks(tl, seal_dropped, seal_dropped_len);
 
         tl_memrun_t* mr = NULL;
         TL_LOCK_MEMTABLE(tl);

@@ -142,19 +142,27 @@ static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
      * only occurs during interpreter teardown in practice, so assume it. */
     finalizing = 1;
 #endif
-    if (finalizing && remaining == NULL && pins == 0) {
+    if (finalizing) {
+        /* The process (or interpreter) is going away: the OS reclaims all
+         * memory, so pending retired nodes / live handles are NOT leaks.
+         * A populated retired queue here is the NORMAL outcome of the
+         * documented retention pattern (cutoff+flush, worker compacts,
+         * process exits) — warning on it paged users' log alerting
+         * (v1.3 usability lab, three personas independently). Exit is
+         * silent, full stop, matching docs/operations.md. */
         return;
     }
 
     if (remaining != NULL || ctx->live_len != 0 || pins != 0) {
         fprintf(stderr,
-            "WARNING: tl_py_handle_ctx final destroy skipped Python ref "
-            "drain (%s): live=%zu retired=%p pins=%" PRIu64 ". "
-            "Objects may leak.\n",
-            reason,
+            "timelog: handle context destroyed outside interpreter "
+            "finalization with %zu tracked object(s), %s pending deferred "
+            "release(s), %" PRIu64 " active buffer pin(s) (%s). "
+            "Call close() for deterministic release.\n",
             ctx->live_len,
-            (void*)remaining,
-            pins);
+            remaining != NULL ? "some" : "no",
+            pins,
+            reason);
     }
 }
 

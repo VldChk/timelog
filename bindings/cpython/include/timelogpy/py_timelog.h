@@ -24,8 +24,10 @@
  *   attached thread state on the owning interpreter. The binding detaches
  *   the active thread state, releasing a GIL where present, around long
  *   core calls such as flush(), compact(), maint_step(), stop_maintenance(),
- *   explicit close(), and iterator range-count precomputation. Finalizer
- *   and dealloc cleanup keep the thread state attached.
+ *   and explicit close(). Iterator range-count precomputation deliberately
+ *   stays attached (per-creation detach reset GIL fairness timers and let a
+ *   hot reader loop starve the writer; v1.3 fix). Finalizer and dealloc
+ *   cleanup keep the thread state attached.
  *
  *   Supported builds:
  *     - Regular CPython 3.12-3.14 (single interpreter).

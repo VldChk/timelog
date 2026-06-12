@@ -222,3 +222,119 @@ class TestStatsEnrichment:
         log = Timelog(maintenance="disabled")
         assert log.min_ts_floor is None
         log.close()
+
+
+class TestSealDropRelease:
+    def test_cutoff_then_flush_releases_payloads(self):
+        # v1.2 bug: flush's seal elided tombstone-covered memtable records
+        # WITHOUT firing on_drop_handle -> their Python objects stayed
+        # strongly held until close(). The natural retention order
+        # (cutoff THEN flush) must release them like every other path.
+        import gc
+        import weakref
+
+        class Payload:
+            pass
+
+        log = Timelog(maintenance="disabled")
+        refs = []
+        for i in range(500):
+            p = Payload()
+            refs.append(weakref.ref(p))
+            log[i] = p
+            del p
+        log.cutoff(500)        # tombstone first (memtable-resident records)
+        log.flush()            # seal elides them -> MUST route to drop path
+        log.stats()            # any entrypoint drains the retired queue
+        gc.collect()
+        alive = sum(1 for r in refs if r() is not None)
+        assert alive == 0, f"{alive}/500 payloads leaked by seal-time elision"
+        assert len(log) == 0
+        log.close()
+
+    def test_point_delete_then_flush_releases(self):
+        import gc
+        import weakref
+
+        class Payload:
+            pass
+
+        log = Timelog(maintenance="disabled")
+        p = Payload()
+        ref = weakref.ref(p)
+        log[42] = p
+        del p
+        log.delete(42)
+        log.flush()
+        log.stats()
+        gc.collect()
+        assert ref() is None
+        log.close()
+
+
+class TestExitSilenceWithRetiredQueue:
+    def test_exit_after_retention_tick_is_silent(self):
+        # The documented retention runbook followed by immediate exit used to
+        # warn whenever the retired queue was non-empty at teardown.
+        code = (
+            "import time\n"
+            "from timelog import Timelog\n"
+            "log = Timelog(delete_debt_threshold=0.2)\n"
+            "log.extend([(i, object()) for i in range(5000)])\n"
+            "log.cutoff(4000)\n"
+            "log.flush()\n"
+            "time.sleep(0.4)\n"   # worker compacts; retired queue fills
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            env=_subprocess_env(), timeout=60,
+            cwd=__file__.rsplit("/python/tests", 1)[0])
+        assert proc.returncode == 0
+        assert proc.stderr.strip() == "", f"retention-exit printed: {proc.stderr!r}"
+
+
+class TestTeachingErrorsParity:
+    def test_append_float_ts_teaches(self):
+        log = Timelog(maintenance="disabled")
+        with pytest.raises(TypeError, match="int\\(x\\)|finer time_unit"):
+            log.append("x", ts=1500.5)
+        with pytest.raises(TypeError, match="int\\(x\\)|finer time_unit"):
+            log.append(1500.5, "x")
+        log.close()
+
+    def test_append_datetime_ts_teaches(self):
+        log = Timelog(maintenance="disabled")
+        with pytest.raises(TypeError, match=r"timestamp\(\) \* 1000"):
+            log.append("x", ts=datetime.datetime(2026, 1, 1))
+        log.close()
+
+    def test_extend_skipped_counter(self):
+        log = Timelog(maintenance="disabled")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            log.extend([(1, "a"), ("bad", "b"), (2, "c")])
+            log.extend([(3, "d"), ("bad", "e"), ("bad2", "f")])
+        assert log.extend_skipped == 3
+        assert log.stats()["operational"]["extend_skipped"] == 3
+        log.close()
+
+
+class TestIterRepr:
+    def test_bounded_repr(self):
+        log = Timelog(maintenance="disabled")
+        log.extend([(i, i) for i in range(5)])
+        it = log.range(1, 4)
+        assert repr(it) == "<TimelogIter [1..4) remaining=3>"
+        next(it)
+        assert "remaining=2" in repr(it)
+        it.close()
+        assert repr(it) == "<TimelogIter closed>"
+        log.close()
+
+    def test_unbounded_repr(self):
+        log = Timelog(maintenance="disabled")
+        log[7] = "x"
+        it = log.since(5)
+        assert repr(it).startswith("<TimelogIter [5..)")
+        it.close()
+        log.close()

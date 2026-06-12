@@ -17,9 +17,10 @@
  * - Core calls are serialized by core_lock and mutable Python-object fields use
  *   per-object critical sections / atomics where they can race.
  * - Thread state is detached, releasing a GIL where present, around long
- *   core calls: flush, compact, maint_step, stop_maintenance, explicit close(),
- *   and iterator range-count precomputation — after preserving Python
- *   lifetimes. Finalizer/dealloc cleanup keeps the thread state attached.
+ *   core calls: flush, compact, maint_step, stop_maintenance, explicit
+ *   close() — after preserving Python lifetimes. Iterator range-count
+ *   precomputation deliberately stays attached (GIL-fairness; v1.3).
+ *   Finalizer/dealloc cleanup keeps the thread state attached.
  * - Write operations keep the caller's Python thread state attached throughout
  */
 
@@ -323,6 +324,26 @@ static int tl_py_coerce_ts(PyObject* x, long long* out)
     }
     PyObject* idx = PyNumber_Index(x);   /* == operator.index(x) */
     if (idx == NULL) {
+        /* Teaching errors for the two most common wrong inputs, matching
+         * the facade's _coerce_ts so the C-folded append() and the
+         * FASTCALL query/delete methods read identically to
+         * __setitem__/at() (v1.3 usability lab: the most-used write
+         * method gave the bare CPython index error). */
+        if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+            if (PyFloat_Check(x)) {
+                PyErr_Clear();
+                PyErr_Format(PyExc_TypeError,
+                    "timestamps are integers in the log's time_unit, not "
+                    "float (%R); use int(x), or a finer time_unit", x);
+            } else if (strcmp(Py_TYPE(x)->tp_name, "datetime.datetime") == 0
+                       || strcmp(Py_TYPE(x)->tp_name, "datetime.date") == 0) {
+                PyErr_Clear();
+                PyErr_SetString(PyExc_TypeError,
+                    "timestamps are integers in the log's time_unit; for a "
+                    "datetime use int(dt.timestamp() * 1000) with "
+                    "time_unit='ms' (UTC-aware recommended)");
+            }
+        }
         return -1;
     }
     long long v = PyLong_AsLongLong(idx);
@@ -2238,6 +2259,30 @@ PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
     Py_buffer ts_view;
     if (PyObject_GetBuffer(ts_obj, &ts_view,
                            PyBUF_FORMAT | PyBUF_C_CONTIGUOUS) < 0) {
+        /* numpy datetime64 — the most likely real pandas-user input — has
+         * a buffer interface that refuses dtype 'M' with a raw numpy
+         * message. Replace it with the conversion recipe. */
+        if (PyObject_CheckBuffer(ts_obj) &&
+            PyErr_ExceptionMatches(PyExc_ValueError)) {
+            PyObject* exc = PyErr_GetRaisedException();
+            PyObject* str = exc ? PyObject_Str(exc) : NULL;
+            const char* msg = str ? PyUnicode_AsUTF8(str) : NULL;
+            if (msg != NULL && (strstr(msg, "dtype 'M'") != NULL ||
+                                strstr(msg, "dtype 'm'") != NULL)) {
+                Py_XDECREF(str);
+                Py_XDECREF(exc);
+                Py_DECREF(seq);
+                PyErr_SetString(PyExc_ValueError,
+                    "bulk_append() timestamps must be int64; for a numpy "
+                    "datetime64/timedelta64 array use arr.view('int64') "
+                    "(or astype('int64')) with a matching time_unit");
+                return NULL;
+            }
+            Py_XDECREF(str);
+            if (exc != NULL) {
+                PyErr_SetRaisedException(exc);
+            }
+        }
         /* The most likely user mistake is passing a plain list/tuple of
          * ints; CPython's generic "a bytes-like object is required" gives
          * no remedy, so replace it with an actionable message — but ONLY
@@ -3220,11 +3265,18 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
                 break;
         }
 
-        Py_BEGIN_ALLOW_THREADS
+        /* Deliberately NO thread-state detach here. The count is a cheap
+         * fence-pointer walk (O(K log P)), but detaching on EVERY iterator
+         * creation signals the GIL condvar and resets other threads'
+         * switch-interval timers: a hot reader loop creating slices
+         * back-to-back then wins every GIL handoff race indefinitely,
+         * starving the writer (measured 461x ingest collapse; v1.3
+         * usability lab, hft persona). Keeping the state attached restores
+         * normal ~5ms GIL fairness; on free-threaded builds there is no
+         * GIL to release anyway. */
         st = tl_snapshot_count_range(snap, count_t1, count_t2,
                                       count_unbounded,
                                       &pyit->remaining_count);
-        Py_END_ALLOW_THREADS
     }
     if (st != TL_OK) {
         /* Clear the iterator's pointers before Py_DECREF so its cleanup
