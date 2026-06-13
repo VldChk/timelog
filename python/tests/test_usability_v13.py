@@ -8,6 +8,7 @@ container-protocol dunders, teaching errors, and stats enrichment.
 import array
 import datetime
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -17,6 +18,8 @@ import pytest
 
 from timelog import Timelog, TimelogError
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _subprocess_env():
     """Minimal child env, plus sanitizer/runtime passthrough.
@@ -25,7 +28,8 @@ def _subprocess_env():
     LD_PRELOAD; the child must inherit that (and GIL/TSan knobs) or it dies
     loading the staged module before the behavior under test runs.
     """
-    env = {"PYTHONPATH": "python", "PATH": "/usr/bin:/bin"}
+    env = os.environ.copy()
+    env.setdefault("PATH", os.defpath)
     for key in ("LD_PRELOAD", "ASAN_OPTIONS", "TSAN_OPTIONS",
                 "LSAN_OPTIONS", "PYTHON_GIL"):
         if key in os.environ:
@@ -41,7 +45,7 @@ class TestCleanExitSilence:
         proc = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
             env=_subprocess_env(), timeout=60,
-            cwd=__file__.rsplit("/python/tests", 1)[0])
+            cwd=REPO_ROOT)
         assert proc.returncode == 0
         assert proc.stderr.strip() == "", f"clean exit printed: {proc.stderr!r}"
 
@@ -60,7 +64,7 @@ class TestCleanExitSilence:
         proc = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
             env=_subprocess_env(), timeout=60,
-            cwd=__file__.rsplit("/python/tests", 1)[0])
+            cwd=REPO_ROOT)
         assert proc.returncode == 0
 
 
@@ -288,7 +292,7 @@ class TestExitSilenceWithRetiredQueue:
         proc = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True,
             env=_subprocess_env(), timeout=60,
-            cwd=__file__.rsplit("/python/tests", 1)[0])
+            cwd=REPO_ROOT)
         assert proc.returncode == 0
         assert proc.stderr.strip() == "", f"retention-exit printed: {proc.stderr!r}"
 

@@ -1752,8 +1752,11 @@ static void* tl__maint_worker_entry(void* arg) {
         while (!tl->maint_shutdown &&
                !tl->flush_pending &&
                !tl->compact_pending) {
-            tl_cond_timedwait(&tl->maint_cond, &tl->maint_mu,
-                              tl->config.maintenance_wakeup_ms);
+            bool signalled = tl_cond_timedwait(&tl->maint_cond, &tl->maint_mu,
+                                               tl->config.maintenance_wakeup_ms);
+            if (!signalled) {
+                break;
+            }
         }
 
         if (tl->maint_shutdown) {

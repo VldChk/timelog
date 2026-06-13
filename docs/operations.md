@@ -55,7 +55,8 @@
 ## Common Failure Patterns
 
 1. Retrying writes after busy: can duplicate records.
-2. Omitting flush before close: drops unflushed records.
+2. Assuming flush makes data survive close: Timelog is in-memory; close
+   discards all data.
 3. Assuming point-delete at `TL_TS_MAX`: not representable via `[ts, ts+1)`.
 4. Treating physical `views()` output as tombstone-filtered logical results.
 5. Expecting deletes alone to shrink memory: reclaim requires compaction over the

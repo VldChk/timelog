@@ -26,7 +26,9 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
 - Context manager is supported, but optional.
 
 `Contract`
-- `close()` drops unflushed data. Use `flush()` before close if persistence of in-memory state to immutable segments is required.
+- `close()` discards all data; Timelog is in-memory and nothing survives close.
+  `flush()` matters while the log is open: it materializes pending writes into
+  immutable segments so zero-copy `views()` readers can see them.
 - `close()` can raise while active iterators, `PageSpan` objects, memoryview exports, or other snapshot pins are still alive. Release those readers first, then close again.
 - Lifecycle calls (`close()`, `reopen()`, `configure()`) are not synchronization barriers. Serialize them externally against append/query users of the same instance.
 - Non-context-manager usage (`log = Timelog()`) is supported. If explicit `close()` is omitted, the finalizer auto-closes on collection as a best-effort cleanup path.

@@ -334,11 +334,10 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  * @param tl Instance to close (NULL is safe)
  *
  * DATA LOSS WARNING:
- * tl_close() does NOT flush/materialize unflushed records from the memtable.
- * Any records appended after the last tl_flush() call will be dropped.
- * To materialize all data before close:
- *   tl_flush(tl);   // Flush remaining memtable records
- *   tl_close(tl);   // Now safe to close
+ * Timelog is an in-memory engine. tl_close() discards all records, flushed or
+ * not. tl_flush() only materializes pending memtable records into immutable
+ * segments for readers while the log is open; it does not persist data beyond
+ * tl_close().
  *
  * Preconditions:
  * - All snapshots and iterators must be released before calling tl_close()

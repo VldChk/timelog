@@ -3726,8 +3726,9 @@ static PyMethodDef PyTimelog_methods[] = {
     {"close", (PyCFunction)PyTimelog_close, METH_NOARGS,
      "close() -> None\n\n"
      "Close the timelog. Idempotent. Releases all resources.\n\n"
-     "WARNING: Records not yet flushed will be lost. All Python objects\n"
-     "still owned by the engine are released on close.\n\n"
+     "WARNING: Timelog is in-memory; close() discards all records. flush()\n"
+     "only materializes pending writes for readers while the log is open.\n"
+     "All Python objects still owned by the engine are released on close.\n\n"
      "Note: close() should not raise TimelogBusyError."},
 
     /* Iterator factory methods */

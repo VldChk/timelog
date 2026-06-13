@@ -36,10 +36,10 @@
  *       PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED.
  *
  * Known Limitations:
- *   - Unflushed records are dropped on close(). The binding tracks all
- *     inserted handles and releases Python objects during close(), but
- *     data is not persisted. Call flush() before close() if you need to
- *     preserve all records.
+ *   - Timelog is in-memory. close() discards all records, flushed or not.
+ *     flush() only materializes pending writes for readers while the log is
+ *     open. The binding tracks inserted handles and releases Python objects
+ *     during close().
  *
  * See: docs/python-api.md
  *      docs/internals/components/python-binding-architecture.md

@@ -97,8 +97,9 @@ class Timelog(_CTimelog):
             * Free-threaded CPython 3.14t (Py_GIL_DISABLED=1).
 
     Warning:
-        ``close()`` drops unflushed records. Call ``flush()`` first to
-        materialize pending writes. Call ``close()`` for deterministic
+        ``close()`` discards all records; Timelog is in-memory and nothing
+        survives close. ``flush()`` materializes pending writes for zero-copy
+        ``views()`` while the log is open. Call ``close()`` for deterministic
         cleanup; release active iterators, PageSpans, object views, and
         memoryview exports before closing because they hold snapshot pins.
         If explicit ``close()`` is omitted, collection auto-closes the log

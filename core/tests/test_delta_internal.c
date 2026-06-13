@@ -849,6 +849,45 @@ TEST_DECLARE(delta_memtable_flush_head_enomem_returns_ebusy) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sink) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    mt.ooo_chunk_records = 2;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 20));
+
+    /* The second OOO insert reaches the chunk threshold. Because the
+     * opportunistic flush has no dropped-record callback sink and active
+     * tombstones cover an older OOO record, it must become a no-op and preserve
+     * the per-record seqs in the head. */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 15, 15));
+    TEST_ASSERT_EQ(2, tl_memtable_ooo_head_len(&mt));
+    TEST_ASSERT_EQ(0, tl_ooorunset_count(mt.ooo_runs));
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal_ex(&mt, &mu, NULL, delta_next_seq(),
+                                                  &dropped, &dropped_len));
+    TEST_ASSERT_EQ(1, dropped_len);
+    TEST_ASSERT_EQ(10, dropped[0].ts);
+    TEST_ASSERT_EQ(10, (int)dropped[0].handle);
+
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
 TEST_DECLARE(delta_memview_captures_head_sorted_and_pins_runs) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -1213,6 +1252,50 @@ TEST_DECLARE(delta_memtable_seal_ex_collects_tomb_drops) {
         tl__free(&alloc, dropped);
     }
 
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_memtable_seal_drop_reserve_failure_preserves_active_state) {
+    delta_fail_alloc_ctx_t fail_ctx = {0};
+    tl_allocator_t user_alloc = {
+        .ctx = &fail_ctx,
+        .malloc_fn = delta_fail_malloc,
+        .calloc_fn = delta_fail_calloc,
+        .realloc_fn = delta_fail_realloc,
+        .free_fn = delta_fail_free,
+    };
+
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, &user_alloc);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 10));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 20, 20));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 30));
+    TEST_ASSERT_EQ(2, tl_memtable_run_len(&mt));
+    TEST_ASSERT_EQ(1, tl_intervals_len(&mt.active_tombs));
+
+    size_t before = fail_ctx.alloc_count;
+    fail_ctx.fail_after_n = before + 2; /* memrun shell succeeds; drop reserve fails. */
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_ENOMEM, tl_memtable_seal_ex(&mt, &mu, NULL,
+                                                      delta_next_seq(),
+                                                      &dropped, &dropped_len));
+    TEST_ASSERT_NULL(dropped);
+    TEST_ASSERT_EQ(0, dropped_len);
+    TEST_ASSERT_EQ(2, tl_memtable_run_len(&mt));
+    TEST_ASSERT_EQ(1, tl_intervals_len(&mt.active_tombs));
+    TEST_ASSERT_EQ(0, mt.sealed_len);
+
+    fail_ctx.fail_after_n = 0;
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
     tl__alloc_destroy(&alloc);
@@ -2766,6 +2849,23 @@ TEST_DECLARE(delta_memtable_batch_insert_overflow) {
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(delta_memtable_batch_insert_fast_path_overflow_prechecked) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 1024, 256, 4));
+
+    tl_record_t rec = {.ts = 100, .handle = 1};
+    tl_status_t st = tl_memtable_insert_batch(&mt, &rec, SIZE_MAX, 0);
+    TEST_ASSERT_STATUS(TL_EOVERFLOW, st);
+    TEST_ASSERT_EQ(0, tl_memtable_run_len(&mt));
+    TEST_ASSERT_EQ(0, tl_memtable_ooo_head_len(&mt));
+
+    tl_memtable_destroy(&mt);
+    tl__alloc_destroy(&alloc);
+}
+
 /**
  * Fully out-of-order batch. All records have timestamps lower than
  * the current last_inorder_ts, so all go to OOO head.
@@ -3165,6 +3265,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_insert_batch_full_sort_check);
     RUN_TEST(delta_memtable_insert_batch_alloc_failure_no_partial);
     RUN_TEST(delta_memtable_flush_head_enomem_returns_ebusy);
+    RUN_TEST(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sink);
     RUN_TEST(delta_memview_captures_head_sorted_and_pins_runs);
     RUN_TEST(delta_memview_captures_concurrent_pins);
     RUN_TEST(delta_memview_copy_sealed_ring_order);
@@ -3180,6 +3281,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_seal_empty_noop);
     RUN_TEST(delta_memtable_seal_basic);
     RUN_TEST(delta_memtable_seal_ex_collects_tomb_drops);
+    RUN_TEST(delta_memtable_seal_drop_reserve_failure_preserves_active_state);
     RUN_TEST(delta_memtable_seal_transfers_multiple_runs);
     RUN_TEST(delta_memtable_seal_preserves_on_ebusy);
     RUN_TEST(delta_memtable_should_seal_bytes);
@@ -3233,6 +3335,7 @@ void run_delta_internal_tests(void) {
 
     /* OOO, batch, and overflow edge case tests (8 tests) */
     RUN_TEST(delta_memtable_batch_insert_overflow);
+    RUN_TEST(delta_memtable_batch_insert_fast_path_overflow_prechecked);
     RUN_TEST(delta_memtable_fully_ooo_batch);
     RUN_TEST(delta_memtable_reverse_sorted_batch);
     RUN_TEST(delta_memtable_interleaved_ooo_batch);
