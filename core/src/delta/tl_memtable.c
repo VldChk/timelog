@@ -744,7 +744,8 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     tl_ooorunset_t* ooo_runs = mt->ooo_runs;
     mt->ooo_runs = NULL;
 
-    if (run_len != run_seqs_len) {
+    if (run_len != run_seqs_len ||
+        (run_len > 0 && (run == NULL || run_seqs == NULL))) {
         if (run != NULL) tl__free(mt->alloc, run);
         if (run_seqs != NULL) tl__free(mt->alloc, run_seqs);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);

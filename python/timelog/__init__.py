@@ -17,13 +17,10 @@ Example::
 
 from __future__ import annotations
 
+from importlib import metadata as _importlib_metadata
 from pathlib import Path as _Path
+from typing import Iterator
 import tomllib as _tomllib
-
-try:
-    from importlib import metadata as _importlib_metadata
-except ImportError:
-    _importlib_metadata = None
 
 
 def _resolve_local_version() -> str | None:
@@ -44,9 +41,6 @@ def _resolve_version() -> str:
     if local_version is not None:
         return local_version
 
-    if _importlib_metadata is None:
-        return "0+unknown"
-
     package_not_found = _importlib_metadata.PackageNotFoundError
     for dist_name in ("timelog-lib", "timelog"):
         try:
@@ -58,10 +52,8 @@ def _resolve_version() -> str:
 
 __version__ = _resolve_version()
 
-from typing import Iterator
-
 try:
-    from timelog._timelog import (
+    from timelog._timelog import (  # noqa: E402
         TimelogError,
         TimelogBusyError,
         TimelogIter,
@@ -69,14 +61,14 @@ try:
         PageSpanIter,
         PageSpanObjectsView,
     )
-    from timelog._timelog import Timelog as _CTimelog
+    from timelog._timelog import Timelog as _CTimelog  # noqa: E402
 except ImportError as e:
     raise ImportError(
         "timelog extension module not found. "
         "Ensure the package is properly installed."
     ) from e
 
-from timelog._api import _coerce_ts, _slice_to_iter, TL_TS_MIN, TL_TS_MAX
+from timelog._api import _coerce_ts, _slice_to_iter, TL_TS_MIN, TL_TS_MAX  # noqa: E402
 
 Record = tuple[int, object]
 RecordIter = Iterator[Record]

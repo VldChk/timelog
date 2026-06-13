@@ -153,7 +153,10 @@ class TestFastcallConcurrency:
     Invariants hold for any consistent snapshot, even under concurrent mutation."""
 
     def test_converted_methods_race_free_and_correct(self):
-        import sys, time, random
+        import random
+        import sys
+        import time
+
         N = 4000
         tl = timelog.Timelog(busy_policy="flush")
         for i in range(N):
@@ -176,17 +179,20 @@ class TestFastcallConcurrency:
                     for ts, _ in tl.point(x):
                         if ts != x:
                             errors.append(f"point({x}) returned ts={ts}")
-                    a = rng.randint(0, N); b = a + rng.randint(1, 300)
+                    a = rng.randint(0, N)
+                    b = a + rng.randint(1, 300)
                     for ts, _ in tl.range(a, b):
                         if not (a <= ts < b):
                             errors.append(f"range({a},{b}) returned ts={ts}")
                     s = rng.randint(0, N)
                     for ts, _ in tl.since(s):
                         if ts < s:
-                            errors.append(f"since({s}) returned ts={ts}"); break
+                            errors.append(f"since({s}) returned ts={ts}")
+                            break
                     for ts, _ in tl.until(s):
                         if ts >= s:
-                            errors.append(f"until({s}) returned ts={ts}"); break
+                            errors.append(f"until({s}) returned ts={ts}")
+                            break
                     for ts, _ in tl.equal(x):
                         if ts != x:
                             errors.append(f"equal({x}) returned ts={ts}")
@@ -197,7 +203,8 @@ class TestFastcallConcurrency:
             try:
                 i = N
                 while not stop.is_set():
-                    tl.append(i, i); i += 1
+                    tl.append(i, i)
+                    i += 1
                     if i % 50 == 0:
                         tl.delete_range(i - 40, i - 20)   # converted 2-arg writer
                     if i % 97 == 0:

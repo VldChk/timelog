@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as _datetime
 import operator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsIndex, cast
 
 if TYPE_CHECKING:
     from timelog import Timelog, TimelogIter
@@ -27,7 +27,7 @@ def _coerce_ts(x: object) -> int:
     if isinstance(x, bool):
         raise TypeError("timestamp must be int (bool not allowed)")
     try:
-        ts = operator.index(x)
+        ts = operator.index(cast(SupportsIndex, x))
     except TypeError:
         # The two mistakes every user makes once: teach, don't scold.
         if isinstance(x, _datetime.datetime):

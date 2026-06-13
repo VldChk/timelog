@@ -244,6 +244,34 @@ static int parse_busy_policy(const char* s, tl_py_busy_policy_t* out)
     return -1;
 }
 
+static int
+tl_py_dict_get_item_string_ref(PyObject* dict, const char* key, PyObject** out)
+{
+    *out = NULL;
+#if PY_VERSION_HEX >= 0x030D0000
+    return PyDict_GetItemStringRef(dict, key, out) < 0 ? -1 : 0;
+#else
+    PyObject* val = PyDict_GetItemString(dict, key);
+    if (val == NULL) {
+        return PyErr_Occurred() ? -1 : 0;
+    }
+    *out = Py_NewRef(val);
+    return 0;
+#endif
+}
+
+static int
+tl_py_dict_has_key_string(PyObject* dict, const char* key, int* out)
+{
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    *out = val != NULL;
+    Py_XDECREF(val);
+    return 0;
+}
+
 /**
  * Check whether a kwarg was provided (positional or keyword).
  *
@@ -255,14 +283,10 @@ kwarg_was_provided(PyObject* args, PyObject* kwds,
 {
     *out = 0;
     if (kwds != NULL) {
-        PyObject* v = PyDict_GetItemString(kwds, name);
-        if (v != NULL) {
-            *out = 1;
-            return 0;
-        }
-        if (PyErr_Occurred()) {
+        if (tl_py_dict_has_key_string(kwds, name, out) < 0) {
             return -1;
         }
+        if (*out) return 0;
     }
     if (args != NULL) {
         Py_ssize_t nargs = PyTuple_GET_SIZE(args);
@@ -659,14 +683,15 @@ static void tl_py_release_snapshot_pinned(tl_snapshot_t* snap,
 static int
 dict_get_ssize(PyObject* dict, const char* key, Py_ssize_t* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);  /* borrowed ref */
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
     if (val == NULL) {
-        /* PyDict_GetItemString returns NULL for both "key absent" and
-         * internal error (e.g. OOM during key string creation).
-         * Distinguish via PyErr_Occurred(). */
-        return PyErr_Occurred() ? -1 : 0;
+        return 0;
     }
     Py_ssize_t v = PyLong_AsSsize_t(val);
+    Py_DECREF(val);
     if (v == -1 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -678,9 +703,13 @@ dict_get_ssize(PyObject* dict, const char* key, Py_ssize_t* out)
 static int
 dict_get_llong(PyObject* dict, const char* key, long long* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);
-    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    if (val == NULL) return 0;
     long long v = PyLong_AsLongLong(val);
+    Py_DECREF(val);
     if (v == -1 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -692,9 +721,13 @@ dict_get_llong(PyObject* dict, const char* key, long long* out)
 static int
 dict_get_double(PyObject* dict, const char* key, double* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);
-    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    if (val == NULL) return 0;
     double v = PyFloat_AsDouble(val);
+    Py_DECREF(val);
     if (v == -1.0 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -921,10 +954,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 #define CHECK_ADAPTIVE_CONFLICT(flat_var, sentinel, key_name)           \
         do {                                                            \
             if ((flat_var) != (sentinel)) {                             \
-                PyObject* _v = PyDict_GetItemString(                    \
-                    adaptive_dict, key_name);                           \
-                if (_v == NULL && PyErr_Occurred()) return -1;          \
-                if (_v != NULL) {                                       \
+                int _present = 0;                                       \
+                if (tl_py_dict_has_key_string(                          \
+                        adaptive_dict, key_name, &_present) < 0) {      \
+                    return -1;                                          \
+                }                                                       \
+                if (_present) {                                         \
                     PyErr_Format(PyExc_ValueError,                      \
                         "Cannot specify both adaptive_%s and "          \
                         "adaptive={'%s': ...}", key_name, key_name);    \
@@ -944,9 +979,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         CHECK_ADAPTIVE_CONFLICT(adaptive_failure_backoff_pct, PY_SSIZE_T_MIN, "failure_backoff_pct");
 
         if (adaptive_alpha_flat_set) {
-            PyObject* _v = PyDict_GetItemString(adaptive_dict, "alpha");
-            if (_v == NULL && PyErr_Occurred()) return -1;
-            if (_v != NULL) {
+            int _present = 0;
+            if (tl_py_dict_has_key_string(adaptive_dict, "alpha",
+                                          &_present) < 0) {
+                return -1;
+            }
+            if (_present) {
                 PyErr_Format(PyExc_ValueError,
                     "Cannot specify both adaptive_alpha and "
                     "adaptive={'alpha': ...}");
@@ -969,9 +1007,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
             return -1;
         }
 
-        PyObject* alpha_val = PyDict_GetItemString(adaptive_dict, "alpha");
-        if (alpha_val == NULL && PyErr_Occurred()) return -1;
-        if (alpha_val != NULL) {
+        int alpha_present = 0;
+        if (tl_py_dict_has_key_string(adaptive_dict, "alpha",
+                                      &alpha_present) < 0) {
+            return -1;
+        }
+        if (alpha_present) {
             adaptive_alpha_set = 1;
         }
     }
@@ -997,10 +1038,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 #define CHECK_COMPACTION_CONFLICT(flat_var, sentinel, key_name, flat_name) \
         do {                                                              \
             if ((flat_var) != (sentinel)) {                               \
-                PyObject* _v = PyDict_GetItemString(                      \
-                    compaction_dict, key_name);                           \
-                if (_v == NULL && PyErr_Occurred()) return -1;            \
-                if (_v != NULL) {                                         \
+                int _present = 0;                                         \
+                if (tl_py_dict_has_key_string(                            \
+                        compaction_dict, key_name, &_present) < 0) {      \
+                    return -1;                                            \
+                }                                                         \
+                if (_present) {                                           \
                     PyErr_Format(PyExc_ValueError,                        \
                         "Cannot specify both %s and "                     \
                         "compaction={'%s': ...}", flat_name, key_name);   \
@@ -1809,7 +1852,11 @@ success:
 /*===========================================================================
  * PyTimelog_extend
  *
- * CRITICAL: obj is borrowed from item. INCREF obj BEFORE DECREF item.
+ * CRITICAL: concrete caller-owned sequences are snapshotted before borrowed
+ * item access. PySequence_Fast(list) would return the original list, which is
+ * not safe under Py_GIL_DISABLED if another thread mutates it concurrently.
+ *
+ * CRITICAL: obj is borrowed from item/pair. INCREF obj BEFORE DECREF item/pair.
  *===========================================================================*/
 
 static PyObject*
@@ -1826,15 +1873,16 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
         return NULL;
     }
 
-    /* Fast path for concrete sequences (no materialization cost). */
+    /* Fast path for concrete sequences. Snapshot the outer list/tuple so later
+     * borrowed item access is from our owned immutable tuple, not a mutable
+     * caller list that another free-threaded thread can rewrite underneath us. */
     if (PyList_CheckExact(iterable) || PyTuple_CheckExact(iterable)) {
-        PyObject* seq = PySequence_Fast(iterable,
-                                        "extend() expects an iterable of (ts, obj)");
+        PyObject* seq = PySequence_Tuple(iterable);
         if (seq == NULL) {
             return NULL;
         }
 
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
         if (n == 0) {
             Py_DECREF(seq);
             Py_RETURN_NONE;
@@ -1856,38 +1904,48 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
         memset(objs, 0, (size_t)n * sizeof(PyObject*));
 
         for (Py_ssize_t i = 0; i < n; i++) {
-            PyObject* item = PySequence_Fast_GET_ITEM(seq, i); /* borrowed */
+            PyObject* item = PyTuple_GET_ITEM(seq, i); /* borrowed from our tuple */
             long long ts_ll;
             PyObject* obj;
+            int obj_is_strong = 0;
 
             if (PyArg_ParseTuple(item, "LO", &ts_ll, &obj)) {
                 /* Parsed tuple directly */
             } else {
                 PyErr_Clear();
-                PyObject* pair = PySequence_Fast(item, "extend() expects (ts, obj)");
+                PyObject* pair = PySequence_Tuple(item);
                 if (pair == NULL) {
                     goto error_seq;
                 }
-                if (PySequence_Fast_GET_SIZE(pair) != 2) {
+                if (PyTuple_GET_SIZE(pair) != 2) {
                     Py_DECREF(pair);
                     PyErr_SetString(PyExc_ValueError,
                         "extend() expects (ts, obj) pairs");
                     goto error_seq;
                 }
-                PyObject* ts_obj = PySequence_Fast_GET_ITEM(pair, 0);
-                obj = PySequence_Fast_GET_ITEM(pair, 1);
+                PyObject* ts_obj = PyTuple_GET_ITEM(pair, 0);
+                obj = PyTuple_GET_ITEM(pair, 1);
                 ts_ll = PyLong_AsLongLong(ts_obj);
-                Py_DECREF(pair);
                 if (PyErr_Occurred()) {
+                    Py_DECREF(pair);
                     goto error_seq;
                 }
+                /* obj may be owned only by this temporary tuple. */
+                Py_INCREF(obj);
+                obj_is_strong = 1;
+                Py_DECREF(pair);
             }
 
             if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
+                if (obj_is_strong) {
+                    Py_DECREF(obj);
+                }
                 goto error_seq;
             }
 
-            Py_INCREF(obj);
+            if (!obj_is_strong) {
+                Py_INCREF(obj);
+            }
             objs[i] = obj;
             records[i].ts = (tl_ts_t)ts_ll;
             records[i].handle = tl_py_handle_encode(obj);
@@ -1993,20 +2051,20 @@ error_seq:
             Py_INCREF(obj);
         } else {
             PyErr_Clear();
-            PyObject* pair = PySequence_Fast(item, "extend() expects (ts, obj)");
+            PyObject* pair = PySequence_Tuple(item);
             if (pair == NULL) {
                 Py_DECREF(item);
                 goto error_stream;
             }
-            if (PySequence_Fast_GET_SIZE(pair) != 2) {
+            if (PyTuple_GET_SIZE(pair) != 2) {
                 Py_DECREF(pair);
                 Py_DECREF(item);
                 PyErr_SetString(PyExc_ValueError,
                     "extend() expects (ts, obj) pairs");
                 goto error_stream;
             }
-            PyObject* ts_obj = PySequence_Fast_GET_ITEM(pair, 0);
-            obj = PySequence_Fast_GET_ITEM(pair, 1);
+            PyObject* ts_obj = PyTuple_GET_ITEM(pair, 0);
+            obj = PyTuple_GET_ITEM(pair, 1);
             ts_ll = PyLong_AsLongLong(ts_obj);
             /* INCREF obj before DECREF pair: obj is borrowed from pair. */
             Py_INCREF(obj);

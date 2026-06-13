@@ -622,3 +622,46 @@ class TestBulkAppendFreeThreaded:
             seen += 1
         assert seen == inserted
         log.close()
+
+
+class TestExtendFreeThreaded:
+    """extend() must not borrow directly from a caller-owned mutable list."""
+
+    def test_extend_with_concurrent_source_replacement(self, compat_runtime) -> None:
+        from timelog._timelog import Timelog as RawTimelog
+
+        rounds = _iters(compat_runtime.short_stress, full=200, quick=20)
+        width = 512
+        log = RawTimelog(
+            maintenance="disabled",
+            busy_policy="flush",
+            memtable_max_bytes=8 * 1024 * 1024,
+        )
+        stop = threading.Event()
+        source: list[tuple[int, object]] = [(i, i) for i in range(width)]
+        errors: list[BaseException] = []
+
+        def mutator() -> None:
+            rng = random.Random(4321)
+            try:
+                while not stop.is_set():
+                    idx = rng.randrange(width)
+                    source[idx] = (rng.randrange(10**9), rng.random())
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        thread = threading.Thread(target=mutator)
+        thread.start()
+        try:
+            for _ in range(rounds):
+                log.extend(source)
+        finally:
+            stop.set()
+            thread.join()
+
+        assert errors == []
+        log.flush()
+        assert int(log.stats()["storage"]["records_estimate"]) == rounds * width
+        for _, obj in log.range(0, 10**12):
+            assert isinstance(obj, (int, float))
+        log.close()
