@@ -11,7 +11,7 @@ This repository includes a dedicated PR workflow at `.github/workflows/tests-pr.
 5. Demo/methodology/correctness tests in `demo/tests` via `unittest`.
 6. Layer A subinterpreter tests on CPython 3.14 via `demo/ci/run_compat_baseline.py --legs subinterpreters`.
 
-## Advisory Compatibility Baseline
+## Compatibility Baseline
 
 The repository also includes compatibility workflows at
 `.github/workflows/compatibility-baseline-pr.yml` and

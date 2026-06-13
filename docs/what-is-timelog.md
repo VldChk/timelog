@@ -17,11 +17,21 @@ Timelog is a native-C, in-memory, time-indexed multimap for Python.
 `Implementation note`
 - Timelog uses a mutable ingest layer (memtable), immutable paged segments, and background/manual maintenance (flush/compaction).
 - The design is LSM-inspired but specialized for in-memory timestamp indexing.
+- `flush()` materializes pending writes into immutable in-memory segments while
+  the instance is open; it is not persistence. `close()` always discards all
+  records.
 
 `Positioning`
 - Timelog's wedge is **amortized O(1) memtable-layer out-of-order append under bounded maintenance contention** and **snapshot-safe concurrent reads over live Python objects**: appends stay cheap even when timestamps arrive out of order, and independent threads read consistent snapshots while writes proceed.
 - It is *not positioned as* the fastest static range-query index. Range scans are fast, but the differentiator is out-of-order ingestion plus concurrency over Python objects — not winning every static benchmark.
 
+`Current runtime support`
+- Regular CPython 3.12-3.14.
+- Isolated subinterpreters with per-interpreter GIL.
+- Free-threaded CPython 3.14t on the supported wheel set. The extension opts
+  into `Py_MOD_GIL_NOT_USED` and synchronizes mutable binding state explicitly.
+
 `Out of scope`
 - Timelog is not a distributed database.
 - Timelog is not a vectorized analytics engine for payloads.
+- Timelog is not durable storage.

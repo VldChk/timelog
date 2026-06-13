@@ -1,6 +1,10 @@
 # Timelog
 
-In-memory, LSM-inspired, time-indexed multimap for Python (C17 core + CPython extension).
+In-memory, LSM-inspired, time-indexed multimap for Python.
+
+Timelog stores many Python objects per timestamp, supports out-of-order ingest,
+and answers timestamp/range queries from a native C17 engine through a CPython
+extension. Current package version: **1.3.0**.
 
 [![License](https://img.shields.io/github/license/VldChk/timelog)](LICENSE)
 [![PyPI version](https://img.shields.io/pypi/v/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
@@ -23,6 +27,14 @@ It provides a native in-memory index with snapshot-consistent reads, out-of-orde
 At a high level, writes flow through mutable ingest state into immutable layers (memrun, L0, L1), while reads merge across layers with tombstone-aware filtering.  
 The design is LSM-inspired, but explicitly scoped to an embedded in-memory engine.
 
+Use it when you want a local Python object index optimized for:
+
+- append-heavy event streams,
+- range scans over integer timestamps,
+- retention via logical deletes/tombstones,
+- concurrent snapshot readers over live Python objects,
+- zero-copy timestamp views for analytics-style scans.
+
 ## Installation
 
 Install from PyPI:
@@ -43,6 +55,18 @@ Distribution name is `timelog-lib`, import namespace stays `timelog`:
 from timelog import Timelog
 ```
 
+## Runtime Support
+
+- Regular CPython **3.12-3.14**.
+- Isolated subinterpreters with a per-interpreter GIL.
+- Free-threaded CPython **3.14t** (`Py_GIL_DISABLED=1`) on the supported wheel set;
+  importing Timelog does not re-enable the GIL.
+- Typed package metadata is included (`py.typed` and `_timelog.pyi`).
+
+The Python API remains single-writer at the instance level: writes and lifecycle
+operations must be externally serialized. Independent snapshot readers can run
+concurrently.
+
 ## Quickstart: Streaming
 
 ```python
@@ -60,7 +84,7 @@ log[1_700_000_000_000] = {"event": "tick"}
 rows = list(log[1_700_000_000_000:1_700_000_000_001])
 print(rows)
 
-log.close()  # optional explicit cleanup
+log.close()  # deterministic cleanup; finalizer cleanup is best-effort
 ```
 
 ## Quickstart: Correctness Semantics
@@ -88,6 +112,7 @@ Timelog uses sequenced tombstones, so later inserts are not hidden by earlier de
 - Concurrency model is single writer plus concurrent readers.
 - Duplicate timestamps are allowed (multimap semantics).
 - Write-path backpressure (`TimelogBusyError`) indicates the write was accepted; do not blind-retry the same write.
+- `close()` discards all data. Timelog is in-memory; `flush()` improves open-instance visibility for readers, not durability.
 
 ## What Timelog Is (and Isn’t)
 
@@ -111,34 +136,42 @@ immutable segments so zero-copy `views()` readers can see them.
 
 Core Python facade surface:
 
-- Constructors:
-  - `Timelog(...)`
-  - `Timelog.for_streaming(...)`
-  - `Timelog.for_bulk_ingest(...)`
-  - `Timelog.for_low_latency(...)`
+- Constructors: `Timelog(...)`, `for_streaming(...)`, `for_bulk_ingest(...)`,
+  `for_low_latency(...)`.
 - Writes:
-  - `append(...)`
-  - `extend(...)`
-  - `bulk_append(timestamps, objects)` — typed-buffer fast path (NumPy int64 / `array.array("q")`)
-  - `log[ts] = obj`
-  - `delete(t1, t2)` / `delete(ts)`
-  - `cutoff(ts)`
+  - `append(obj)`, `append(obj, ts=...)`, `append(ts, obj)`.
+  - `extend([(ts, obj), ...], mostly_ordered=..., insert_on_error=...)`.
+  - `bulk_append(timestamps, objects)` for contiguous native-endian int64 buffers
+    plus a same-length list/tuple of payloads.
+  - `log[ts] = obj`, `delete(t1, t2)`, `delete(ts)`, `cutoff(ts)`.
 - Reads:
-  - `log[t1:t2]`, `log[t1:]`, `log[:t2]`, `log[:]`
-  - `log[ts]` / `at(ts)`
+  - `log[t1:t2]`, `log[t1:]`, `log[:t2]`, `log[:]`.
+  - `log[ts]` / `at(ts)`.
+  - named iterators: `range`, `since`, `until`, `all`, `point` / `equal`.
+  - iterator helpers: `len(it)`, `next_batch(n)`, and `it.view()`.
 - Introspection and views:
-  - `stats()`
-  - `views(...)`
+  - `stats()`, `busy_events`, `extend_skipped`, `retired_queue_len`.
+  - `views(...)` / `page_spans(...)` for zero-copy timestamp spans.
+  - `PageSpan.timestamps` is a read-only memoryview; `PageSpan.objects()` lazily
+    exposes the corresponding Python payloads.
 
 See `docs/python-api.md` for the full behavior contract.
 
-## Threading and Backpressure
+## Lifecycle, Threading, and Backpressure
 
-- Writes and lifecycle operations must be externally serialized.
-- Snapshot iterators are safe for concurrent reads.
-- Background maintenance can run automatically (`maintenance="background"`) or be controlled manually.
-- `TimelogBusyError` on write operations means accepted write + pressure signal, not "write lost".
+- Most users should write `log = Timelog(...)` or use a preset constructor and
+  keep the object for the required scope. A context manager is available but not
+  required.
+- Explicit `close()` gives deterministic cleanup. If omitted, collection
+  auto-closes on a best-effort basis.
 - Do not call `close()` concurrently with other operations on the same instance.
+- Release active iterators, `PageSpan` objects, object views, and exported
+  memoryviews before closing; they hold snapshot pins.
+- Background maintenance can run automatically (`maintenance="background"`) or
+  be controlled manually (`maintenance="disabled"` + `flush()` / `compact()` /
+  `maint_step()`).
+- `TimelogBusyError` on write operations means accepted write + pressure signal,
+  not "write lost".
 
 ## Architecture
 
@@ -166,32 +199,49 @@ Deletes are logical tombstones; physical cleanup is deferred to maintenance.
 
 ## Performance at a Glance
 
-v1.3 hot-path improvements (final release-gate A/B vs the v1.2.0 wheel, identical pinned
-harness, Linux x86_64, Python `3.13.12`, median of 5; raw artifacts in `docs/benchmarks/`,
-`ideas-lab/verification/`, and the release-notes appendix):
+Same-harness v1.3 A/B against the v1.2.0 wheel, Linux x86_64, pinned CPU,
+CPython `3.13.12`, median of 5:
 
-- `append(obj)` folded into C: `4.3x` faster (`append(ts, obj)`: `3.6x`, `append(obj, ts=...)`: `3.4x`)
-- `point`/`equal` and the `range`/`since`/`until` family: `1.3x-1.6x` faster
-- `extend` (10k-pair batches): `1.21x` faster
-- Size-gated branchless binary search: `1.93x-4.98x` faster at gated sizes (5 seams)
-- New `bulk_append`: `21.6 ns/record` on repeated 10k batches (`113 ns/record` in a
-  single cold 200k batch); `8.4x` vs `extend` per record in the batched shape
-- Zero regressions: no measured operation is slower than v1.2.0
+| Operation | v1.2.0 | v1.3.0 | Change |
+|---|---:|---:|---:|
+| `append(obj)` | 513.9 ns | 117.1 ns | 4.39x faster |
+| `append(ts, obj)` | 352.1 ns | 103.9 ns | 3.39x faster |
+| `append(obj, ts=...)` | 364.7 ns | 109.6 ns | 3.33x faster |
+| `point(ts)` | 457.1 ns | 337.1 ns | 1.36x faster |
+| `range(t1, t2)` | 575.9 ns | 458.0 ns | 1.26x faster |
+| `delete_range(t1, t2)` | 18,059.6 ns | 13,289.3 ns | 1.36x faster |
 
-Historical snapshot (`2026-02-15`, Linux x86_64, Python `3.13.12`, dataset `11,550,000` rows):
+New v1.3 ingest fast path:
 
-- Batch ingest (`A2`): `191,105` records/sec
-- Full scan (`B4`): `18,088,679` records/sec
-- Append latency (`K1`, background): `p99 = 672 ns`
+- `bulk_append(np.int64 array, list)`: **113.3 ns/record** on a 200k-record
+  measured batch.
+- In that benchmark, `bulk_append` was **2.23x** faster than a post-v1.3
+  per-record append loop and **3.51x** faster than `extend(zip(...))`.
+
+Search-path optimization:
+
+- Size-gated branchless lower/upper-bound search measured **1.9x-5.0x faster**
+  at gated sizes up to 262,144 records, and falls back to the neutral path for
+  very large arrays where it no longer wins.
+
+Historical scale snapshot (`2026-02-15`, Linux x86_64, CPython `3.13.12`,
+dataset `11,550,000` rows):
+
+- Batch ingest (`A2`): `191,105` records/sec.
+- Full scan (`B4`): `18,088,679` records/sec.
+- Append latency (`K1`, background): `p99 = 672 ns`.
+- PageSpan iteration (`F1`): `1.48B` timestamps/sec on the timestamp-only span path.
 
 Results are workload-, configuration-, and hardware-dependent.
 
 Methodology and context:
 
 - `docs/PERFORMANCE_METHODOLOGY.md`
+- `docs/performance.md`
+- `docs/benchmarks/bulk_append.md`
+- `docs/benchmarks/max_delta_segments.md`
 - `docs/BENCHMARK_1GB_7PCT_OOO_UNIX.md`
 - `docs/BENCHMARK_REPORT.md`
-- `docs/performance.md`
 
 Complexity claims should be interpreted with stated assumptions. In practice:
 
@@ -202,6 +252,7 @@ Complexity claims should be interpreted with stated assumptions. In practice:
 ## Documentation
 
 - Index: `docs/index.md`
+- Release notes: `docs/release-notes.md`
 - Python API: `docs/python-api.md`
 - Configuration: `docs/configuration.md`
 - Error and retry semantics: `docs/errors-and-retry-semantics.md`

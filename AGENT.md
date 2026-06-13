@@ -1,8 +1,8 @@
 # AGENT Context: timelog Repository
 
 ## Repository Identity And Build System
-- The project is a C project named `timelog`, version `1.0.0`, compiled as C17. (`CMakeLists.txt:2`, `CMakeLists.txt:8`)
-- The root README defines timelog as a native C library for Python time-series operations. (`README.md:2`)
+- The project is a C project named `timelog`, version `1.3.0`, compiled as C17. (`CMakeLists.txt:2`, `CMakeLists.txt:8`)
+- The root README defines timelog as an in-memory, LSM-inspired, time-indexed multimap for Python. (`README.md:3`)
 - Build options include native CPU tuning and shared-library toggle. (`CMakeLists.txt:13`, `CMakeLists.txt:15`)
 - Default build type is `Release` if not explicitly set. (`CMakeLists.txt:17`, `CMakeLists.txt:19`)
 - GCC/Clang builds enable `-Wall -Wextra -Wpedantic -Werror` and hidden symbol visibility. (`CMakeLists.txt:47`, `CMakeLists.txt:49`, `CMakeLists.txt:51`)
