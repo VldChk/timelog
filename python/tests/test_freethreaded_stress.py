@@ -21,6 +21,7 @@ race windows hard enough to surface them under TSan.
 from __future__ import annotations
 
 import gc
+import importlib
 import random
 import sys
 import sysconfig
@@ -42,7 +43,7 @@ def _require_freethreaded(compat_runtime) -> None:
         pytest.skip("free-threaded stress requires Py_GIL_DISABLED=1 build")
     if sys._is_gil_enabled():
         pytest.fail("free-threaded stress must run with PYTHON_GIL=0")
-    import timelog  # noqa: F401
+    importlib.import_module("timelog")
     if sys._is_gil_enabled():
         pytest.fail("importing timelog re-enabled the GIL")
 
@@ -75,7 +76,7 @@ class TestConcurrentReadStress:
         # Readers scan a FIXED window so per-op work does not grow with the
         # writer's appends (which would make `all` super-linear).
         scan_window = 4096
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
         stop = threading.Event()
 
         log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
@@ -92,7 +93,7 @@ class TestConcurrentReadStress:
                         i += 1
                         if i % 256 == 0:
                             log.flush()
-                except BaseException as exc:  # pragma: no cover - surfaced
+                except Exception as exc:  # pragma: no cover - surfaced
                     errors.append(exc)
 
             def reader(seed: int) -> None:
@@ -133,7 +134,7 @@ class TestConcurrentReadStress:
                                 # fully consumed and released (an un-consumed
                                 # slice iterator would pin a snapshot).
                             _ = list(log[0:64])
-                except BaseException as exc:
+                except Exception as exc:
                     errors.append(exc)
 
             w = threading.Thread(target=writer)
@@ -173,7 +174,7 @@ class TestPageSpanCrossThreadRelease:
 
         n_records = 4096
         per_span_ops = _iters(compat_runtime.short_stress, full=50, quick=8)
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -204,7 +205,7 @@ class TestPageSpanCrossThreadRelease:
                     except BufferError:
                         # Acceptable: another thread might still hold a buffer
                         pass
-                except BaseException as exc:
+                except Exception as exc:
                     errors.append(exc)
 
             threads = [
@@ -243,7 +244,7 @@ class TestMutableObjectStateOverlap:
 
         n_records = 256
         per_thread = _iters(compat_runtime.short_stress, full=500, quick=30)
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -252,8 +253,8 @@ class TestMutableObjectStateOverlap:
 
             spans = list(log.views(0, n_records))
             for span in spans:
-                e1: list[BaseException] = []
-                e2: list[BaseException] = []
+                e1: list[Exception] = []
+                e2: list[Exception] = []
 
                 def reader(target=span, err=e1):
                     try:
@@ -265,7 +266,7 @@ class TestMutableObjectStateOverlap:
                                 _ = target.start_ts
                             except (ValueError, BufferError):
                                 return
-                    except BaseException as exc:
+                    except Exception as exc:
                         err.append(exc)
 
                 def closer(target=span, err=e2):
@@ -275,7 +276,7 @@ class TestMutableObjectStateOverlap:
                                 target.close()
                             except (ValueError, BufferError):
                                 pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         err.append(exc)
 
                 t1 = threading.Thread(target=reader)
@@ -300,7 +301,7 @@ class TestMutableObjectStateOverlap:
         from timelog import Timelog
 
         iters = _iters(compat_runtime.short_stress, full=200, quick=20)
-        crashes: list[BaseException] = []
+        crashes: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -316,7 +317,7 @@ class TestMutableObjectStateOverlap:
                             pass
                     except (RuntimeError, ValueError):
                         pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         crashes.append(exc)
 
                 def closer(target=it):
@@ -324,7 +325,7 @@ class TestMutableObjectStateOverlap:
                         target.close()
                     except (RuntimeError, ValueError):
                         pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         crashes.append(exc)
 
                 t1 = threading.Thread(target=exhaust)
@@ -392,14 +393,14 @@ class TestDropDrainStress:
                 except Exception:
                     pass
 
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def producer(start: int) -> None:
             try:
                 for i in range(start, start + per_producer):
                     with writer_lock:
                         log.append(i, ReentrantPayload(i))
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         try:
@@ -410,12 +411,12 @@ class TestDropDrainStress:
             for t in threads:
                 t.start()
             # Concurrent flush cycles while producers append.
-            maintenance_errors: list[BaseException] = []
+            maintenance_errors: list[Exception] = []
             for _ in range(5):
                 try:
                     with writer_lock:
                         log.flush()
-                except BaseException as exc:
+                except Exception as exc:
                     maintenance_errors.append(exc)
                     break
             for t in threads:
@@ -447,7 +448,7 @@ class TestDropDrainStress:
                     if not did_work:
                         with writer_lock:
                             log.compact()
-                except BaseException as exc:
+                except Exception as exc:
                     maintenance_errors.append(exc)
                     break
                 time.sleep(0.002)
@@ -539,14 +540,14 @@ class TestBulkAppendFreeThreaded:
         batches = _iters(compat_runtime.short_stress, full=50, quick=8)
         log = Timelog(maintenance="background")
         stop = threading.Event()
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def reader() -> None:
             while not stop.is_set():
                 try:
                     for _ in log[0:10**9]:
                         pass
-                except BaseException as exc:  # snapshot reads must never error
+                except Exception as exc:  # snapshot reads must never error
                     errors.append(exc)
                     return
 
@@ -639,7 +640,7 @@ class TestExtendFreeThreaded:
         )
         stop = threading.Event()
         source: list[tuple[int, object]] = [(i, i) for i in range(width)]
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def mutator() -> None:
             rng = random.Random(4321)
@@ -647,7 +648,7 @@ class TestExtendFreeThreaded:
                 while not stop.is_set():
                     idx = rng.randrange(width)
                     source[idx] = (rng.randrange(10**9), rng.random())
-            except BaseException as exc:  # pragma: no cover - failure path
+            except Exception as exc:  # pragma: no cover - failure path
                 errors.append(exc)
 
         thread = threading.Thread(target=mutator)

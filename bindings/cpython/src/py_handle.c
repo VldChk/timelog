@@ -116,6 +116,18 @@ static int tl_py_attached_to_interp(const tl_py_handle_ctx_t* ctx)
     return cur != NULL && cur == ctx->interp;
 }
 
+static int tl_py_runtime_finalizing_for_teardown(void)
+{
+#if PY_VERSION_HEX >= 0x030D0000
+    return Py_IsFinalizing();   /* safe without an attached tstate */
+#else
+    if (tl_py_current_interp_or_null() == NULL) {
+        return 1;
+    }
+    return TL_PY_IS_FINALIZING();
+#endif
+}
+
 static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
                                                  const char* reason)
 {
@@ -125,24 +137,12 @@ static void tl_py_handle_ctx_warn_unsafe_destroy(const tl_py_handle_ctx_t* ctx,
     uint64_t pins = atomic_load_explicit(
         (_Atomic(uint64_t)*)&ctx->pins, memory_order_relaxed);
 
-    /* Live-only state during interpreter finalization is the NORMAL path
-     * for the documented no-context-manager usage (module-global log, no
-     * close(), process exiting): the OS reclaims everything and nothing
-     * can leak. Printing a scary WARNING here trips users' log-based
-     * alerting on every deploy (v1.3 usability lab finding), so stay
-     * silent for that case. Pins or undrained retired nodes still warn —
-     * an exported buffer or pending drop outliving teardown is a genuine
-     * anomaly worth surfacing. */
-    int finalizing;
-#if PY_VERSION_HEX >= 0x030D0000
-    finalizing = Py_IsFinalizing();   /* safe without an attached tstate */
-#else
-    /* 3.12: sys.is_finalizing() needs an attached tstate, which this path
-     * by definition lacks. A final destroy with no attached thread state
-     * only occurs during interpreter teardown in practice, so assume it. */
-    finalizing = 1;
-#endif
-    if (finalizing) {
+    /* Pending Python-handle bookkeeping during interpreter finalization is
+     * normal for documented no-context-manager usage (module-global log, no
+     * close(), process exiting). There is no safe owning-interpreter drain at
+     * that point, and the OS reclaims the process heap, so finalization stays
+     * silent. Outside finalization, the same state is actionable and warns. */
+    if (tl_py_runtime_finalizing_for_teardown()) {
         /* The process (or interpreter) is going away: the OS reclaims all
          * memory, so pending retired nodes / live handles are NOT leaks.
          * A populated retired queue here is the NORMAL outcome of the
@@ -547,27 +547,29 @@ void tl_py_handle_ctx_destroy(tl_py_handle_ctx_t* ctx)
 
     /* Warn on leaked resources (cannot DECREF without owning thread state). */
 #ifndef NDEBUG
-    tl_py_drop_node_t* remaining = atomic_load_explicit(
-        &ctx->retired_head, memory_order_relaxed);
-    if (remaining != NULL) {
-        fprintf(stderr,
-            "WARNING: tl_py_handle_ctx_destroy called with non-empty queue. "
-            "Objects will leak.\n");
-    }
+    if (!tl_py_runtime_finalizing_for_teardown()) {
+        tl_py_drop_node_t* remaining = atomic_load_explicit(
+            &ctx->retired_head, memory_order_relaxed);
+        if (remaining != NULL) {
+            fprintf(stderr,
+                "WARNING: tl_py_handle_ctx_destroy called with non-empty queue. "
+                "Objects will leak.\n");
+        }
 
-    uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_relaxed);
-    if (pins != 0) {
-        fprintf(stderr,
-            "WARNING: tl_py_handle_ctx_destroy called with pins=%" PRIu64 ". "
-            "This indicates a snapshot/iterator leak.\n",
-            pins);
-    }
+        uint64_t pins = atomic_load_explicit(&ctx->pins, memory_order_relaxed);
+        if (pins != 0) {
+            fprintf(stderr,
+                "WARNING: tl_py_handle_ctx_destroy called with pins=%" PRIu64 ". "
+                "This indicates a snapshot/iterator leak.\n",
+                pins);
+        }
 
-    if (ctx->live_len != 0) {
-        fprintf(stderr,
-            "WARNING: tl_py_handle_ctx_destroy called with %zu live objects. "
-            "Did you forget to call tl_py_live_release_all()?\n",
-            ctx->live_len);
+        if (ctx->live_len != 0) {
+            fprintf(stderr,
+                "WARNING: tl_py_handle_ctx_destroy called with %zu live objects. "
+                "Did you forget to call tl_py_live_release_all()?\n",
+                ctx->live_len);
+        }
     }
 #endif
 
@@ -614,7 +616,8 @@ void tl_py_pins_enter(tl_py_handle_ctx_t* ctx)
 void tl_py_pins_exit_and_maybe_drain(tl_py_handle_ctx_t* ctx)
 {
 #ifndef NDEBUG
-    assert(tl_py_attached_to_interp(ctx) &&
+    assert((tl_py_attached_to_interp(ctx) ||
+            tl_py_runtime_finalizing_for_teardown()) &&
            "tl_py_pins_exit_and_maybe_drain requires owning interpreter");
 #endif
 

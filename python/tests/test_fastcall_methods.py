@@ -14,8 +14,8 @@ from __future__ import annotations
 import threading
 import pytest
 
-import timelog
 from timelog import _timelog as C
+from timelog import Timelog
 from timelog import TimelogError
 
 ONE_ARG = ["point", "since", "until", "equal", "next_ts", "prev_ts", "delete_before"]
@@ -33,7 +33,7 @@ def _fresh_raw(n=64):
 
 class TestFastcallParity:
     def test_results_match_known_dataset(self):
-        tl = timelog.Timelog()
+        tl = Timelog()
         for i in range(10):
             tl.append(i, i * 100)
         assert list(tl.range(2, 5)) == [(2, 200), (3, 300), (4, 400)]
@@ -158,7 +158,7 @@ class TestFastcallConcurrency:
         import time
 
         N = 4000
-        tl = timelog.Timelog(busy_policy="flush")
+        tl = Timelog(busy_policy="flush")
         for i in range(N):
             tl.append(i, i)
         gil_off = (hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled())

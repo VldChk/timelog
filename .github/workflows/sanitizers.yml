@@ -151,19 +151,24 @@ jobs:
       - name: Build e2e targets
         run: cmake --build build-tsan --target timelog_e2e_build --config Debug -j 2
 
-      - name: Resolve ThreadSanitizer runtime preload
+      - name: Resolve ThreadSanitizer runtime library
         shell: bash
         run: |
           libtsan="$(gcc -print-file-name=libtsan.so)"
           if [ -n "${libtsan}" ] && [ "${libtsan}" != "libtsan.so" ]; then
-            echo "LD_PRELOAD=${libtsan}" >> "${GITHUB_ENV}"
+            echo "LIBTSAN=${libtsan}" >> "${GITHUB_ENV}"
           fi
 
       - name: Run subinterpreter tests under ThreadSanitizer
         shell: bash
         run: |
           set +e
-          cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+          # Keep libtsan scoped to the Python test process. If it is exported
+          # through GITHUB_ENV, the Node-based Actions cleanup/upload steps run
+          # under TSan and report unrelated V8/libuv races.
+          setarch -R env \
+            "LD_PRELOAD=${LIBTSAN:-}" \
+            "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
             python demo/ci/run_compat_baseline.py \
               --legs subinterpreters \
               --summary-json "${RUNNER_TEMP}/tsan-subinterpreters.json" \
@@ -227,12 +232,12 @@ jobs:
       - name: Build e2e targets
         run: cmake --build build-tsan-ft --target timelog_e2e_build --config RelWithDebInfo -j 2
 
-      - name: Resolve ThreadSanitizer runtime preload
+      - name: Resolve ThreadSanitizer runtime library
         shell: bash
         run: |
           libtsan="$(gcc -print-file-name=libtsan.so)"
           if [ -n "${libtsan}" ] && [ "${libtsan}" != "libtsan.so" ]; then
-            echo "LD_PRELOAD=${libtsan}" >> "${GITHUB_ENV}"
+            echo "LIBTSAN=${libtsan}" >> "${GITHUB_ENV}"
           fi
 
       - name: Run freethreading + stress legs under ThreadSanitizer
@@ -248,7 +253,9 @@ jobs:
           set +e
           # setarch -R disables ASLR: TSan otherwise fails with
           # "unexpected memory mapping" on recent kernels.
-          setarch -R cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+          setarch -R env \
+            "LD_PRELOAD=${LIBTSAN:-}" \
+            "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
             "PYTHON_GIL=0" \
             python demo/ci/run_compat_baseline.py \
               --legs freethreading \

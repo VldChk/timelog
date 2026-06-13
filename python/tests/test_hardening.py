@@ -19,7 +19,7 @@ import collections.abc
 
 import pytest
 
-import timelog
+from timelog import Timelog
 from timelog import _timelog
 
 # Py_TPFLAGS_HAVE_VECTORCALL (Include/object.h). The binding must never set it.
@@ -38,7 +38,7 @@ _C_TYPES = (
 
 def _make_span(values=("v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7")):
     """Return (log, span) with `len(values)` records materialized into a page."""
-    log = timelog.Timelog(maintenance="disabled")
+    log = Timelog(maintenance="disabled")
     log.extend([(i, v) for i, v in enumerate(values)])
     log.flush()
     span = next(log.views(0, len(values)))

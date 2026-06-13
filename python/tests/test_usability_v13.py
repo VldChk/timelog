@@ -7,6 +7,7 @@ container-protocol dunders, teaching errors, and stats enrichment.
 """
 import array
 import datetime
+import operator
 import os
 from pathlib import Path
 import subprocess
@@ -49,11 +50,11 @@ class TestCleanExitSilence:
         assert proc.returncode == 0
         assert proc.stderr.strip() == "", f"clean exit printed: {proc.stderr!r}"
 
-    def test_exported_buffer_at_exit_still_warns(self):
-        # A PageSpan buffer export pinned at exit IS an anomaly -> warn path
-        # stays. (We only assert the clean case is silent and the process
-        # does not crash here; the pin-warning path keeps its coverage in
-        # the C suite.)
+    def test_exported_buffer_at_exit_does_not_crash(self):
+        # A PageSpan buffer export pinned at process exit must not abort during
+        # late interpreter teardown. Runtime pin leaks still warn outside
+        # finalization; exit itself stays silent for the no-context-manager
+        # lifecycle.
         code = ("from timelog import Timelog\n"
                 "log = Timelog(maintenance='disabled')\n"
                 "log.extend([(i, i) for i in range(100)])\n"
@@ -140,7 +141,7 @@ class TestContainerProtocol:
     def test_contains_rejects_non_int(self):
         log = Timelog(maintenance="disabled")
         with pytest.raises(TypeError):
-            "ten" in log
+            operator.contains(log, "ten")
         log.close()
 
     def test_reversed_raises_with_guidance(self):
@@ -320,6 +321,19 @@ class TestTeachingErrorsParity:
             log.extend([(3, "d"), ("bad", "e"), ("bad2", "f")])
         assert log.extend_skipped == 3
         assert log.stats()["operational"]["extend_skipped"] == 3
+        log.close()
+
+    def test_reopen_resets_extend_skipped_counter(self):
+        log = Timelog(maintenance="disabled")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            log.extend([(1, "a"), ("bad", "b")])
+        assert log.extend_skipped == 1
+        log.close()
+
+        log.reopen(maintenance="disabled")
+        assert log.extend_skipped == 0
+        assert log.stats()["operational"]["extend_skipped"] == 0
         log.close()
 
 

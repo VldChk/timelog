@@ -249,6 +249,7 @@ class Timelog(_CTimelog):
 
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_default
+        self._extend_skipped = 0
         _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
