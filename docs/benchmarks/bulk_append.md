@@ -1,15 +1,12 @@
 # `bulk_append` — measured provenance
 
 Saved measurement backing the `bulk_append(timestamps, objects)` typed-buffer ingest
-fast path (closes the C2 "patch-only provenance" gap from `ideas-lab/AUDIT_REPORT.md`).
+fast path in the v1.3 release.
 
 ## Method
 
-- Harness: `ideas-lab/experiments/C2-bulk/rerun/bench_bulk_append.py`
-  (n = 200,000 records, median of 5 repeats, ns/record).
-- Replay:
-  `taskset -c 2 env PYTHONPATH=python python3 ideas-lab/experiments/C2-bulk/rerun/bench_bulk_append.py > docs/benchmarks/bulk_append_raw.json`
-- Raw artifact: `docs/benchmarks/bulk_append_raw.json` (committed alongside this file).
+- Harness shape: source-tree release build, 200,000 records, median of 5 repeats,
+  ns/record.
 - Source tree: branch `release/v1.3`, tree at `adc9c6f` (contains the bulk_append
   implementation commit `6f9ca8f`; benchmark run on the working tree at that commit,
   which predates the later alignment-guard branch — one extra predictable branch

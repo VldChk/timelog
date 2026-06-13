@@ -769,7 +769,7 @@ across 3.13 / 3.14t / TSan) maintained outside the repository — it exists on t
 maintainer's machine, not in git checkouts. When present: `lab/run_lab.py` is the entry
 point, `lab/harness.py` + `lab/oracle.py` + `lab/generators.py` the machinery,
 `lab/CONCURRENCY_CONTRACT.md` the contract under test, `lab/RESILIENCE_REPORT.md` the
-latest results. Preserved lab run summaries live in `ideas-lab/verification/`.
+latest results.
 
 ### CMake Options
 

@@ -1,4 +1,0 @@
-cwd: /home/vldvhk/Documents/tl-feat-perf
-command: python /tmp/timelog-lab-tl-feat/lab/lint_naked_unlocked_ctx.py
-result:
-naked-unlocked-ctx lint: clean (17 sites in baseline)

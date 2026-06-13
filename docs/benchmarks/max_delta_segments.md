@@ -5,18 +5,12 @@ It is a directional benchmark snapshot, not a contractual performance guarantee.
 
 ## Method
 
-- Driver shape: subprocess-isolated compaction lab, three paired seeds per cell.
+- Driver shape: subprocess-isolated compaction benchmark, three paired seeds per cell.
 - Runtime: CPython 3.13.12 source-tree build.
 - Rows: 400,000 for the three-workload matrix.
 - Source tree: baseline `e7e7efb` source checkout.
 - Matrix seeds: `[1, 2, 3]`; adversarial confirmation repeats use deterministic
   shuffled inputs with seeds `13`, `14`, and `15`.
-- Replay commands from the audit scratch tree:
-  - `python ideas-lab/harness/run_matrix.py /home/vldvhk/Documents/timelog/python ideas-lab/experiments/exp04-compaction/knob_matrix_baseline.json`
-  - `PYTHONPATH=/home/vldvhk/Documents/timelog/python python ideas-lab/experiments/exp04-compaction/confirm.py > ideas-lab/experiments/exp04-compaction/exp04_confirm.json`
-- Raw artifacts checked in with this docs snapshot:
-  [knob_matrix_baseline.json](knob_matrix_baseline.json) and
-  [exp04_confirm.json](exp04_confirm.json).
 - Write-amp is a segment re-merge proxy, not byte write amplification.
 - Point/range latency units are nanoseconds.
 

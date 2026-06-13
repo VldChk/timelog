@@ -41,8 +41,6 @@ cmake.source-dir = "."
 cmake.build-type = "Release"
 wheel.packages = ["python/timelog"]
 install.components = ["python"]
-# The ideas-lab audit trail lives in git, not in the published sdist.
-sdist.exclude = ["ideas-lab/"]
 
 [tool.scikit-build.cmake.define]
 TIMELOG_BUILD_PYTHON = true

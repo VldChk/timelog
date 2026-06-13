@@ -54,7 +54,7 @@ Timelog is a good fit when you want timestamp slicing as a primitive inside Pyth
 - Write concurrency is intentionally constrained (single writer) to keep the core simple and fast.
 - NumPy support is limited to timestamp buffers accepted by `bulk_append()` and
   read-only memoryviews from `PageSpan.timestamps`; Timelog is not a vectorized
-  payload analytics engine and does not ship Arrow/DLPack exports.
+  payload analytics engine.
 
 ## Quality and Delivery Confidence
 - Large C test surface (hundreds of assertions across core suites), plus binding and Python façade tests.  

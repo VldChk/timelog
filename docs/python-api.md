@@ -18,8 +18,7 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
   atomic refcounts on the engine/handle contexts and the core pagespan owner.
 - The public buffer/analytics surface is intentionally narrow: `bulk_append()`
   consumes contiguous native-endian int64 timestamp buffers, and
-  `PageSpan.timestamps` exposes a read-only memoryview. Arrow C Data and DLPack
-  exports are not part of the shipped API.
+  `PageSpan.timestamps` exposes a read-only memoryview.
 
 ## Lifecycle
 

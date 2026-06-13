@@ -29,9 +29,6 @@ CPython `3.13.12`, median of 5:
 | `delete_range(t1, t2)` | 18,059.6 ns | 13,289.3 ns | 1.36x |
 | `delete_before(ts)` | 109.7 ns | 80.8 ns | 1.36x |
 
-Artifact: `ideas-lab/verification/perf_ab_extended_summary_2026-06-09.md`
-with raw JSON siblings in the same directory.
-
 `bulk_append` measured provenance:
 
 | Path | ns/record | Relative |
@@ -40,8 +37,7 @@ with raw JSON siblings in the same directory.
 | `append(int(ts), obj)` loop after v1.3 append folding | 252.1 | bulk is 2.23x faster |
 | `extend(zip(ts_list, objects))` | 397.2 | bulk is 3.51x faster |
 
-Artifact: `docs/benchmarks/bulk_append.md` and
-`docs/benchmarks/bulk_append_raw.json`.
+Artifact: `docs/benchmarks/bulk_append.md`.
 
 Search microbenchmark:
 
@@ -50,15 +46,9 @@ Search microbenchmark:
 - At very large sizes the advantage disappears, so the implementation is
   deliberately gated rather than universally branchless.
 
-Artifact: `ideas-lab/verification/branchless_five_seam_benchmark_2026-06-10.txt`.
-
 These numbers are same-machine evidence for the v1.3 release work. They are
 not a hardware-independent guarantee and should not be mixed with historical
 1GB workload numbers below.
-
-Public v1.3 timestamp-buffer interop is the Python buffer protocol consumed by
-`bulk_append()` and exposed by `PageSpan.timestamps`. Arrow C Data and DLPack
-exports remain ideas-lab prototypes, not shipped public API.
 
 ## Measurement Policy
 
