@@ -461,6 +461,7 @@ void tl_close(tl_timelog_t* tl) {
 /* Forward declaration: the write path requests flushes after dropping
  * writer_mu, but the definition lives with the maintenance plumbing below. */
 static void tl__maint_request_flush(tl_timelog_t* tl);
+static void tl__maint_request_compact(tl_timelog_t* tl);
 
 static void tl__emit_drop_callbacks(tl_timelog_t* tl,
                                     tl_record_t* dropped,
@@ -1121,20 +1122,37 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
      * sealed memrun. Repeat until both the active run and the sealed queue
      * are empty, so on return all data is durably in segments. */
     for (;;) {
+        tl_record_t* seal_dropped = NULL;
+        size_t seal_dropped_len = 0;
+
         TL_LOCK_WRITER(tl);
         bool need_seal = !tl_memtable_is_active_empty(&tl->memtable);
         if (need_seal) {
-            st = tl_memtable_seal(&tl->memtable,
-                                   &tl->memtable_mu,
-                                   NULL,
-                                   tl->op_seq);
+            /* MUST be the drop-collecting seal: sealing applies the active
+             * tombstone set, physically eliding covered memtable records.
+             * The non-collecting variant silently discarded their handles
+             * here, permanently leaking the bound Python payloads under the
+             * natural retention order cutoff() -> flush() (records that
+             * never reached a segment have no other drop path). v1.2 bug,
+             * found by the v1.3 usability lab's TTL-cache persona. */
+            st = tl_memtable_seal_ex(&tl->memtable,
+                                     &tl->memtable_mu,
+                                     NULL,
+                                     tl->op_seq,
+                                     &seal_dropped,
+                                     &seal_dropped_len);
             if (st != TL_OK && st != TL_EBUSY) {
                 TL_UNLOCK_WRITER(tl);
+                tl__emit_drop_callbacks(tl, seal_dropped, seal_dropped_len);
                 TL_UNLOCK_FLUSH(tl);
                 return st;
             }
         }
         TL_UNLOCK_WRITER(tl);
+
+        /* Fire outside writer_mu (callbacks are engine-lock-free by
+         * contract: the binding only mallocs + pushes a lock-free node). */
+        tl__emit_drop_callbacks(tl, seal_dropped, seal_dropped_len);
 
         tl_memrun_t* mr = NULL;
         TL_LOCK_MEMTABLE(tl);
@@ -1161,6 +1179,16 @@ tl_status_t tl_flush(tl_timelog_t* tl) {
     }
 
     TL_UNLOCK_FLUSH(tl);
+
+    /* A user-driven flush publishes L0 segments outside the worker loop, so
+     * nudge the worker if that pushed a compaction trigger over threshold.
+     * Runs after flush_mu is released (lock order: maint_mu -> flush_mu).
+     * The worker's periodic wake-up also re-evaluates triggers now; this
+     * nudge just removes up to maintenance_wakeup_ms of latency. */
+    if (tl->config.maintenance_mode == TL_MAINT_BACKGROUND &&
+        tl_compact_needed(tl)) {
+        tl__maint_request_compact(tl);
+    }
     return TL_OK;
 }
 
@@ -1724,8 +1752,11 @@ static void* tl__maint_worker_entry(void* arg) {
         while (!tl->maint_shutdown &&
                !tl->flush_pending &&
                !tl->compact_pending) {
-            tl_cond_timedwait(&tl->maint_cond, &tl->maint_mu,
-                              tl->config.maintenance_wakeup_ms);
+            bool signalled = tl_cond_timedwait(&tl->maint_cond, &tl->maint_mu,
+                                               tl->config.maintenance_wakeup_ms);
+            if (!signalled) {
+                break;
+            }
         }
 
         if (tl->maint_shutdown) {
@@ -1757,11 +1788,17 @@ static void* tl__maint_worker_entry(void* arg) {
             work |= TL_WORK_FLUSH;
         }
 
-        /* Compaction triggers change only as a result of new L0 segments
-         * appearing, so a heuristic check is meaningful only when we are
-         * about to flush — otherwise the answer cannot have changed since
-         * the previous loop iteration. */
-        if (!(work & TL_WORK_COMPACT_EXPLICIT) && (work & TL_WORK_FLUSH)) {
+        /* Evaluate the compaction heuristic on EVERY wake-up, not only when
+         * this worker is about to flush. Triggers can change without worker
+         * flush activity: a user-called tl_flush() publishes L0 segments
+         * directly, and delete-debt grows from tombstone insertion alone
+         * (delete-heavy retention workloads with no new writes). The check
+         * is cheap (manifest counters + cursor sweep) and runs at most once
+         * per maintenance_wakeup_ms when idle. Previously this was gated on
+         * pending flush work, which let user-flushed L0 grow unboundedly and
+         * left delete_debt_threshold inert on idle instances (v1.3 usability
+         * lab findings). */
+        if (!(work & TL_WORK_COMPACT_EXPLICIT)) {
             if (tl_compact_needed(tl)) {
                 work |= TL_WORK_COMPACT_HEURISTIC;
             }

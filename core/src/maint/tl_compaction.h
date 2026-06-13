@@ -44,12 +44,13 @@
  *   merge runs without locks.
  *
  * Trigger coupling with flush (background mode):
- * In background mode the worker only calls tl_compact_needed() when flush
- * work is also pending. This is safe because compaction triggers only
- * change when segment state changes (flush adds L0; compaction removes
- * L0/L1 and adds L1). On idle wakes with no writes the trigger state is
- * unchanged and there is nothing to evaluate. See tl_compact_needed()
- * for the full explanation.
+ * The worker evaluates tl_compact_needed() on every wake-up (periodic or
+ * signalled). Trigger state can change without worker-driven flushes: a
+ * user-called tl_flush() publishes L0 segments directly (and nudges the
+ * worker via tl__maint_request_compact), and delete-debt grows from
+ * tombstone insertion alone on otherwise-idle instances. The check is
+ * cheap (manifest counters + capped O(T+W) cursor sweep) and runs at
+ * most once per maintenance_wakeup_ms when idle.
  *
  * Handle-drop callback semantics:
  * - Callbacks are DEFERRED until AFTER a successful publish. During merge,

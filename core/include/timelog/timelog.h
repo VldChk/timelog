@@ -265,7 +265,20 @@ typedef struct tl_config {
     /* Maintenance timing */
     uint32_t        maintenance_wakeup_ms;  /* 0 => default (100ms). Periodic wake interval. */
 
-    size_t          max_delta_segments;     /* 0 => default (8). L0 segment bound. */
+    /*
+     * max_delta_segments: 0 => default (8). Bounds the L0 segment count: when
+     * L0 reaches this many segments, compaction collapses them into the leveled
+     * L1. The tiering<->leveling dial -- an analogy for how eagerly the
+     * overlapping L0 tier is collapsed; it does NOT change the L0->L1 merge or
+     * L1's non-overlap discipline. Lower = eager leveling (low read fan-in, high
+     * write-amp + compaction CPU); higher = lazy tiering (cheap writes, higher
+     * read fan-in). Raising it above the L0 count a workload accumulates stops
+     * the *automatic* L0 trigger -- delete_debt_threshold and an explicit
+     * tl_compact() still fire, but a delete-free workload that never calls
+     * tl_compact() then grows read-amp unbounded. Measured curve + guidance:
+     * docs/configuration.md.
+     */
+    size_t          max_delta_segments;
 
     tl_ts_t         window_size;            /* 0 => default window (1 hour) */
     tl_ts_t         window_origin;          /* default: 0 */
@@ -321,11 +334,10 @@ TL_API tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out);
  * @param tl Instance to close (NULL is safe)
  *
  * DATA LOSS WARNING:
- * tl_close() does NOT flush/materialize unflushed records from the memtable.
- * Any records appended after the last tl_flush() call will be dropped.
- * To materialize all data before close:
- *   tl_flush(tl);   // Flush remaining memtable records
- *   tl_close(tl);   // Now safe to close
+ * Timelog is an in-memory engine. tl_close() discards all records, flushed or
+ * not. tl_flush() only materializes pending memtable records into immutable
+ * segments for readers while the log is open; it does not persist data beyond
+ * tl_close().
  *
  * Preconditions:
  * - All snapshots and iterators must be released before calling tl_close()

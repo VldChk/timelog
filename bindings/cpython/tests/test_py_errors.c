@@ -330,7 +330,9 @@ TEST(raise_formatted_appends_status_message)
     text = PyUnicode_AsUTF8(exc_text);
     ASSERT(text != NULL);
     ASSERT(strstr(text, "custom context") != NULL);
-    ASSERT(strstr(text, tl_strerror(TL_ESTATE)) != NULL);
+    /* v1.3: custom messages stand alone — the status is encoded in the
+     * exception type; no ": invalid state" suffix (usability lab). */
+    ASSERT(strstr(text, tl_strerror(TL_ESTATE)) == NULL);
 
     Py_XDECREF(exc_text);
     Py_XDECREF(exc_type);

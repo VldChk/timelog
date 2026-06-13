@@ -243,6 +243,12 @@ static int pagespan_getbuffer(PyObject* exporter, Py_buffer* view, int flags)
         byte_len_local = (size_t)self->len * sizeof(tl_ts_t);
         ts_local = (void*)self->ts;
 
+        /* SECURITY: export ONLY the int64 timestamp array (self->ts). The
+         * handle array self->h holds encoded PyObject* values; exposing it as
+         * a numeric zero-copy buffer would disclose/forge raw pointers (UAF).
+         * Decoded payloads are reachable only via PageSpanObjectsView, which
+         * returns real PyObjects, never the raw handle. PageSpan is the sole
+         * buffer exporter in the binding (guarded by test_hardening.py). */
         /* Fill view (request-independent fields). */
         view->buf = ts_local;
         view->len = (Py_ssize_t)byte_len_local;
@@ -552,7 +558,11 @@ static PyType_Slot PyPageSpan_slots[] = {
         "Zero-copy view of timestamps from a single page slice.\n\n"
         "The .timestamps property returns a memoryview directly backed by\n"
         "page memory. Cannot be instantiated directly; use Timelog.views()\n"
-        "(alias: page_spans())."
+        "(alias: page_spans()).\n\n"
+        "Implements the PEP 688 buffer protocol over read-only int64 (format\n"
+        "'q') timestamps, so it is a collections.abc.Buffer and works with\n"
+        "memoryview(). The encoded handle array is never exposed numerically;\n"
+        "decoded payloads are reached via .objects() as real Python objects."
     )},
     {Py_tp_dealloc, (void*)PyPageSpan_dealloc},
     {Py_tp_traverse, (void*)PyPageSpan_traverse},
@@ -562,6 +572,8 @@ static PyType_Slot PyPageSpan_slots[] = {
     {Py_bf_getbuffer, (void*)pagespan_getbuffer},
     {Py_bf_releasebuffer, (void*)pagespan_releasebuffer},
     {Py_sq_length, (void*)PyPageSpan_length},
+    /* No Py_tp_call / vectorcall slot (see PyTimelog_slots): PageSpan exposes
+     * only the read-only int64 timestamp buffer above, never a call protocol. */
     {0, NULL}
 };
 

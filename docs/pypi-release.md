@@ -11,7 +11,8 @@ from timelog import Timelog
 
 1. Distribution name: `timelog-lib`
 2. Import package: `timelog`
-3. Initial published version: `1.0.0`
+3. Current project version is read from `pyproject.toml`; release tags must use
+   the matching `vX.Y.Z` form.
 
 ## Local Packaging Commands
 
@@ -133,15 +134,20 @@ Complete these once per registry:
      - `pypi`
 3. Confirm GitHub workflow permissions include `id-token: write`.
 4. Perform first publish to TestPyPI and validate install.
-5. Publish tag `v1.0.0` to claim `timelog-lib` on PyPI.
+5. Publish the release tag matching `pyproject.toml` to publish to PyPI.
 
 ## Release Operator Commands
 
 Create and push a release tag:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+version="$(python - <<'PY'
+import tomllib
+print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])
+PY
+)"
+git tag "v${version}"
+git push origin "v${version}"
 ```
 
 Run TestPyPI release before first production publish:

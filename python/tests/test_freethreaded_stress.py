@@ -21,6 +21,7 @@ race windows hard enough to surface them under TSan.
 from __future__ import annotations
 
 import gc
+import importlib
 import random
 import sys
 import sysconfig
@@ -42,7 +43,7 @@ def _require_freethreaded(compat_runtime) -> None:
         pytest.skip("free-threaded stress requires Py_GIL_DISABLED=1 build")
     if sys._is_gil_enabled():
         pytest.fail("free-threaded stress must run with PYTHON_GIL=0")
-    import timelog  # noqa: F401
+    importlib.import_module("timelog")
     if sys._is_gil_enabled():
         pytest.fail("importing timelog re-enabled the GIL")
 
@@ -75,7 +76,7 @@ class TestConcurrentReadStress:
         # Readers scan a FIXED window so per-op work does not grow with the
         # writer's appends (which would make `all` super-linear).
         scan_window = 4096
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
         stop = threading.Event()
 
         log = Timelog(maintenance="background", maintenance_wakeup_ms=1)
@@ -92,7 +93,7 @@ class TestConcurrentReadStress:
                         i += 1
                         if i % 256 == 0:
                             log.flush()
-                except BaseException as exc:  # pragma: no cover - surfaced
+                except Exception as exc:  # pragma: no cover - surfaced
                     errors.append(exc)
 
             def reader(seed: int) -> None:
@@ -133,7 +134,7 @@ class TestConcurrentReadStress:
                                 # fully consumed and released (an un-consumed
                                 # slice iterator would pin a snapshot).
                             _ = list(log[0:64])
-                except BaseException as exc:
+                except Exception as exc:
                     errors.append(exc)
 
             w = threading.Thread(target=writer)
@@ -173,7 +174,7 @@ class TestPageSpanCrossThreadRelease:
 
         n_records = 4096
         per_span_ops = _iters(compat_runtime.short_stress, full=50, quick=8)
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -204,7 +205,7 @@ class TestPageSpanCrossThreadRelease:
                     except BufferError:
                         # Acceptable: another thread might still hold a buffer
                         pass
-                except BaseException as exc:
+                except Exception as exc:
                     errors.append(exc)
 
             threads = [
@@ -243,7 +244,7 @@ class TestMutableObjectStateOverlap:
 
         n_records = 256
         per_thread = _iters(compat_runtime.short_stress, full=500, quick=30)
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -252,8 +253,8 @@ class TestMutableObjectStateOverlap:
 
             spans = list(log.views(0, n_records))
             for span in spans:
-                e1: list[BaseException] = []
-                e2: list[BaseException] = []
+                e1: list[Exception] = []
+                e2: list[Exception] = []
 
                 def reader(target=span, err=e1):
                     try:
@@ -265,7 +266,7 @@ class TestMutableObjectStateOverlap:
                                 _ = target.start_ts
                             except (ValueError, BufferError):
                                 return
-                    except BaseException as exc:
+                    except Exception as exc:
                         err.append(exc)
 
                 def closer(target=span, err=e2):
@@ -275,7 +276,7 @@ class TestMutableObjectStateOverlap:
                                 target.close()
                             except (ValueError, BufferError):
                                 pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         err.append(exc)
 
                 t1 = threading.Thread(target=reader)
@@ -300,7 +301,7 @@ class TestMutableObjectStateOverlap:
         from timelog import Timelog
 
         iters = _iters(compat_runtime.short_stress, full=200, quick=20)
-        crashes: list[BaseException] = []
+        crashes: list[Exception] = []
 
         log = Timelog(maintenance="disabled")
         try:
@@ -316,7 +317,7 @@ class TestMutableObjectStateOverlap:
                             pass
                     except (RuntimeError, ValueError):
                         pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         crashes.append(exc)
 
                 def closer(target=it):
@@ -324,7 +325,7 @@ class TestMutableObjectStateOverlap:
                         target.close()
                     except (RuntimeError, ValueError):
                         pass
-                    except BaseException as exc:
+                    except Exception as exc:
                         crashes.append(exc)
 
                 t1 = threading.Thread(target=exhaust)
@@ -392,14 +393,14 @@ class TestDropDrainStress:
                 except Exception:
                     pass
 
-        errors: list[BaseException] = []
+        errors: list[Exception] = []
 
         def producer(start: int) -> None:
             try:
                 for i in range(start, start + per_producer):
                     with writer_lock:
                         log.append(i, ReentrantPayload(i))
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
 
         try:
@@ -410,12 +411,12 @@ class TestDropDrainStress:
             for t in threads:
                 t.start()
             # Concurrent flush cycles while producers append.
-            maintenance_errors: list[BaseException] = []
+            maintenance_errors: list[Exception] = []
             for _ in range(5):
                 try:
                     with writer_lock:
                         log.flush()
-                except BaseException as exc:
+                except Exception as exc:
                     maintenance_errors.append(exc)
                     break
             for t in threads:
@@ -447,7 +448,7 @@ class TestDropDrainStress:
                     if not did_work:
                         with writer_lock:
                             log.compact()
-                except BaseException as exc:
+                except Exception as exc:
                     maintenance_errors.append(exc)
                     break
                 time.sleep(0.002)
@@ -519,3 +520,149 @@ class TestFinalizationAndReopen:
         assert log_ref() is None, (
             "Unclosed Timelog was not collected — refcount cycle leak?"
         )
+
+
+# ---------------------------------------------------------------------------
+# bulk_append under true parallelism
+# ---------------------------------------------------------------------------
+
+
+class TestBulkAppendFreeThreaded:
+    """bulk_append (single writer, externally serialized) vs parallel readers,
+    plus concurrent mutation of the caller-owned source list (the
+    PySequence_Tuple snapshot must make that harmless)."""
+
+    def test_bulk_append_with_concurrent_readers(self, compat_runtime) -> None:
+        import array
+
+        from timelog import Timelog
+
+        batches = _iters(compat_runtime.short_stress, full=50, quick=8)
+        log = Timelog(maintenance="background")
+        stop = threading.Event()
+        errors: list[Exception] = []
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    for _ in log[0:10**9]:
+                        pass
+                except Exception as exc:  # snapshot reads must never error
+                    errors.append(exc)
+                    return
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for t in threads:
+            t.start()
+        try:
+            for batch in range(batches):
+                base = batch * 1000
+                log.bulk_append(
+                    array.array("q", range(base, base + 1000)),
+                    list(range(base, base + 1000)),
+                )
+        finally:
+            stop.set()
+            for t in threads:
+                t.join()
+        assert errors == []
+        log.flush()
+        assert len(log) == batches * 1000
+        log.close()
+
+    def test_bulk_append_with_concurrent_source_mutation(
+        self, compat_runtime
+    ) -> None:
+        import array
+
+        from timelog import Timelog
+
+        rounds = _iters(compat_runtime.short_stress, full=200, quick=20)
+        log = Timelog(maintenance="disabled")
+        stop = threading.Event()
+        source: list[object] = list(range(1000))
+
+        def mutator() -> None:
+            rng = random.Random(1234)
+            while not stop.is_set():
+                idx = rng.randrange(1000)
+                source[idx] = rng.random()
+                if rng.random() < 0.01:
+                    source.append(rng.random())
+                    del source[rng.randrange(len(source))]
+
+        thread = threading.Thread(target=mutator)
+        thread.start()
+        inserted = 0
+        try:
+            for round_no in range(rounds):
+                # Snapshot len/list pair under our control: bulk_append itself
+                # tuple-snapshots `payload`, so torn reads must be impossible
+                # even though `source` churns concurrently.
+                payload = source
+                ts = array.array("q", range(round_no * 2000, round_no * 2000 + len(payload)))
+                try:
+                    log.bulk_append(ts, payload)
+                    inserted += len(ts)
+                except ValueError:
+                    # Length mismatch is acceptable if the mutator resized
+                    # between our len() capture inside array construction and
+                    # the call; nothing may be inserted in that case.
+                    pass
+        finally:
+            stop.set()
+            thread.join()
+        log.flush()
+        assert len(log) == inserted
+        # Read every stored payload back: forces INCREF + type access on each
+        # handle, turning a missing-snapshot UAF (dangling pointer to a freed
+        # mutator float) into a deterministic failure even without ASan.
+        seen = 0
+        for _, obj in log[0:10**12]:
+            assert isinstance(obj, (int, float))
+            seen += 1
+        assert seen == inserted
+        log.close()
+
+
+class TestExtendFreeThreaded:
+    """extend() must not borrow directly from a caller-owned mutable list."""
+
+    def test_extend_with_concurrent_source_replacement(self, compat_runtime) -> None:
+        from timelog._timelog import Timelog as RawTimelog
+
+        rounds = _iters(compat_runtime.short_stress, full=200, quick=20)
+        width = 512
+        log = RawTimelog(
+            maintenance="disabled",
+            busy_policy="flush",
+            memtable_max_bytes=8 * 1024 * 1024,
+        )
+        stop = threading.Event()
+        source: list[tuple[int, object]] = [(i, i) for i in range(width)]
+        errors: list[Exception] = []
+
+        def mutator() -> None:
+            rng = random.Random(4321)
+            try:
+                while not stop.is_set():
+                    idx = rng.randrange(width)
+                    source[idx] = (rng.randrange(10**9), rng.random())
+            except Exception as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        thread = threading.Thread(target=mutator)
+        thread.start()
+        try:
+            for _ in range(rounds):
+                log.extend(source)
+        finally:
+            stop.set()
+            thread.join()
+
+        assert errors == []
+        log.flush()
+        assert int(log.stats()["storage"]["records_estimate"]) == rounds * width
+        for _, obj in log.range(0, 10**12):
+            assert isinstance(obj, (int, float))
+        log.close()

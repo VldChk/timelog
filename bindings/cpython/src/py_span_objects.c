@@ -82,17 +82,35 @@ static int PyPageSpanObjectsView_clear(PyPageSpanObjectsView* self)
 
 static Py_ssize_t PyPageSpanObjectsView_length(PyPageSpanObjectsView* self)
 {
+    if (self->span == NULL) {
+        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
+        return -1;
+    }
+
     PyPageSpan* span = (PyPageSpan*)self->span;
     Py_ssize_t n;
+    int closed;
+
     TL_PY_OBJ_LOCK(span);
-    n = span->closed ? 0 : (Py_ssize_t)span->len;
+    closed = span->closed;
+    n = closed ? -1 : (Py_ssize_t)span->len;
     TL_PY_OBJ_UNLOCK();
+
+    if (closed) {
+        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
+        return -1;
+    }
     return n;
 }
 
 static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
                                                 Py_ssize_t index)
 {
+    if (self->span == NULL) {
+        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
+        return NULL;
+    }
+
     PyPageSpan* span = (PyPageSpan*)self->span;
 
     /* Decode AND Py_NewRef the payload UNDER the span's CS. Holding the
@@ -196,12 +214,14 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
      * and the decoded object cannot be freed before we incref it. Only the
      * final result return happens after the CS.
      */
-    int err = 0;  /* 0=ok 1=eof 2=no-h 3=bad-handle */
+    int err = 0;  /* 0=ok 1=eof 2=no-h 3=bad-handle 4=closed */
     PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK2(self, span);
-    if (span->closed || self->view == NULL) {
+    if (self->view == NULL) {
         err = 1;
+    } else if (span->closed) {
+        err = 4;
     } else if (span->h == NULL) {
         err = 2;
     } else {
@@ -229,6 +249,10 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
     }
     if (err == 3) {
         PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
+        return NULL;
+    }
+    if (err == 4) {
+        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
     return obj;
@@ -262,6 +286,11 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
                                              PyObject* noargs)
 {
     (void)noargs;
+
+    if (self->span == NULL) {
+        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
+        return NULL;
+    }
 
     PyPageSpan* span = (PyPageSpan*)self->span;
 

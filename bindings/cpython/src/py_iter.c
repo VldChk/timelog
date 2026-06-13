@@ -505,6 +505,39 @@ static PyGetSetDef PyTimelogIter_getset[] = {
  * Type Specification
  *===========================================================================*/
 
+static PyObject* PyTimelogIter_repr(PyTimelogIter* self)
+{
+    /* Notebook-grade summary (v1.3 usability lab): the range and the
+     * precomputed remaining count are already on hand. */
+    int closed;
+    uint64_t remaining;
+    int remaining_valid;
+    tl_ts_t t1, t2;
+
+    TL_PY_OBJ_LOCK(self);
+    closed = self->closed;
+    remaining = self->remaining_count;
+    remaining_valid = self->remaining_valid;
+    t1 = self->range_t1;
+    t2 = self->range_t2;
+    TL_PY_OBJ_UNLOCK();
+
+    if (closed) {
+        return PyUnicode_FromString("<TimelogIter closed>");
+    }
+    if (!remaining_valid) {
+        return PyUnicode_FromString("<TimelogIter>");
+    }
+    if (t2 == TL_TS_MAX) {           /* normalized unbounded upper bound */
+        return PyUnicode_FromFormat(
+            "<TimelogIter [%lld..) remaining=%llu>",
+            (long long)t1, (unsigned long long)remaining);
+    }
+    return PyUnicode_FromFormat(
+        "<TimelogIter [%lld..%lld) remaining=%llu>",
+        (long long)t1, (long long)t2, (unsigned long long)remaining);
+}
+
 static PyType_Slot PyTimelogIter_slots[] = {
     {Py_tp_doc, PyDoc_STR(
         "Snapshot-based iterator over timelog records.\n\n"
@@ -516,6 +549,7 @@ static PyType_Slot PyTimelogIter_slots[] = {
     {Py_tp_dealloc, (void*)PyTimelogIter_dealloc},
     {Py_tp_traverse, (void*)PyTimelogIter_traverse},
     {Py_tp_clear, (void*)PyTimelogIter_clear},
+    {Py_tp_repr, (void*)PyTimelogIter_repr},
     {Py_tp_iter, PyObject_SelfIter},
     {Py_tp_iternext, (void*)PyTimelogIter_iternext},
     {Py_tp_methods, PyTimelogIter_methods},

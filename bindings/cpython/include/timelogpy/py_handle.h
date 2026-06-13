@@ -173,15 +173,32 @@ typedef struct tl_py_handle_ctx {
      * Live handle tracking (multiset by pointer identity).
      * Used to DECREF all remaining objects on close().
      *
-     * Mutation and scan are protected by `live_lock`. Callers must
-     * collect refs under the lock and then drop it before any
-     * Py_DECREF runs (a __del__ that touched the same context would
-     * otherwise deadlock).
+     * MUTATION is protected by `live_lock`; callers must collect refs
+     * under the lock and drop it before any Py_DECREF runs (a __del__
+     * that touched the same context would otherwise deadlock).
+     *
+     * READING happens WITHOUT the lock: tp_traverse is a single
+     * registered lock-free walk (it must never park or allocate — a
+     * frozen thread during a free-threaded stop-the-world collection can
+     * hold live_lock or even the libc arena lock forever; the v1.2 FT
+     * deadlock). The table lives in a single allocation published via an
+     * atomic pointer (`live_tab`); entries publish FULL with release and
+     * retire with seq_cst; resized-out tables are only freed at ctx
+     * teardown (`retired_tables` chain). See `traverse_readers` below for
+     * the lifetime handshake.
      */
-    struct tl_py_live_entry* live_entries;
-    size_t                  live_cap;
+    _Atomic(struct tl_py_live_table*) live_tab;
+    struct tl_py_live_table* retired_tables;
     size_t                  live_len;
     size_t                  live_tombstones;
+    /**
+     * Count of in-flight lock-free tp_traverse walkers. While nonzero,
+     * drains DEFER their Py_DECREFs (re-pushing nodes to the retired
+     * stack) and release_all waits, so a borrowed obj pointer observed by
+     * a walker can never be freed mid-visit. Walkers never park, so the
+     * counter is transient by construction.
+     */
+    _Atomic(size_t)         traverse_readers;
     /* Atomic so close-time consumers can sample without taking live_lock.
      * Writes happen under live_lock for ordering with table mutations. */
     _Atomic(uint8_t)        live_tracking_failed;
@@ -351,8 +368,12 @@ void tl_py_live_release_all(tl_py_handle_ctx_t* ctx);
 
 /**
  * GC traversal helper: visit all Python objects currently referenced by ctx.
- * Must be called on the owning interpreter with an attached Python thread
- * state.
+ *
+ * Single registered lock-free walk: never parks, never allocates, calls no
+ * Python C-API, and is valid WITHOUT an attached thread state (it runs
+ * during late-finalization GC too). Borrowed-pointer lifetime is guaranteed
+ * by the traverse_readers handshake (drains defer Py_DECREFs, release_all
+ * waits). The caller must hold a ctx refcount across the call.
  */
 int tl_py_handle_ctx_traverse(tl_py_handle_ctx_t* ctx, visitproc visit, void* arg);
 

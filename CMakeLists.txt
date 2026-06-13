@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(timelog VERSION 1.0.0 LANGUAGES C)
+project(timelog VERSION 1.3.0 LANGUAGES C)
 
 # =============================================================================
 # Build Configuration
@@ -110,14 +110,26 @@ else()
     endif()
 
     if(NOT _timelog_sanitizer_flags STREQUAL "")
-        set(CMAKE_C_FLAGS_DEBUG
-            "${CMAKE_C_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
-        set(CMAKE_EXE_LINKER_FLAGS_DEBUG
-            "${CMAKE_EXE_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
-        set(CMAKE_SHARED_LINKER_FLAGS_DEBUG
-            "${CMAKE_SHARED_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
-        set(CMAKE_MODULE_LINKER_FLAGS_DEBUG
-            "${CMAKE_MODULE_LINKER_FLAGS_DEBUG} ${_timelog_sanitizer_flags}")
+        set(_timelog_sanitizer_build_types Debug)
+        if(TIMELOG_SANITIZER STREQUAL "thread")
+            # The free-threaded TSan CI leg uses RelWithDebInfo to keep runtime
+            # manageable. Apply TSan there as well so the job cannot silently
+            # produce an uninstrumented "TSan" build.
+            list(APPEND _timelog_sanitizer_build_types RelWithDebInfo)
+        endif()
+
+        foreach(_timelog_sanitizer_build_type IN LISTS _timelog_sanitizer_build_types)
+            string(TOUPPER "${_timelog_sanitizer_build_type}" _timelog_sanitizer_build_type_upper)
+            set(CMAKE_C_FLAGS_${_timelog_sanitizer_build_type_upper}
+                "${CMAKE_C_FLAGS_${_timelog_sanitizer_build_type_upper}} ${_timelog_sanitizer_flags}")
+            set(CMAKE_EXE_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}
+                "${CMAKE_EXE_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}} ${_timelog_sanitizer_flags}")
+            set(CMAKE_SHARED_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}
+                "${CMAKE_SHARED_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}} ${_timelog_sanitizer_flags}")
+            set(CMAKE_MODULE_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}
+                "${CMAKE_MODULE_LINKER_FLAGS_${_timelog_sanitizer_build_type_upper}} ${_timelog_sanitizer_flags}")
+        endforeach()
+
     endif()
 endif()
 
@@ -219,6 +231,7 @@ if(TIMELOG_BUILD_CORE_TESTS)
         core/tests/test_internal_sync.c
         core/tests/test_internal_data_structures.c
         core/tests/test_storage_internal.c
+        core/tests/test_search_branchless.c
         core/tests/test_delta_internal.c
         core/tests/test_compaction_internal.c
         # Functional tests (public API behavior)
@@ -265,6 +278,14 @@ if(TIMELOG_BUILD_CORE_TESTS)
     endif()
 
     add_test(NAME timelog_tests COMMAND test_timelog)
+
+    add_executable(bench_search_lower_bound EXCLUDE_FROM_ALL
+        core/tests/bench_search_lower_bound.c
+    )
+    target_link_libraries(bench_search_lower_bound PRIVATE timelog)
+    target_include_directories(bench_search_lower_bound
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src
+    )
 endif()
 
 # =============================================================================

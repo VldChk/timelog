@@ -12,8 +12,16 @@
  *
  * Thread Safety:
  * - Single-writer model: external synchronization required for writes
- * - GIL released only for: flush, compact, stop_maintenance, close
- * - All write operations hold GIL throughout
+ * - CPython entry points require an attached thread state; on free-threaded
+ *   builds there may be no process-wide GIL.
+ * - Core calls are serialized by core_lock and mutable Python-object fields use
+ *   per-object critical sections / atomics where they can race.
+ * - Thread state is detached, releasing a GIL where present, around long
+ *   core calls: flush, compact, maint_step, stop_maintenance, explicit
+ *   close() — after preserving Python lifetimes. Iterator range-count
+ *   precomputation deliberately stays attached (GIL-fairness; v1.3).
+ *   Finalizer/dealloc cleanup keeps the thread state attached.
+ * - Write operations keep the caller's Python thread state attached throughout
  */
 
 #define PY_SSIZE_T_CLEAN
@@ -29,6 +37,7 @@
 #include "timelog/timelog.h"
 
 #include <limits.h>
+#include <time.h>   /* timespec_get for in-C auto-timestamp (append fold) */
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -45,8 +54,10 @@ static PyObject* PyTimelog_stats(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_maint_step(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_min_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
 static PyObject* PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args));
-static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject* args);
-static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject* args);
+static PyObject* PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
+                                       Py_ssize_t nargs, PyObject* kwnames);
+static PyObject* PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
+static PyObject* PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs);
 static PyObject* PyTimelog_validate(PyTimelog* self, PyObject* Py_UNUSED(args));
 static void PyTimelog_finalize(PyObject* self_obj);
 typedef tl_status_t (*tl_py_core_call_fn)(tl_timelog_t*);
@@ -233,6 +244,34 @@ static int parse_busy_policy(const char* s, tl_py_busy_policy_t* out)
     return -1;
 }
 
+static int
+tl_py_dict_get_item_string_ref(PyObject* dict, const char* key, PyObject** out)
+{
+    *out = NULL;
+#if PY_VERSION_HEX >= 0x030D0000
+    return PyDict_GetItemStringRef(dict, key, out) < 0 ? -1 : 0;
+#else
+    PyObject* val = PyDict_GetItemString(dict, key);
+    if (val == NULL) {
+        return PyErr_Occurred() ? -1 : 0;
+    }
+    *out = Py_NewRef(val);
+    return 0;
+#endif
+}
+
+static int
+tl_py_dict_has_key_string(PyObject* dict, const char* key, int* out)
+{
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    *out = val != NULL;
+    Py_XDECREF(val);
+    return 0;
+}
+
 /**
  * Check whether a kwarg was provided (positional or keyword).
  *
@@ -244,14 +283,10 @@ kwarg_was_provided(PyObject* args, PyObject* kwds,
 {
     *out = 0;
     if (kwds != NULL) {
-        PyObject* v = PyDict_GetItemString(kwds, name);
-        if (v != NULL) {
-            *out = 1;
-            return 0;
-        }
-        if (PyErr_Occurred()) {
+        if (tl_py_dict_has_key_string(kwds, name, out) < 0) {
             return -1;
         }
+        if (*out) return 0;
     }
     if (args != NULL) {
         Py_ssize_t nargs = PyTuple_GET_SIZE(args);
@@ -279,6 +314,133 @@ static int tl_py_validate_ts(long long v, const char* name)
 }
 
 /**
+ * Extract an int64 from a single METH_FASTCALL argument, matching
+ * PyArg_ParseTuple "L" semantics exactly. PyLong_AsLongLong, like "L", is
+ * __index__-based since CPython 3.10 (requires-python >= 3.12, so always):
+ * it accepts int and __index__-able objects, rejects float/str/None with
+ * TypeError, and raises OverflowError beyond the int64 range. Returns 0 on
+ * success (*out set), or -1 with a Python exception set on failure.
+ */
+static int tl_py_fast_i64(PyObject* arg, long long* out)
+{
+    long long v = PyLong_AsLongLong(arg);
+    if (v == -1 && PyErr_Occurred()) {
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/**
+ * Coerce a timestamp argument matching the facade _coerce_ts EXACTLY:
+ * reject bool -> TypeError("timestamp must be int (bool not allowed)");
+ * coerce via __index__ (PyNumber_Index) so float/str/None -> TypeError; and on
+ * out-of-int64 raise OverflowError with the facade's exact message. Used by the
+ * append fold's explicit-ts paths. (Distinct from tl_py_fast_i64, which ACCEPTS
+ * bool, for the idea-2 query/delete methods.) Returns 0 (*out set) or -1 w/ exc.
+ */
+static int tl_py_coerce_ts(PyObject* x, long long* out)
+{
+    if (PyBool_Check(x)) {
+        PyErr_SetString(PyExc_TypeError,
+            "timestamp must be int (bool not allowed)");
+        return -1;
+    }
+    PyObject* idx = PyNumber_Index(x);   /* == operator.index(x) */
+    if (idx == NULL) {
+        /* Teaching errors for the two most common wrong inputs, matching
+         * the facade's _coerce_ts so the C-folded append() and the
+         * FASTCALL query/delete methods read identically to
+         * __setitem__/at() (v1.3 usability lab: the most-used write
+         * method gave the bare CPython index error). */
+        if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+            if (PyFloat_Check(x)) {
+                PyErr_Clear();
+                PyErr_Format(PyExc_TypeError,
+                    "timestamps are integers in the log's time_unit, not "
+                    "float (%R); use int(x), or a finer time_unit", x);
+            } else if (strcmp(Py_TYPE(x)->tp_name, "datetime.datetime") == 0
+                       || strcmp(Py_TYPE(x)->tp_name, "datetime.date") == 0) {
+                PyErr_Clear();
+                PyErr_SetString(PyExc_TypeError,
+                    "timestamps are integers in the log's time_unit; for a "
+                    "datetime use int(dt.timestamp() * 1000) with "
+                    "time_unit='ms' (UTC-aware recommended)");
+            }
+        }
+        return -1;
+    }
+    long long v = PyLong_AsLongLong(idx);
+    if (v == -1 && PyErr_Occurred()) {
+        if (PyErr_ExceptionMatches(PyExc_OverflowError)) {
+            PyErr_Clear();
+            PyErr_Format(PyExc_OverflowError,
+                "timestamp %S is outside int64 range [%lld, %lld]",
+                idx, (long long)TL_TS_MIN, (long long)TL_TS_MAX);
+        }
+        Py_DECREF(idx);
+        return -1;
+    }
+    Py_DECREF(idx);
+    *out = v;
+    return 0;
+}
+
+/**
+ * Wall-clock auto-timestamp matching the facade _now_ts: time.time_ns() scaled
+ * by the instance's time_unit. time.time_ns() is CLOCK_REALTIME-based; use the
+ * portable C11 timespec_get(TIME_UTC) (works on Linux/macOS/Windows). The clock
+ * is non-negative, so integer division == floor (matching Python's //).
+ */
+static long long tl_py_floor_div_ll(long long value, long long divisor)
+{
+    long long q = value / divisor;
+    long long r = value % divisor;
+    return (r != 0 && value < 0) ? q - 1 : q;
+}
+
+static int tl_py_now_ts(const PyTimelog* self, long long* out)
+{
+    struct timespec tsp = {0, 0};
+    if (timespec_get(&tsp, TIME_UTC) != TIME_UTC) {
+        PyErr_SetString(PyExc_RuntimeError, "failed to read system clock");
+        return -1;
+    }
+
+    long double sec_ld = (long double)tsp.tv_sec;
+    if (sec_ld > ((long double)LLONG_MAX / 1000000000.0L) ||
+        sec_ld < ((long double)LLONG_MIN / 1000000000.0L)) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+
+    long long sec = (long long)tsp.tv_sec;
+    long long ns;
+    if (sec > 0 &&
+        sec > (LLONG_MAX - (long long)tsp.tv_nsec) / 1000000000LL) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+    if (sec < 0 &&
+        sec < (LLONG_MIN + (long long)tsp.tv_nsec) / 1000000000LL) {
+        PyErr_SetString(PyExc_OverflowError,
+            "auto timestamp is outside int64 range");
+        return -1;
+    }
+    ns = sec * 1000000000LL + (long long)tsp.tv_nsec;
+
+    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
+        case TL_TIME_S:  *out = tl_py_floor_div_ll(ns, 1000000000LL); break;
+        case TL_TIME_MS: *out = tl_py_floor_div_ll(ns, 1000000LL); break;
+        case TL_TIME_US: *out = tl_py_floor_div_ll(ns, 1000LL); break;
+        case TL_TIME_NS: default: *out = ns; break;
+    }
+    return 0;
+}
+
+/**
  * Handle TL_EBUSY for write operations.
  *
  * Returns 0 to continue, -1 if an exception was raised.
@@ -286,6 +448,11 @@ static int tl_py_validate_ts(long long v, const char* name)
  */
 static int tl_py_handle_write_ebusy(PyTimelog* self, const char* msg)
 {
+    /* Count every surfaced write-path EBUSY regardless of policy so
+     * operators can alert on chronic backpressure even under 'silent'
+     * or 'flush' (v1.3 usability lab: stats offered no trace). */
+    atomic_fetch_add_explicit(&self->busy_events, 1, memory_order_relaxed);
+
     if (self->busy_policy == TL_PY_BUSY_RAISE) {
         TL_PY_RAISE_STATUS_FMT(self, TL_EBUSY, "%s", msg);
         return -1;
@@ -353,6 +520,24 @@ static tl_py_handle_ctx_t* tl_py_acquire_owned_handle_ctx(PyTimelog* self)
 }
 
 /*
+ * Non-blocking variant for tp_traverse, which must never park: during a
+ * free-threaded stop-the-world collection core_lock can be held by a FROZEN
+ * thread that will only run again after the GC finishes — and the GC cannot
+ * finish while traverse is parked on the lock. Returns NULL when the lock
+ * is contended; the caller under-reports for this GC cycle (over-retention
+ * for one cycle, which is always sound).
+ */
+static tl_py_handle_ctx_t* tl_py_try_acquire_owned_handle_ctx(PyTimelog* self)
+{
+    if (!TL_PY_TRYLOCK(self)) {
+        return NULL;
+    }
+    tl_py_handle_ctx_t* h = tl_py_own_handle_ctx_locked(self);
+    TL_PY_UNLOCK(self);
+    return h;
+}
+
+/*
  * Opportunistic post-core-call drain. Own a handle_ctx reference (so a
  * concurrent close() cannot free it mid-drain), drain retired Python refs
  * best-effort (force=0), then drop the reference. Runs with no lock held:
@@ -380,7 +565,8 @@ tl_py_core_call_strict(PyTimelog* self, tl_py_core_call_fn fn, tl_status_t* out_
 
     Py_BEGIN_ALLOW_THREADS
     *out_status = fn(self->tl);
-    /* Release core_lock before GIL reacquire to prevent ABBA deadlock. */
+    /* Release core_lock before re-attaching the thread state to prevent an
+     * ABBA deadlock on GIL builds. */
     PyThread_release_lock(self->core_lock);
     Py_END_ALLOW_THREADS
 
@@ -400,9 +586,9 @@ tl_py_core_call_best_effort(PyTimelog* self, tl_py_core_call_fn fn)
         Py_BEGIN_ALLOW_THREADS
         st = fn(self->tl);
         /*
-         * Release core_lock BEFORE re-acquiring GIL to prevent ABBA
-         * deadlock: Thread A holds core_lock + wants GIL, Thread B
-         * holds GIL + wants core_lock.
+         * Release core_lock BEFORE re-attaching the thread state to prevent
+         * ABBA deadlock on GIL builds: Thread A holds core_lock + wants the
+         * GIL, Thread B holds the GIL + wants core_lock.
          */
         PyThread_release_lock(self->core_lock);
         Py_END_ALLOW_THREADS
@@ -497,14 +683,15 @@ static void tl_py_release_snapshot_pinned(tl_snapshot_t* snap,
 static int
 dict_get_ssize(PyObject* dict, const char* key, Py_ssize_t* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);  /* borrowed ref */
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
     if (val == NULL) {
-        /* PyDict_GetItemString returns NULL for both "key absent" and
-         * internal error (e.g. OOM during key string creation).
-         * Distinguish via PyErr_Occurred(). */
-        return PyErr_Occurred() ? -1 : 0;
+        return 0;
     }
     Py_ssize_t v = PyLong_AsSsize_t(val);
+    Py_DECREF(val);
     if (v == -1 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -516,9 +703,13 @@ dict_get_ssize(PyObject* dict, const char* key, Py_ssize_t* out)
 static int
 dict_get_llong(PyObject* dict, const char* key, long long* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);
-    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    if (val == NULL) return 0;
     long long v = PyLong_AsLongLong(val);
+    Py_DECREF(val);
     if (v == -1 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -530,9 +721,13 @@ dict_get_llong(PyObject* dict, const char* key, long long* out)
 static int
 dict_get_double(PyObject* dict, const char* key, double* out)
 {
-    PyObject* val = PyDict_GetItemString(dict, key);
-    if (val == NULL) return PyErr_Occurred() ? -1 : 0;
+    PyObject* val = NULL;
+    if (tl_py_dict_get_item_string_ref(dict, key, &val) < 0) {
+        return -1;
+    }
+    if (val == NULL) return 0;
     double v = PyFloat_AsDouble(val);
+    Py_DECREF(val);
     if (v == -1.0 && PyErr_Occurred()) return -1;
     *out = v;
     return 0;
@@ -759,10 +954,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 #define CHECK_ADAPTIVE_CONFLICT(flat_var, sentinel, key_name)           \
         do {                                                            \
             if ((flat_var) != (sentinel)) {                             \
-                PyObject* _v = PyDict_GetItemString(                    \
-                    adaptive_dict, key_name);                           \
-                if (_v == NULL && PyErr_Occurred()) return -1;          \
-                if (_v != NULL) {                                       \
+                int _present = 0;                                       \
+                if (tl_py_dict_has_key_string(                          \
+                        adaptive_dict, key_name, &_present) < 0) {      \
+                    return -1;                                          \
+                }                                                       \
+                if (_present) {                                         \
                     PyErr_Format(PyExc_ValueError,                      \
                         "Cannot specify both adaptive_%s and "          \
                         "adaptive={'%s': ...}", key_name, key_name);    \
@@ -782,9 +979,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         CHECK_ADAPTIVE_CONFLICT(adaptive_failure_backoff_pct, PY_SSIZE_T_MIN, "failure_backoff_pct");
 
         if (adaptive_alpha_flat_set) {
-            PyObject* _v = PyDict_GetItemString(adaptive_dict, "alpha");
-            if (_v == NULL && PyErr_Occurred()) return -1;
-            if (_v != NULL) {
+            int _present = 0;
+            if (tl_py_dict_has_key_string(adaptive_dict, "alpha",
+                                          &_present) < 0) {
+                return -1;
+            }
+            if (_present) {
                 PyErr_Format(PyExc_ValueError,
                     "Cannot specify both adaptive_alpha and "
                     "adaptive={'alpha': ...}");
@@ -807,9 +1007,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
             return -1;
         }
 
-        PyObject* alpha_val = PyDict_GetItemString(adaptive_dict, "alpha");
-        if (alpha_val == NULL && PyErr_Occurred()) return -1;
-        if (alpha_val != NULL) {
+        int alpha_present = 0;
+        if (tl_py_dict_has_key_string(adaptive_dict, "alpha",
+                                      &alpha_present) < 0) {
+            return -1;
+        }
+        if (alpha_present) {
             adaptive_alpha_set = 1;
         }
     }
@@ -835,10 +1038,12 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
 #define CHECK_COMPACTION_CONFLICT(flat_var, sentinel, key_name, flat_name) \
         do {                                                              \
             if ((flat_var) != (sentinel)) {                               \
-                PyObject* _v = PyDict_GetItemString(                      \
-                    compaction_dict, key_name);                           \
-                if (_v == NULL && PyErr_Occurred()) return -1;            \
-                if (_v != NULL) {                                         \
+                int _present = 0;                                         \
+                if (tl_py_dict_has_key_string(                            \
+                        compaction_dict, key_name, &_present) < 0) {      \
+                    return -1;                                            \
+                }                                                         \
+                if (_present) {                                           \
                     PyErr_Format(PyExc_ValueError,                        \
                         "Cannot specify both %s and "                     \
                         "compaction={'%s': ...}", flat_name, key_name);   \
@@ -905,6 +1110,8 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
         tl_py_timelog_drop_handle_ctx(self);
         return -1;
     }
+    /* Fresh engine (init or reopen): backpressure counter starts at zero. */
+    atomic_store_explicit(&self->busy_events, 0, memory_order_relaxed);
 
     /* Apply numeric overrides with range/overflow validation. */
     if (memtable_max_bytes != PY_SSIZE_T_MIN) {
@@ -1216,10 +1423,19 @@ PyTimelog_init(PyTimelog* self, PyObject* args, PyObject* kwds)
     }
 
     /* Success - store introspection fields */
+    atomic_store_explicit(&self->time_unit,
+                          time_unit_set ? cfg.time_unit : TL_TIME_MS,
+                          memory_order_release);
     atomic_store_explicit(&self->tl, tl_local, memory_order_release);
     atomic_store_explicit(&self->closed, 0, memory_order_release);
-    self->time_unit = time_unit_set ? cfg.time_unit : TL_TIME_MS;
     self->maint_mode = cfg.maintenance_mode;
+    /* Deliberately do NOT reset the min_ts floor here. Fresh tp_alloc memory is
+     * already zeroed (no guard); on reopen the facade re-applies the floor via
+     * _set_min_ts_floor() as the sole authority. Resetting here would briefly
+     * expose a no-guard window if an append raced a reopen. Leaving the prior
+     * floor preserves the pre-fold facade's persistent `_min_ts` slot until the
+     * new floor is applied. Writes racing lifecycle/reopen are outside the
+     * public single-writer/lifecycle serialization contract. */
 
     /* tl_open() auto-starts maintenance in background mode. */
 
@@ -1375,7 +1591,9 @@ PyTimelog_close(PyTimelog* self, PyObject* Py_UNUSED(args))
     uint64_t pins = pytimelog_close_no_raise(self, 0);
     if (pins != 0) {
         return TL_PY_RAISE_STATUS_FMT(self, TL_ESTATE,
-            "Cannot close: %llu active snapshots/iterators",
+            "Cannot close: %llu active reader(s) still pinned "
+            "(iterators, PageSpans, or exported memoryviews); exhaust, "
+            "del, or .close() them, then call close() again",
             (unsigned long long)pins);
     }
 
@@ -1436,7 +1654,11 @@ PyTimelog_traverse(PyTimelog* self, visitproc visit, void* arg)
 {
     Py_VISIT(Py_TYPE(self));
 
-    tl_py_handle_ctx_t* hctx = tl_py_acquire_owned_handle_ctx(self);
+    /* MUST be the non-blocking acquire: tp_traverse parking on core_lock
+     * during a stop-the-world collection is a deadlock (the holder may be a
+     * frozen thread). NULL (contended or already closed) => under-report
+     * this cycle, which only over-retains. */
+    tl_py_handle_ctx_t* hctx = tl_py_try_acquire_owned_handle_ctx(self);
     if (hctx == NULL) {
         return 0;
     }
@@ -1469,20 +1691,116 @@ PyTimelog_clear(PyTimelog* self)
  *===========================================================================*/
 
 static PyObject*
-PyTimelog_append(PyTimelog* self, PyObject* args)
+PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs,
+                 PyObject* kwnames)
 {
-    CHECK_CLOSED(self);
+    /* Folded facade append: 3 signatures (idea 3).
+     *   append(obj)          -> auto-timestamp from the wall clock
+     *   append(obj, ts=X)    -> explicit keyword timestamp
+     *   append(ts, obj)      -> legacy 2-positional
+     * Matches the (now-deleted) Python override, including: ts=None means
+     * auto-timestamp; a ts= kw is IGNORED when the object is provided via the
+     * second positional/obj_or_none path; and the old exposed parameter names
+     * obj_or_ts / obj_or_none remain accepted for compatibility. */
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    Py_ssize_t nkw = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+
+    PyObject* obj_or_ts = NULL;     /* borrowed */
+    PyObject* obj_or_none = NULL;   /* borrowed, NULL means sentinel */
+    PyObject* ts_kw = NULL;         /* borrowed value of ts=, if present */
+
+    if (n > 2) {
+        PyErr_Format(PyExc_TypeError,
+            "append() takes 1 or 2 positional arguments but %zd were given", n);
+        return NULL;
+    }
+    if (n >= 1) {
+        obj_or_ts = args[0];
+    }
+    if (n == 2) {
+        obj_or_none = args[1];
+    }
+
+    for (Py_ssize_t i = 0; i < nkw; i++) {
+        PyObject* name = PyTuple_GET_ITEM(kwnames, i);
+        if (PyUnicode_CompareWithASCIIString(name, "ts") == 0) {
+            if (ts_kw != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for keyword argument 'ts'");
+                return NULL;
+            }
+            ts_kw = args[n + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "obj_or_ts") == 0) {
+            if (obj_or_ts != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for argument 'obj_or_ts'");
+                return NULL;
+            }
+            obj_or_ts = args[n + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "obj_or_none") == 0) {
+            if (obj_or_none != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "append() got multiple values for argument 'obj_or_none'");
+                return NULL;
+            }
+            obj_or_none = args[n + i];
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "append() got an unexpected keyword argument '%S'", name);
+            return NULL;
+        }
+    }
 
     long long ts_ll;
     PyObject* obj;
-    if (!PyArg_ParseTuple(args, "LO", &ts_ll, &obj)) {
+    if (obj_or_ts == NULL) {
+        PyErr_SetString(PyExc_TypeError,
+            "append() missing required argument 'obj_or_ts'");
         return NULL;
     }
 
-    /* Validate timestamp range */
+    if (obj_or_none == NULL) {
+        obj = obj_or_ts;
+        if (ts_kw != NULL && ts_kw != Py_None) {   /* append(obj, ts=X) */
+            if (tl_py_coerce_ts(ts_kw, &ts_ll) < 0) {
+                return NULL;
+            }
+        } else {                                  /* append(obj) or append(obj, ts=None) */
+            if (tl_py_now_ts(self, &ts_ll) < 0) {
+                return NULL;
+            }
+        }
+    } else {                                       /* append(ts, obj); ts= kw ignored, like the facade */
+        if (tl_py_coerce_ts(obj_or_ts, &ts_ll) < 0) {
+            return NULL;
+        }
+        obj = obj_or_none;
+    }
+
+    /* min_ts floor guard (single source of truth; matches facade _check_min_ts).
+     * Atomic acquire-load with flag-before-value ordering, paired with the
+     * release stores in _set_min_ts_floor, so append never observes the flag set
+     * against a torn bound. Lifecycle/reopen still require external
+     * serialization against concurrent writers. */
+    if (atomic_load_explicit(&self->has_min_ts_floor, memory_order_acquire)) {
+        long long floor = atomic_load_explicit(&self->min_ts_floor,
+                                                memory_order_acquire);
+        if (ts_ll < floor) {
+            PyErr_Format(PyExc_ValueError,
+                "timestamp %lld is below min_ts boundary (%lld)",
+                ts_ll, floor);
+            return NULL;
+        }
+    }
+
+    /* Validate timestamp range (defense-in-depth) */
     if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
         return NULL;
     }
+
+    /* Preserve the old facade ordering: Python argument binding/coercion and
+     * the min_ts guard ran before super().append() observed closed state. */
+    CHECK_CLOSED(self);
 
     /* INCREF object (engine-owned reference) */
     Py_INCREF(obj);
@@ -1534,7 +1852,11 @@ success:
 /*===========================================================================
  * PyTimelog_extend
  *
- * CRITICAL: obj is borrowed from item. INCREF obj BEFORE DECREF item.
+ * CRITICAL: concrete caller-owned sequences are snapshotted before borrowed
+ * item access. PySequence_Fast(list) would return the original list, which is
+ * not safe under Py_GIL_DISABLED if another thread mutates it concurrently.
+ *
+ * CRITICAL: obj is borrowed from item/pair. INCREF obj BEFORE DECREF item/pair.
  *===========================================================================*/
 
 static PyObject*
@@ -1551,15 +1873,16 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
         return NULL;
     }
 
-    /* Fast path for concrete sequences (no materialization cost). */
+    /* Fast path for concrete sequences. Snapshot the outer list/tuple so later
+     * borrowed item access is from our owned immutable tuple, not a mutable
+     * caller list that another free-threaded thread can rewrite underneath us. */
     if (PyList_CheckExact(iterable) || PyTuple_CheckExact(iterable)) {
-        PyObject* seq = PySequence_Fast(iterable,
-                                        "extend() expects an iterable of (ts, obj)");
+        PyObject* seq = PySequence_Tuple(iterable);
         if (seq == NULL) {
             return NULL;
         }
 
-        Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+        Py_ssize_t n = PyTuple_GET_SIZE(seq);
         if (n == 0) {
             Py_DECREF(seq);
             Py_RETURN_NONE;
@@ -1581,38 +1904,48 @@ PyTimelog_extend(PyTimelog* self, PyObject* args, PyObject* kwds)
         memset(objs, 0, (size_t)n * sizeof(PyObject*));
 
         for (Py_ssize_t i = 0; i < n; i++) {
-            PyObject* item = PySequence_Fast_GET_ITEM(seq, i); /* borrowed */
+            PyObject* item = PyTuple_GET_ITEM(seq, i); /* borrowed from our tuple */
             long long ts_ll;
             PyObject* obj;
+            int obj_is_strong = 0;
 
             if (PyArg_ParseTuple(item, "LO", &ts_ll, &obj)) {
                 /* Parsed tuple directly */
             } else {
                 PyErr_Clear();
-                PyObject* pair = PySequence_Fast(item, "extend() expects (ts, obj)");
+                PyObject* pair = PySequence_Tuple(item);
                 if (pair == NULL) {
                     goto error_seq;
                 }
-                if (PySequence_Fast_GET_SIZE(pair) != 2) {
+                if (PyTuple_GET_SIZE(pair) != 2) {
                     Py_DECREF(pair);
                     PyErr_SetString(PyExc_ValueError,
                         "extend() expects (ts, obj) pairs");
                     goto error_seq;
                 }
-                PyObject* ts_obj = PySequence_Fast_GET_ITEM(pair, 0);
-                obj = PySequence_Fast_GET_ITEM(pair, 1);
+                PyObject* ts_obj = PyTuple_GET_ITEM(pair, 0);
+                obj = PyTuple_GET_ITEM(pair, 1);
                 ts_ll = PyLong_AsLongLong(ts_obj);
-                Py_DECREF(pair);
                 if (PyErr_Occurred()) {
+                    Py_DECREF(pair);
                     goto error_seq;
                 }
+                /* obj may be owned only by this temporary tuple. */
+                Py_INCREF(obj);
+                obj_is_strong = 1;
+                Py_DECREF(pair);
             }
 
             if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
+                if (obj_is_strong) {
+                    Py_DECREF(obj);
+                }
                 goto error_seq;
             }
 
-            Py_INCREF(obj);
+            if (!obj_is_strong) {
+                Py_INCREF(obj);
+            }
             objs[i] = obj;
             records[i].ts = (tl_ts_t)ts_ll;
             records[i].handle = tl_py_handle_encode(obj);
@@ -1718,20 +2051,20 @@ error_seq:
             Py_INCREF(obj);
         } else {
             PyErr_Clear();
-            PyObject* pair = PySequence_Fast(item, "extend() expects (ts, obj)");
+            PyObject* pair = PySequence_Tuple(item);
             if (pair == NULL) {
                 Py_DECREF(item);
                 goto error_stream;
             }
-            if (PySequence_Fast_GET_SIZE(pair) != 2) {
+            if (PyTuple_GET_SIZE(pair) != 2) {
                 Py_DECREF(pair);
                 Py_DECREF(item);
                 PyErr_SetString(PyExc_ValueError,
                     "extend() expects (ts, obj) pairs");
                 goto error_stream;
             }
-            PyObject* ts_obj = PySequence_Fast_GET_ITEM(pair, 0);
-            obj = PySequence_Fast_GET_ITEM(pair, 1);
+            PyObject* ts_obj = PyTuple_GET_ITEM(pair, 0);
+            obj = PyTuple_GET_ITEM(pair, 1);
             ts_ll = PyLong_AsLongLong(ts_obj);
             /* INCREF obj before DECREF pair: obj is borrowed from pair. */
             Py_INCREF(obj);
@@ -1841,6 +2174,385 @@ error_stream:
 }
 
 /*===========================================================================
+ * PyTimelog_bulk_append
+ *
+ * Typed-buffer bulk append fast path:
+ *   bulk_append(timestamps, objects, *, mostly_ordered=<instance default>)
+ *
+ * timestamps: contiguous 1-D buffer of NATIVE-endian int64 ('q'/'l',
+ * itemsize 8). objects: concrete ordered sequence (list/tuple) of equal
+ * length; str/bytes/iterators are rejected. Single all-or-nothing
+ * tl_append_batch. TL_EBUSY => all records committed; never rolled back.
+ *
+ * Free-threaded safety: `objects` is snapshotted with PySequence_Tuple()
+ * before any borrowed-item access, so concurrent mutation of a caller-owned
+ * list cannot tear reads. For exact lists the copy is a single
+ * critical-section snapshot (PyList_AsTuple under the list's per-object
+ * lock on free-threaded builds); for other sequences PySequence_Tuple
+ * falls back to itemwise iteration, which is memory-safe via owned
+ * references but not an atomic point-in-time copy. All later item reads
+ * go through our owned tuple.
+ *===========================================================================*/
+
+#if !defined(PY_BIG_ENDIAN) || !defined(PY_LITTLE_ENDIAN)
+#  error "pyport.h byte-order macros are required (CPython >= 3.12)"
+#endif
+
+static int
+tl_py_buffer_fmt_is_native_i64(const char* fmt)
+{
+    if (fmt == NULL) {
+        return 0;
+    }
+    const char* p = fmt;
+    if (*p == '@' || *p == '=') {
+        p++;                          /* native order, explicitly */
+    } else if (*p == '<' || *p == '>' || *p == '!') {
+#if PY_BIG_ENDIAN
+        if (*p == '<') {
+            return -1;                /* little-endian buffer on BE host */
+        }
+#else
+        if (*p == '>' || *p == '!') {
+            return -1;                /* big-endian buffer on LE host */
+        }
+#endif
+        p++;
+    }
+    if ((p[0] == 'q' || p[0] == 'l') && p[1] == '\0') {
+        return 1;
+    }
+    return 0;
+}
+
+static PyObject*
+PyTimelog_bulk_append(PyTimelog* self, PyObject *const *args,
+                      Py_ssize_t nargs, PyObject* kwnames)
+{
+    CHECK_CLOSED(self);
+
+    /* Hand-rolled FASTCALL+kwnames parsing, mirroring append() above. */
+    Py_ssize_t n_pos = PyVectorcall_NARGS(nargs);
+    Py_ssize_t nkw = (kwnames == NULL) ? 0 : PyTuple_GET_SIZE(kwnames);
+
+    PyObject* ts_obj = NULL;             /* borrowed */
+    PyObject* objects = NULL;            /* borrowed */
+    PyObject* mostly_ordered_obj = NULL; /* borrowed; NULL = not given */
+
+    if (n_pos > 2) {
+        PyErr_Format(PyExc_TypeError,
+            "bulk_append() takes 2 positional arguments but %zd were given",
+            n_pos);
+        return NULL;
+    }
+    if (n_pos >= 1) {
+        ts_obj = args[0];
+    }
+    if (n_pos == 2) {
+        objects = args[1];
+    }
+
+    for (Py_ssize_t i = 0; i < nkw; i++) {
+        PyObject* name = PyTuple_GET_ITEM(kwnames, i);
+        if (PyUnicode_CompareWithASCIIString(name, "timestamps") == 0) {
+            if (ts_obj != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'timestamps'");
+                return NULL;
+            }
+            ts_obj = args[n_pos + i];
+        } else if (PyUnicode_CompareWithASCIIString(name, "objects") == 0) {
+            if (objects != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'objects'");
+                return NULL;
+            }
+            objects = args[n_pos + i];
+        } else if (PyUnicode_CompareWithASCIIString(name,
+                                                    "mostly_ordered") == 0) {
+            if (mostly_ordered_obj != NULL) {
+                PyErr_SetString(PyExc_TypeError,
+                    "bulk_append() got multiple values for argument "
+                    "'mostly_ordered'");
+                return NULL;
+            }
+            mostly_ordered_obj = args[n_pos + i];
+        } else {
+            PyErr_Format(PyExc_TypeError,
+                "bulk_append() got an unexpected keyword argument '%S'",
+                name);
+            return NULL;
+        }
+    }
+    if (ts_obj == NULL || objects == NULL) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() missing required arguments 'timestamps' and "
+            "'objects'");
+        return NULL;
+    }
+
+    /* Objects policy: a parallel array needs a stable order and per-item
+     * payloads. Reject text/bytes (would insert characters) and anything
+     * that is not a real sequence (sets, dicts, generators, iterators). */
+    if (PyUnicode_Check(objects) || PyBytes_Check(objects) ||
+        PyByteArray_Check(objects)) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() objects must be a sequence of payload objects, "
+            "not str/bytes");
+        return NULL;
+    }
+    if (!PySequence_Check(objects)) {
+        PyErr_SetString(PyExc_TypeError,
+            "bulk_append() objects must be a concrete sequence "
+            "(use extend() for streaming/iterator input)");
+        return NULL;
+    }
+
+    /* Immutable snapshot (owned): FT-safe borrowed access from here on. */
+    PyObject* seq = PySequence_Tuple(objects);
+    if (seq == NULL) {
+        return NULL;
+    }
+
+    Py_buffer ts_view;
+    if (PyObject_GetBuffer(ts_obj, &ts_view,
+                           PyBUF_FORMAT | PyBUF_C_CONTIGUOUS) < 0) {
+        /* numpy datetime64 — the most likely real pandas-user input — has
+         * a buffer interface that refuses dtype 'M' with a raw numpy
+         * message. Replace it with the conversion recipe. */
+        if (PyObject_CheckBuffer(ts_obj) &&
+            PyErr_ExceptionMatches(PyExc_ValueError)) {
+            PyObject* exc = PyErr_GetRaisedException();
+            PyObject* str = exc ? PyObject_Str(exc) : NULL;
+            const char* msg = str ? PyUnicode_AsUTF8(str) : NULL;
+            if (msg != NULL && (strstr(msg, "dtype 'M'") != NULL ||
+                                strstr(msg, "dtype 'm'") != NULL)) {
+                Py_XDECREF(str);
+                Py_XDECREF(exc);
+                Py_DECREF(seq);
+                PyErr_SetString(PyExc_ValueError,
+                    "bulk_append() timestamps must be int64; for a numpy "
+                    "datetime64/timedelta64 array use arr.view('int64') "
+                    "(or astype('int64')) with a matching time_unit");
+                return NULL;
+            }
+            Py_XDECREF(str);
+            if (exc != NULL) {
+                PyErr_SetRaisedException(exc);
+            }
+        }
+        /* The most likely user mistake is passing a plain list/tuple of
+         * ints; CPython's generic "a bytes-like object is required" gives
+         * no remedy, so replace it with an actionable message — but ONLY
+         * for objects with no buffer protocol at all. Real buffer producers
+         * (e.g. a strided numpy view) raise accurate errors of their own. */
+        if (!PyObject_CheckBuffer(ts_obj)) {
+            PyErr_Format(PyExc_TypeError,
+                "bulk_append() timestamps must be an int64 buffer "
+                "(e.g. numpy int64 array or array.array('q')), not %.80s; "
+                "build one with array.array('q', ts) or "
+                "np.asarray(ts, dtype=np.int64), or use extend()",
+                Py_TYPE(ts_obj)->tp_name);
+        }
+        Py_DECREF(seq);
+        return NULL;
+    }
+    if (ts_view.ndim != 1) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be a 1-D buffer");
+        return NULL;
+    }
+    /* Reading through an int64_t* requires natural alignment; a sliced
+     * byte-buffer cast (e.g. memoryview(bytearray(...))[1:9].cast("q")) can
+     * be 8-byte-itemsize yet misaligned, which is C undefined behavior on
+     * load. Real producers (numpy, array.array) are always aligned. */
+    if (ts_view.len > 0 &&
+        ((uintptr_t)ts_view.buf % _Alignof(int64_t)) != 0) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps buffer must be 8-byte aligned");
+        return NULL;
+    }
+    if (ts_view.itemsize != (Py_ssize_t)sizeof(int64_t)) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must have 8-byte items (int64)");
+        return NULL;
+    }
+    switch (tl_py_buffer_fmt_is_native_i64(ts_view.format)) {
+    case 1:
+        break;
+    case -1:
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be native byte order "
+            "(byteswap the array first)");
+        return NULL;
+    default:
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError,
+            "bulk_append() timestamps must be int64 "
+            "(buffer format 'q' or 'l')");
+        return NULL;
+    }
+
+    Py_ssize_t bn = ts_view.shape[0];
+    if (PyTuple_GET_SIZE(seq) != bn) {
+        PyErr_Format(PyExc_ValueError,
+            "bulk_append() length mismatch: %zd timestamps, %zd objects",
+            bn, PyTuple_GET_SIZE(seq));
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return NULL;
+    }
+    if (bn == 0) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        Py_RETURN_NONE;
+    }
+    if ((size_t)bn > SIZE_MAX / sizeof(tl_record_t)) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return PyErr_Format(PyExc_OverflowError, "batch size too large");
+    }
+
+    /* Resolve mostly_ordered: explicit argument wins (None = use default);
+     * omitted/None -> the facade's _mostly_ordered_default (extend parity);
+     * attribute absent (raw _CTimelog) -> false. */
+    int mostly_ordered = 0;
+    if (mostly_ordered_obj != NULL && mostly_ordered_obj != Py_None) {
+        mostly_ordered = PyObject_IsTrue(mostly_ordered_obj);
+        if (mostly_ordered < 0) {
+            PyBuffer_Release(&ts_view);
+            Py_DECREF(seq);
+            return NULL;
+        }
+    } else {
+        PyObject* dflt = PyObject_GetAttrString((PyObject*)self,
+                                                "_mostly_ordered_default");
+        if (dflt == NULL) {
+            /* Only a missing attribute (raw _CTimelog) is expected; anything
+             * else (MemoryError, a raising facade property) must propagate,
+             * not be silently swallowed. */
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                PyBuffer_Release(&ts_view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+            PyErr_Clear();
+        } else {
+            mostly_ordered = PyObject_IsTrue(dflt);
+            Py_DECREF(dflt);
+            if (mostly_ordered < 0) {
+                PyBuffer_Release(&ts_view);
+                Py_DECREF(seq);
+                return NULL;
+            }
+        }
+    }
+
+    /* min_ts floor: snapshotted once per call with the same acquire pairing
+     * as append(). close()/reopen()/configure() are documented as externally
+     * serialized against all other users of the instance, so the floor
+     * cannot legally change mid-call; a caller who violates that contract
+     * gets unspecified floor application, never memory-unsafety. */
+    int has_floor = atomic_load_explicit(&self->has_min_ts_floor,
+                                         memory_order_acquire);
+    long long floor_v = has_floor
+        ? atomic_load_explicit(&self->min_ts_floor, memory_order_acquire)
+        : 0;
+
+    tl_record_t* records =
+        (tl_record_t*)PyMem_Malloc((size_t)bn * sizeof(tl_record_t));
+    if (records == NULL) {
+        PyBuffer_Release(&ts_view);
+        Py_DECREF(seq);
+        return PyErr_NoMemory();
+    }
+
+    const int64_t* ts_arr = (const int64_t*)ts_view.buf;
+    for (Py_ssize_t i = 0; i < bn; i++) {
+        long long ts_ll = (long long)ts_arr[i];
+        if (tl_py_validate_ts(ts_ll, "timestamp") < 0 ||
+            (has_floor && ts_ll < floor_v)) {
+            if (!PyErr_Occurred()) {
+                PyErr_Format(PyExc_ValueError,
+                    "bulk_append() timestamp %lld at index %zd is below "
+                    "min_ts %lld", ts_ll, i, floor_v);
+            }
+            for (Py_ssize_t j = 0; j < i; j++) {
+                Py_DECREF(PyTuple_GET_ITEM(seq, j));
+            }
+            PyMem_Free(records);
+            PyBuffer_Release(&ts_view);
+            Py_DECREF(seq);
+            return NULL;
+        }
+        PyObject* obj = PyTuple_GET_ITEM(seq, i); /* borrowed from OUR tuple */
+        Py_INCREF(obj);                           /* ownership -> the log */
+        records[i].ts = (tl_ts_t)ts_ll;
+        records[i].handle = tl_py_handle_encode(obj);
+    }
+    PyBuffer_Release(&ts_view);
+
+    {
+        uint32_t flags = mostly_ordered ? TL_APPEND_HINT_MOSTLY_IN_ORDER : 0;
+        tl_status_t st;
+        if (tl_py_lock_checked(self) < 0) {
+            for (Py_ssize_t i = 0; i < bn; i++) {
+                Py_DECREF(PyTuple_GET_ITEM(seq, i));
+            }
+            PyMem_Free(records);
+            Py_DECREF(seq);
+            return NULL;
+        }
+        tl_py_handle_ctx_t* hctx = tl_py_own_handle_ctx_locked(self);
+        st = tl_append_batch(self->tl, records, (size_t)bn, flags);
+        TL_PY_UNLOCK(self);
+
+        if (st == TL_OK || st == TL_EBUSY) {
+            for (Py_ssize_t i = 0; i < bn; i++) {
+                (void)tl_py_live_note_insert(hctx, PyTuple_GET_ITEM(seq, i));
+            }
+            PyMem_Free(records);
+            if (st == TL_EBUSY) {
+                if (tl_py_handle_write_ebusy(self,
+                        "Backpressure during bulk insert. "
+                        "All records were committed. "
+                        "Call flush() or wait for background maintenance "
+                        "to relieve.") < 0) {
+                    tl_py_drain_retired(hctx, 0);
+                    tl_py_handle_ctx_decref(hctx);
+                    Py_DECREF(seq);
+                    return NULL;
+                }
+            }
+            tl_py_drain_retired(hctx, 0);
+            tl_py_handle_ctx_decref(hctx);
+            Py_DECREF(seq);
+            Py_RETURN_NONE;
+        }
+
+        /* True failure (ENOMEM/EOVERFLOW/...): engine inserted nothing. */
+        for (Py_ssize_t i = 0; i < bn; i++) {
+            Py_DECREF(PyTuple_GET_ITEM(seq, i));
+        }
+        tl_py_handle_ctx_decref(hctx);
+        PyMem_Free(records);
+        Py_DECREF(seq);
+        return TL_PY_RAISE_STATUS(self, st);
+    }
+}
+
+/*===========================================================================
  * PyTimelog_delete_range
  *
  * CRITICAL: Same TL_EBUSY semantics as append.
@@ -1878,12 +2590,19 @@ tl_py_finish_tombstone_write(PyTimelog* self, tl_py_handle_ctx_t* hctx,
 }
 
 static PyObject*
-PyTimelog_delete_range(PyTimelog* self, PyObject* args)
+PyTimelog_delete_range(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 2) {
+        PyErr_Format(PyExc_TypeError,
+            "delete_range() takes exactly 2 arguments (%zd given)", n);
+        return NULL;
+    }
     long long t1_ll, t2_ll;
-    if (!PyArg_ParseTuple(args, "LL", &t1_ll, &t2_ll)) {
+    if (tl_py_fast_i64(args[0], &t1_ll) < 0 ||
+        tl_py_fast_i64(args[1], &t2_ll) < 0) {
         return NULL;
     }
 
@@ -1914,12 +2633,18 @@ PyTimelog_delete_range(PyTimelog* self, PyObject* args)
  *===========================================================================*/
 
 static PyObject*
-PyTimelog_delete_before(PyTimelog* self, PyObject* args)
+PyTimelog_delete_before(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "delete_before() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long cutoff_ll;
-    if (!PyArg_ParseTuple(args, "L", &cutoff_ll)) {
+    if (tl_py_fast_i64(args[0], &cutoff_ll) < 0) {
         return NULL;
     }
 
@@ -2205,13 +2930,58 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
     return PyLong_FromLongLong((long long)out);
 }
 
+/*===========================================================================
+ * min_ts floor guard (single source of truth; facade `_min_ts` property)
+ *
+ * NOTE: distinct from min_ts() above, which returns the engine's smallest
+ * stored timestamp. The "floor" is the facade's lower-bound REJECTION guard.
+ *===========================================================================*/
+
 static PyObject*
-PyTimelog_next_ts(PyTimelog* self, PyObject* args)
+PyTimelog__set_min_ts_floor(PyTimelog* self, PyObject* value)
+{
+    /* Accepts None (clear the guard) or an int (already coerced by the facade
+     * via _coerce_ts). Plain field state -> no CHECK_CLOSED (valid during
+     * reopen() on a closed instance). */
+    if (value == Py_None) {
+        atomic_store_explicit(&self->has_min_ts_floor, 0, memory_order_release);
+        atomic_store_explicit(&self->min_ts_floor, 0, memory_order_release);
+        Py_RETURN_NONE;
+    }
+    long long v = PyLong_AsLongLong(value);
+    if (v == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    /* Store the bound before the flag (release) so an append that acquires
+     * has_min_ts_floor==1 is guaranteed to observe the matching min_ts_floor. */
+    atomic_store_explicit(&self->min_ts_floor, v, memory_order_release);
+    atomic_store_explicit(&self->has_min_ts_floor, 1, memory_order_release);
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+PyTimelog__min_ts_floor(PyTimelog* self, PyObject* Py_UNUSED(args))
+{
+    if (!atomic_load_explicit(&self->has_min_ts_floor, memory_order_acquire)) {
+        Py_RETURN_NONE;
+    }
+    return PyLong_FromLongLong(
+        atomic_load_explicit(&self->min_ts_floor, memory_order_acquire));
+}
+
+static PyObject*
+PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "next_ts() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long ts_ll;
-    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
+    if (tl_py_fast_i64(args[0], &ts_ll) < 0) {
         return NULL;
     }
 
@@ -2241,12 +3011,18 @@ PyTimelog_next_ts(PyTimelog* self, PyObject* args)
 }
 
 static PyObject*
-PyTimelog_prev_ts(PyTimelog* self, PyObject* args)
+PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
     CHECK_CLOSED(self);
 
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "prev_ts() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long ts_ll;
-    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
+    if (tl_py_fast_i64(args[0], &ts_ll) < 0) {
         return NULL;
     }
 
@@ -2523,7 +3299,8 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
         default:               pyit->range_t1 = TL_TS_MIN; pyit->range_t2 = TL_TS_MAX; break;
     }
 
-    /* Precompute remaining count (GIL released for long computation). */
+    /* Precompute remaining count with the thread state detached for the long
+     * core computation. */
     {
         tl_ts_t count_t1, count_t2;
         int count_unbounded;
@@ -2548,11 +3325,18 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
                 break;
         }
 
-        Py_BEGIN_ALLOW_THREADS
+        /* Deliberately NO thread-state detach here. The count is a cheap
+         * fence-pointer walk (O(K log P)), but detaching on EVERY iterator
+         * creation signals the GIL condvar and resets other threads'
+         * switch-interval timers: a hot reader loop creating slices
+         * back-to-back then wins every GIL handoff race indefinitely,
+         * starving the writer (measured 461x ingest collapse; v1.3
+         * usability lab, hft persona). Keeping the state attached restores
+         * normal ~5ms GIL fairness; on free-threaded builds there is no
+         * GIL to release anyway. */
         st = tl_snapshot_count_range(snap, count_t1, count_t2,
                                       count_unbounded,
                                       &pyit->remaining_count);
-        Py_END_ALLOW_THREADS
     }
     if (st != TL_OK) {
         /* Clear the iterator's pointers before Py_DECREF so its cleanup
@@ -2581,11 +3365,17 @@ static PyObject* pytimelog_make_iter(PyTimelog* self,
  * Create an iterator for records in [t1, t2).
  * If t1 > t2, raises ValueError; t1 == t2 yields empty iterator.
  */
-static PyObject* PyTimelog_range(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_range(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 2) {
+        PyErr_Format(PyExc_TypeError,
+            "range() takes exactly 2 arguments (%zd given)", n);
+        return NULL;
+    }
     long long t1, t2;
-
-    if (!PyArg_ParseTuple(args, "LL", &t1, &t2)) {
+    if (tl_py_fast_i64(args[0], &t1) < 0 ||
+        tl_py_fast_i64(args[1], &t2) < 0) {
         return NULL;
     }
 
@@ -2606,11 +3396,16 @@ static PyObject* PyTimelog_range(PyTimelog* self, PyObject* args)
  *
  * Create an iterator for records with ts >= t.
  */
-static PyObject* PyTimelog_since(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_since(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "since() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2626,11 +3421,16 @@ static PyObject* PyTimelog_since(PyTimelog* self, PyObject* args)
  *
  * Create an iterator for records with ts < t.
  */
-static PyObject* PyTimelog_until(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_until(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "until() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2657,11 +3457,16 @@ static PyObject* PyTimelog_all(PyTimelog* self, PyObject* Py_UNUSED(args))
  *
  * Create an iterator for records with ts == t.
  */
-static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_equal(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "equal() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2678,11 +3483,16 @@ static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
  * Create an iterator for records at exact timestamp t.
  * Alias for equal() for semantic clarity in point queries.
  */
-static PyObject* PyTimelog_point(PyTimelog* self, PyObject* args)
+static PyObject* PyTimelog_point(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
 {
+    Py_ssize_t n = PyVectorcall_NARGS(nargs);
+    if (n != 1) {
+        PyErr_Format(PyExc_TypeError,
+            "point() takes exactly 1 argument (%zd given)", n);
+        return NULL;
+    }
     long long t;
-
-    if (!PyArg_ParseTuple(args, "L", &t)) {
+    if (tl_py_fast_i64(args[0], &t) < 0) {
         return NULL;
     }
 
@@ -2752,7 +3562,7 @@ static PyObject* PyTimelog_get_closed(PyTimelog* self, void* Py_UNUSED(closure))
 static PyObject* PyTimelog_get_time_unit(PyTimelog* self, void* Py_UNUSED(closure))
 {
     const char* unit_str;
-    switch (self->time_unit) {
+    switch (atomic_load_explicit(&self->time_unit, memory_order_acquire)) {
         case TL_TIME_S:  unit_str = "s";  break;
         case TL_TIME_MS: unit_str = "ms"; break;
         case TL_TIME_US: unit_str = "us"; break;
@@ -2805,6 +3615,12 @@ static PyObject* PyTimelog_get_alloc_failures(PyTimelog* self, void* Py_UNUSED(c
     return PyLong_FromUnsignedLongLong(failures);
 }
 
+static PyObject* PyTimelog_get_busy_events(PyTimelog* self, void* Py_UNUSED(closure))
+{
+    uint64_t n = atomic_load_explicit(&self->busy_events, memory_order_relaxed);
+    return PyLong_FromUnsignedLongLong(n);
+}
+
 /*===========================================================================
  * Property Table
  *===========================================================================*/
@@ -2828,6 +3644,10 @@ static PyGetSetDef PyTimelog_getset[] = {
     {"alloc_failures", (getter)PyTimelog_get_alloc_failures, NULL,
      "Number of allocation failures in on_drop callback (objects leaked).", NULL},
 
+    {"busy_events", (getter)PyTimelog_get_busy_events, NULL,
+     "Cumulative write-path backpressure (TL_EBUSY) events, counted under "
+     "every busy_policy.", NULL},
+
     {NULL, NULL, NULL, NULL, NULL}
 };
 
@@ -2836,9 +3656,14 @@ static PyGetSetDef PyTimelog_getset[] = {
  *===========================================================================*/
 
 static PyMethodDef PyTimelog_methods[] = {
-    {"append", (PyCFunction)PyTimelog_append, METH_VARARGS,
-     "append(ts, obj) -> None\n\n"
-     "Append a record at timestamp ts with payload obj.\n\n"
+    {"append", (PyCFunction)(void(*)(void))PyTimelog_append,
+     METH_FASTCALL | METH_KEYWORDS,
+     "append($self, obj_or_ts, obj_or_none=None, *, ts=None)\n"
+     "--\n\n"
+     "append(obj) | append(obj, ts=X) | append(ts, obj) -> None\n\n"
+     "Append a record. With one positional arg and no ts, the timestamp is\n"
+     "taken from the wall clock (scaled by time_unit). 'ts' may be given as a\n"
+     "keyword; the 2-positional form is (ts, obj).\n\n"
      "Note: TimelogBusyError means the record WAS committed; do not retry."},
 
     {"extend", (PyCFunction)PyTimelog_extend, METH_VARARGS | METH_KEYWORDS,
@@ -2850,12 +3675,22 @@ static PyMethodDef PyTimelog_methods[] = {
      "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
      "Note: TimelogBusyError means the records WERE committed; do not retry."},
 
-    {"delete_range", (PyCFunction)PyTimelog_delete_range, METH_VARARGS,
+    {"bulk_append", (PyCFunction)(void(*)(void))PyTimelog_bulk_append,
+     METH_FASTCALL | METH_KEYWORDS,
+     "bulk_append(timestamps, objects, *, mostly_ordered=None) -> None\n\n"
+     "Fast-path bulk append from a contiguous 1-D native-endian int64\n"
+     "timestamp buffer (numpy int64 array, array.array('q'), memoryview)\n"
+     "and a parallel concrete sequence of payload objects.\n\n"
+     "Single all-or-nothing batch append. mostly_ordered=None uses the\n"
+     "instance's mostly_ordered_default. Respects min_ts.\n\n"
+     "Note: TimelogBusyError means the records WERE committed; do not retry."},
+
+    {"delete_range", (PyCFunction)(void(*)(void))PyTimelog_delete_range, METH_FASTCALL,
      "delete_range(t1, t2) -> None\n\n"
      "Mark records in [t1, t2) for deletion (tombstone).\n\n"
      "Note: TimelogBusyError means the tombstone WAS committed; do not retry."},
 
-    {"delete_before", (PyCFunction)PyTimelog_delete_before, METH_VARARGS,
+    {"delete_before", (PyCFunction)(void(*)(void))PyTimelog_delete_before, METH_FASTCALL,
      "delete_before(cutoff) -> None\n\n"
      "Mark records in [MIN, cutoff) for deletion.\n\n"
      "Note: TimelogBusyError means the tombstone WAS committed; do not retry."},
@@ -2891,21 +3726,22 @@ static PyMethodDef PyTimelog_methods[] = {
     {"close", (PyCFunction)PyTimelog_close, METH_NOARGS,
      "close() -> None\n\n"
      "Close the timelog. Idempotent. Releases all resources.\n\n"
-     "WARNING: Records not yet flushed will be lost. All Python objects\n"
-     "still owned by the engine are released on close.\n\n"
+     "WARNING: Timelog is in-memory; close() discards all records. flush()\n"
+     "only materializes pending writes for readers while the log is open.\n"
+     "All Python objects still owned by the engine are released on close.\n\n"
      "Note: close() should not raise TimelogBusyError."},
 
     /* Iterator factory methods */
-    {"range", (PyCFunction)PyTimelog_range, METH_VARARGS,
+    {"range", (PyCFunction)(void(*)(void))PyTimelog_range, METH_FASTCALL,
      "range(t1, t2) -> TimelogIter\n\n"
      "Return an iterator over records in [t1, t2).\n"
      "If t1 > t2, raises ValueError; t1 == t2 yields an empty iterator."},
 
-    {"since", (PyCFunction)PyTimelog_since, METH_VARARGS,
+    {"since", (PyCFunction)(void(*)(void))PyTimelog_since, METH_FASTCALL,
      "since(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts >= t."},
 
-    {"until", (PyCFunction)PyTimelog_until, METH_VARARGS,
+    {"until", (PyCFunction)(void(*)(void))PyTimelog_until, METH_FASTCALL,
      "until(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts < t."},
 
@@ -2913,11 +3749,11 @@ static PyMethodDef PyTimelog_methods[] = {
      "all() -> TimelogIter\n\n"
      "Return an iterator over all records."},
 
-    {"equal", (PyCFunction)PyTimelog_equal, METH_VARARGS,
+    {"equal", (PyCFunction)(void(*)(void))PyTimelog_equal, METH_FASTCALL,
      "equal(t) -> TimelogIter\n\n"
      "Return an iterator over records with ts == t."},
 
-    {"point", (PyCFunction)PyTimelog_point, METH_VARARGS,
+    {"point", (PyCFunction)(void(*)(void))PyTimelog_point, METH_FASTCALL,
      "point(t) -> TimelogIter\n\n"
      "Return an iterator for the exact timestamp t.\n"
      "Alias for equal() for point query semantics."},
@@ -2926,16 +3762,24 @@ static PyMethodDef PyTimelog_methods[] = {
      "min_ts() -> int | None\n\n"
      "Return minimum timestamp in snapshot, or None if empty."},
 
+    {"_set_min_ts_floor", (PyCFunction)PyTimelog__set_min_ts_floor, METH_O,
+     "_set_min_ts_floor(value) -> None\n\n"
+     "Internal: set (int) or clear (None) the min_ts rejection floor."},
+
+    {"_min_ts_floor", (PyCFunction)PyTimelog__min_ts_floor, METH_NOARGS,
+     "_min_ts_floor() -> int | None\n\n"
+     "Internal: the min_ts rejection floor (None if unset)."},
+
     {"max_ts", (PyCFunction)PyTimelog_max_ts, METH_NOARGS,
      "max_ts() -> int | None\n\n"
      "Return maximum timestamp in snapshot, or None if empty.\n"
      "WARNING: O(N) complexity."},
 
-    {"next_ts", (PyCFunction)PyTimelog_next_ts, METH_VARARGS,
+    {"next_ts", (PyCFunction)(void(*)(void))PyTimelog_next_ts, METH_FASTCALL,
      "next_ts(ts) -> int | None\n\n"
      "Return next timestamp strictly greater than ts, or None."},
 
-    {"prev_ts", (PyCFunction)PyTimelog_prev_ts, METH_VARARGS,
+    {"prev_ts", (PyCFunction)(void(*)(void))PyTimelog_prev_ts, METH_FASTCALL,
      "prev_ts(ts) -> int | None\n\n"
      "Return previous timestamp strictly less than ts, or None.\n"
      "WARNING: O(N) complexity."},
@@ -2951,6 +3795,8 @@ static PyMethodDef PyTimelog_methods[] = {
      "Each PageSpan exposes a contiguous slice of page timestamps\n"
      "as a read-only memoryview (zero-copy). Use for bulk timestamp\n"
      "access without per-record Python object allocation.\n\n"
+     "Only FLUSHED segments are visible: on a freshly-written log call\n"
+     "flush() first, or this yields nothing while len(log) is non-zero.\n\n"
      "Parameters:\n"
      "  t1: Range start (inclusive)\n"
      "  t2: Range end (exclusive)\n"
@@ -2992,6 +3838,11 @@ static PyType_Slot PyTimelog_slots[] = {
     {Py_tp_clear, (void*)PyTimelog_clear},
     {Py_tp_methods, PyTimelog_methods},
     {Py_tp_getset, PyTimelog_getset},
+    /* Deliberately NO Py_tp_call / vectorcall slot: Timelog instances are not
+     * callable, and wiring tp_vectorcall on a heap type carries lifetime and
+     * tp_vectorcall_offset hazards. The METH_FASTCALL methods are per-method
+     * vectorcall (the correct, supported form). Regression-guarded by
+     * test_hardening.py (Py_TPFLAGS_HAVE_VECTORCALL must stay clear). */
     {0, NULL}
 };
 

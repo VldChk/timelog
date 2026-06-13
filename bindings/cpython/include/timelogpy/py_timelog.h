@@ -21,9 +21,13 @@
  *     - lock-free retired-stack between maintenance thread and drain
  *
  *   Thread states required, not the GIL: Python C-API access requires an
- *   attached thread state on the owning interpreter. The binding releases
- *   the active interpreter's GIL during flush(), compact(),
- *   stop_maintenance(), and close().
+ *   attached thread state on the owning interpreter. The binding detaches
+ *   the active thread state, releasing a GIL where present, around long
+ *   core calls such as flush(), compact(), maint_step(), stop_maintenance(),
+ *   and explicit close(). Iterator range-count precomputation deliberately
+ *   stays attached (per-creation detach reset GIL fairness timers and let a
+ *   hot reader loop starve the writer; v1.3 fix). Finalizer and dealloc
+ *   cleanup keep the thread state attached.
  *
  *   Supported builds:
  *     - Regular CPython 3.12-3.14 (single interpreter).
@@ -32,10 +36,10 @@
  *       PyModuleDef declares Py_mod_gil = Py_MOD_GIL_NOT_USED.
  *
  * Known Limitations:
- *   - Unflushed records are dropped on close(). The binding tracks all
- *     inserted handles and releases Python objects during close(), but
- *     data is not persisted. Call flush() before close() if you need to
- *     preserve all records.
+ *   - Timelog is in-memory. close() discards all records, flushed or not.
+ *     flush() only materializes pending writes for readers while the log is
+ *     open. The binding tracks inserted handles and releases Python objects
+ *     during close().
  *
  * See: docs/python-api.md
  *      docs/internals/components/python-binding-architecture.md
@@ -152,16 +156,48 @@ typedef struct {
 
     /**
      * Config introspection (stored for Python access).
-     * Set during init, immutable after.
+     * Set during init. `time_unit` is read on the append auto-timestamp hot
+     * path (tl_py_now_ts) without core_lock, so it is atomic: written with
+     * release at (re)open, read with acquire. `maint_mode` is touched only by
+     * its getter, so it stays a plain field.
      */
-    tl_time_unit_t time_unit;
+    _Atomic(tl_time_unit_t) time_unit;
     tl_maint_mode_t maint_mode;
+
+    /*
+     * min_ts floor guard (single source of truth for the facade's min_ts).
+     * has_min_ts_floor == 0 -> no guard; otherwise append() rejects ts <
+     * min_ts_floor with ValueError. Set/cleared via _set_min_ts_floor() at
+     * facade __init__/reopen, which is the SOLE authority. Read on the append
+     * hot path BEFORE core_lock, so both fields are atomic: the writer stores
+     * min_ts_floor then has_min_ts_floor (release); the append reader loads
+     * has_min_ts_floor (acquire) then min_ts_floor, so it never observes the
+     * flag set against a torn bound. Lifecycle/reopen races are outside the
+     * public serialization contract below.
+     *
+     * PyTimelog_init deliberately does NOT reset these: fresh tp_alloc memory
+     * is already zeroed (no guard), and on reopen the facade re-applies the
+     * floor via _set_min_ts_floor(). Resetting here would briefly expose a
+     * no-guard window if an append raced a reopen; leaving the prior floor
+     * preserves the pre-fold facade's persistent `_min_ts` slot until the new
+     * floor is applied. Writes racing lifecycle/reopen are outside the public
+     * single-writer/lifecycle serialization contract.
+     */
+    _Atomic(int) has_min_ts_floor;
+    _Atomic(long long) min_ts_floor;
 
     /**
      * Backpressure policy.
      * Controls behavior when TL_EBUSY is returned.
      */
     tl_py_busy_policy_t busy_policy;
+
+    /**
+     * Cumulative count of write-path TL_EBUSY events, regardless of
+     * busy_policy ('silent'/'flush' otherwise leave backpressure invisible
+     * to operators). Relaxed atomic; read via the busy_events property.
+     */
+    _Atomic(uint64_t) busy_events;
 
 } PyTimelog;
 
@@ -230,6 +266,17 @@ int tl_py_lock_checked(PyTimelog* self);
             PyThread_release_lock((self)->core_lock); \
         } \
     } while (0)
+
+/**
+ * Non-blocking core_lock acquire. Evaluates to nonzero on success.
+ * Required by tp_traverse: parking on core_lock during a free-threaded
+ * stop-the-world collection deadlocks when the holder is a frozen thread
+ * (it can never run to release; the GC can never finish to unfreeze it).
+ */
+#define TL_PY_TRYLOCK(self) \
+    ((self)->core_lock \
+         ? (PyThread_acquire_lock((self)->core_lock, 0) == 1) \
+         : 1)
 
 #ifdef __cplusplus
 }

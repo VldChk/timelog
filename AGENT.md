@@ -1,8 +1,8 @@
 # AGENT Context: timelog Repository
 
 ## Repository Identity And Build System
-- The project is a C project named `timelog`, version `1.0.0`, compiled as C17. (`CMakeLists.txt:2`, `CMakeLists.txt:8`)
-- The root README defines timelog as a native C library for Python time-series operations. (`README.md:2`)
+- The project is a C project named `timelog`, version `1.3.0`, compiled as C17. (`CMakeLists.txt:2`, `CMakeLists.txt:8`)
+- The root README defines timelog as an in-memory, LSM-inspired, time-indexed multimap for Python. (`README.md:3`)
 - Build options include native CPU tuning and shared-library toggle. (`CMakeLists.txt:13`, `CMakeLists.txt:15`)
 - Default build type is `Release` if not explicitly set. (`CMakeLists.txt:17`, `CMakeLists.txt:19`)
 - GCC/Clang builds enable `-Wall -Wextra -Wpedantic -Werror` and hidden symbol visibility. (`CMakeLists.txt:47`, `CMakeLists.txt:49`, `CMakeLists.txt:51`)
@@ -20,7 +20,7 @@
 - Time ranges are half-open `[t1, t2)` across APIs. (`core/include/timelog/timelog.h:22`, `core/include/timelog/timelog.h:450`)
 - Status semantics explicitly distinguish write `TL_EBUSY` (data accepted; do not retry) from true write failures like `TL_ENOMEM`/`TL_EOVERFLOW` (no insert). (`core/include/timelog/timelog.h:118`, `core/include/timelog/timelog.h:124`, `core/include/timelog/timelog.h:130`, `core/include/timelog/timelog.h:143`)
 - `tl_open()` documents background maintenance auto-start in `TL_MAINT_BACKGROUND` mode and manual maintenance in disabled mode. (`core/include/timelog/timelog.h:340`, `core/include/timelog/timelog.h:343`, `core/include/timelog/timelog.h:349`)
-- `tl_close()` documents that unflushed data is dropped unless `tl_flush()` is called first. (`core/include/timelog/timelog.h:357`, `core/include/timelog/timelog.h:360`)
+- `tl_close()` documents that Timelog is in-memory and discards all records, flushed or not; `tl_flush()` only materializes pending writes for readers while the log is open. (`core/include/timelog/timelog.h:357`, `core/include/timelog/timelog.h:360`)
 - The write API includes append, batch append, delete-range, delete-before, flush, and compact request. (`core/include/timelog/timelog.h:411`, `core/include/timelog/timelog.h:413`, `core/include/timelog/timelog.h:417`, `core/include/timelog/timelog.h:420`, `core/include/timelog/timelog.h:432`, `core/include/timelog/timelog.h:435`)
 - Snapshot and iterator APIs are explicit (`tl_snapshot_acquire/release`, range/since/until/equal/point iteration). (`core/include/timelog/timelog.h:441`, `core/include/timelog/timelog.h:444`, `core/include/timelog/timelog.h:451`, `core/include/timelog/timelog.h:455`, `core/include/timelog/timelog.h:459`, `core/include/timelog/timelog.h:466`, `core/include/timelog/timelog.h:475`)
 - Stats expose storage, memtable, and cumulative operational counters (including compaction retries and publish EBUSY counts). (`core/include/timelog/timelog.h:648`, `core/include/timelog/timelog.h:663`, `core/include/timelog/timelog.h:669`, `core/include/timelog/timelog.h:670`)
@@ -128,13 +128,13 @@
 - Binding test suite is enabled by default via `TIMELOG_BUILD_PY_TESTS` and registered as CTest tests (`py_handle`, `py_timelog`, `py_iter`, `py_span`, `py_maint_b5`, `py_errors`). (`bindings/cpython/CMakeLists.txt:177`, `bindings/cpython/CMakeLists.txt:496`, `bindings/cpython/CMakeLists.txt:501`, `bindings/cpython/CMakeLists.txt:506`, `bindings/cpython/CMakeLists.txt:511`, `bindings/cpython/CMakeLists.txt:516`, `bindings/cpython/CMakeLists.txt:521`)
 - Handle encoding is pointer-cast based with compile-time size assertion and round-trip encode/decode helpers. (`bindings/cpython/include/timelogpy/py_handle.h:49`, `bindings/cpython/include/timelogpy/py_handle.h:55`, `bindings/cpython/include/timelogpy/py_handle.h:64`, `bindings/cpython/include/timelogpy/py_handle.h:74`)
 - Python on-drop callback contract is explicitly no-GIL/no-Python-API on maintenance thread. (`bindings/cpython/include/timelogpy/py_handle.h:16`, `bindings/cpython/include/timelogpy/py_handle.h:219`, `bindings/cpython/include/timelogpy/py_handle.h:221`)
-- The binding explicitly requires the CPython GIL and is marked unsupported on free-threaded/no-GIL builds. (`bindings/cpython/include/timelogpy/py_timelog.h:20`, `bindings/cpython/include/timelogpy/py_timelog.h:21`)
+- The binding supports regular CPython, per-interpreter-GIL subinterpreters, and free-threaded/no-GIL builds. Python C-API work requires an attached thread state on the owning interpreter, not a process-global GIL. (`bindings/cpython/include/timelogpy/py_timelog.h:23`, `bindings/cpython/include/timelogpy/py_timelog.h:29`)
 
 ## `CLAUDE.md` Intent Vs Current Code
 - `CLAUDE.md` documents in-memory/no-disk architecture. (`CLAUDE.md:3`, `CLAUDE.md:4`)
 - Public API and implementation align with in-memory design (`timelog` multimap and all in-memory structures). (`core/include/timelog/timelog.h:8`, `core/src/internal/tl_timelog_internal.h:163`, `core/src/storage/tl_manifest.h:12`)
 - `CLAUDE.md` documents lock order `maint_mu -> flush_mu -> writer_mu -> memtable.mu`, matching internal headers. (`CLAUDE.md:184`, `core/src/internal/tl_timelog_internal.h:85`, `core/src/delta/tl_memtable.h:24`)
-- `CLAUDE.md` describes snapshot seqlock retry protocol, but current snapshot acquisition code states writer-mutex capture without seqlock retry. (`CLAUDE.md:131`, `CLAUDE.md:135`, `core/src/query/tl_snapshot.c:89`, `core/src/query/tl_snapshot.c:92`)
+- `CLAUDE.md` now matches the current snapshot model: `writer_mu` serializes snapshot capture and publishers, while `view_seq` remains a short publication window around manifest/sealed-queue swaps. (`CLAUDE.md:131`, `core/src/query/tl_snapshot.c:89`, `core/src/query/tl_snapshot.c:92`)
 
 ## Tombstone Watermark Model Alignment
 - Canonical model doc: `docs/internals/components/tombstone-watermark-model.md`.

@@ -1,0 +1,11 @@
+# LeakSanitizer suppressions for the core C test suite.
+#
+# The two snapshot-lifetime misuse tests leak BY DESIGN: they validate that
+# debug assertions fire when a snapshot is released with a live iterator /
+# the engine is closed with an outstanding snapshot. Cleaning up after the
+# asserted misuse would be use-after-free (see the INTENTIONAL MEMORY LEAK
+# comments in core/tests/test_snapshot_lifetime.c).
+#
+# Usage: LSAN_OPTIONS=suppressions=.lsan-suppressions ./build-asan/test_timelog
+leak:test_lifetime_iter_outlive_snapshot_debug_assert
+leak:test_lifetime_close_with_outstanding_debug_assert

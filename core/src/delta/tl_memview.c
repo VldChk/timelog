@@ -501,8 +501,14 @@ void tl_memview_shared_release(tl_memview_shared_t* mv) {
     }
 
     TL_REFCOUNT_RELEASE(&mv->refcnt, {
+        /* tl_memview_destroy() memsets the view to zero, wiping view.alloc.
+         * Capture the allocator first or tl__free() receives NULL and
+         * silently no-ops, leaking the wrapper struct (152 bytes per shared
+         * memview — found by LeakSanitizer during the v1.3 campaign; CI ran
+         * with detect_leaks=0 and never saw it). */
+        tl_alloc_ctx_t* alloc = mv->view.alloc;
         tl_memview_destroy(&mv->view);
-        tl__free(mv->view.alloc, mv);
+        tl__free(alloc, mv);
     }, "memview double-release: refcnt was 0 before decrement");
 }
 

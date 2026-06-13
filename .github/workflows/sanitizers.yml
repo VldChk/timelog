@@ -54,6 +54,15 @@ jobs:
 
       - name: Run pure C tests by group (sanitizers)
         shell: bash
+        # Leak detection is ON for the pure-C leg (no CPython interpreter
+        # noise here). .lsan-suppressions covers only the two
+        # test_snapshot_lifetime misuse tests that leak by design. The Python
+        # legs below keep the global detect_leaks=0 because the interpreter
+        # itself reports leaks. Regression guard for the v1.3 shared-memview
+        # wrapper leak fix (core/src/delta/tl_memview.c).
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: suppressions=${{ github.workspace }}/.lsan-suppressions
         run: |
           set +e
           python demo/ci/run_core_test_groups.py \
@@ -142,19 +151,24 @@ jobs:
       - name: Build e2e targets
         run: cmake --build build-tsan --target timelog_e2e_build --config Debug -j 2
 
-      - name: Resolve ThreadSanitizer runtime preload
+      - name: Resolve ThreadSanitizer runtime library
         shell: bash
         run: |
           libtsan="$(gcc -print-file-name=libtsan.so)"
           if [ -n "${libtsan}" ] && [ "${libtsan}" != "libtsan.so" ]; then
-            echo "LD_PRELOAD=${libtsan}" >> "${GITHUB_ENV}"
+            echo "LIBTSAN=${libtsan}" >> "${GITHUB_ENV}"
           fi
 
       - name: Run subinterpreter tests under ThreadSanitizer
         shell: bash
         run: |
           set +e
-          cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+          # Keep libtsan scoped to the Python test process. If it is exported
+          # through GITHUB_ENV, the Node-based Actions cleanup/upload steps run
+          # under TSan and report unrelated V8/libuv races.
+          setarch -R env \
+            "LD_PRELOAD=${LIBTSAN:-}" \
+            "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
             python demo/ci/run_compat_baseline.py \
               --legs subinterpreters \
               --summary-json "${RUNNER_TEMP}/tsan-subinterpreters.json" \
@@ -183,11 +197,6 @@ jobs:
     name: thread-sanitizer-freethreaded (ubuntu-latest, 3.14t)
     runs-on: ubuntu-latest
     continue-on-error: true
-    env:
-      # log_path routes TSan reports to files (pytest's capture swallows the
-      # inline report). suppressions filters known CPython-internal BRC noise
-      # so only timelog-frame races surface.
-      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0:suppressions=${{ github.workspace }}/.tsan-suppressions:log_path=${{ runner.temp }}/tsan-report"
 
     steps:
       - name: Checkout
@@ -223,23 +232,30 @@ jobs:
       - name: Build e2e targets
         run: cmake --build build-tsan-ft --target timelog_e2e_build --config RelWithDebInfo -j 2
 
-      - name: Resolve ThreadSanitizer runtime preload
+      - name: Resolve ThreadSanitizer runtime library
         shell: bash
         run: |
           libtsan="$(gcc -print-file-name=libtsan.so)"
           if [ -n "${libtsan}" ] && [ "${libtsan}" != "libtsan.so" ]; then
-            echo "LD_PRELOAD=${libtsan}" >> "${GITHUB_ENV}"
+            echo "LIBTSAN=${libtsan}" >> "${GITHUB_ENV}"
           fi
 
       - name: Run freethreading + stress legs under ThreadSanitizer
         shell: bash
         env:
           TIMELOG_SHORT_STRESS: "1"
+          # log_path routes TSan reports to files (pytest's capture swallows the
+          # inline report). suppressions filters known CPython-internal BRC noise
+          # so only timelog-frame races surface. runner.temp is only valid once a
+          # job is assigned to a runner, so keep this at step scope.
+          TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0:suppressions=${{ github.workspace }}/.tsan-suppressions:log_path=${{ runner.temp }}/tsan-report"
         run: |
           set +e
           # setarch -R disables ASLR: TSan otherwise fails with
           # "unexpected memory mapping" on recent kernels.
-          setarch -R cmake -E env "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
+          setarch -R env \
+            "LD_PRELOAD=${LIBTSAN:-}" \
+            "PYTHONPATH=${GITHUB_WORKSPACE}/python" \
             "PYTHON_GIL=0" \
             python demo/ci/run_compat_baseline.py \
               --legs freethreading \

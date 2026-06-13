@@ -232,6 +232,7 @@ extern void run_snapshot_lifetime_tests(void);
 
 /* Storage layer internal tests */
 extern void run_storage_internal_tests(void);
+extern void run_search_branchless_tests(void);
 
 /* Delta layer internal tests */
 extern void run_delta_internal_tests(void);
@@ -281,6 +282,7 @@ int main(int argc, char* argv[]) {
         printf("\n[Internal] Storage Layer\n");
         printf("----------------------------------------\n");
         run_storage_internal_tests();
+        run_search_branchless_tests();
     }
 
     if (test_group_enabled(groups, "delta")) {

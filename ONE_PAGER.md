@@ -46,12 +46,15 @@ Timelog is a good fit when you want timestamp slicing as a primitive inside Pyth
 - embedded analytics/serving paths  
 - real‑time and near‑real‑time event pipelines  
 - systems that need fast `[t1, t2)` retrieval without external database overhead  
+- bulk timestamp ingest from native int64 buffers, including NumPy arrays
 
 ## Current Boundaries
 - **In‑memory only**: no durable storage layer and no SQL/query language.  
 - Not positioned as a distributed TSDB; it is an embedded engine.  
 - Write concurrency is intentionally constrained (single writer) to keep the core simple and fast.
-- No NumPy integration
+- NumPy support is limited to timestamp buffers accepted by `bulk_append()` and
+  read-only memoryviews from `PageSpan.timestamps`; Timelog is not a vectorized
+  payload analytics engine.
 
 ## Quality and Delivery Confidence
 - Large C test surface (hundreds of assertions across core suites), plus binding and Python façade tests.  

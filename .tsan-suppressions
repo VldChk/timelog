@@ -12,7 +12,7 @@
 # tighten the rule — do NOT broaden it.
 #
 # Reference: CPython Python/brc.c, Python/object_stack.c,
-# Include/internal/pycore_object_stack.h.
+# Include/internal/pycore_object_stack.h, Objects/dictobject.c.
 
 # Biased reference counting cross-thread refcount merge.
 race:_Py_brc_merge_refcounts
@@ -22,6 +22,11 @@ race:merge_queued_objects
 race:_PyObjectStack_Pop
 race:_PyObjectStackChunk_New
 race:_PyObjectStack_Push
+
+# Free-threaded dict resize/key allocation reports seen with Clang 19 TSan.
+# These reports had only libpython frames; keep the rules function-specific.
+race:dictresize
+race:new_keys_object
 
 # NOTE: deliberately NO broad `called_from_lib:libpython3.14t.so` rule —
 # that would mask a genuine timelog race surfaced through a libpython

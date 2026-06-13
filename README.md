@@ -1,6 +1,10 @@
 # Timelog
 
-In-memory, LSM-inspired, time-indexed multimap for Python (C17 core + CPython extension).
+In-memory, LSM-inspired, time-indexed multimap for Python.
+
+Timelog stores many Python objects per timestamp, supports out-of-order ingest,
+and answers timestamp/range queries from a native C17 engine through a CPython
+extension. Current package version: **1.3.0**.
 
 [![License](https://img.shields.io/github/license/VldChk/timelog)](LICENSE)
 [![PyPI version](https://img.shields.io/pypi/v/timelog-lib.svg)](https://pypi.org/project/timelog-lib/)
@@ -23,6 +27,14 @@ It provides a native in-memory index with snapshot-consistent reads, out-of-orde
 At a high level, writes flow through mutable ingest state into immutable layers (memrun, L0, L1), while reads merge across layers with tombstone-aware filtering.  
 The design is LSM-inspired, but explicitly scoped to an embedded in-memory engine.
 
+Use it when you want a local Python object index optimized for:
+
+- append-heavy event streams,
+- range scans over integer timestamps,
+- retention via logical deletes/tombstones,
+- concurrent snapshot readers over live Python objects,
+- zero-copy timestamp views for analytics-style scans.
+
 ## Installation
 
 Install from PyPI:
@@ -43,6 +55,31 @@ Distribution name is `timelog-lib`, import namespace stays `timelog`:
 from timelog import Timelog
 ```
 
+## Runtime Support
+
+- Regular CPython **3.12-3.14**.
+- Isolated subinterpreters with a per-interpreter GIL.
+- Free-threaded CPython **3.14t** (`Py_GIL_DISABLED=1`) on the supported wheel set;
+  importing Timelog does not re-enable the GIL.
+- Typed package metadata is included (`py.typed` and `_timelog.pyi`).
+
+The Python API remains single-writer at the instance level: writes and lifecycle
+operations must be externally serialized. Independent snapshot readers can run
+concurrently.
+
+## What Changed in 1.2 and 1.3
+
+`1.2.0` rebuilt the CPython runtime boundary: `_timelog` now uses
+multi-phase module initialization, module-local exceptions and heap types,
+per-interpreter-safe state recovery, and explicit synchronization for the
+supported free-threaded wheel family.
+
+`1.3.0` keeps that runtime contract and focuses on the hot user paths:
+auto-timestamp `append(obj)` moved from Python into C, common positional
+methods use lower-overhead dispatch, `bulk_append()` ingests typed timestamp
+buffers directly, and core lower/upper-bound searches use a measured
+size-gated branchless path.
+
 ## Quickstart: Streaming
 
 ```python
@@ -60,7 +97,7 @@ log[1_700_000_000_000] = {"event": "tick"}
 rows = list(log[1_700_000_000_000:1_700_000_000_001])
 print(rows)
 
-log.close()  # optional explicit cleanup
+log.close()  # deterministic cleanup; finalizer cleanup is best-effort
 ```
 
 ## Quickstart: Correctness Semantics
@@ -88,6 +125,7 @@ Timelog uses sequenced tombstones, so later inserts are not hidden by earlier de
 - Concurrency model is single writer plus concurrent readers.
 - Duplicate timestamps are allowed (multimap semantics).
 - Write-path backpressure (`TimelogBusyError`) indicates the write was accepted; do not blind-retry the same write.
+- `close()` discards all data. Timelog is in-memory; `flush()` improves open-instance visibility for readers, not durability.
 
 ## What Timelog Is (and Isn’t)
 
@@ -103,39 +141,50 @@ Timelog is not:
 - a distributed TSDB,
 - a SQL query engine.
 
-`close()` does not materialize unflushed writes. Call `flush()` first if you need all pending data materialized into immutable segments before shutdown.
+`close()` discards all data — the engine is in-memory, so nothing survives it.
+`flush()` matters while the log is OPEN: it materializes pending writes into
+immutable segments so zero-copy `views()` readers can see them.
 
 ## API Snapshot
 
 Core Python facade surface:
 
-- Constructors:
-  - `Timelog(...)`
-  - `Timelog.for_streaming(...)`
-  - `Timelog.for_bulk_ingest(...)`
-  - `Timelog.for_low_latency(...)`
+- Constructors: `Timelog(...)`, `for_streaming(...)`, `for_bulk_ingest(...)`,
+  `for_low_latency(...)`.
 - Writes:
-  - `append(...)`
-  - `extend(...)`
-  - `log[ts] = obj`
-  - `delete(t1, t2)` / `delete(ts)`
-  - `cutoff(ts)`
+  - `append(obj)`, `append(obj, ts=...)`, `append(ts, obj)`.
+  - `extend([(ts, obj), ...], mostly_ordered=..., insert_on_error=...)`.
+  - `bulk_append(timestamps, objects)` for contiguous native-endian int64 buffers
+    plus a same-length list/tuple of payloads.
+  - `log[ts] = obj`, `delete(t1, t2)`, `delete(ts)`, `cutoff(ts)`.
 - Reads:
-  - `log[t1:t2]`, `log[t1:]`, `log[:t2]`, `log[:]`
-  - `log[ts]` / `at(ts)`
+  - `log[t1:t2]`, `log[t1:]`, `log[:t2]`, `log[:]`.
+  - `log[ts]` / `at(ts)`.
+  - named iterators: `range`, `since`, `until`, `all`, `point` / `equal`.
+  - iterator helpers: `len(it)`, `next_batch(n)`, and `it.view()`.
 - Introspection and views:
-  - `stats()`
-  - `views(...)`
+  - `stats()`, `busy_events`, `extend_skipped`, `retired_queue_len`.
+  - `views(...)` / `page_spans(...)` for zero-copy timestamp spans.
+  - `PageSpan.timestamps` is a read-only memoryview; `PageSpan.objects()` lazily
+    exposes the corresponding Python payloads.
 
 See `docs/python-api.md` for the full behavior contract.
 
-## Threading and Backpressure
+## Lifecycle, Threading, and Backpressure
 
-- Writes and lifecycle operations must be externally serialized.
-- Snapshot iterators are safe for concurrent reads.
-- Background maintenance can run automatically (`maintenance="background"`) or be controlled manually.
-- `TimelogBusyError` on write operations means accepted write + pressure signal, not "write lost".
+- Most users should write `log = Timelog(...)` or use a preset constructor and
+  keep the object for the required scope. A context manager is available but not
+  required.
+- Explicit `close()` gives deterministic cleanup. If omitted, collection
+  auto-closes on a best-effort basis.
 - Do not call `close()` concurrently with other operations on the same instance.
+- Release active iterators, `PageSpan` objects, object views, and exported
+  memoryviews before closing; they hold snapshot pins.
+- Background maintenance can run automatically (`maintenance="background"`) or
+  be controlled manually (`maintenance="disabled"` + `flush()` / `compact()` /
+  `maint_step()`).
+- `TimelogBusyError` on write operations means accepted write + pressure signal,
+  not "write lost".
 
 ## Architecture
 
@@ -161,22 +210,61 @@ Reads plan sources across active + immutable layers, then run k-way merge with t
 Flush and compaction bound read fan-out over time.  
 Deletes are logical tombstones; physical cleanup is deferred to maintenance.
 
+`flush()` is a visibility operation, not durability: it publishes pending
+writes into immutable in-memory segments so readers and zero-copy `views()` can
+see them. `close()` always tears down the in-memory engine and discards all
+records.
+
 ## Performance at a Glance
 
-Historical snapshot (`2026-02-15`, Linux x86_64, Python `3.13.12`, dataset `11,550,000` rows):
+Same-harness v1.3 A/B against the v1.2.0 wheel, Linux x86_64, pinned CPU,
+CPython `3.13.12`, median of 5:
 
-- Batch ingest (`A2`): `191,105` records/sec
-- Full scan (`B4`): `18,088,679` records/sec
-- Append latency (`K1`, background): `p99 = 672 ns`
+| Operation | v1.2.0 | v1.3.0 | Change |
+|---|---:|---:|---:|
+| `append(obj)` | 513.9 ns | 117.1 ns | 4.39x faster |
+| `append(ts, obj)` | 352.1 ns | 103.9 ns | 3.39x faster |
+| `append(obj, ts=...)` | 364.7 ns | 109.6 ns | 3.33x faster |
+| `point(ts)` | 457.1 ns | 337.1 ns | 1.36x faster |
+| `equal(ts)` | 548.8 ns | 429.3 ns | 1.28x faster |
+| `next_ts(ts)` | 393.8 ns | 299.8 ns | 1.31x faster |
+| `range(t1, t2)` | 575.9 ns | 458.0 ns | 1.26x faster |
+| `delete_range(t1, t2)` | 18,059.6 ns | 13,289.3 ns | 1.36x faster |
+| `delete_before(ts)` | 109.7 ns | 80.8 ns | 1.36x faster |
+
+New v1.3 ingest fast path:
+
+- `bulk_append(np.int64 array, list)`: **113.3 ns/record** on a 200k-record
+  measured batch.
+- In that benchmark, `bulk_append` was **2.23x** faster than a post-v1.3
+  per-record append loop and **3.51x** faster than `extend(zip(...))`.
+
+Search-path optimization:
+
+- Size-gated branchless lower/upper-bound search measured **1.9x-5.0x faster**
+  at gated sizes up to 262,144 records, and falls back to the neutral path for
+  very large arrays where it no longer wins.
+
+Historical scale snapshot (`2026-02-15`, Linux x86_64, CPython `3.13.12`,
+dataset `11,550,000` rows):
+
+- Batch ingest (`A2`): `191,105` records/sec.
+- Full scan (`B4`): `18,088,679` records/sec.
+- Append latency (`K1`, background): `p99 = 672 ns`.
+- PageSpan iteration (`F1`): `1.48B` timestamps/sec on the timestamp-only span path.
 
 Results are workload-, configuration-, and hardware-dependent.
+The current publishable benchmark framing is `docs/performance.md`; older
+reports are retained as historical snapshots.
 
 Methodology and context:
 
 - `docs/PERFORMANCE_METHODOLOGY.md`
+- `docs/performance.md`
+- `docs/benchmarks/bulk_append.md`
+- `docs/benchmarks/max_delta_segments.md`
 - `docs/BENCHMARK_1GB_7PCT_OOO_UNIX.md`
 - `docs/BENCHMARK_REPORT.md`
-- `docs/performance.md`
 
 Complexity claims should be interpreted with stated assumptions. In practice:
 
@@ -187,6 +275,7 @@ Complexity claims should be interpreted with stated assumptions. In practice:
 ## Documentation
 
 - Index: `docs/index.md`
+- Release notes: `docs/release-notes.md`
 - Python API: `docs/python-api.md`
 - Configuration: `docs/configuration.md`
 - Error and retry semantics: `docs/errors-and-retry-semantics.md`

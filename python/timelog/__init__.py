@@ -17,13 +17,10 @@ Example::
 
 from __future__ import annotations
 
+from importlib import metadata as _importlib_metadata
 from pathlib import Path as _Path
+from typing import Iterator
 import tomllib as _tomllib
-
-try:
-    from importlib import metadata as _importlib_metadata
-except ImportError:
-    _importlib_metadata = None
 
 
 def _resolve_local_version() -> str | None:
@@ -44,9 +41,6 @@ def _resolve_version() -> str:
     if local_version is not None:
         return local_version
 
-    if _importlib_metadata is None:
-        return "0+unknown"
-
     package_not_found = _importlib_metadata.PackageNotFoundError
     for dist_name in ("timelog-lib", "timelog"):
         try:
@@ -58,10 +52,8 @@ def _resolve_version() -> str:
 
 __version__ = _resolve_version()
 
-from typing import Iterator
-
 try:
-    from timelog._timelog import (
+    from timelog._timelog import (  # noqa: E402
         TimelogError,
         TimelogBusyError,
         TimelogIter,
@@ -69,14 +61,14 @@ try:
         PageSpanIter,
         PageSpanObjectsView,
     )
-    from timelog._timelog import Timelog as _CTimelog
+    from timelog._timelog import Timelog as _CTimelog  # noqa: E402
 except ImportError as e:
     raise ImportError(
         "timelog extension module not found. "
         "Ensure the package is properly installed."
     ) from e
 
-from timelog._api import _coerce_ts, _slice_to_iter, _now_ts, TL_TS_MIN, TL_TS_MAX
+from timelog._api import _coerce_ts, _slice_to_iter, TL_TS_MIN, TL_TS_MAX  # noqa: E402
 
 Record = tuple[int, object]
 RecordIter = Iterator[Record]
@@ -94,9 +86,10 @@ class Timelog(_CTimelog):
 
     Thread Safety:
         Single-writer API contract. Multiple-thread *writes* on a single
-        Timelog instance require external serialization. Iterators are
-        snapshot-based and safe for concurrent reads from independent
-        threads.
+        Timelog instance require external serialization. Lifecycle calls
+        (``close()``, ``reopen()``, and ``configure()``) must also be externally
+        serialized against all other users of the same instance. Iterators are
+        snapshot-based and safe for concurrent reads from independent threads.
 
         Supported builds:
             * Regular CPython 3.12-3.14 (single interpreter).
@@ -104,9 +97,13 @@ class Timelog(_CTimelog):
             * Free-threaded CPython 3.14t (Py_GIL_DISABLED=1).
 
     Warning:
-        ``close()`` drops unflushed records. Call ``flush()`` first to
-        materialize pending writes. Call ``close()`` for deterministic
-        cleanup.
+        ``close()`` discards all records; Timelog is in-memory and nothing
+        survives close. ``flush()`` materializes pending writes for zero-copy
+        ``views()`` while the log is open. Call ``close()`` for deterministic
+        cleanup; release active iterators, PageSpans, object views, and
+        memoryview exports before closing because they hold snapshot pins.
+        If explicit ``close()`` is omitted, collection auto-closes the log
+        as a best-effort cleanup path.
 
     Example::
 
@@ -147,7 +144,15 @@ class Timelog(_CTimelog):
 
     Args (Advanced):
         maintenance_wakeup_ms: Worker wake interval (0 = engine default).
-        max_delta_segments: L0 segment bound (0 = engine default).
+        max_delta_segments: L0 segment bound (0 = engine default, 8). The
+            tiering<->leveling dial: when L0 reaches this many segments,
+            compaction collapses them into L1. Lower = eager leveling (faster
+            reads, more compaction CPU/write-amp); higher = lazy tiering
+            (cheaper writes, higher read fan-in). Raising it above the L0 count
+            your workload accumulates stops the *automatic* trigger -- a
+            delete-free workload that never calls compact() then grows
+            read-amplification unbounded. See docs/configuration.md for the
+            measured trade-off curve and guidance.
         window_size: L1 window size (0 = engine default based on time_unit).
         window_origin: Window origin (default 0).
         delete_debt_threshold: Ratio [0.0, 1.0] to trigger delete-debt
@@ -208,7 +213,13 @@ class Timelog(_CTimelog):
         PageSpan: Zero-copy timestamp view.
     """
 
-    __slots__ = ("_min_ts", "_mostly_ordered_default")
+    __slots__ = ("_mostly_ordered_default", "_extend_skipped")
+
+    @property
+    def _min_ts(self):
+        # Single source of truth lives in C (self._min_ts_floor()); this
+        # read-only property keeps _check_min_ts/extend/slicing readers working.
+        return _CTimelog._min_ts_floor(self)
 
     def __init__(self, *, min_ts=None, mostly_ordered_default=True, **kwargs):
         if not isinstance(mostly_ordered_default, bool):
@@ -216,7 +227,8 @@ class Timelog(_CTimelog):
         min_ts_val = None if min_ts is None else _coerce_ts(min_ts)
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_ordered_default
-        self._min_ts = min_ts_val
+        self._extend_skipped = 0
+        _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 
@@ -237,7 +249,8 @@ class Timelog(_CTimelog):
 
         super().__init__(**kwargs)
         self._mostly_ordered_default = mostly_default
-        self._min_ts = min_ts_val
+        self._extend_skipped = 0
+        _CTimelog._set_min_ts_floor(self, min_ts_val)
         if min_ts_val is not None:
             super().delete_before(min_ts_val)
 
@@ -289,61 +302,69 @@ class Timelog(_CTimelog):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    # These underscore helpers are not subclass extension points. Write paths
+    # dispatch through Timelog.* explicitly so append(), extend(), and
+    # __setitem__ share the same C-owned min_ts floor semantics.
+
     def _check_min_ts(self, ts: int) -> None:
         """Raise ValueError if ts is below the min_ts guard."""
-        if self._min_ts is not None and ts < self._min_ts:
+        min_ts = _CTimelog._min_ts_floor(self)
+        if min_ts is not None and ts < min_ts:
             raise ValueError(
-                f"timestamp {ts} is below min_ts boundary ({self._min_ts})"
+                f"timestamp {ts} is below min_ts boundary ({min_ts})"
             )
 
     def _coerce_and_guard(self, ts):
         """Coerce ts and apply min_ts guard."""
         ts = _coerce_ts(ts)
-        self._check_min_ts(ts)
+        Timelog._check_min_ts(self, ts)
         return ts
 
     def _filtered_pairs(self, iterable):
-        """Yield (ts, obj) pairs, skipping type/overflow errors but raising on non-pairs and min_ts."""
+        """Yield (ts, obj) pairs, skipping type/overflow errors but raising on non-pairs and min_ts.
+
+        Skipped rows are reported with a RuntimeWarning after the stream is
+        consumed — silent partial ingest in a storage engine is data loss.
+
+        The min_ts floor is snapshotted ONCE per call: it lives in C and is
+        immutable while the instance is open (set only at init/reopen), and
+        a per-item C method call cost ~13% on the 10k-pair extend path
+        (v1.3 perf lab regression gate).
+        """
+        floor = _CTimelog._min_ts_floor(self)
+        coerce = _coerce_ts
+        skipped = 0
         for item in iterable:
             try:
                 ts, obj = item
             except (TypeError, ValueError) as exc:
                 raise ValueError("extend() expects (ts, obj) pairs") from exc
             try:
-                ts = self._coerce_and_guard(ts)
+                ts = coerce(ts)
             except (TypeError, OverflowError):
+                skipped += 1
                 continue
+            if floor is not None and ts < floor:
+                raise ValueError(
+                    f"timestamp {ts} is below min_ts boundary ({floor})"
+                )
             yield (ts, obj)
+        if skipped:
+            self._extend_skipped += skipped
+            import warnings
+            warnings.warn(
+                f"extend() skipped {skipped} record(s) with invalid "
+                "timestamps (insert_on_error=True); pass "
+                "insert_on_error=False to validate the whole batch instead",
+                RuntimeWarning, stacklevel=3)
 
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
 
-    def append(self, obj_or_ts, obj_or_none=_SENTINEL, *, ts=None):
-        """Append a record.
-
-        Signatures::
-
-            append(obj)              # auto-timestamp from wall clock
-            append(obj, ts=1000)     # explicit keyword timestamp
-            append(ts, obj)          # positional (legacy)
-
-        Note:
-            TimelogBusyError means the record WAS committed; do not retry.
-        """
-        if obj_or_none is _SENTINEL:
-            # Single arg: append(obj) or append(obj, ts=X)
-            obj = obj_or_ts
-            if ts is None:
-                ts = _now_ts(self.time_unit)
-            else:
-                ts = _coerce_ts(ts)
-        else:
-            # Two positional args: append(ts, obj) -- C-style compat
-            ts = _coerce_ts(obj_or_ts)
-            obj = obj_or_none
-        self._check_min_ts(ts)
-        super().append(ts, obj)
+    # append() is implemented entirely in C (METH_FASTCALL|METH_KEYWORDS):
+    # 3 signatures + wall-clock auto-timestamp + _coerce_ts parity (bool reject)
+    # + the min_ts floor guard (self._min_ts_floor in C). No Python override.
 
     def extend(self, ts_or_iterable, objects=None, *,
                mostly_ordered=None, insert_on_error=True):
@@ -375,7 +396,7 @@ class Timelog(_CTimelog):
                 pairs = list(zip(ts_or_iterable, objects, strict=True))
                 normalized = []
                 for ts_val, obj in pairs:
-                    ts = self._coerce_and_guard(ts_val)
+                    ts = Timelog._coerce_and_guard(self, ts_val)
                     normalized.append((ts, obj))
                 super().extend(normalized, mostly_ordered=mostly_ordered)
                 return
@@ -388,12 +409,28 @@ class Timelog(_CTimelog):
                 except TypeError:
                     pass
             def gen():
+                floor = _CTimelog._min_ts_floor(self)
+                coerce = _coerce_ts
+                skipped = 0
                 for ts_val, obj in zip(ts_or_iterable, objects, strict=True):
                     try:
-                        ts = self._coerce_and_guard(ts_val)
+                        ts = coerce(ts_val)
                     except (TypeError, OverflowError):
+                        skipped += 1
                         continue
+                    if floor is not None and ts < floor:
+                        raise ValueError(
+                            f"timestamp {ts} is below min_ts boundary ({floor})"
+                        )
                     yield (ts, obj)
+                if skipped:
+                    self._extend_skipped += skipped
+                    import warnings
+                    warnings.warn(
+                        f"extend() skipped {skipped} record(s) with invalid "
+                        "timestamps (insert_on_error=True); pass "
+                        "insert_on_error=False to validate the whole batch "
+                        "instead", RuntimeWarning, stacklevel=3)
 
             super().extend(gen(), mostly_ordered=mostly_ordered)
             return
@@ -411,18 +448,18 @@ class Timelog(_CTimelog):
                     ts_val, obj = item
                 except Exception as exc:
                     raise ValueError("extend() expects (ts, obj) pairs") from exc
-                ts = self._coerce_and_guard(ts_val)
+                ts = Timelog._coerce_and_guard(self, ts_val)
                 normalized.append((ts, obj))
             super().extend(normalized, mostly_ordered=mostly_ordered)
             return
 
         # insert_on_error=True: streaming with skip
-        super().extend(self._filtered_pairs(ts_or_iterable),
+        super().extend(Timelog._filtered_pairs(self, ts_or_iterable),
                        mostly_ordered=mostly_ordered)
 
     def __setitem__(self, ts, obj):
         """Insert a record: ``log[ts] = obj``."""
-        ts = self._coerce_and_guard(ts)
+        ts = Timelog._coerce_and_guard(self, ts)
         super().append(ts, obj)
 
     # ------------------------------------------------------------------
@@ -433,6 +470,83 @@ class Timelog(_CTimelog):
         """Return tombstone-aware record count (takes a fresh snapshot each call)."""
         s = self.stats()
         return int(s["storage"]["records_estimate"])
+
+    def __contains__(self, ts) -> bool:
+        """Return True if any record exists at exactly ``ts`` (O(log n)).
+
+        Without this, Python's fallback would full-scan ``(ts, obj)`` tuples
+        and silently answer False for timestamps that exist.
+        """
+        it = self.point(_coerce_ts(ts))
+        try:
+            return len(it) > 0          # precomputed count; nothing consumed
+        finally:
+            it.close()
+
+    def __reversed__(self):
+        """Descending iteration is not supported by the LSM read path."""
+        raise TypeError(
+            "Timelog does not support reversed(); iterate forward over a "
+            "bounded window instead, e.g. list(log[t1:t2]) and reverse the "
+            "materialized list, or walk back with prev_ts(ts)"
+        )
+
+    def __repr__(self) -> str:
+        try:
+            if self.closed:
+                return f"<{type(self).__name__} closed>"
+            s = self.stats()["storage"]
+            n = int(s["records_estimate"])
+            lo, hi = s["min_ts"], s["max_ts"]
+            span = f" [{lo}..{hi}]" if (lo is not None and hi is not None) else ""
+            return (f"<{type(self).__name__} len~{n} "
+                    f"time_unit={self.time_unit!r}{span}>")
+        except Exception:
+            return object.__repr__(self)
+
+    @property
+    def extend_skipped(self) -> int:
+        """Total records dropped by extend(insert_on_error=True) skips.
+
+        Python's warning machinery deduplicates the RuntimeWarning per call
+        site, so a long-running ingest loop sees it once; this counter (also
+        in ``stats()['operational']['extend_skipped']``) makes recurring
+        drops monitorable.
+        """
+        return self._extend_skipped
+
+    @property
+    def min_ts_floor(self):
+        """The configured ``min_ts`` retention floor, or None.
+
+        Distinct from ``min_ts()`` (the smallest timestamp currently in the
+        data). Writes below the floor raise ValueError.
+        """
+        return _CTimelog._min_ts_floor(self)
+
+    def stats(self):
+        """Return engine statistics with facade enrichments.
+
+        On top of the C engine's counters: empty-log sentinel bounds are
+        mapped to None, ``operational.busy_events`` counts write-path
+        backpressure under every busy_policy, and ``config`` echoes the
+        effective instance configuration for dashboards/alerting.
+        """
+        s = super().stats()
+        storage = s["storage"]
+        if storage["min_ts"] == TL_TS_MAX and storage["max_ts"] == TL_TS_MIN:
+            storage["min_ts"] = None    # empty-log sentinels
+            storage["max_ts"] = None
+        s["operational"]["busy_events"] = self.busy_events
+        s["operational"]["extend_skipped"] = self._extend_skipped
+        s["config"] = {
+            "time_unit": self.time_unit,
+            "maintenance": self.maintenance_mode,
+            "busy_policy": self.busy_policy,
+            "min_ts": _CTimelog._min_ts_floor(self),
+            "mostly_ordered_default": self._mostly_ordered_default,
+        }
+        return s
 
     # ------------------------------------------------------------------
     # Read path

@@ -1,3 +1,6 @@
 pytest>=8
 pytest-timeout>=2.3
 pytest-cov>=5
+# bulk_append dtype/endianness contract tests need numpy (cp314t manylinux
+# wheels exist as of numpy 2.4.6); the array.array contract tests run without it.
+numpy>=1.26

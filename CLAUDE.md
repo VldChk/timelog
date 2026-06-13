@@ -59,9 +59,9 @@ merge across ALL levels simultaneously. This is the essence of LSM.
 | **OOORunset** | Immutable | Refcounted array of sorted OOO runs | OOO run collection |
 | **Memrun** | Immutable | Sealed memtable snapshot | Flush queue (ring buffer) |
 | **Memview** | Immutable | Deep copy of active + pinned sealed | Snapshot delta state |
-| **Page** | Immutable | `ts[]` + `h[]` arrays | ~4KB memory unit |
+| **Page** | Immutable | `ts[]` + `h[]` arrays | ~64 KiB memory unit (`target_page_bytes`, ≈4K records) |
 | **Segment** | Immutable | Page array + fence pointers | In-memory container |
-| **Manifest** | Immutable | L0 + L1 segment catalogs + tombstones | Current state |
+| **Manifest** | Immutable | L0 + L1 segment catalogs (tombstones live on L0 segments) | Current state |
 | **Snapshot** | Immutable | Manifest ref + memview | Consistent read view |
 
 ### OOO Mini-LSM Architecture (Option B)
@@ -132,15 +132,17 @@ Tombstones form an interval set that is always:
 - Non-adjacent (touching intervals are merged)
 - Half-open `[start, end)`
 
-### 6. Snapshot Consistency (Seqlock Protocol)
+### 6. Snapshot Consistency
 
-A snapshot sees exactly one consistent state via seqlock:
+A snapshot sees exactly one consistent state by taking `writer_mu`, which also
+serializes every manifest publisher:
 ```
-Lock writer_mu → read seq1 → acquire manifest → capture memview → read seq2 → unlock
-If seq1 != seq2 OR seq1 is odd: retry
+Lock writer_mu → acquire manifest → capture/ref cached memview → capture op_seq → unlock
 ```
-`view_seq` is even when idle, odd during publication.
-Writers: `view_seq++` before update, `view_seq++` after update.
+Publication still wraps manifest swaps and sealed-queue pops in a short
+`view_seq` seqlock window, but current snapshot acquisition does not run a
+standalone seqlock retry loop because `writer_mu` already prevents torn
+manifest/memview captures.
 
 ### 7. Sealed Queue Ring Buffer (H-07)
 
@@ -377,8 +379,13 @@ contract:
   the correct interpreter is the only precondition. Probe with
   `PyThreadState_GetUnchecked()` + `PyThreadState_GetInterpreter()` on 3.13+
   (see `tl_py_attached_to_interp`), NOT `PyGILState_Check()`.
-- **Release the active interpreter's GIL** (if held) around long C work:
-  `flush`, `compact`, `stop_maintenance`, `close`. Use `Py_BEGIN_ALLOW_THREADS`.
+- **Detach the active thread state** around long C work, releasing a GIL where
+  present: `flush`, `compact`, `maint_step`, `stop_maintenance`, explicit
+  user `close`, and iterator range-count precomputation. For `PyTimelog`
+  engine entrypoints, use the existing helper pattern: hold `core_lock`,
+  detach with `Py_BEGIN_ALLOW_THREADS`, call the core, release `core_lock`
+  before reattaching, then do Python cleanup after reattach. Finalizer/dealloc
+  cleanup keeps the thread state attached.
 - **Internal locks** (see LLD §5.4):
   - L1 `PyTimelog.core_lock` (`PyThread_type_lock`): lifecycle + engine entry.
   - L2 `handle_ctx.live_lock` (`PyMutex` / `PyThread_type_lock` fallback):
@@ -393,9 +400,12 @@ contract:
   under `core_lock` with `atomic_store_explicit(release)`.
 
 ```c
+/* PyTimelog engine-entry pattern: self->core_lock is already held. */
 Py_BEGIN_ALLOW_THREADS
-// Long-running C work (NO Python calls, NO internal locks held!)
+st = core_call(self->tl);               /* no Python C-API */
+PyThread_release_lock(self->core_lock); /* before reattaching */
 Py_END_ALLOW_THREADS
+/* Python cleanup / Py_DECREF happens here, with no internal locks held. */
 ```
 
 ### Handle Lifecycle (Lock-Free Retired Queue)
@@ -513,6 +523,9 @@ bindings/cpython/src/              # CPython extension (_timelog): py_timelog, p
 bindings/cpython/tests/            # C-level binding tests (embedded Python)
 python/timelog/                    # Pure Python facade (_api.py + __init__.py)
 python/tests/                      # Python facade tests (pytest)
+lab/                               # Resilience lab (LOCAL/untracked): oracle-driven concurrency/property harness
+demo/ci/                           # CI helper scripts (static phase checks, compat baseline runner)
+benchmarks/                        # Benchmark harnesses (see docs/PERFORMANCE_METHODOLOGY.md)
 ```
 
 ---
@@ -576,7 +589,8 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 
 **C Core**:
 1. Holding `writer_mu` during build — blocks snapshots
-2. `view_seq` not incremented twice — readers stuck in retry loop
+2. Manifest or sealed-queue publication outside the short `view_seq` write
+   window — snapshots can observe source/output double visibility
 3. Off-by-one in binary search — wrong results
 4. Signed overflow in timestamp math — UB
 5. Using `malloc()` directly — breaks custom allocator
@@ -590,7 +604,9 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 13. Merge iterator ignores error state — must propagate errors (H-16)
 
 **Python Bindings**:
-14. Python C-API without GIL — crash
+14. Python C-API without an attached thread state on the owning interpreter —
+    crash or cross-interpreter corruption; free-threaded builds do not make
+    Python C-API calls thread-state-free
 15. Missing INCREF on return — leak or UAF
 16. Closing span with exported buffer — must raise `BufferError`
 17. DECREF before INCREF on borrowed ref — UAF
@@ -622,10 +638,14 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 | `docs/internals/components/adaptive-segmentation.md` | Adaptive window behavior |
 | `docs/internals/components/python-binding-architecture.md` | CPython binding design |
 | `docs/internals/components/tombstone-watermark-model.md` | Tombstone sequencing model |
+| `docs/timelog_lld_gil_free_subinterpreters.md` | GIL-free / subinterpreters LLD (Layer A + Layer B) |
+| `docs/CI_TESTS.md` | CI test matrix and execution |
+| `docs/BENCHMARK_REPORT.md` | Benchmark results and analysis |
+| `docs/BENCHMARK_1GB_7PCT_OOO_UNIX.md` | Large-scale benchmark report (1 GB, 7% OOO) |
 
 ---
 
-## Engineering Review Status (January 2026)
+## Engineering Review Status (June 2026)
 
 All critical and high-priority issues have been resolved:
 
@@ -643,7 +663,27 @@ All critical and high-priority issues have been resolved:
 - **O(T+W) delete debt**: Linear cursor-based algorithm (H-18)
 - **Strict publish protocol**: Bounded retries with metrics (H-17)
 
-Test coverage: 428 tests passing, verified with ASan/UBSan.
+**GIL-free milestone (merged June 2026, PR #20):**
+- **Layer A (interpreter isolation)**: Multi-phase module init, per-module state,
+  heap types, no process-global Python objects; `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`
+  on 3.12+
+- **Layer B (free-threaded safety)**: `Py_mod_gil = Py_MOD_GIL_NOT_USED` on 3.13+;
+  explicit synchronization (atomics, `core_lock`, `live_lock`, per-object critical
+  sections) replaces interpreter-lock serialization
+- New test surfaces: `test_subinterpreters.py`, `test_free_threading.py`,
+  `test_freethreaded_stress.py`; static phase checker `demo/ci/check_layer_a_static.py`
+
+**v1.3 additions (June 2026):**
+- **`bulk_append(timestamps, objects)`**: typed-buffer C ingest fast path on the binding
+  (native-endian int64 buffer + parallel sequence; single all-or-nothing `tl_append_batch`;
+  see `docs/python-api.md` and `docs/benchmarks/bulk_append.md`)
+- **Shared-memview wrapper leak fixed** (`core/src/delta/tl_memview.c`): the wrapper struct
+  leaked 152 bytes per shared memview since the snapshot cache landed; CI's pure-C sanitizer
+  leg now runs LeakSanitizer (`.lsan-suppressions` covers two by-design misuse tests)
+
+Test coverage: ~485 C core tests (497 in Debug/ASan builds, which add debug-only suites) +
+~236 Python facade tests collected, verified with ASan/UBSan+LSan. Counts drift as suites
+grow — treat `ctest`/`pytest --collect-only` as the source of truth.
 
 ---
 
@@ -708,6 +748,29 @@ python3 -m pytest python/tests/ -v -m "not subinterpreters and not freethreading
 
 Markers defined: `subinterpreters`, `freethreading`, `stress`.
 
+### Free-Threaded (3.14t) and Subinterpreter Testing
+
+```bash
+# Free-threaded leg (requires a 3.14t interpreter, e.g. via pyenv)
+PYTHONPATH=python python3.14t -m pytest python/tests/test_free_threading.py -v
+
+# Compatibility-baseline legs (same harness CI uses; legs: subinterpreters, freethreading, stress)
+PYTHONPATH=python python3 demo/ci/run_compat_baseline.py --legs subinterpreters,freethreading
+
+# Static phase checks (run in tests-pr.yml / docs-check.yml)
+python3 demo/ci/check_layer_a_static.py      # Layer A interpreter-isolation contract
+python3 demo/ci/check_docs_consistency.py    # docs/code consistency
+```
+
+### Resilience Lab (differential + property suite)
+
+`lab/` is a LOCAL, UNTRACKED oracle-driven concurrency/property harness (~100+ scenarios
+across 3.13 / 3.14t / TSan) maintained outside the repository — it exists on the
+maintainer's machine, not in git checkouts. When present: `lab/run_lab.py` is the entry
+point, `lab/harness.py` + `lab/oracle.py` + `lab/generators.py` the machinery,
+`lab/CONCURRENCY_CONTRACT.md` the contract under test, `lab/RESILIENCE_REPORT.md` the
+latest results.
+
 ### CMake Options
 
 | Option | Default | Purpose |
@@ -721,14 +784,18 @@ Markers defined: `subinterpreters`, `freethreading`, `stress`.
 
 ### CI Workflows
 
-The project has extensive CI in `.github/workflows/`. Key workflows:
-- `tests-pr.yml` — C core + binding + Python tests on PR
-- `sanitizers.yml` — ASan/UBSan/TSan matrix
-- `packaging-pr.yml` — Wheel build + install verification
+The project has extensive CI in `.github/workflows/` (17 workflows). Key workflows:
+- `tests-pr.yml` — C core + binding + Python tests on PR (includes Layer A static check)
+- `sanitizers.yml` — ASan/UBSan/TSan matrix (includes a 3.14t free-threaded TSan leg)
+- `compatibility-baseline-pr.yml` / `compatibility-baseline-main.yml` — subinterpreters/freethreading/stress legs
+- `packaging-pr.yml` — Wheel build + install verification (cp312–cp314 + cp314t)
 - `correctness-e2e-pr.yml` / `correctness-e2e-main.yml` — Full E2E correctness
+- `benchmark-methodology-pr.yml` / `benchmark-methodology-main.yml` — Benchmark methodology runs
 - `coverage.yml` — Code coverage via codecov
-- `codeql.yml` — Security analysis
+- `codeql.yml` / `dependency-review.yml` — Security analysis
+- `docs-check.yml` — Docs consistency (`demo/ci/check_docs_consistency.py`)
 - `release-pypi.yml` / `release-testpypi.yml` — PyPI publishing
+- `claude.yml` / `claude-code-review.yml` — Claude Code automation
 
 ### When In Doubt
 

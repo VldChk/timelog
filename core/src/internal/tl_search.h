@@ -14,9 +14,23 @@
 TL_INLINE size_t tl_record_lower_bound(const tl_record_t* data,
                                         size_t len,
                                         tl_ts_t target) {
+    /* Branchless (cmov) power-of-two-step search for page/memtable-sized arrays;
+     * branchy fallback above the size gate where branch speculation wins on huge
+     * arrays (see TL_LOWER_BOUND_BRANCHLESS_MAX). Both forms return the identical
+     * first index i in [0,len] with data[i].ts >= target. */
+    if (len <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
+        size_t base = 0;
+        size_t length = len;
+        while (length > 0) {
+            size_t half = length / 2;
+            base += (size_t)(data[base + half].ts < target) * (length - half);
+            length = half;
+        }
+        return base;
+    }
+
     size_t lo = 0;
     size_t hi = len;
-
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (data[mid].ts < target) {
@@ -25,7 +39,6 @@ TL_INLINE size_t tl_record_lower_bound(const tl_record_t* data,
             hi = mid;
         }
     }
-
     return lo;
 }
 

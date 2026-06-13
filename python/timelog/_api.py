@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import datetime as _datetime
 import operator
-import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsIndex, cast
 
 if TYPE_CHECKING:
     from timelog import Timelog, TimelogIter
@@ -13,12 +13,8 @@ if TYPE_CHECKING:
 TL_TS_MIN = -(2**63)      # INT64_MIN
 TL_TS_MAX = 2**63 - 1     # INT64_MAX
 
-_UNIT_DIVISORS = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
-
-
-def _now_ts(time_unit: str) -> int:
-    """Return current wall-clock time as an integer timestamp in the given unit."""
-    return time.time_ns() // _UNIT_DIVISORS[time_unit]
+# Note: auto-timestamping now lives in C (tl_py_now_ts); the former Python
+# _now_ts/_UNIT_DIVISORS helpers were removed when append folded into C.
 
 
 def _coerce_ts(x: object) -> int:
@@ -30,7 +26,23 @@ def _coerce_ts(x: object) -> int:
     """
     if isinstance(x, bool):
         raise TypeError("timestamp must be int (bool not allowed)")
-    ts = operator.index(x)
+    try:
+        ts = operator.index(cast(SupportsIndex, x))
+    except TypeError:
+        # The two mistakes every user makes once: teach, don't scold.
+        if isinstance(x, _datetime.datetime):
+            raise TypeError(
+                "timestamps are integers in the log's time_unit; for a "
+                "datetime use e.g. int(dt.timestamp() * 1000) with "
+                "time_unit='ms' (UTC-aware datetimes recommended)"
+            ) from None
+        if isinstance(x, float):
+            raise TypeError(
+                f"timestamps are integers in the log's time_unit, not float "
+                f"({x!r}); use int(x), or a finer time_unit ('us'/'ns') if "
+                "you need sub-unit precision"
+            ) from None
+        raise
     if ts < TL_TS_MIN or ts > TL_TS_MAX:
         raise OverflowError(
             f"timestamp {ts} is outside int64 range [{TL_TS_MIN}, {TL_TS_MAX}]"
@@ -68,4 +80,13 @@ def _slice_to_iter(log: Timelog, s: slice) -> TimelogIter:
     if stop is None:
         return log.since(_coerce_ts(start))
 
-    return log.range(_coerce_ts(start), _coerce_ts(stop))
+    t1 = _coerce_ts(start)
+    t2 = _coerce_ts(stop)
+    if t1 > t2:
+        # Sequence semantics: lst[10:1] == [], and the engine's own
+        # convention says "empty range: t1 >= t2". Explicit range()/delete()
+        # calls still raise on reversed bounds; the slice OPERATOR follows
+        # Python container instincts (e.g. a wall clock stepping backwards
+        # in a now-window loop should not blow up a monitoring endpoint).
+        return log.range(t1, t1)
+    return log.range(t1, t2)

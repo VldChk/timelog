@@ -236,24 +236,163 @@ static tl_status_t memtable_collect_drop(tl_memtable_t* mt,
         return TL_OK;
     }
 
+    if (*dropped_len == SIZE_MAX) {
+        return TL_EOVERFLOW;
+    }
     if (*dropped_len >= *dropped_cap) {
-        size_t new_cap = (*dropped_cap == 0) ? 64 : (*dropped_cap * 2);
-        if (tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
-            return TL_EOVERFLOW;
+        size_t needed = *dropped_len + 1;
+        size_t new_cap = (*dropped_cap == 0) ? 64 : *dropped_cap;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) {
+                new_cap = needed;
+                break;
+            }
+            new_cap *= 2;
         }
-        tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
-                                           new_cap * sizeof(tl_record_t));
-        if (new_arr == NULL) {
-            return TL_ENOMEM;
+        tl_status_t reserve_st = TL_OK;
+        if (new_cap < needed ||
+            tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+            reserve_st = TL_EOVERFLOW;
+        } else {
+            tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
+                                               new_cap * sizeof(tl_record_t));
+            if (new_arr == NULL) {
+                reserve_st = TL_ENOMEM;
+            } else {
+                *dropped = new_arr;
+                *dropped_cap = new_cap;
+            }
         }
-        *dropped = new_arr;
-        *dropped_cap = new_cap;
+        if (reserve_st != TL_OK) {
+            return reserve_st;
+        }
     }
 
     (*dropped)[*dropped_len].ts = ts;
     (*dropped)[*dropped_len].handle = handle;
     (*dropped_len)++;
     return TL_OK;
+}
+
+static tl_status_t memtable_reserve_drops(tl_memtable_t* mt,
+                                          tl_record_t** dropped,
+                                          size_t* dropped_cap,
+                                          size_t needed) {
+    if (needed == 0) {
+        return TL_OK;
+    }
+    if (dropped == NULL || dropped_cap == NULL) {
+        return TL_OK;
+    }
+    if (needed <= *dropped_cap) {
+        return TL_OK;
+    }
+
+    size_t new_cap = (*dropped_cap == 0) ? 64 : *dropped_cap;
+    while (new_cap < needed) {
+        if (new_cap > SIZE_MAX / 2) {
+            new_cap = needed;
+            break;
+        }
+        new_cap *= 2;
+    }
+    if (new_cap < needed ||
+        tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
+        return TL_EOVERFLOW;
+    }
+
+    tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
+                                       new_cap * sizeof(tl_record_t));
+    if (new_arr == NULL) {
+        return TL_ENOMEM;
+    }
+
+    *dropped = new_arr;
+    *dropped_cap = new_cap;
+    return TL_OK;
+}
+
+static tl_status_t memtable_count_sorted_tomb_drops(const tl_record_t* records,
+                                                    const tl_seq_t* seqs,
+                                                    size_t len,
+                                                    tl_intervals_imm_t tombs,
+                                                    size_t* out_count) {
+    TL_ASSERT(out_count != NULL);
+
+    if (len == 0 || tombs.len == 0) {
+        *out_count = 0;
+        return TL_OK;
+    }
+    if (records == NULL || seqs == NULL) {
+        return TL_EINTERNAL;
+    }
+
+    tl_intervals_cursor_t cur;
+    tl_intervals_cursor_init(&cur, tombs);
+
+    size_t count = 0;
+    for (size_t i = 0; i < len; i++) {
+        tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&cur, records[i].ts);
+        if (tomb_seq > seqs[i]) {
+            count++;
+        }
+    }
+    *out_count = count;
+    return TL_OK;
+}
+
+static tl_status_t memtable_count_tomb_drops(tl_memtable_t* mt,
+                                             const tl_record_t* records,
+                                             const tl_seq_t* seqs,
+                                             size_t len,
+                                             tl_intervals_imm_t tombs,
+                                             bool already_sorted,
+                                             size_t* out_count) {
+    TL_ASSERT(mt != NULL);
+    TL_ASSERT(out_count != NULL);
+
+    if (already_sorted || len <= 1 || tombs.len == 0) {
+        return memtable_count_sorted_tomb_drops(records, seqs, len, tombs,
+                                               out_count);
+    }
+    if (records == NULL || seqs == NULL) {
+        return TL_EINTERNAL;
+    }
+    if (tl__alloc_would_overflow(len, sizeof(tl_record_t)) ||
+        tl__alloc_would_overflow(len, sizeof(tl_seq_t))) {
+        return TL_EOVERFLOW;
+    }
+
+    size_t bytes = len * sizeof(tl_record_t);
+    size_t seq_bytes = len * sizeof(tl_seq_t);
+    tl_record_t* copy = tl__malloc(mt->alloc, bytes);
+    if (copy == NULL) {
+        return TL_ENOMEM;
+    }
+    tl_seq_t* copy_seqs = tl__malloc(mt->alloc, seq_bytes);
+    if (copy_seqs == NULL) {
+        tl__free(mt->alloc, copy);
+        return TL_ENOMEM;
+    }
+
+    memcpy(copy, records, bytes);
+    memcpy(copy_seqs, seqs, seq_bytes);
+
+    tl_recvec_t tmp = {
+        .data = copy,
+        .len = len,
+        .cap = len,
+        .alloc = mt->alloc
+    };
+    tl_status_t st = tl_recvec_sort_with_seqs(&tmp, copy_seqs);
+    if (st == TL_OK) {
+        st = memtable_count_sorted_tomb_drops(copy, copy_seqs, len, tombs,
+                                             out_count);
+    }
+
+    tl__free(mt->alloc, copy_seqs);
+    tl__free(mt->alloc, copy);
+    return st;
 }
 
 static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
@@ -270,6 +409,31 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
     if (!required && mt->ooo_run_limit > 0 &&
         tl_ooorunset_count(mt->ooo_runs) >= mt->ooo_run_limit) {
         return TL_EBUSY;
+    }
+
+    bool collect_drops = (dropped != NULL &&
+                          dropped_len != NULL &&
+                          dropped_cap != NULL);
+    if (!required && !collect_drops) {
+        tl_intervals_imm_t tombs = tl_intervals_as_imm(&mt->active_tombs);
+        size_t tomb_drops = 0;
+        tl_status_t count_st = memtable_count_tomb_drops(
+            mt,
+            tl_recvec_data(&mt->ooo_head),
+            tl_seqvec_data(&mt->ooo_head_seqs),
+            head_len,
+            tombs,
+            mt->ooo_head_sorted,
+            &tomb_drops);
+        if (count_st != TL_OK) {
+            return count_st;
+        }
+        if (tomb_drops > 0) {
+            /* Opportunistic flushes have no callback sink. Keep the head in its
+             * per-record-sequence form rather than either dropping callbacks or
+             * collapsing tomb-covered records into a uniform-watermark OOO run. */
+            return TL_OK;
+        }
     }
 
     if (head_len > SIZE_MAX / sizeof(tl_record_t)) {
@@ -309,28 +473,32 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
         }
     }
 
-    tl_intervals_imm_t tombs = tl_intervals_as_imm(&mt->active_tombs);
-    tl_intervals_cursor_t cur;
-    tl_intervals_cursor_init(&cur, tombs);
-
     size_t out_len = 0;
-    for (size_t i = 0; i < head_len; i++) {
-        tl_seq_t tomb_seq = 0;
-        if (tombs.len > 0) {
-            tomb_seq = tl_intervals_cursor_max_seq(&cur, copy[i].ts);
-        }
-        if (tomb_seq > copy_seqs[i]) {
-            tl_status_t drop_st = memtable_collect_drop(mt, dropped, dropped_len,
-                                                        dropped_cap, copy[i].ts,
-                                                        copy[i].handle);
-            if (drop_st != TL_OK) {
-                tl__free(mt->alloc, copy_seqs);
-                tl__free(mt->alloc, copy);
-                return drop_st;
+    if (collect_drops) {
+        tl_intervals_imm_t tombs = tl_intervals_as_imm(&mt->active_tombs);
+        tl_intervals_cursor_t cur;
+        tl_intervals_cursor_init(&cur, tombs);
+
+        for (size_t i = 0; i < head_len; i++) {
+            tl_seq_t tomb_seq = 0;
+            if (tombs.len > 0) {
+                tomb_seq = tl_intervals_cursor_max_seq(&cur, copy[i].ts);
             }
-            continue;
+            if (tomb_seq > copy_seqs[i]) {
+                tl_status_t drop_st = memtable_collect_drop(mt, dropped, dropped_len,
+                                                            dropped_cap, copy[i].ts,
+                                                            copy[i].handle);
+                if (drop_st != TL_OK) {
+                    tl__free(mt->alloc, copy_seqs);
+                    tl__free(mt->alloc, copy);
+                    return drop_st;
+                }
+                continue;
+            }
+            copy[out_len++] = copy[i];
         }
-        copy[out_len++] = copy[i];
+    } else {
+        out_len = head_len;
     }
 
     tl__free(mt->alloc, copy_seqs);
@@ -491,6 +659,11 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
     }
 
     TL_ASSERT(records != NULL);
+
+    if (tl__alloc_would_overflow(n, sizeof(tl_record_t)) ||
+        tl__alloc_would_overflow(n, sizeof(tl_seq_t))) {
+        return TL_EOVERFLOW;
+    }
 
     tl_status_t st;
     size_t inserted = 0;
@@ -720,6 +893,49 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         return TL_ENOMEM;
     }
 
+    tl_intervals_imm_t active_tombs = tl_intervals_as_imm(&mt->active_tombs);
+    size_t ooo_drop_count = 0;
+    size_t active_drop_count = 0;
+    tl_status_t count_st = memtable_count_tomb_drops(
+        mt,
+        tl_recvec_data(&mt->ooo_head),
+        tl_seqvec_data(&mt->ooo_head_seqs),
+        tl_recvec_len(&mt->ooo_head),
+        active_tombs,
+        mt->ooo_head_sorted,
+        &ooo_drop_count);
+    if (count_st != TL_OK) {
+        tl__free(mt->alloc, mr);
+        return count_st;
+    }
+    count_st = memtable_count_tomb_drops(
+        mt,
+        tl_recvec_data(&mt->active_run),
+        tl_seqvec_data(&mt->active_run_seqs),
+        tl_recvec_len(&mt->active_run),
+        active_tombs,
+        true,
+        &active_drop_count);
+    if (count_st != TL_OK) {
+        tl__free(mt->alloc, mr);
+        return count_st;
+    }
+
+    if (ooo_drop_count > SIZE_MAX - active_drop_count) {
+        tl__free(mt->alloc, mr);
+        return TL_EOVERFLOW;
+    }
+    size_t needed_drops = ooo_drop_count + active_drop_count;
+    if (needed_drops > 0) {
+        tl_status_t reserve_st = memtable_reserve_drops(mt, &dropped,
+                                                        &dropped_cap,
+                                                        needed_drops);
+        if (reserve_st != TL_OK) {
+            tl__free(mt->alloc, mr);
+            return reserve_st;
+        }
+    }
+
     /* Drain the OOO head into a final sorted run so the sealed memrun contains
      * a complete, immutable picture of pending out-of-order writes. */
     tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq,
@@ -744,12 +960,13 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     tl_ooorunset_t* ooo_runs = mt->ooo_runs;
     mt->ooo_runs = NULL;
 
-    if (run_len != run_seqs_len) {
-        if (run != NULL) tl__free(mt->alloc, run);
-        if (run_seqs != NULL) tl__free(mt->alloc, run_seqs);
+    if (run_len != run_seqs_len ||
+        (run_len > 0 && (run == NULL || run_seqs == NULL))) {
+        tl__free(mt->alloc, run);
+        tl__free(mt->alloc, run_seqs);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-        if (tombs != NULL) tl__free(mt->alloc, tombs);
-        if (dropped != NULL) tl__free(mt->alloc, dropped);
+        tl__free(mt->alloc, tombs);
+        tl__free(mt->alloc, dropped);
         tl__free(mt->alloc, mr);
         return TL_EINTERNAL;
     }
@@ -766,11 +983,11 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
                                                             &dropped_cap, run[i].ts,
                                                             run[i].handle);
                 if (drop_st != TL_OK) {
-                    if (run != NULL) tl__free(mt->alloc, run);
-                    if (run_seqs != NULL) tl__free(mt->alloc, run_seqs);
+                    tl__free(mt->alloc, run);
+                    tl__free(mt->alloc, run_seqs);
                     if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-                    if (tombs != NULL) tl__free(mt->alloc, tombs);
-                    if (dropped != NULL) tl__free(mt->alloc, dropped);
+                    tl__free(mt->alloc, tombs);
+                    tl__free(mt->alloc, dropped);
                     tl__free(mt->alloc, mr);
                     return drop_st;
                 }
@@ -795,10 +1012,10 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         /* Invariant violation reaching this point means the arrays are no
          * longer reachable from the memtable: free them here so they do not
          * leak, even though the caller will lose the data. */
-        if (run != NULL) tl__free(mt->alloc, run);
+        tl__free(mt->alloc, run);
         if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-        if (tombs != NULL) tl__free(mt->alloc, tombs);
-        if (dropped != NULL) tl__free(mt->alloc, dropped);
+        tl__free(mt->alloc, tombs);
+        tl__free(mt->alloc, dropped);
         tl__free(mt->alloc, mr);
         return TL_EINTERNAL;
     }
@@ -809,7 +1026,7 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
         tl_memrun_release(mr);
-        if (dropped != NULL) tl__free(mt->alloc, dropped);
+        tl__free(mt->alloc, dropped);
         return TL_EBUSY;
     }
     TL_ASSERT(mt->sealed_len < mt->sealed_max_runs);
@@ -832,7 +1049,7 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     if (out_dropped != NULL && out_dropped_len != NULL) {
         *out_dropped = dropped;
         *out_dropped_len = dropped_len;
-    } else if (dropped != NULL) {
+    } else {
         tl__free(mt->alloc, dropped);
     }
 

@@ -146,9 +146,23 @@ size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target) {
     }
 
     const tl_ts_t* ts = page->ts;
-    size_t lo = 0;
-    size_t hi = page->count;
+    size_t n = page->count;
 
+    /* Branchless (cmov) for page-sized arrays; branchy fallback above the size
+     * gate. Identical result: first i in [0,n) with ts[i] >= target (else n). */
+    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
+        size_t base = 0;
+        size_t length = n;
+        while (length > 0) {
+            size_t half = length / 2;
+            base += (size_t)(ts[base + half] < target) * (length - half);
+            length = half;
+        }
+        return base;
+    }
+
+    size_t lo = 0;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (ts[mid] < target) {
@@ -157,7 +171,6 @@ size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target) {
             hi = mid;
         }
     }
-
     return lo;
 }
 
@@ -169,9 +182,23 @@ size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target) {
     }
 
     const tl_ts_t* ts = page->ts;
-    size_t lo = 0;
-    size_t hi = page->count;
+    size_t n = page->count;
 
+    /* Branchless (cmov) for page-sized arrays; branchy fallback above the size
+     * gate. Identical result: first i in [0,n) with ts[i] > target (else n). */
+    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
+        size_t base = 0;
+        size_t length = n;
+        while (length > 0) {
+            size_t half = length / 2;
+            base += (size_t)(ts[base + half] <= target) * (length - half);
+            length = half;
+        }
+        return base;
+    }
+
+    size_t lo = 0;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (ts[mid] <= target) {
@@ -180,7 +207,6 @@ size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target) {
             hi = mid;
         }
     }
-
     return lo;
 }
 
