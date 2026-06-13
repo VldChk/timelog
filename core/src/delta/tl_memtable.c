@@ -312,12 +312,19 @@ static tl_status_t memtable_reserve_drops(tl_memtable_t* mt,
     return TL_OK;
 }
 
-static size_t memtable_count_tomb_drops(const tl_record_t* records,
-                                        const tl_seq_t* seqs,
-                                        size_t len,
-                                        tl_intervals_imm_t tombs) {
-    if (len == 0 || records == NULL || seqs == NULL || tombs.len == 0) {
-        return 0;
+static tl_status_t memtable_count_sorted_tomb_drops(const tl_record_t* records,
+                                                    const tl_seq_t* seqs,
+                                                    size_t len,
+                                                    tl_intervals_imm_t tombs,
+                                                    size_t* out_count) {
+    TL_ASSERT(out_count != NULL);
+
+    if (len == 0 || tombs.len == 0) {
+        *out_count = 0;
+        return TL_OK;
+    }
+    if (records == NULL || seqs == NULL) {
+        return TL_EINTERNAL;
     }
 
     tl_intervals_cursor_t cur;
@@ -330,7 +337,62 @@ static size_t memtable_count_tomb_drops(const tl_record_t* records,
             count++;
         }
     }
-    return count;
+    *out_count = count;
+    return TL_OK;
+}
+
+static tl_status_t memtable_count_tomb_drops(tl_memtable_t* mt,
+                                             const tl_record_t* records,
+                                             const tl_seq_t* seqs,
+                                             size_t len,
+                                             tl_intervals_imm_t tombs,
+                                             bool already_sorted,
+                                             size_t* out_count) {
+    TL_ASSERT(mt != NULL);
+    TL_ASSERT(out_count != NULL);
+
+    if (already_sorted || len <= 1 || tombs.len == 0) {
+        return memtable_count_sorted_tomb_drops(records, seqs, len, tombs,
+                                               out_count);
+    }
+    if (records == NULL || seqs == NULL) {
+        return TL_EINTERNAL;
+    }
+    if (tl__alloc_would_overflow(len, sizeof(tl_record_t)) ||
+        tl__alloc_would_overflow(len, sizeof(tl_seq_t))) {
+        return TL_EOVERFLOW;
+    }
+
+    size_t bytes = len * sizeof(tl_record_t);
+    size_t seq_bytes = len * sizeof(tl_seq_t);
+    tl_record_t* copy = tl__malloc(mt->alloc, bytes);
+    if (copy == NULL) {
+        return TL_ENOMEM;
+    }
+    tl_seq_t* copy_seqs = tl__malloc(mt->alloc, seq_bytes);
+    if (copy_seqs == NULL) {
+        tl__free(mt->alloc, copy);
+        return TL_ENOMEM;
+    }
+
+    memcpy(copy, records, bytes);
+    memcpy(copy_seqs, seqs, seq_bytes);
+
+    tl_recvec_t tmp = {
+        .data = copy,
+        .len = len,
+        .cap = len,
+        .alloc = mt->alloc
+    };
+    tl_status_t st = tl_recvec_sort_with_seqs(&tmp, copy_seqs);
+    if (st == TL_OK) {
+        st = memtable_count_sorted_tomb_drops(copy, copy_seqs, len, tombs,
+                                             out_count);
+    }
+
+    tl__free(mt->alloc, copy_seqs);
+    tl__free(mt->alloc, copy);
+    return st;
 }
 
 static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
@@ -354,11 +416,18 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
                           dropped_cap != NULL);
     if (!required && !collect_drops) {
         tl_intervals_imm_t tombs = tl_intervals_as_imm(&mt->active_tombs);
-        size_t tomb_drops = memtable_count_tomb_drops(
+        size_t tomb_drops = 0;
+        tl_status_t count_st = memtable_count_tomb_drops(
+            mt,
             tl_recvec_data(&mt->ooo_head),
             tl_seqvec_data(&mt->ooo_head_seqs),
             head_len,
-            tombs);
+            tombs,
+            mt->ooo_head_sorted,
+            &tomb_drops);
+        if (count_st != TL_OK) {
+            return count_st;
+        }
         if (tomb_drops > 0) {
             /* Opportunistic flushes have no callback sink. Keep the head in its
              * per-record-sequence form rather than either dropping callbacks or
@@ -825,16 +894,32 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     }
 
     tl_intervals_imm_t active_tombs = tl_intervals_as_imm(&mt->active_tombs);
-    size_t ooo_drop_count = memtable_count_tomb_drops(
+    size_t ooo_drop_count = 0;
+    size_t active_drop_count = 0;
+    tl_status_t count_st = memtable_count_tomb_drops(
+        mt,
         tl_recvec_data(&mt->ooo_head),
         tl_seqvec_data(&mt->ooo_head_seqs),
         tl_recvec_len(&mt->ooo_head),
-        active_tombs);
-    size_t active_drop_count = memtable_count_tomb_drops(
+        active_tombs,
+        mt->ooo_head_sorted,
+        &ooo_drop_count);
+    if (count_st != TL_OK) {
+        tl__free(mt->alloc, mr);
+        return count_st;
+    }
+    count_st = memtable_count_tomb_drops(
+        mt,
         tl_recvec_data(&mt->active_run),
         tl_seqvec_data(&mt->active_run_seqs),
         tl_recvec_len(&mt->active_run),
-        active_tombs);
+        active_tombs,
+        true,
+        &active_drop_count);
+    if (count_st != TL_OK) {
+        tl__free(mt->alloc, mr);
+        return count_st;
+    }
 
     if (ooo_drop_count > SIZE_MAX - active_drop_count) {
         tl__free(mt->alloc, mr);

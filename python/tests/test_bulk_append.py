@@ -5,6 +5,7 @@ min_ts floor, mostly_ordered default resolution, EBUSY-means-committed,
 all-or-nothing failure, lifecycle, and no-context-manager usage.
 """
 import array
+import gc
 import sys
 
 import pytest
@@ -21,6 +22,25 @@ NATIVE_IS_LE = sys.byteorder == "little"
 
 def _ts_array(values):
     return array.array("q", values)
+
+
+def _build_abandoned_bulk_log():
+    log = Timelog(maintenance="disabled")
+    log.bulk_append(_ts_array(range(1000)), list(range(1000)))
+    assert len(log) == 1000
+
+
+def _build_payload_ref_with_abandoned_log():
+    import weakref
+
+    class Payload:
+        pass
+
+    log = Timelog(maintenance="disabled")
+    p = Payload()
+    ref = weakref.ref(p)
+    log.bulk_append(_ts_array([1]), [p])
+    return ref
 
 
 class TestBulkAppendBasics:
@@ -56,10 +76,8 @@ class TestBulkAppendBasics:
 
     def test_no_context_manager_no_close(self):
         # The 99.9999% case: plain usage, abandoned to GC.
-        log = Timelog(maintenance="disabled")
-        log.bulk_append(_ts_array(range(1000)), list(range(1000)))
-        assert len(log) == 1000
-        del log  # finalizer must clean up without errors
+        _build_abandoned_bulk_log()
+        gc.collect()  # finalizer must clean up without errors
 
 
 @pytest.mark.skipif(np is None, reason="numpy not installed")
@@ -323,17 +341,8 @@ class TestBulkAppendSemantics:
     def test_abandoned_log_releases_objects(self):
         # No-context-manager abandonment: finalizer must release tracked refs.
         import gc
-        import weakref
 
-        class Payload:
-            pass
-
-        log = Timelog(maintenance="disabled")
-        p = Payload()
-        ref = weakref.ref(p)
-        log.bulk_append(_ts_array([1]), [p])
-        del p
-        del log                        # abandon WITHOUT close()
+        ref = _build_payload_ref_with_abandoned_log()
         for _ in range(3):
             gc.collect()               # robust under 3.14t deferred refcounting
         assert ref() is None, "abandoned Timelog leaked a payload reference"

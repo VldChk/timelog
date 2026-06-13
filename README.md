@@ -67,6 +67,19 @@ The Python API remains single-writer at the instance level: writes and lifecycle
 operations must be externally serialized. Independent snapshot readers can run
 concurrently.
 
+## What Changed in 1.2 and 1.3
+
+`1.2.0` rebuilt the CPython runtime boundary: `_timelog` now uses
+multi-phase module initialization, module-local exceptions and heap types,
+per-interpreter-safe state recovery, and explicit synchronization for the
+supported free-threaded wheel family.
+
+`1.3.0` keeps that runtime contract and focuses on the hot user paths:
+auto-timestamp `append(obj)` moved from Python into C, common positional
+methods use lower-overhead dispatch, `bulk_append()` ingests typed timestamp
+buffers directly, and core lower/upper-bound searches use a measured
+size-gated branchless path.
+
 ## Quickstart: Streaming
 
 ```python
@@ -197,6 +210,11 @@ Reads plan sources across active + immutable layers, then run k-way merge with t
 Flush and compaction bound read fan-out over time.  
 Deletes are logical tombstones; physical cleanup is deferred to maintenance.
 
+`flush()` is a visibility operation, not durability: it publishes pending
+writes into immutable in-memory segments so readers and zero-copy `views()` can
+see them. `close()` always tears down the in-memory engine and discards all
+records.
+
 ## Performance at a Glance
 
 Same-harness v1.3 A/B against the v1.2.0 wheel, Linux x86_64, pinned CPU,
@@ -208,8 +226,11 @@ CPython `3.13.12`, median of 5:
 | `append(ts, obj)` | 352.1 ns | 103.9 ns | 3.39x faster |
 | `append(obj, ts=...)` | 364.7 ns | 109.6 ns | 3.33x faster |
 | `point(ts)` | 457.1 ns | 337.1 ns | 1.36x faster |
+| `equal(ts)` | 548.8 ns | 429.3 ns | 1.28x faster |
+| `next_ts(ts)` | 393.8 ns | 299.8 ns | 1.31x faster |
 | `range(t1, t2)` | 575.9 ns | 458.0 ns | 1.26x faster |
 | `delete_range(t1, t2)` | 18,059.6 ns | 13,289.3 ns | 1.36x faster |
+| `delete_before(ts)` | 109.7 ns | 80.8 ns | 1.36x faster |
 
 New v1.3 ingest fast path:
 
@@ -233,6 +254,8 @@ dataset `11,550,000` rows):
 - PageSpan iteration (`F1`): `1.48B` timestamps/sec on the timestamp-only span path.
 
 Results are workload-, configuration-, and hardware-dependent.
+The current publishable benchmark framing is `docs/performance.md`; older
+reports are retained as historical snapshots.
 
 Methodology and context:
 

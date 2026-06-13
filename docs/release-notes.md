@@ -23,6 +23,9 @@ Focus: Python-facing usability and hot-path performance.
   monitor.
 - `views()` / `PageSpan` usability is expanded with timestamp memoryviews,
   lazy `PageSpan.objects()`, `copy_timestamps()`, and typed stubs.
+- Timestamp-buffer interop is limited to `bulk_append()` input buffers and
+  `PageSpan.timestamps` memoryviews in this release; Arrow/DLPack exports remain
+  lab prototypes.
 - Performance artifacts show v1.3 same-harness wins versus the v1.2.0 wheel:
   `append(obj)` 513.9 ns -> 117.1 ns, `append(ts, obj)` 352.1 ns -> 103.9 ns,
   and `bulk_append(np.int64 array, list)` 113.3 ns/record in its committed

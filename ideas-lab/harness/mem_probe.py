@@ -76,13 +76,12 @@ def run_worker(n: int, seed: int, sample_pipe_fd: int, sample_period_s: float,
                flush_every: int, compact_trigger: int) -> None:
     """Sustained workload. Emits 'tracemalloc' samples on the pipe; monitor pairs them with RSS."""
     import random
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
 
     try:
         os.sched_setaffinity(0, {0})
     except Exception:
-        pass
+        pass  # CPU affinity is optional outside Linux benchmark hosts.
 
     pipe = os.fdopen(sample_pipe_fd, "w", buffering=1)
 
@@ -93,6 +92,7 @@ def run_worker(n: int, seed: int, sample_pipe_fd: int, sample_period_s: float,
         try:
             self_rss = rss_bytes(os.getpid())
         except Exception:
+            # The monitor still samples RSS; this worker-side landmark is best effort.
             self_rss = 0
         pipe.write(json.dumps({
             "t": time.monotonic(),
@@ -106,8 +106,8 @@ def run_worker(n: int, seed: int, sample_pipe_fd: int, sample_period_s: float,
     gc.disable()  # match production hot-path; we still collect explicitly at boundaries
     tracemalloc.start()
 
-    tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                         target_page_bytes=64 * 1024)
+    tl = Timelog(maintenance="disabled", busy_policy="flush",
+                 target_page_bytes=64 * 1024)
 
     # ---- PHASE 1: ingest with periodic flush + compaction drain ----
     last_emit = 0.0
@@ -175,7 +175,7 @@ def run_worker(n: int, seed: int, sample_pipe_fd: int, sample_period_s: float,
         import ctypes
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
-        pass
+        pass  # Non-glibc hosts or restricted runtimes may not expose malloc_trim.
     gc.collect()
     emit("trimmed")
 
@@ -198,7 +198,7 @@ def run_monitored(args, csv_path: str) -> dict:
         os.close(r_fd)
         try:
             run_worker(args.n, args.seed, w_fd, args.period, args.flush_every, args.trigger)
-        except BaseException:
+        except Exception:
             traceback.print_exc()
             os._exit(1)
         else:

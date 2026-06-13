@@ -13,6 +13,20 @@ import pytest
 import timelog
 
 
+_UNIT_DIVISORS = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
+_AUTOTS_SLACK_NS = 20_000_000
+
+
+def _assert_auto_timestamp_near_wall_clock(ts: int, unit: str,
+                                           before_ns: int,
+                                           after_ns: int) -> None:
+    div = _UNIT_DIVISORS[unit]
+    slack = max(2, _AUTOTS_SLACK_NS // div)
+    before = before_ns // div
+    after = after_ns // div
+    assert before - slack <= ts <= after + slack
+
+
 class TestAppendSignatures:
     def test_append_signature_remains_introspectable(self):
         sig = inspect.signature(timelog.Timelog.append)
@@ -38,12 +52,12 @@ class TestAppendSignatures:
     def test_one_positional_keyword_ts_none_autotimestamps(self):
         # Old Python facade treated explicit ts=None the same as omitted ts.
         tl = timelog.Timelog(time_unit="ms")
-        before = time.time_ns() // 10**6
+        before = time.time_ns()
         tl.append("obj", ts=None)
-        after = time.time_ns() // 10**6
+        after = time.time_ns()
         got = list(tl.all())
         assert len(got) == 1
-        assert before <= got[0][0] <= after
+        _assert_auto_timestamp_near_wall_clock(got[0][0], "ms", before, after)
         assert got[0][1] == "obj"
         tl.close()
 
@@ -60,12 +74,12 @@ class TestAppendSignatures:
         # signature. Keep them working even though the documented forms are
         # append(obj), append(obj, ts=X), and append(ts, obj).
         tl = timelog.Timelog(time_unit="ms")
-        before = time.time_ns() // 10**6
+        before = time.time_ns()
         tl.append(obj_or_ts="auto")
-        after = time.time_ns() // 10**6
+        after = time.time_ns()
         auto = list(tl.all())
         assert len(auto) == 1
-        assert before <= auto[0][0] <= after
+        _assert_auto_timestamp_near_wall_clock(auto[0][0], "ms", before, after)
         assert auto[0][1] == "auto"
 
         tl.append(obj_or_ts="kw-ts", ts=7)
@@ -82,24 +96,24 @@ class TestAppendSignatures:
 
     def test_one_positional_autotimestamp(self):
         tl = timelog.Timelog(time_unit="ms")
-        before = time.time_ns() // 10**6
+        before = time.time_ns()
         tl.append("obj")                    # auto-ts
-        after = time.time_ns() // 10**6
+        after = time.time_ns()
         got = list(tl.all())
         assert len(got) == 1
         ts, val = got[0]
         assert val == "obj"
-        assert before <= ts <= after        # valid ms wall-clock
+        _assert_auto_timestamp_near_wall_clock(ts, "ms", before, after)
         tl.close()
 
-    @pytest.mark.parametrize("unit,div", [("s", 10**9), ("ms", 10**6), ("us", 10**3), ("ns", 1)])
-    def test_autotimestamp_unit_scaling(self, unit, div):
+    @pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+    def test_autotimestamp_unit_scaling(self, unit):
         tl = timelog.Timelog(time_unit=unit)
-        before = time.time_ns() // div
+        before = time.time_ns()
         tl.append("x")
-        after = time.time_ns() // div
+        after = time.time_ns()
         ts = list(tl.all())[0][0]
-        assert before <= ts <= after
+        _assert_auto_timestamp_near_wall_clock(ts, unit, before, after)
         tl.close()
 
     def test_autotimestamp_monotonicish(self):

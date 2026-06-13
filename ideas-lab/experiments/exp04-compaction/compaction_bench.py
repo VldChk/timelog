@@ -16,11 +16,12 @@ than the maximum-overlap OOO case. Exp4/5 provide the wide-overlap OOO signal.
 Run: PYTHONPATH=python taskset -c 0 python3 compaction_bench.py
 """
 from __future__ import annotations
-import os, sys, time, json, statistics, random
+import os, sys, time, json, random
 
 def pin():
     try: os.sched_setaffinity(0, {0})
-    except Exception: pass
+    except Exception:
+        pass  # CPU affinity is optional outside Linux benchmark hosts.
 
 def _seg(tl):
     s = tl.stats(); st = s["storage"]; op = s["operational"]
@@ -59,12 +60,12 @@ def _query_latency(tl, n_ts, queries=20000, width=50):
 
 # ---------- Exp1: READ AMP vs L0 depth (CLEAN: large memtable so flush==exactly 1 L0) ----------
 def exp1_read_amp(N=262_144, depths=(1, 2, 4, 8, 16, 32, 64, 128)):
-    import timelog
+    from timelog import Timelog
     BIG_MEMTABLE = 256 * 1024 * 1024   # 256 MiB: prevents auto-seal mid-batch -> controlled depth
     rows = []
     for d in depths:
-        tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                             max_delta_segments=10**9, memtable_max_bytes=BIG_MEMTABLE)
+        tl = Timelog(maintenance="disabled", busy_policy="flush",
+                     max_delta_segments=10**9, memtable_max_bytes=BIG_MEMTABLE)
         per = N // d
         for b in range(d):
             for i in range(b * per, (b + 1) * per):
@@ -75,8 +76,8 @@ def exp1_read_amp(N=262_144, depths=(1, 2, 4, 8, 16, 32, 64, 128)):
         rows.append({"target_depth": d, **seg, **lat})
         tl.close()
     # compacted-to-L1 baseline (leveled): build d=128 L0 then compact to 1 L1
-    tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                         max_delta_segments=2, memtable_max_bytes=BIG_MEMTABLE)
+    tl = Timelog(maintenance="disabled", busy_policy="flush",
+                 max_delta_segments=2, memtable_max_bytes=BIG_MEMTABLE)
     per = N // 128
     for b in range(128):
         for i in range(b * per, (b + 1) * per): tl.append(i, i)
@@ -89,14 +90,14 @@ def exp1_read_amp(N=262_144, depths=(1, 2, 4, 8, 16, 32, 64, 128)):
 
 # ---------- Exp4: OOO workload — does out-of-order ingest worsen the layout/read-amp? ----------
 def exp4_ooo(N=200_000):
-    import timelog, random
+    from timelog import Timelog
     BIG = 256 * 1024 * 1024
     out = {}
     for label, order in [("in_order", False), ("out_of_order", True)]:
         seq = list(range(N))
         if order: random.Random(13).shuffle(seq)
-        tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                             max_delta_segments=10**9, memtable_max_bytes=BIG)
+        tl = Timelog(maintenance="disabled", busy_policy="flush",
+                     max_delta_segments=10**9, memtable_max_bytes=BIG)
         # 16 flushes -> 16 L0 segments; OOO spreads each segment's ts range -> more overlap
         per = N // 16
         for b in range(16):
@@ -109,12 +110,11 @@ def exp4_ooo(N=200_000):
 
 # ---------- Exp2: WRITE AMP vs max_delta_segments (trigger sweep) ----------
 def exp2_write_amp(N=400_000, triggers=(2, 4, 8, 16, 32, 64)):
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
     rows = []
     for trig in triggers:
-        tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                             max_delta_segments=trig)
+        tl = Timelog(maintenance="disabled", busy_policy="flush",
+                     max_delta_segments=trig)
         # ingest with periodic flush; whenever L0 hits the trigger, drive compaction
         # (this mimics what the background worker does, but deterministically)
         FLUSH_EVERY = 25_000
@@ -138,10 +138,10 @@ def exp2_write_amp(N=400_000, triggers=(2, 4, 8, 16, 32, 64)):
 
 # ---------- Exp3: SPACE / delete reclaim ----------
 def exp3_space_delete(N=200_000):
-    import timelog
+    from timelog import Timelog
     out = {}
     # space: pages before vs after compaction (dense, overlapping L0)
-    tl = timelog.Timelog(maintenance="disabled", busy_policy="flush", max_delta_segments=10_000)
+    tl = Timelog(maintenance="disabled", busy_policy="flush", max_delta_segments=10_000)
     per = N // 8
     for b in range(8):
         for i in range(b * per, (b + 1) * per): tl.append(i, i)
@@ -150,7 +150,7 @@ def exp3_space_delete(N=200_000):
     _drain_compaction(tl)  # won't trigger (trigger huge) -> force via maint? trigger huge so no-op
     # force compaction by lowering not possible at runtime; instead measure on a low-trigger twin
     tl.close()
-    tl = timelog.Timelog(maintenance="disabled", busy_policy="flush", max_delta_segments=2)
+    tl = Timelog(maintenance="disabled", busy_policy="flush", max_delta_segments=2)
     for b in range(8):
         for i in range(b * per, (b + 1) * per): tl.append(i, i)
         tl.flush()
@@ -166,13 +166,13 @@ def exp5_ooo_trigger(N=200_000, triggers=(2, 4, 8, 16, 32, 1_000_000_000)):
     """Out-of-order ingest under different max_delta_segments. Lower trigger compacts the
     overlapping L0 sooner -> faster reads; a huge trigger never compacts -> read-amp explodes.
     This is the concrete tuning lever the notes only hand-waved at."""
-    import timelog, random
+    from timelog import Timelog
     BIG = 256 * 1024 * 1024
     seq = list(range(N)); random.Random(13).shuffle(seq)
     rows = []
     for trig in triggers:
-        tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                             max_delta_segments=trig, memtable_max_bytes=BIG)
+        tl = Timelog(maintenance="disabled", busy_policy="flush",
+                     max_delta_segments=trig, memtable_max_bytes=BIG)
         per = N // 16
         for b in range(16):
             for ts in seq[b*per:(b+1)*per]: tl.append(ts, ts)

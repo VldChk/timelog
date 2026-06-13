@@ -17,14 +17,15 @@ Usage (single cell): python compaction_lab.py '<json-config>'
             "query_shapes": [...], "queries": ...}
 """
 from __future__ import annotations
-import os, sys, gc, json, time, statistics, random
+import importlib, os, sys, gc, json, time, random
 
 PAGE_BYTES_DEFAULT = 64 * 1024
 REC_BYTES = 16  # sizeof(int64 ts) + sizeof(uint64 handle)
 
 def _pin():
     try: os.sched_setaffinity(0, {0})
-    except Exception: pass
+    except Exception:
+        pass  # CPU affinity is optional outside Linux benchmark hosts.
 
 def _rss_mb():
     try:
@@ -114,8 +115,8 @@ def _query_latency(tl, lo, hi, shapes, queries):
     return out
 
 def run_cell(cfg):
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
+    timelog_module = importlib.import_module("timelog")
     _pin()
     N = cfg["N"]; seed = cfg.get("seed", 1)
     page_bytes = cfg.get("page_bytes", PAGE_BYTES_DEFAULT)
@@ -126,7 +127,7 @@ def run_cell(cfg):
     events, deletes = gen_workload(cfg["workload"], N, seed)
 
     gc.disable()
-    tl = timelog.Timelog(**tl_kwargs)
+    tl = Timelog(**tl_kwargs)
     c0 = _counters(tl)
     # ingest (flush every flush_every to create L0; drive compaction when trigger met)
     flush_every = cfg.get("flush_every", 25_000)
@@ -171,7 +172,7 @@ def run_cell(cfg):
     gc.enable()
     return {
         "workload": cfg["workload"], "N": N, "seed": seed, "tl_kwargs": cfg.get("tl_kwargs", {}),
-        "module": timelog._timelog.__file__ if hasattr(timelog, "_timelog") else timelog.__file__,
+        "module": timelog_module._timelog.__file__ if hasattr(timelog_module, "_timelog") else timelog_module.__file__,
         "layout": {k: c1[k] for k in ("l0", "l1", "pages", "tomb", "comp")},
         "segments_merged": merged, "maint_steps": steps,
         "write_amp": round(write_amp, 3), "space_amp": round(space_amp, 3),

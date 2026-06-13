@@ -132,15 +132,17 @@ Tombstones form an interval set that is always:
 - Non-adjacent (touching intervals are merged)
 - Half-open `[start, end)`
 
-### 6. Snapshot Consistency (Seqlock Protocol)
+### 6. Snapshot Consistency
 
-A snapshot sees exactly one consistent state via seqlock:
+A snapshot sees exactly one consistent state by taking `writer_mu`, which also
+serializes every manifest publisher:
 ```
-Lock writer_mu → read seq1 → acquire manifest → capture memview → read seq2 → unlock
-If seq1 != seq2 OR seq1 is odd: retry
+Lock writer_mu → acquire manifest → capture/ref cached memview → capture op_seq → unlock
 ```
-`view_seq` is even when idle, odd during publication.
-Writers: `view_seq++` before update, `view_seq++` after update.
+Publication still wraps manifest swaps and sealed-queue pops in a short
+`view_seq` seqlock window, but current snapshot acquisition does not run a
+standalone seqlock retry loop because `writer_mu` already prevents torn
+manifest/memview captures.
 
 ### 7. Sealed Queue Ring Buffer (H-07)
 
@@ -587,7 +589,8 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 
 **C Core**:
 1. Holding `writer_mu` during build — blocks snapshots
-2. `view_seq` not incremented twice — readers stuck in retry loop
+2. Manifest or sealed-queue publication outside the short `view_seq` write
+   window — snapshots can observe source/output double visibility
 3. Off-by-one in binary search — wrong results
 4. Signed overflow in timestamp math — UB
 5. Using `malloc()` directly — breaks custom allocator
@@ -601,7 +604,9 @@ After bulk ingestion, switch back to background maintenance for ongoing writes.
 13. Merge iterator ignores error state — must propagate errors (H-16)
 
 **Python Bindings**:
-14. Python C-API without GIL — crash
+14. Python C-API without an attached thread state on the owning interpreter —
+    crash or cross-interpreter corruption; free-threaded builds do not make
+    Python C-API calls thread-state-free
 15. Missing INCREF on return — leak or UAF
 16. Closing span with exported buffer — must raise `BufferError`
 17. DECREF before INCREF on borrowed ref — UAF

@@ -12,14 +12,15 @@ import bisect, time, statistics, threading, json, sys, os
 
 def pin():
     try: os.sched_setaffinity(0, {0})
-    except Exception: pass
+    except Exception:
+        pass  # CPU affinity is a best-effort benchmark hygiene hint.
 
 # ---------- A. incremental append: per-op cost as N grows ----------
 def _append_order(order):
     """order='inorder' -> ts ascending (bisect appends at end, O(1));
        order='ooo'     -> ts shuffled (bisect must shift, O(n))."""
-    import timelog, random
-    from timelog import TimelogBusyError
+    import random
+    from timelog import Timelog, TimelogBusyError
     try: from sortedcontainers import SortedList
     except ImportError: SortedList = None
     sizes = [20_000, 50_000, 100_000, 200_000]
@@ -30,7 +31,7 @@ def _append_order(order):
             random.Random(11).shuffle(seq)
         row = {"N": N}
         # Timelog facade (note: pays the ~181ns Python wrapper; raw-C is ~95-126ns)
-        tl = timelog.Timelog()
+        tl = Timelog()
         t0 = time.perf_counter()
         for ts in seq:
             try:
@@ -60,8 +61,8 @@ def append_scaling():
 
 # ---------- B. range-query latency over a pre-built structure ----------
 def range_latency(N=200_000, queries=5_000, width=1_000):
-    import timelog, random
-    from timelog import TimelogBusyError
+    import random
+    from timelog import Timelog, TimelogBusyError
     try: from sortedcontainers import SortedList
     except ImportError: SortedList = None
     try: import numpy as np
@@ -71,7 +72,7 @@ def range_latency(N=200_000, queries=5_000, width=1_000):
 
     out = {}
     # Timelog
-    tl = timelog.Timelog()
+    tl = Timelog()
     for i in range(N):
         try:
             tl.append(i, i)
@@ -108,8 +109,6 @@ def range_latency(N=200_000, queries=5_000, width=1_000):
 
 def _timeit(fn, n, reps=5):
     fn()  # warm
-    best = min((time.perf_counter(), fn(), time.perf_counter())[2] - (lambda t0: t0)(time.perf_counter())
-               for _ in range(1)) if False else None
     samples = []
     for _ in range(reps):
         t0 = time.perf_counter(); fn(); samples.append((time.perf_counter()-t0)/n*1e6)
@@ -120,8 +119,7 @@ def concurrency_safety(N=100_000, readers=4, duration=1.5):
     """One writer appends 0..N while readers repeatedly range-query.
     Count reader exceptions and inconsistent reads. Timelog (snapshot isolation)
     must never raise; list+bisect / SortedList can raise or read torn state."""
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
     try: from sortedcontainers import SortedList
     except ImportError: SortedList = None
     results = {}
@@ -157,7 +155,7 @@ def concurrency_safety(N=100_000, readers=4, duration=1.5):
         return errors
 
     # Timelog: snapshot-isolated reads
-    def tl_make(): return timelog.Timelog()
+    def tl_make(): return Timelog()
     def tl_write(s, i):
         try:
             s.append(i, i)

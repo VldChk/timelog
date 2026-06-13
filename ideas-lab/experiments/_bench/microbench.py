@@ -36,7 +36,6 @@ def _median_ns_per_op(fn, iters: int, reps: int = 5) -> dict:
     }
 
 def bench_raw_c(iters_append=1_000_000, iters_query=1_000_000, reps=5):
-    import timelog
     from timelog import _timelog as C
     pinned = pin_cpu(0)
 
@@ -76,14 +75,13 @@ def bench_raw_c(iters_append=1_000_000, iters_query=1_000_000, reps=5):
     return results
 
 def bench_facade_append(iters=1_000_000, reps=5):
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
     pin_cpu(0)
     obj = object()
     def run(n):
         # Default maintenance (background worker on), matching the raw-C default
         # so the comparison isolates the Python-wrapper cost, not maintenance mode.
-        tl = timelog.Timelog()
+        tl = Timelog()
         a = tl.append
         for i in range(n):
             try:

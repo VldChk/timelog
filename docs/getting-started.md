@@ -68,8 +68,9 @@ immutable segments that zero-copy `views()` can expose.
 
 ## Bulk Ingest
 
-Use `bulk_append()` when timestamps already live in a contiguous int64 buffer
-and payloads are in a concrete Python sequence:
+Use `bulk_append()` when timestamps already live in a contiguous native-endian
+int64 buffer, such as an `array.array("q")`, a NumPy `int64` array, or a
+memoryview of either, and payloads are in a concrete Python sequence:
 
 ```python
 from array import array

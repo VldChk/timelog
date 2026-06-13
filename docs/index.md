@@ -7,10 +7,11 @@ Historical iteration docs are archived under `docs/archive/`.
 
 ## Current Release (1.3.0)
 
-- Supports regular CPython 3.12-3.14, isolated subinterpreters, and the
-  supported CPython 3.14t free-threaded wheel set.
+- Carries the v1.2 runtime isolation work: multi-phase `_timelog`
+  initialization, module-local heap types/exceptions, isolated subinterpreters,
+  and the supported CPython 3.14t free-threaded wheel set.
 - Adds the v1.3 hot-path work: C-level `append(obj)` auto-timestamping,
-  FASTCALL query/delete dispatch, typed-buffer `bulk_append`, and gated
+  lower-overhead query/delete dispatch, typed-buffer `bulk_append`, and gated
   branchless search.
 - Keeps Timelog explicitly in-memory: `flush()` materializes data for
   open-instance readers and zero-copy views; `close()` discards all records.

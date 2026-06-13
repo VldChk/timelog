@@ -30,9 +30,17 @@ source corpus is not reproduced in this deliverable).
 phase-one report and is intentionally kept as historical context. Headline results and candidates:
 facade-`append` fold **3.46×** (exp06), strict typed-buffer `bulk_append` **9–10×** vs per-append (C2),
 `METH_FASTCALL` append −23.7%/point −15.8% (exp01), branchless `lower_bound` point −15.2% / 3–5× search
-(exp02), Arrow/DLPack zero-copy interop as medium feature work (C3), compaction studied + the adversarial-OOO
+(exp02), Arrow/DLPack zero-copy interop as prototype-only medium feature work (C3), compaction studied + the adversarial-OOO
 **5.3×** read lever and workload-sensitive delete reclaim gap (C4/C5); loser-tree, SoA catalog, and modern
 disk-LSM strategies were killed or rejected by measurement/research.
+
+Release status: v1.3 productionized the append fold, FASTCALL dispatch,
+branchless search, `max_delta_segments` docs, and the strict typed-buffer
+`bulk_append` path. The current measured `bulk_append` ratio is documented in
+`docs/benchmarks/bulk_append.md` as **2.23x** versus post-v1.3 per-record
+append and **3.51x** versus `extend(zip(...))`; the older 9–10x lab figure was
+against the pre-v1.3 Python append baseline. Arrow and DLPack remain prototype
+artifacts here, not public v1.3 APIs.
 
 Current evidence caveat: C2/C3 preserve prototype patches and prior-run reported numbers, but not raw
 benchmark/test transcripts in this tree. Treat them as high-value rerun candidates before production PRs.

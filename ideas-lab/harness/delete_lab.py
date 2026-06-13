@@ -38,7 +38,8 @@ REC_BYTES = 16  # int64 ts + uint64 handle
 
 def _pin():
     try: os.sched_setaffinity(0, {0})
-    except Exception: pass
+    except Exception:
+        pass  # CPU affinity is optional outside Linux benchmark hosts.
 
 
 def _rss_mb():
@@ -101,9 +102,9 @@ def _point_range_lat(tl, lo, hi, queries, width):
 
 
 def run_cell(cfg):
-    import timelog
+    from timelog import Timelog
     _pin()
-    N = cfg["N"]; seed = cfg.get("seed", 1)
+    N = cfg["N"]
     page_bytes = cfg.get("page_bytes", PAGE_BYTES_DEFAULT)
     del_frac = cfg.get("del_frac", 0.40)
     n_chunks = cfg.get("n_chunks", 8)
@@ -123,7 +124,7 @@ def run_cell(cfg):
         tl_kwargs["window_size"] = cfg["window_size"]
 
     gc.disable()
-    tl = timelog.Timelog(**tl_kwargs)
+    tl = Timelog(**tl_kwargs)
 
     # ---- Phase 1: steady ingest, periodic flush, drain compaction so we reach
     # a clean baseline with data laid out into L1 (non-overlapping windows). ----
@@ -147,8 +148,6 @@ def run_cell(cfg):
             f"l0={base['l0']} l1={base['l1']}"
         )
     base_rss = _rss_mb()
-    base_pages = base["pages"]
-
     # ---- Phase 2: delete a contiguous chunk of the timeline near the front.
     # Front placement guarantees window-dense coverage so a window's covered
     # fraction is ~1.0 (well above any threshold) -> isolates debt trigger. ----

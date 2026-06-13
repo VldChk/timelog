@@ -13,7 +13,8 @@ import os, sys, gc, time, json, statistics, random
 
 def pin():
     try: os.sched_setaffinity(0, {0})
-    except Exception: pass
+    except Exception:
+        pass  # CPU affinity is optional outside Linux benchmark hosts.
 
 def _stats(tl):
     s = tl.stats()
@@ -42,7 +43,7 @@ def _point_p(tl, n_ts, queries=20000):
     return lat[len(lat)//2], lat[int(0.99*len(lat))]
 
 def run_ooo_trigger(N=200_000, triggers=(2, 8, 32, 10**9), reps=3):
-    import timelog
+    from timelog import Timelog
     BIG = 256 * 1024 * 1024
     agg = {}
     for trig in triggers:
@@ -50,8 +51,8 @@ def run_ooo_trigger(N=200_000, triggers=(2, 8, 32, 10**9), reps=3):
         for rep in range(reps):
             seq = list(range(N)); random.Random(13 + rep).shuffle(seq)
             gc.disable()
-            tl = timelog.Timelog(maintenance="disabled", busy_policy="flush",
-                                 max_delta_segments=trig, memtable_max_bytes=BIG)
+            tl = Timelog(maintenance="disabled", busy_policy="flush",
+                         max_delta_segments=trig, memtable_max_bytes=BIG)
             per = N // 16
             for b in range(16):
                 for ts in seq[b*per:(b+1)*per]: tl.append(ts, ts)

@@ -888,6 +888,46 @@ TEST_DECLARE(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sin
     tl__alloc_destroy(&alloc);
 }
 
+TEST_DECLARE(delta_memtable_ooo_flush_counts_tombs_after_sorting_head) {
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    mt.ooo_chunk_records = 3;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 200, 200));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 100));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 10));
+    TEST_ASSERT(!mt.ooo_head_sorted);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 50));
+
+    /* This insert reaches the opportunistic OOO-head flush threshold. The
+     * no-sink path must still detect the newer tombstone covering ts=10 even
+     * though the head order is [100, 10, 150]. */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 150, 150));
+    TEST_ASSERT_EQ(3, tl_memtable_ooo_head_len(&mt));
+    TEST_ASSERT_EQ(0, tl_ooorunset_count(mt.ooo_runs));
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal_ex(&mt, &mu, NULL, delta_next_seq(),
+                                                  &dropped, &dropped_len));
+    TEST_ASSERT_EQ(1, dropped_len);
+    TEST_ASSERT_EQ(10, dropped[0].ts);
+    TEST_ASSERT_EQ(10, (int)dropped[0].handle);
+
+    if (dropped != NULL) {
+        tl__free(&alloc, dropped);
+    }
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
 TEST_DECLARE(delta_memview_captures_head_sorted_and_pins_runs) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -3266,6 +3306,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_insert_batch_alloc_failure_no_partial);
     RUN_TEST(delta_memtable_flush_head_enomem_returns_ebusy);
     RUN_TEST(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sink);
+    RUN_TEST(delta_memtable_ooo_flush_counts_tombs_after_sorting_head);
     RUN_TEST(delta_memview_captures_head_sorted_and_pins_runs);
     RUN_TEST(delta_memview_captures_concurrent_pins);
     RUN_TEST(delta_memview_copy_sealed_ring_order);

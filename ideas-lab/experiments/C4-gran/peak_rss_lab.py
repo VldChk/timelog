@@ -163,8 +163,7 @@ def _layout(tl):
 
 
 def run_cell(cap, cfg):
-    import timelog
-    from timelog import TimelogBusyError
+    from timelog import Timelog, TimelogBusyError
     N = cfg["N"]
     seed = cfg.get("seed", 1)
     n_windows = cfg.get("n_windows", 200)
@@ -190,7 +189,7 @@ def run_cell(cap, cfg):
         tl_kwargs["max_compaction_windows"] = cap
 
     gc.disable()
-    tl = timelog.Timelog(**tl_kwargs)
+    tl = Timelog(**tl_kwargs)
 
     def _ingest(evs):
         for idx, (ts, pid) in enumerate(evs):

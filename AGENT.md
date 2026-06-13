@@ -134,7 +134,7 @@
 - `CLAUDE.md` documents in-memory/no-disk architecture. (`CLAUDE.md:3`, `CLAUDE.md:4`)
 - Public API and implementation align with in-memory design (`timelog` multimap and all in-memory structures). (`core/include/timelog/timelog.h:8`, `core/src/internal/tl_timelog_internal.h:163`, `core/src/storage/tl_manifest.h:12`)
 - `CLAUDE.md` documents lock order `maint_mu -> flush_mu -> writer_mu -> memtable.mu`, matching internal headers. (`CLAUDE.md:184`, `core/src/internal/tl_timelog_internal.h:85`, `core/src/delta/tl_memtable.h:24`)
-- `CLAUDE.md` describes snapshot seqlock retry protocol, but current snapshot acquisition code states writer-mutex capture without seqlock retry. (`CLAUDE.md:131`, `CLAUDE.md:135`, `core/src/query/tl_snapshot.c:89`, `core/src/query/tl_snapshot.c:92`)
+- `CLAUDE.md` now matches the current snapshot model: `writer_mu` serializes snapshot capture and publishers, while `view_seq` remains a short publication window around manifest/sealed-queue swaps. (`CLAUDE.md:131`, `core/src/query/tl_snapshot.c:89`, `core/src/query/tl_snapshot.c:92`)
 
 ## Tombstone Watermark Model Alignment
 - Canonical model doc: `docs/internals/components/tombstone-watermark-model.md`.

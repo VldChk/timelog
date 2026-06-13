@@ -4,8 +4,8 @@ Primary methodology: `docs/PERFORMANCE_METHODOLOGY.md`.
 
 ## Current Release Snapshot (v1.3.0)
 
-v1.3 focuses on reducing Python/C boundary overhead and making high-throughput
-bulk ingest explicit:
+v1.3 builds on the v1.2 subinterpreter/free-threaded runtime work and focuses
+on reducing Python/C boundary overhead:
 
 - `append(obj)` now stays in the C extension fast path for auto-timestamping.
 - Common positional methods use `METH_FASTCALL`-style dispatch.
@@ -55,6 +55,10 @@ Artifact: `ideas-lab/verification/branchless_five_seam_benchmark_2026-06-10.txt`
 These numbers are same-machine evidence for the v1.3 release work. They are
 not a hardware-independent guarantee and should not be mixed with historical
 1GB workload numbers below.
+
+Public v1.3 timestamp-buffer interop is the Python buffer protocol consumed by
+`bulk_append()` and exposed by `PageSpan.timestamps`. Arrow C Data and DLPack
+exports remain ideas-lab prototypes, not shipped public API.
 
 ## Measurement Policy
 
@@ -120,4 +124,5 @@ Notes:
 - `docs/BENCHMARK_1GB_7PCT_OOO_UNIX.md`
 - `docs/benchmarks/max_delta_segments.md`
 
-These are snapshots, not universal guarantees.
+These are snapshots, not universal guarantees. Prefer the current-release
+tables above for v1.3 release notes and README claims.
