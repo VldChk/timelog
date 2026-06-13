@@ -155,13 +155,13 @@ index 8d248e5..e913a1f 100644
  #include "timelogpy/py_handle.h"
  #include "timelogpy/py_timelog.h"
 +#include "timelogpy/dlpack.h"
- 
+
  /*===========================================================================
   * Forward Declarations
 @@ -297,6 +298,233 @@ static void pagespan_releasebuffer(PyObject* exporter, Py_buffer* view)
      TL_PY_OBJ_UNLOCK();
  }
- 
+
 +/*===========================================================================
 + * DLPack Export (__dlpack__ / __dlpack_device__)
 + *
@@ -414,8 +414,8 @@ index 4cefec0..b80aa2d 100644
 +++ b/python/tests/test_facade.py
 @@ -560,6 +560,126 @@ class TestPageSpanBuffers:
                      pass
- 
- 
+
+
 +# =============================================================================
 +# Category 8b: PageSpan DLPack export
 +# =============================================================================

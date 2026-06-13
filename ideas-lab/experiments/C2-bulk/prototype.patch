@@ -14,7 +14,7 @@ index e6a0ed4..de77ddd 100644
 @@ -1840,6 +1842,213 @@ error_stream:
      return NULL;
  }
- 
+
 +/*===========================================================================
 + * PyTimelog_bulk_append
 + *
@@ -228,7 +228,7 @@ index e6a0ed4..de77ddd 100644
 @@ -2850,6 +3058,16 @@ static PyMethodDef PyTimelog_methods[] = {
       "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
       "Note: TimelogBusyError means the records WERE committed; do not retry."},
- 
+
 +    {"bulk_append", (PyCFunction)PyTimelog_bulk_append,
 +     METH_VARARGS | METH_KEYWORDS,
 +     "bulk_append(timestamps, objects, *, mostly_ordered=False) -> None\n\n"

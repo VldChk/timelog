@@ -87,13 +87,13 @@ index 8d248e5..0bb604f 100644
  #include "timelogpy/py_handle.h"
  #include "timelogpy/py_timelog.h"
 +#include "timelogpy/arrow_c_data.h"
- 
+
  /*===========================================================================
   * Forward Declarations
 @@ -297,6 +298,310 @@ static void pagespan_releasebuffer(PyObject* exporter, Py_buffer* view)
      TL_PY_OBJ_UNLOCK();
  }
- 
+
 +/*===========================================================================
 + * Arrow C Data Interface (PyCapsule export)
 + *

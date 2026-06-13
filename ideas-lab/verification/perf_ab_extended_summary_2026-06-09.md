@@ -39,4 +39,3 @@ Median ratios (`baseline_ns / current_ns`):
 | `raw_until` | 540.850883 | 440.080208 | 1.23x |
 | `raw_delete_range` | 18059.635470 | 13289.338990 | 1.36x |
 | `raw_delete_before` | 109.713330 | 80.787490 | 1.36x |
-

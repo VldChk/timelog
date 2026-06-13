@@ -57,9 +57,9 @@ Alright, so we take your AUDIT_REPORT.md and implemented its first piece "Worth
   lint — all green
   - Perf A/B vs e7e7efb (identical harness, pinned core): every hot path faster, none slower
   (the point "slowdown" was a false alarm from a non-comparable prior harness — same-harness
-  A/B shows it 1.21× faster)""". 
-  
-  
+  A/B shows it 1.21× faster)""".
+
+
   It is a massive scale change. It
   impacts A LOT of places, a lot of commits, a huge chunk of changes. """That's the whole change: ~1,342 insertions across 21 files — roughly half production code
   (core search + bindings) and half new tests (test_append_contract, test_fastcall_methods,

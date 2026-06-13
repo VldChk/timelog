@@ -15,13 +15,13 @@ index e6a0ed4..c1990cf 100644
  typedef tl_status_t (*tl_py_core_call_fn)(tl_timelog_t*);
 @@ -1469,15 +1469,23 @@ PyTimelog_clear(PyTimelog* self)
   *===========================================================================*/
- 
+
  static PyObject*
 -PyTimelog_append(PyTimelog* self, PyObject* args)
 +PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
  {
      CHECK_CLOSED(self);
- 
+
 -    long long ts_ll;
 -    PyObject* obj;
 -    if (!PyArg_ParseTuple(args, "LO", &ts_ll, &obj)) {
@@ -38,18 +38,18 @@ index e6a0ed4..c1990cf 100644
 +        return NULL;
 +    }
 +    PyObject* obj = args[1];
- 
+
      /* Validate timestamp range */
      if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
 @@ -2206,12 +2214,17 @@ PyTimelog_max_ts(PyTimelog* self, PyObject* Py_UNUSED(args))
  }
- 
+
  static PyObject*
 -PyTimelog_next_ts(PyTimelog* self, PyObject* args)
 +PyTimelog_next_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
  {
      CHECK_CLOSED(self);
- 
+
 -    long long ts_ll;
 -    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
 +    if (nargs != 1) {
@@ -61,16 +61,16 @@ index e6a0ed4..c1990cf 100644
 +    if (ts_ll == -1 && PyErr_Occurred()) {
          return NULL;
      }
- 
+
 @@ -2241,12 +2254,17 @@ PyTimelog_next_ts(PyTimelog* self, PyObject* args)
  }
- 
+
  static PyObject*
 -PyTimelog_prev_ts(PyTimelog* self, PyObject* args)
 +PyTimelog_prev_ts(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
  {
      CHECK_CLOSED(self);
- 
+
 -    long long ts_ll;
 -    if (!PyArg_ParseTuple(args, "L", &ts_ll)) {
 +    if (nargs != 1) {
@@ -82,7 +82,7 @@ index e6a0ed4..c1990cf 100644
 +    if (ts_ll == -1 && PyErr_Occurred()) {
          return NULL;
      }
- 
+
 @@ -2678,11 +2696,15 @@ static PyObject* PyTimelog_equal(PyTimelog* self, PyObject* args)
   * Create an iterator for records at exact timestamp t.
   * Alias for equal() for semantic clarity in point queries.
@@ -102,10 +102,10 @@ index e6a0ed4..c1990cf 100644
 +    if (t == -1 && PyErr_Occurred()) {
          return NULL;
      }
- 
+
 @@ -2836,7 +2858,7 @@ static PyGetSetDef PyTimelog_getset[] = {
   *===========================================================================*/
- 
+
  static PyMethodDef PyTimelog_methods[] = {
 -    {"append", (PyCFunction)PyTimelog_append, METH_VARARGS,
 +    {"append", (PyCFunction)(void(*)(void))PyTimelog_append, METH_FASTCALL,
@@ -115,7 +115,7 @@ index e6a0ed4..c1990cf 100644
 @@ -2917,7 +2939,7 @@ static PyMethodDef PyTimelog_methods[] = {
       "equal(t) -> TimelogIter\n\n"
       "Return an iterator over records with ts == t."},
- 
+
 -    {"point", (PyCFunction)PyTimelog_point, METH_VARARGS,
 +    {"point", (PyCFunction)(void(*)(void))PyTimelog_point, METH_FASTCALL,
       "point(t) -> TimelogIter\n\n"
@@ -124,12 +124,12 @@ index e6a0ed4..c1990cf 100644
 @@ -2931,11 +2953,11 @@ static PyMethodDef PyTimelog_methods[] = {
       "Return maximum timestamp in snapshot, or None if empty.\n"
       "WARNING: O(N) complexity."},
- 
+
 -    {"next_ts", (PyCFunction)PyTimelog_next_ts, METH_VARARGS,
 +    {"next_ts", (PyCFunction)(void(*)(void))PyTimelog_next_ts, METH_FASTCALL,
       "next_ts(ts) -> int | None\n\n"
       "Return next timestamp strictly greater than ts, or None."},
- 
+
 -    {"prev_ts", (PyCFunction)PyTimelog_prev_ts, METH_VARARGS,
 +    {"prev_ts", (PyCFunction)(void(*)(void))PyTimelog_prev_ts, METH_FASTCALL,
       "prev_ts(ts) -> int | None\n\n"

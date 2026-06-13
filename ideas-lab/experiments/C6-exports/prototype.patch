@@ -5,7 +5,7 @@ index 5cead78..bab8711 100644
 @@ -338,6 +338,129 @@ class TestMutableObjectStateOverlap:
          finally:
              log.close()
- 
+
 +    @pytest.mark.timeout(180)
 +    def test_buffer_export_lifetime_high_contention(self, compat_runtime) -> None:
 +        """C6-exports: hammer the close()-vs-buffer-export race.
@@ -129,6 +129,6 @@ index 5cead78..bab8711 100644
 +                except Exception:  # noqa: BLE001
 +                    pass
 +
- 
+
  # ---------------------------------------------------------------------------
  # Drop/drain stress with reentrant __del__

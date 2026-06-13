@@ -4,13 +4,13 @@ index e6a0ed4..2dd0dc9 100644
 +++ b/bindings/cpython/src/py_timelog.c
 @@ -1469,15 +1469,23 @@ PyTimelog_clear(PyTimelog* self)
   *===========================================================================*/
- 
+
  static PyObject*
 -PyTimelog_append(PyTimelog* self, PyObject* args)
 +PyTimelog_append(PyTimelog* self, PyObject *const *args, Py_ssize_t nargs)
  {
      CHECK_CLOSED(self);
- 
+
 -    long long ts_ll;
 -    PyObject* obj;
 -    if (!PyArg_ParseTuple(args, "LO", &ts_ll, &obj)) {
@@ -27,12 +27,12 @@ index e6a0ed4..2dd0dc9 100644
          return NULL;
      }
 +    PyObject* obj = args[1];
- 
+
      /* Validate timestamp range */
      if (tl_py_validate_ts(ts_ll, "timestamp") < 0) {
 @@ -2836,7 +2844,7 @@ static PyGetSetDef PyTimelog_getset[] = {
   *===========================================================================*/
- 
+
  static PyMethodDef PyTimelog_methods[] = {
 -    {"append", (PyCFunction)PyTimelog_append, METH_VARARGS,
 +    {"append", (PyCFunction)(void(*)(void))PyTimelog_append, METH_FASTCALL,
