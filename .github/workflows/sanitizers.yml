@@ -192,11 +192,6 @@ jobs:
     name: thread-sanitizer-freethreaded (ubuntu-latest, 3.14t)
     runs-on: ubuntu-latest
     continue-on-error: true
-    env:
-      # log_path routes TSan reports to files (pytest's capture swallows the
-      # inline report). suppressions filters known CPython-internal BRC noise
-      # so only timelog-frame races surface.
-      TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0:suppressions=${{ github.workspace }}/.tsan-suppressions:log_path=${{ runner.temp }}/tsan-report"
 
     steps:
       - name: Checkout
@@ -244,6 +239,11 @@ jobs:
         shell: bash
         env:
           TIMELOG_SHORT_STRESS: "1"
+          # log_path routes TSan reports to files (pytest's capture swallows the
+          # inline report). suppressions filters known CPython-internal BRC noise
+          # so only timelog-frame races surface. runner.temp is only valid once a
+          # job is assigned to a runner, so keep this at step scope.
+          TSAN_OPTIONS: "halt_on_error=0:second_deadlock_stack=1:report_signal_unsafe=0:suppressions=${{ github.workspace }}/.tsan-suppressions:log_path=${{ runner.temp }}/tsan-report"
         run: |
           set +e
           # setarch -R disables ASLR: TSan otherwise fails with
