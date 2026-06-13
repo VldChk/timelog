@@ -260,6 +260,7 @@ def run_monitored(args, csv_path: str) -> dict:
             samples.append((tr, rb, tw.get("phase", "?"),
                             tw.get("tm_cur", 0), tw.get("tm_peak", 0)))
         except (FileNotFoundError, ProcessLookupError):
+            # The worker can exit between waitpid polling and /proc sampling.
             pass
 
         if dead:
