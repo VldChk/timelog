@@ -346,3 +346,16 @@ remains load-bearing.**
 4. **Test frameworks:** cmocka (2.0.2, Jan 2026, MSVC CI, no-fork, Apache-2.0) and utest.h (Unlicense, MSVC+ClangCL CI, no fork, auto-registration, but unversioned + AI-policy question) are the two live fits; munit is abandoned (frozen 2020, never 1.0), greatest dormant, Criterion structurally disqualified (mandatory fork/exec-per-test).
 5. **Interval sets & merge machinery:** nothing exists. All C interval libraries (cgranges/AIList/NCLS) are static build-once indexes with no insert/delete; no pure-C k-way-merge/LSM-component library exists (the closest artifact, SQLite lsm1, is disowned by its own authors). Tombstone interval set and `tl_submerge`/`tl_merge_iter` stay in-house by necessity, not preference.
 6. **CPython boilerplate & atomics shim:** both hand-rolled layers are validated as necessary — no pure-C binding helper exists (HPy is dormant/alpha/no-3.14t; pythoncapi-compat is a polyfill), and MSVC C11 atomics remain experimental through VS 2026 18.7 (June 2026), with CPython itself shipping an Interlocked shim.
+
+---
+
+## ERRATUM (added post-panel, 2026-07-07)
+
+The claim herein that MSVC defines `__STDC_NO_ATOMICS__` even with
+`/experimental:c11atomics` is **disproven for this project's shipping toolchain**:
+`bindings/cpython/src/py_handle.c:419-421` hard-`#error`s if `__STDC_NO_ATOMICS__`
+is defined, that guard existed at tags v1.0.0–v1.3.0, win_amd64 wheels shipped on
+PyPI for four releases, and the v1.3.0 release-pypi Windows job log (gh job
+81203935604) shows cl.exe (MSVC 19.51, VS 2026) compiling it clean with
+`/std:c17 /experimental:c11atomics`. The Dec-2022 MSVC blog statement is stale
+against observed VS 2026 behavior. See audit/panel-verdicts.md (V-atomics).
