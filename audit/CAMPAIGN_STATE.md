@@ -12,8 +12,10 @@ All findings must survive a hostile cross-review panel including Codex CLI.
 - [x] P1 Scope: branch created, inventory measured (core 21.8K + bindings 7.8K prod C; 26K test C; MIT license)
 - [x] P2 Module audits: 12 Claude auditors (112 findings, audit/modules/*.md + audit/fleet-summary.md) + 3 independent Codex audits (audit/codex/independent-*.md). Convergent verdict: zero library adoptions; debt is speculative completeness (dead code, unused knobs), not reinvention.
 - [x] P3 Prior-art research: audit/prior-art/landscape-facts.md (18 libraries fact-checked 2026-07-07). Key: MSVC C11 atomics STILL experimental in VS2026; liburcu LGPL; CK requires __GNUC__; liblfds/munit dead; no pure-C interval/LSM/CPython-helper lib exists.
-- [ ] P4 Hostile panel: RUNNING — workflow wf_e3656272-367 (10 cluster verifiers, REFUTE-by-default) + Codex cross-review (audit/codex/cross-review.md). Draft under test: audit/REPORT-draft.md (clusters A-G, ~4.4-5.2K LOC claimed).
-- [ ] P5 Synthesis: `audit/REPORT.md` ranked adopt / consider / no-and-no; commit to branch
+- [x] P4 Hostile panel: 10 cluster verifiers (audit/panel-verdicts.md: 30 CONFIRMED / 19 MODIFIED / 0 REFUTED, ~20 new hazards incl. real bugs) + Codex cross-review (audit/codex/cross-review.md: blocks C9/A7-major/D3-dep, endorses core). D1 adjudicated adopt-with-gates via v1.3.0 release-log evidence (landscape erratum appended).
+- [x] P5 Synthesis: **audit/REPORT.md** — final answers: (a) YES, ~3.1-3.4K prod LOC + ~1.6-1.8K infra LOC simplifiable at zero regression (2 changes perf-positive); (b) NO external library adoption, unanimously grounded. 7 by-product bugs/hazards to fix regardless. 9-step execution order.
+
+**CAMPAIGN COMPLETE 2026-07-07.**
 
 ## Adoption constraints (any library recommendation must pass ALL)
 
