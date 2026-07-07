@@ -10,9 +10,9 @@ All findings must survive a hostile cross-review panel including Codex CLI.
 ## Phases
 
 - [x] P1 Scope: branch created, inventory measured (core 21.8K + bindings 7.8K prod C; 26K test C; MIT license)
-- [ ] P2 Module audits: 12 parallel ponytail auditors → `audit/modules/*.md` + structured summaries
-- [ ] P3 Prior-art research: dedupe sub-problems → WebSearch agents per domain (license/MSVC/C17/perf fit)
-- [ ] P4 Hostile panel: adversarial refuters per finding (correctness/invariants, perf, dependency-cost lenses) + Codex CLI cross-review
+- [x] P2 Module audits: 12 Claude auditors (112 findings, audit/modules/*.md + audit/fleet-summary.md) + 3 independent Codex audits (audit/codex/independent-*.md). Convergent verdict: zero library adoptions; debt is speculative completeness (dead code, unused knobs), not reinvention.
+- [x] P3 Prior-art research: audit/prior-art/landscape-facts.md (18 libraries fact-checked 2026-07-07). Key: MSVC C11 atomics STILL experimental in VS2026; liburcu LGPL; CK requires __GNUC__; liblfds/munit dead; no pure-C interval/LSM/CPython-helper lib exists.
+- [ ] P4 Hostile panel: RUNNING — workflow wf_e3656272-367 (10 cluster verifiers, REFUTE-by-default) + Codex cross-review (audit/codex/cross-review.md). Draft under test: audit/REPORT-draft.md (clusters A-G, ~4.4-5.2K LOC claimed).
 - [ ] P5 Synthesis: `audit/REPORT.md` ranked adopt / consider / no-and-no; commit to branch
 
 ## Adoption constraints (any library recommendation must pass ALL)
