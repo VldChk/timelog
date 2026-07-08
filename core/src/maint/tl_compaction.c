@@ -5,6 +5,7 @@
 #include "../internal/tl_seqlock.h"
 #include "../internal/tl_heap.h"
 #include "../internal/tl_recvec.h"
+#include "../internal/tl_tombstone_utils.h"
 #include "../query/tl_segment_iter.h"
 #include "../query/tl_snapshot.h"
 #include "../storage/tl_window.h"
@@ -176,30 +177,6 @@ static void tl__validate_l1_non_overlap(const tl_manifest_t* m) {
  * Delete Debt Computation (Internal)
  *===========================================================================*/
 
-/** Union immutable tombstones into mutable accumulator via temp buffer. */
-static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
-                                         tl_intervals_imm_t add,
-                                         tl_alloc_ctx_t* alloc) {
-    if (add.len == 0) {
-        return TL_OK;
-    }
-
-    tl_intervals_t temp;
-    tl_intervals_init(&temp, alloc);
-
-    tl_status_t st = tl_intervals_union_imm(&temp,
-                                             tl_intervals_as_imm(accum),
-                                             add);
-    if (st != TL_OK) {
-        tl_intervals_destroy(&temp);
-        return st;
-    }
-
-    tl_intervals_destroy(accum);
-    *accum = temp;
-    return TL_OK;
-}
-
 /** Compute max delete debt ratio across all windows. */
 static double tl__compute_delete_debt(const tl_timelog_t* tl,
                                        const tl_manifest_t* m,
@@ -211,8 +188,8 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         const tl_segment_t* seg = tl_manifest_l0_get(m, i);
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            tl_status_t union_st = tl__tombs_union_into(&tombs, seg_tombs,
-                                                        (tl_alloc_ctx_t*)&tl->alloc);
+            tl_status_t union_st = tl_tombstones_add_intervals(&tombs, seg_tombs,
+                                                               TL_TS_MIN, 0, true);
             if (union_st != TL_OK) {
                 tl_intervals_destroy(&tombs);
                 return 1.0;
@@ -990,7 +967,8 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         const tl_segment_t* seg = ctx->input_l0[i];
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            st = tl__tombs_union_into(&ctx->tombs, seg_tombs, ctx->alloc);
+            st = tl_tombstones_add_intervals(&ctx->tombs, seg_tombs,
+                                             TL_TS_MIN, 0, true);
             if (st != TL_OK) return st;
         }
     }
@@ -1001,7 +979,8 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         const tl_segment_t* seg = ctx->input_l1[i];
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            st = tl__tombs_union_into(&ctx->tombs, seg_tombs, ctx->alloc);
+            st = tl_tombstones_add_intervals(&ctx->tombs, seg_tombs,
+                                             TL_TS_MIN, 0, true);
             if (st != TL_OK) return st;
         }
     }

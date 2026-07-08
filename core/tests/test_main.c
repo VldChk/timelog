@@ -163,6 +163,74 @@ static bool test_group_enabled(const char* groups, const char* name) {
     return false;
 }
 
+/* Registered group names. Keep in sync with the test_group_enabled()
+ * dispatch chain in main(); the guard below fails the run if TL_TEST_GROUPS
+ * names a group that no longer exists (prevents silent test skips in CI). */
+static const char* const k_test_groups[] = {
+    "internal_sync", "internal_data", "storage", "delta", "compaction",
+    "pagespan", "adaptive", "functional", "api_semantics",
+    "snapshot_lifetime", "invariants", "concurrency", "stress",
+};
+
+/* Validate TL_TEST_GROUPS: every requested name must match a registered
+ * group. Tokenization and comparison are identical to test_group_enabled().
+ * Returns 0 if groups is NULL/empty or all names match; otherwise prints
+ * the unmatched name(s) and returns nonzero. */
+static int test_groups_validate(const char* groups) {
+    if (groups == NULL || *groups == '\0') {
+        return 0;
+    }
+
+    int unmatched = 0;
+    int n_tokens = 0;
+    const char* p = groups;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        const char* end = p;
+        while (*end != '\0' && *end != ',') {
+            end++;
+        }
+
+        size_t len = (size_t)(end - p);
+        n_tokens++;
+        bool matched = false;
+        for (size_t i = 0;
+             i < sizeof(k_test_groups) / sizeof(k_test_groups[0]); i++) {
+            if (len == strlen(k_test_groups[i]) &&
+                strncmp(p, k_test_groups[i], len) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            fprintf(stderr,
+                    "ERROR: TL_TEST_GROUPS names unknown group '%.*s'\n",
+                    (int)len, p);
+            unmatched = 1;
+        }
+
+        p = end;
+    }
+
+    /* A non-empty value made only of separators would otherwise select
+     * nothing and "pass" with zero tests run — treat it as an error. */
+    if (n_tokens == 0) {
+        fprintf(stderr,
+                "ERROR: TL_TEST_GROUPS is set but names no groups: '%s'\n",
+                groups);
+        return 1;
+    }
+
+    return unmatched;
+}
+
 static bool test_name_enabled(const char* filter, const char* name) {
     if (filter == NULL || *filter == '\0') {
         return true;
@@ -256,6 +324,10 @@ int main(int argc, char* argv[]) {
 
     const char* groups = getenv("TL_TEST_GROUPS");
     g_test_filter = getenv("TL_TEST_FILTER");
+
+    if (test_groups_validate(groups) != 0) {
+        return 1;
+    }
 
     printf("Timelog Test Suite\n");
     printf("========================================\n\n");

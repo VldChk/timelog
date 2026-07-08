@@ -12,6 +12,7 @@
 #include "delta/tl_memrun.h"
 #include "delta/tl_flush.h"
 #include "storage/tl_manifest.h"
+#include "storage/tl_window.h"
 #include "query/tl_snapshot.h"
 #include "query/tl_plan.h"
 #include "query/tl_merge_iter.h"
@@ -79,17 +80,6 @@ const char* tl_strerror(tl_status_t s) {
 /*===========================================================================
  * Configuration Defaults
  *===========================================================================*/
-
-/** Default window size of one hour, expressed in the configured time unit. */
-static tl_ts_t default_window_size(tl_time_unit_t unit) {
-    switch (unit) {
-        case TL_TIME_S:  return TL_WINDOW_1H_S;
-        case TL_TIME_MS: return TL_WINDOW_1H_MS;
-        case TL_TIME_US: return TL_WINDOW_1H_US;
-        case TL_TIME_NS: return TL_WINDOW_1H_NS;
-        default:         return TL_WINDOW_1H_MS;
-    }
-}
 
 tl_status_t tl_config_init_defaults(tl_config_t* cfg) {
     if (cfg == NULL) {
@@ -190,7 +180,7 @@ static void normalize_config(tl_timelog_t* tl) {
 
     /* Derived defaults (depend on base config resolved above). */
     tl->effective_window_size = (cfg->window_size == 0)
-        ? default_window_size(cfg->time_unit) : cfg->window_size;
+        ? tl_window_default_size(cfg->time_unit) : cfg->window_size;
     tl->effective_ooo_budget = (cfg->ooo_budget_bytes == 0)
         ? cfg->memtable_max_bytes / 10 : cfg->ooo_budget_bytes;
 
@@ -979,16 +969,7 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
 
     if (seg == NULL) {
         flush_discard_memrun(tl, mr);
-        if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
-            for (size_t i = 0; i < dropped_len; i++) {
-                tl->config.on_drop_handle(tl->config.on_drop_ctx,
-                                          dropped[i].ts,
-                                          dropped[i].handle);
-            }
-        }
-        if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
+        tl__emit_drop_callbacks(tl, dropped, dropped_len);
         return TL_OK;
     }
 
@@ -999,15 +980,10 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
         st = flush_publish(tl, mr, seg);
         if (st != TL_EBUSY) {
             if (st == TL_OK) {
-                if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
-                    for (size_t i = 0; i < dropped_len; i++) {
-                        tl->config.on_drop_handle(tl->config.on_drop_ctx,
-                                                  dropped[i].ts,
-                                                  dropped[i].handle);
-                    }
-                }
-            }
-            if (dropped != NULL) {
+                tl__emit_drop_callbacks(tl, dropped, dropped_len);
+            } else if (dropped != NULL) {
+                /* Publish failed: records were never published, so no drop
+                 * callbacks by contract — free only. */
                 tl__free(&tl->alloc, dropped);
             }
             return st;
@@ -1015,7 +991,9 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     }
 
     /* Retries exhausted: discard the segment we built and surface EBUSY so
-     * the caller (or worker loop) can rebuild against a newer manifest. */
+     * the caller (or worker loop) can rebuild against a newer manifest.
+     * Free-only, NOT tl__emit_drop_callbacks: nothing was published, and
+     * on_drop_handle fires only after a successful manifest publish. */
     tl_segment_release(seg);
     if (dropped != NULL) {
         tl__free(&tl->alloc, dropped);

@@ -3344,7 +3344,8 @@ static PyMethodDef PyTimelog_methods[] = {
      "For sequences, uses a single batch append (all-or-nothing).\n"
      "For generators, uses chunked batches; records from completed chunks\n"
      "are committed even if a later chunk fails.\n"
-     "If mostly_ordered=True, provides a hint to optimize OOO handling.\n\n"
+     "mostly_ordered is accepted for compatibility and currently ignored;\n"
+     "sortedness is always verified, so the flag has no effect.\n\n"
      "Note: TimelogBusyError means the records WERE committed; do not retry."},
 
     {"bulk_append", (PyCFunction)(void(*)(void))PyTimelog_bulk_append,
@@ -3354,7 +3355,9 @@ static PyMethodDef PyTimelog_methods[] = {
      "timestamp buffer (numpy int64 array, array.array('q'), memoryview)\n"
      "and a parallel concrete sequence of payload objects.\n\n"
      "Single all-or-nothing batch append. mostly_ordered=None uses the\n"
-     "instance's mostly_ordered_default. Respects min_ts.\n\n"
+     "instance's mostly_ordered_default; the flag is accepted for\n"
+     "compatibility and currently ignored (sortedness is always verified).\n"
+     "Respects min_ts.\n\n"
      "Note: TimelogBusyError means the records WERE committed; do not retry."},
 
     {"delete_range", (PyCFunction)(void(*)(void))PyTimelog_delete_range, METH_FASTCALL,

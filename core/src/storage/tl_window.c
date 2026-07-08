@@ -13,6 +13,10 @@ tl_ts_t tl_window_default_size(tl_time_unit_t unit) {
     case TL_TIME_US: return TL_WINDOW_1H_US;
     case TL_TIME_NS: return TL_WINDOW_1H_NS;
     default:
+        /* Production-unreachable: tl_open's validate_config rejects any
+         * time_unit outside [TL_TIME_S, TL_TIME_NS] before normalize_config
+         * calls this. The 1H_S fallback contract is pinned by
+         * test_storage_internal.c. */
         return TL_WINDOW_1H_S;
     }
 }

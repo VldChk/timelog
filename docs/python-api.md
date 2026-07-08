@@ -55,6 +55,9 @@ Source of truth for Python behavior: `python/timelog/__init__.py`.
   the `min_ts` floor always aborts the whole batch with `ValueError`
   regardless of `insert_on_error` (floor violations are pre-validated, not
   skippable).
+- `mostly_ordered` (and the instance-level `mostly_ordered_default`) is
+  accepted for compatibility and currently ignored: the engine always
+  verifies sortedness itself, so the hint has no effect today.
 - `bulk_append(timestamps, objects)` is the typed-buffer fast path for bulk ingest:
   `timestamps` must be a contiguous 1-D native-endian int64 buffer (a NumPy `int64`
   array, `array.array("q")`, or a memoryview of either); `objects` must be a concrete
