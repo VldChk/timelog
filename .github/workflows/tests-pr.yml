@@ -46,12 +46,8 @@ jobs:
         shell: bash
         run: |
           set +e
-          python demo/ci/run_core_test_groups.py \
-            --build-dir build \
-            --config Release \
-            --ctest-regex '^timelog_tests$' \
-            --summary-json "${RUNNER_TEMP}/core-groups-summary-${{ runner.os }}-${{ matrix.python-version }}.json" \
-            --summary-md "${RUNNER_TEMP}/core-groups-summary-${{ runner.os }}-${{ matrix.python-version }}.md" \
+          ctest --test-dir build -C Release -L core_group -j 4 --output-on-failure --no-tests=error \
+            --output-junit "${RUNNER_TEMP}/core-groups-${{ runner.os }}-${{ matrix.python-version }}.xml" \
             2>&1 | tee "${RUNNER_TEMP}/core-groups-${{ runner.os }}-${{ matrix.python-version }}.log"
           exit_code=${PIPESTATUS[0]}
           exit $exit_code
@@ -61,7 +57,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$' \
+          ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$' --no-tests=error \
             2>&1 | tee "${RUNNER_TEMP}/ctest-bindings-${{ runner.os }}-${{ matrix.python-version }}.log"
           exit_code=${PIPESTATUS[0]}
           exit $exit_code
@@ -93,8 +89,7 @@ jobs:
         with:
           name: tests-pr-${{ runner.os }}-${{ matrix.python-version }}
           path: |
-            ${{ runner.temp }}/core-groups-summary-${{ runner.os }}-${{ matrix.python-version }}.json
-            ${{ runner.temp }}/core-groups-summary-${{ runner.os }}-${{ matrix.python-version }}.md
+            ${{ runner.temp }}/core-groups-${{ runner.os }}-${{ matrix.python-version }}.xml
             ${{ runner.temp }}/core-groups-${{ runner.os }}-${{ matrix.python-version }}.log
             ${{ runner.temp }}/ctest-bindings-${{ runner.os }}-${{ matrix.python-version }}.log
             ${{ runner.temp }}/pytest-facade-${{ runner.os }}-${{ matrix.python-version }}.log
@@ -105,34 +100,40 @@ jobs:
         shell: bash
         run: |
           python - <<'PY'
-          import json
           import os
+          import xml.etree.ElementTree as ET
           from pathlib import Path
 
-          summary = Path(
+          junit = Path(
               os.environ["RUNNER_TEMP"]
-          ) / "core-groups-summary-${{ runner.os }}-${{ matrix.python-version }}.json"
+          ) / "core-groups-${{ runner.os }}-${{ matrix.python-version }}.xml"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
               out.write("## Tests (PR)\n")
               out.write(f"- os: `${{ runner.os }}`\n")
               out.write(f"- python: `${{ matrix.python-version }}`\n")
-              if not summary.exists():
-                  out.write("- core groups summary: missing\n")
+              if not junit.exists():
+                  out.write("- core groups junit: missing\n")
               else:
                   try:
-                      payload = json.loads(summary.read_text(encoding="utf-8"))
-                  except Exception as exc:
-                      out.write(f"- core groups summary parse error: {exc}\n")
-                  else:
-                      out.write(f"- core groups result: `{payload.get('result')}`\n")
-                      out.write(
-                          f"- core groups passed/total: "
-                          f"`{payload.get('groups_passed')}/{payload.get('groups_total')}`\n"
-                      )
-                      failed_groups = [
-                          row["name"] for row in payload.get("groups", [])
-                          if row.get("status") != "pass"
+                      cases = ET.parse(junit).getroot().iter("testcase")
+                      rows = [
+                          (
+                              case.get("name", "?"),
+                              case.find("failure") is None
+                              and case.find("error") is None,
+                          )
+                          for case in cases
                       ]
+                  except Exception as exc:
+                      out.write(f"- core groups junit parse error: {exc}\n")
+                  else:
+                      passed = sum(1 for _, ok in rows if ok)
+                      result = "pass" if rows and passed == len(rows) else "fail"
+                      out.write(f"- core groups result: `{result}`\n")
+                      out.write(
+                          f"- core groups passed/total: `{passed}/{len(rows)}`\n"
+                      )
+                      failed_groups = [name for name, ok in rows if not ok]
                       out.write(
                           f"- failed core groups: "
                           f"`{', '.join(failed_groups) if failed_groups else 'none'}`\n"

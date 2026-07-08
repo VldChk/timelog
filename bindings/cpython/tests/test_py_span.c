@@ -6,8 +6,7 @@
  * Tests run with Python initialized on an attached Python thread state.
  */
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "py_test_harness.h"
 
 #include "timelogpy/py_timelog.h"
 #include "timelogpy/py_iter.h"
@@ -18,66 +17,6 @@
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-/*===========================================================================
- * Test Framework
- *===========================================================================*/
-
-static int tests_run = 0;
-static int tests_failed = 0;
-
-/*===========================================================================
- * Python Initialization Helper
- *===========================================================================*/
-
-static void tlpy_set_pythonhome(void)
-{
-#ifdef TIMELOG_PYTHON_EXECUTABLE
-    const char* existing = getenv("PYTHONHOME");
-    if (existing != NULL && existing[0] != '\0') {
-        return;
-    }
-
-    const char* exe = TIMELOG_PYTHON_EXECUTABLE;
-    size_t len = strlen(exe);
-    char* buf = (char*)malloc(len + 1);
-    if (buf == NULL) {
-        return;
-    }
-    memcpy(buf, exe, len + 1);
-
-    char* last_slash = strrchr(buf, '\\');
-    char* last_fwd = strrchr(buf, '/');
-    char* last = last_slash;
-    if (last_fwd != NULL && (last == NULL || last_fwd > last)) {
-        last = last_fwd;
-    }
-    if (last != NULL) {
-        *last = '\0';
-#ifdef _WIN32
-        _putenv_s("PYTHONHOME", buf);
-#else
-        setenv("PYTHONHOME", buf, 0);
-#endif
-    }
-    free(buf);
-#endif
-}
-
-static void tlpy_init_python(void)
-{
-    tlpy_set_pythonhome();
-    Py_Initialize();
-}
-
-static int tlpy_finalize_python(void)
-{
-    return Py_FinalizeEx();
-}
 
 static PyObject* test_module = NULL;
 static PyObject* test_timelog_type = NULL;
@@ -126,82 +65,6 @@ static void tlpy_clear_test_module(void)
     Py_CLEAR(test_timelog_type);
     Py_CLEAR(test_module);
 }
-
-#define TEST(name) \
-    static void test_##name(void); \
-    static void run_##name(void) { \
-        printf("  %s... ", #name); \
-        fflush(stdout); \
-        tests_run++; \
-        test_##name(); \
-        if (PyErr_Occurred()) { \
-            printf("FAIL (exception set)\n"); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        printf("PASS\n"); \
-    } \
-    static void test_##name(void)
-
-#define ASSERT(cond) \
-    do { \
-        if (!(cond)) { \
-            printf("FAIL\n    Assertion failed: %s\n    at %s:%d\n", \
-                   #cond, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_EQ(a, b) \
-    do { \
-        if ((a) != (b)) { \
-            printf("FAIL\n    Expected %s == %s\n    Got %lld != %lld\n    at %s:%d\n", \
-                   #a, #b, (long long)(a), (long long)(b), __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_NOT_NULL(ptr) \
-    do { \
-        if ((ptr) == NULL) { \
-            printf("FAIL\n    Expected %s != NULL\n    at %s:%d\n", \
-                   #ptr, __FILE__, __LINE__); \
-            if (PyErr_Occurred()) PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_NULL(ptr) \
-    do { \
-        if ((ptr) != NULL) { \
-            printf("FAIL\n    Expected %s == NULL\n    at %s:%d\n", \
-                   #ptr, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_EXCEPTION(exc_type) \
-    do { \
-        if (!PyErr_Occurred()) { \
-            printf("FAIL\n    Expected exception %s, none occurred\n    at %s:%d\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-        if (!PyErr_ExceptionMatches(exc_type)) { \
-            printf("FAIL\n    Expected exception %s, got different\n    at %s:%d\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        PyErr_Clear(); \
-    } while(0)
 
 /*===========================================================================
  * Helper: Create a PyTimelog instance with default config
@@ -1895,15 +1758,7 @@ int main(void)
     run_many_spans_no_leak();
     run_buffer_cycle_stress();
 
-    /* Summary */
-    printf("\n=================================\n");
-    printf("Tests run:    %d\n", tests_run);
-    printf("Tests passed: %d\n", tests_run - tests_failed);
-    printf("Tests failed: %d\n", tests_failed);
-    printf("=================================\n");
-
     tlpy_clear_test_module();
-    tlpy_finalize_python();
 
-    return tests_failed > 0 ? 1 : 0;
+    return tlpy_test_report();
 }

@@ -4,7 +4,7 @@ This repository includes a dedicated PR workflow at `.github/workflows/tests-pr.
 
 ## What It Runs
 
-1. Pure C core tests (`timelog_tests`) split by `TL_TEST_GROUPS`.
+1. Pure C core tests split by group via labeled CTest entries (`ctest -L core_group`), one `core_group_<name>` test per `TL_TEST_GROUPS` group.
 2. Production-source Layer A static regression check.
 3. C-level CPython binding tests via `ctest -R ^py_.*_tests$`.
 4. Python facade tests in `python/tests` via `pytest`.
@@ -52,7 +52,10 @@ Compatibility markers:
 
 ## Core Group List
 
-The grouped core run uses these 13 groups from `core/tests/test_main.c`:
+The grouped core run uses these 13 groups, registered as `core_group_<name>`
+CTest entries in the root `CMakeLists.txt` and defined by the `k_test_suites[]`
+table in `core/tests/test_main.c` (the binary rejects unknown group names, so
+list drift fails loudly):
 
 1. `internal_sync`
 2. `internal_data`
@@ -104,7 +107,7 @@ See `docs/pypi-release.md` for publish runbooks and OIDC setup.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIMELOG_BUILD_PYTHON=ON -DTIMELOG_BUILD_PY_TESTS=ON
 cmake --build build --target timelog_e2e_build -j 2
 python demo/ci/check_layer_a_static.py
-python demo/ci/run_core_test_groups.py --build-dir build --config Release --summary-json demo/benchmark_runs/core.local.json --summary-md demo/benchmark_runs/core.local.md
+ctest --test-dir build -C Release -L core_group -j 4 --output-on-failure
 ctest --test-dir build -C Release --output-on-failure -R '^py_.*_tests$'
 cmake -E env PYTHONPATH="$PWD/python" python -m pytest python/tests -q
 python -m unittest discover -s demo/tests -p "test_*.py" -v

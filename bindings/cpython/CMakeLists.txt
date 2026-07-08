@@ -204,347 +204,63 @@ if(TIMELOG_BUILD_PY_TESTS)
     endif()
 
     # =========================================================================
-    # Test: test_py_handle (Handle unit tests)
+    # Test Executables
     # =========================================================================
-    add_executable(test_py_handle
-        tests/test_py_handle.c
-        src/py_handle.c         # Handle implementation under test
-    )
 
-    target_include_directories(test_py_handle PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-    )
+    # One canonical way to declare an embedded-Python C test executable.
+    #   NO_CORE_LINK       link only against Python3 (black-box import tests)
+    #   OMIT_CORE_INCLUDES skip TIMELOG_ROOT/core/src (tests without internals)
+    function(timelog_add_py_test)
+        cmake_parse_arguments(arg
+            "NO_CORE_LINK;OMIT_CORE_INCLUDES" "NAME" "SOURCES;EXTRA_DEFS" ${ARGN})
 
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_handle PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+        add_executable(${arg_NAME} ${arg_SOURCES})
+
+        target_include_directories(${arg_NAME} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${Python3_INCLUDE_DIRS}
         )
-    endif()
+        if(NOT arg_OMIT_CORE_INCLUDES)
+            # Internal headers for B4 (tl_page.h, tl_segment.h, etc.)
+            target_include_directories(${arg_NAME} PRIVATE ${TIMELOG_ROOT}/core/src)
+        endif()
 
-    target_link_libraries(test_py_handle PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
+        if(Python3_EXECUTABLE)
+            target_compile_definitions(${arg_NAME} PRIVATE
+                TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
+            )
+        endif()
+        if(arg_EXTRA_DEFS)
+            target_compile_definitions(${arg_NAME} PRIVATE ${arg_EXTRA_DEFS})
+        endif()
 
-    timelog_copy_python_runtime(test_py_handle)
+        if(arg_NO_CORE_LINK)
+            target_link_libraries(${arg_NAME} PRIVATE ${Python3_LIBRARIES})
+        else()
+            target_link_libraries(${arg_NAME} PRIVATE timelog ${Python3_LIBRARIES})
+        endif()
 
-    if(MSVC)
-        target_compile_options(test_py_handle PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_handle PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
+        timelog_copy_python_runtime(${arg_NAME})
 
-    # =========================================================================
-    # Test: test_py_timelog (PyTimelog unit tests)
-    # =========================================================================
-    add_executable(test_py_timelog
-        tests/test_py_timelog.c
-        src/module.c            # Module definition helpers
-        src/py_handle.c         # Handle dependency
-        src/py_errors.c         # Error translation
-        src/py_timelog.c        # PyTimelog implementation under test
-        src/py_iter.c           # Iterator dependency (used by py_timelog.c)
-        src/py_span.c           # PageSpan dependency (used by py_timelog.c)
-        src/py_span_iter.c      # PageSpan dependency
-        src/py_span_objects.c   # PageSpan dependency
-    )
+        if(MSVC)
+            target_compile_options(${arg_NAME} PRIVATE
+                /W4
+                /WX-
+                /D_CRT_SECURE_NO_WARNINGS
+                /std:c17
+                /experimental:c11atomics
+            )
+        else()
+            target_compile_options(${arg_NAME} PRIVATE
+                -Wall -Wextra -Wpedantic
+                -Wno-unused-parameter
+            )
+        endif()
+    endfunction()
 
-    target_include_directories(test_py_timelog PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_timelog PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-    target_compile_definitions(test_py_timelog PRIVATE
-        TL_PY_MODULE_TEST_HOOKS
-    )
-
-    target_link_libraries(test_py_timelog PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_timelog)
-
-    if(MSVC)
-        target_compile_options(test_py_timelog PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_timelog PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_iter (Iterator unit tests)
-    # =========================================================================
-    add_executable(test_py_iter
-        tests/test_py_iter.c
-        src/module.c            # Module definition helpers
-        src/py_handle.c         # Handle dependency
-        src/py_errors.c         # Error translation
-        src/py_timelog.c        # PyTimelog dependency (factory methods)
-        src/py_iter.c           # Iterator implementation under test
-        src/py_span.c           # PageSpan dependency (used by py_timelog.c)
-        src/py_span_iter.c      # PageSpan dependency
-        src/py_span_objects.c   # PageSpan dependency
-    )
-
-    target_include_directories(test_py_iter PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_iter PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-    target_compile_definitions(test_py_iter PRIVATE
-        TL_PY_MODULE_TEST_HOOKS
-        TL_PY_ITER_TEST_HOOKS
-    )
-
-    target_link_libraries(test_py_iter PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_iter)
-
-    if(MSVC)
-        target_compile_options(test_py_iter PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_iter PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_span (PageSpan unit tests)
-    # =========================================================================
-    add_executable(test_py_span
-        tests/test_py_span.c
-        src/module.c            # Module definition helpers
-        src/py_handle.c         # Handle dependency
-        src/py_errors.c         # Error translation
-        src/py_timelog.c        # PyTimelog dependency (factory methods)
-        src/py_iter.c           # Iterator dependency
-        src/py_span.c           # PageSpan implementation under test
-        src/py_span_iter.c      # PageSpan iterator
-        src/py_span_objects.c   # PageSpan objects view
-    )
-
-    target_include_directories(test_py_span PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_span PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-    target_compile_definitions(test_py_span PRIVATE
-        TL_PY_MODULE_TEST_HOOKS
-    )
-
-    target_link_libraries(test_py_span PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_span)
-
-    if(MSVC)
-        target_compile_options(test_py_span PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_span PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_maint_b5 (Maintenance unit tests - Maintenance + Threading)
-    # =========================================================================
-    add_executable(test_py_maint_b5
-        tests/test_py_maint_b5.c
-        src/module.c            # Module definition helpers
-        src/py_handle.c         # Handle dependency
-        src/py_errors.c         # Error translation
-        src/py_timelog.c        # PyTimelog dependency (factory methods)
-        src/py_iter.c           # Iterator dependency
-        src/py_span.c           # PageSpan dependency
-        src/py_span_iter.c      # PageSpan dependency
-        src/py_span_objects.c   # PageSpan dependency
-    )
-
-    target_include_directories(test_py_maint_b5 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src     # Internal headers for B4
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_maint_b5 PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-    target_compile_definitions(test_py_maint_b5 PRIVATE
-        TL_PY_MODULE_TEST_HOOKS
-    )
-
-    target_link_libraries(test_py_maint_b5 PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_maint_b5)
-
-    if(MSVC)
-        target_compile_options(test_py_maint_b5 PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_maint_b5 PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_errors (Error Model unit tests - Error Model Subsystem)
-    # =========================================================================
-    add_executable(test_py_errors
-        tests/test_py_errors.c
-        src/module.c            # Module definition helpers
-        src/py_handle.c         # Handle dependency
-        src/py_errors.c         # Error translation (primary target)
-        src/py_timelog.c        # PyTimelog dependency (integration tests)
-        src/py_iter.c           # Iterator dependency (integration tests)
-        src/py_span.c           # PageSpan dependency
-        src/py_span_iter.c      # PageSpan dependency
-        src/py_span_objects.c   # PageSpan dependency
-    )
-
-    target_include_directories(test_py_errors PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src     # Internal headers
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_errors PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-
-    target_link_libraries(test_py_errors PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_errors)
-
-    if(MSVC)
-        target_compile_options(test_py_errors PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_errors PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_module (black-box module import tests)
-    # =========================================================================
-    add_executable(test_py_module
-        tests/test_py_module.c
-    )
-
-    target_include_directories(test_py_module PRIVATE
-        ${Python3_INCLUDE_DIRS}
-    )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_module PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-
-    target_link_libraries(test_py_module PRIVATE
-        ${Python3_LIBRARIES}
-    )
-
-    timelog_copy_python_runtime(test_py_module)
-
-    if(MSVC)
-        target_compile_options(test_py_module PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_module PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
-
-    # =========================================================================
-    # Test: test_py_module_exec (direct Py_mod_exec validation)
-    # =========================================================================
-    add_executable(test_py_module_exec
-        tests/test_py_module_exec.c
+    # Most test executables compile the full extension source set directly
+    # into the test binary (white-box testing of module internals).
+    set(_timelog_py_test_sources
         src/module.c
         src/py_handle.c
         src/py_errors.c
@@ -555,42 +271,38 @@ if(TIMELOG_BUILD_PY_TESTS)
         src/py_span_objects.c
     )
 
-    target_include_directories(test_py_module_exec PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${Python3_INCLUDE_DIRS}
-        ${TIMELOG_ROOT}/core/src
+    timelog_add_py_test(NAME test_py_handle
+        SOURCES tests/test_py_handle.c src/py_handle.c
+        OMIT_CORE_INCLUDES
     )
-
-    if(Python3_EXECUTABLE)
-        target_compile_definitions(test_py_module_exec PRIVATE
-            TIMELOG_PYTHON_EXECUTABLE=\"${Python3_EXECUTABLE}\"
-        )
-    endif()
-    target_compile_definitions(test_py_module_exec PRIVATE
-        TL_PY_MODULE_TEST_HOOKS
+    timelog_add_py_test(NAME test_py_timelog
+        SOURCES tests/test_py_timelog.c ${_timelog_py_test_sources}
+        EXTRA_DEFS TL_PY_MODULE_TEST_HOOKS
     )
-
-    target_link_libraries(test_py_module_exec PRIVATE
-        timelog
-        ${Python3_LIBRARIES}
+    timelog_add_py_test(NAME test_py_iter
+        SOURCES tests/test_py_iter.c ${_timelog_py_test_sources}
+        EXTRA_DEFS TL_PY_MODULE_TEST_HOOKS TL_PY_ITER_TEST_HOOKS
     )
-
-    timelog_copy_python_runtime(test_py_module_exec)
-
-    if(MSVC)
-        target_compile_options(test_py_module_exec PRIVATE
-            /W4
-            /WX-
-            /D_CRT_SECURE_NO_WARNINGS
-            /std:c17
-            /experimental:c11atomics
-        )
-    else()
-        target_compile_options(test_py_module_exec PRIVATE
-            -Wall -Wextra -Wpedantic
-            -Wno-unused-parameter
-        )
-    endif()
+    timelog_add_py_test(NAME test_py_span
+        SOURCES tests/test_py_span.c ${_timelog_py_test_sources}
+        EXTRA_DEFS TL_PY_MODULE_TEST_HOOKS
+    )
+    timelog_add_py_test(NAME test_py_maint_b5
+        SOURCES tests/test_py_maint_b5.c ${_timelog_py_test_sources}
+        EXTRA_DEFS TL_PY_MODULE_TEST_HOOKS
+    )
+    timelog_add_py_test(NAME test_py_errors
+        SOURCES tests/test_py_errors.c ${_timelog_py_test_sources}
+    )
+    timelog_add_py_test(NAME test_py_module
+        SOURCES tests/test_py_module.c
+        NO_CORE_LINK
+        OMIT_CORE_INCLUDES
+    )
+    timelog_add_py_test(NAME test_py_module_exec
+        SOURCES tests/test_py_module_exec.c ${_timelog_py_test_sources}
+        EXTRA_DEFS TL_PY_MODULE_TEST_HOOKS
+    )
 
     # =========================================================================
     # CTest Integration - Run all tests with 'ctest' command

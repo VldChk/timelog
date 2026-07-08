@@ -162,8 +162,7 @@ set(TIMELOG_SOURCES
     core/src/delta/tl_memview.c
     core/src/query/tl_snapshot.c
     core/src/query/tl_segment_iter.c
-    core/src/query/tl_memrun_iter.c
-    core/src/query/tl_active_iter.c
+    core/src/query/tl_delta_iter.c
     core/src/query/tl_iter_build.c
     core/src/query/tl_submerge.c
     core/src/query/tl_plan.c
@@ -268,6 +267,34 @@ if(TIMELOG_BUILD_CORE_TESTS)
     endif()
 
     add_test(NAME timelog_tests COMMAND test_timelog)
+
+    # Per-group CTest entries (CI runs `ctest -L core_group -j <n>`).
+    # Group names MUST match the k_test_suites[] table in
+    # core/tests/test_main.c; test_timelog exits nonzero when
+    # TL_TEST_GROUPS names an unknown group, so drift fails loudly.
+    set(TIMELOG_TEST_GROUPS
+        internal_sync internal_data storage delta compaction pagespan
+        adaptive functional api_semantics snapshot_lifetime invariants
+        concurrency stress
+    )
+    foreach(_tl_group IN LISTS TIMELOG_TEST_GROUPS)
+        add_test(NAME core_group_${_tl_group} COMMAND test_timelog)
+        set_tests_properties(core_group_${_tl_group} PROPERTIES
+            ENVIRONMENT "TL_TEST_GROUPS=${_tl_group}"
+            LABELS core_group
+            TIMEOUT 600
+        )
+    endforeach()
+
+    # Bidirectional drift guard: fails if this list and test_main.c's
+    # k_test_suites table ever disagree in either direction.
+    string(REPLACE ";" "," _tl_groups_csv "${TIMELOG_TEST_GROUPS}")
+    add_test(NAME core_group_sync COMMAND test_timelog)
+    set_tests_properties(core_group_sync PROPERTIES
+        ENVIRONMENT "TL_TEST_EXPECT_GROUPS=${_tl_groups_csv}"
+        LABELS core_group
+        TIMEOUT 60
+    )
 
     add_executable(bench_search_lower_bound EXCLUDE_FROM_ALL
         core/tests/bench_search_lower_bound.c
