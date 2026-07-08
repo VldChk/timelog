@@ -46,8 +46,12 @@ static void compute_tombstone_bounds(const tl_interval_t* tombstones, size_t n,
 static tl_status_t create_tombstones(tl_alloc_ctx_t* alloc,
                                       const tl_interval_t* src, size_t n,
                                       tl_tombstones_t** out) {
+    /* Explicitly NULL on every failure path so callers can hand a partially
+     * built segment to segment_destroy without relying on TL_NEW's calloc
+     * semantics for this field. */
+    *out = NULL;
+
     if (n == 0) {
-        *out = NULL;
         return TL_OK;
     }
 
@@ -105,8 +109,8 @@ static void segment_destroy(tl_segment_t* seg) {
 /*
  * Partition a sorted record stream into fixed-capacity pages and populate
  * the catalog. The capacity is computed from target_page_bytes; the final
- * page may be short. On any failure all pages built so far are destroyed so
- * the segment never observes a half-populated catalog.
+ * page may be short. On failure, pages already pushed stay in the catalog
+ * and are freed by the caller via segment_destroy().
  */
 static tl_status_t build_pages(tl_segment_t* seg,
                                 const tl_record_t* records, size_t record_count,
@@ -134,36 +138,42 @@ static tl_status_t build_pages(tl_segment_t* seg,
          * input stream is sorted within slices but not across them. */
         if (offset > 0) {
             if (records[offset - 1].ts > records[offset].ts) {
-                st = TL_EINVAL;
-                goto rollback;
+                return TL_EINVAL;
             }
         }
 
         tl_page_t* page = NULL;
         st = tl_page_build(alloc, &records[offset], chunk, &page);
         if (st != TL_OK) {
-            goto rollback;
+            return st;
         }
 
         st = tl_page_catalog_push(&seg->catalog, page);
         if (st != TL_OK) {
+            /* Not yet in the catalog, so segment_destroy() would miss it. */
             tl_page_destroy(page, alloc);
-            goto rollback;
+            return st;
         }
 
         offset += chunk;
     }
 
     return TL_OK;
+}
 
-rollback:
-    /* The catalog stores page pointers but does not own them. We have to
-     * free each page explicitly before the caller destroys the catalog. */
-    for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
-        tl_page_destroy(seg->catalog.pages[i].page, alloc);
+/* Populate seg->page_prefix_counts from the catalog (page_count > 0). */
+static tl_status_t build_prefix_counts(tl_segment_t* seg) {
+    size_t prefix_len = (size_t)seg->page_count + 1;
+    seg->page_prefix_counts = TL_NEW_ARRAY(seg->alloc, uint64_t, prefix_len);
+    if (seg->page_prefix_counts == NULL) {
+        return TL_ENOMEM;
     }
-    seg->catalog.n_pages = 0;
-    return st;
+    seg->page_prefix_counts[0] = 0;
+    for (uint32_t i = 0; i < seg->page_count; i++) {
+        seg->page_prefix_counts[i + 1] =
+            seg->page_prefix_counts[i] + seg->catalog.pages[i].count;
+    }
+    return TL_OK;
 }
 
 /*===========================================================================
@@ -202,33 +212,13 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     /* Tombstones must arrive canonical: sorted, non-overlapping, coalesced,
      * with seq <= applied_seq and at most one trailing unbounded interval.
      * Enforced in release builds because a violation here would corrupt
-     * read-path tombstone filtering. */
+     * read-path tombstone filtering. tl_intervals_arr_validate covers every
+     * canonical-form rule except the applied_seq cap. */
+    if (!tl_intervals_arr_validate(tombstones, tombstones_len)) {
+        return TL_EINVAL;
+    }
     for (size_t i = 0; i < tombstones_len; i++) {
-        const tl_interval_t* cur = &tombstones[i];
-        if (cur->max_seq == 0 || cur->max_seq > applied_seq) {
-            return TL_EINVAL;
-        }
-        if (!cur->end_unbounded && cur->end <= cur->start) {
-            return TL_EINVAL;
-        }
-        if (i > 0) {
-            const tl_interval_t* prev = &tombstones[i - 1];
-            if (cur->start < prev->start) {
-                return TL_EINVAL;
-            }
-            if (prev->end_unbounded) {
-                return TL_EINVAL;
-            }
-            if (!prev->end_unbounded && prev->end > cur->start) {
-                return TL_EINVAL;
-            }
-            if (!prev->end_unbounded &&
-                prev->end == cur->start &&
-                prev->max_seq == cur->max_seq) {
-                return TL_EINVAL;
-            }
-        }
-        if (cur->end_unbounded && i + 1 < tombstones_len) {
+        if (tombstones[i].max_seq > applied_seq) {
             return TL_EINVAL;
         }
     }
@@ -249,8 +239,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
 
     tl_status_t st = create_tombstones(alloc, tombstones, tombstones_len, &seg->tombstones);
     if (st != TL_OK) {
-        tl_page_catalog_destroy(&seg->catalog);
-        TL_FREE(alloc, seg);
+        segment_destroy(seg);
         return st;
     }
 
@@ -258,9 +247,7 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         TL_ASSERT(records != NULL);
         st = build_pages(seg, records, record_count, target_page_bytes);
         if (st != TL_OK) {
-            destroy_tombstones(seg->tombstones, alloc);
-            tl_page_catalog_destroy(&seg->catalog);
-            TL_FREE(alloc, seg);
+            segment_destroy(seg);
             return st;
         }
     }
@@ -269,21 +256,10 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
     seg->page_count = seg->catalog.n_pages;
 
     if (seg->page_count > 0) {
-        size_t prefix_len = (size_t)seg->page_count + 1;
-        seg->page_prefix_counts = TL_NEW_ARRAY(alloc, uint64_t, prefix_len);
-        if (seg->page_prefix_counts == NULL) {
-            destroy_tombstones(seg->tombstones, alloc);
-            for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
-                tl_page_destroy(seg->catalog.pages[i].page, alloc);
-            }
-            tl_page_catalog_destroy(&seg->catalog);
-            TL_FREE(alloc, seg);
-            return TL_ENOMEM;
-        }
-        seg->page_prefix_counts[0] = 0;
-        for (uint32_t i = 0; i < seg->page_count; i++) {
-            seg->page_prefix_counts[i + 1] =
-                seg->page_prefix_counts[i] + seg->catalog.pages[i].count;
+        st = build_prefix_counts(seg);
+        if (st != TL_OK) {
+            segment_destroy(seg);
+            return st;
         }
     }
 
@@ -366,8 +342,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
 
     tl_status_t st = build_pages(seg, records, record_count, target_page_bytes);
     if (st != TL_OK) {
-        tl_page_catalog_destroy(&seg->catalog);
-        TL_FREE(alloc, seg);
+        segment_destroy(seg);
         return st;
     }
 
@@ -375,20 +350,10 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->page_count = seg->catalog.n_pages;
 
     if (seg->page_count > 0) {
-        size_t prefix_len = (size_t)seg->page_count + 1;
-        seg->page_prefix_counts = TL_NEW_ARRAY(alloc, uint64_t, prefix_len);
-        if (seg->page_prefix_counts == NULL) {
-            for (uint32_t i = 0; i < seg->catalog.n_pages; i++) {
-                tl_page_destroy(seg->catalog.pages[i].page, alloc);
-            }
-            tl_page_catalog_destroy(&seg->catalog);
-            TL_FREE(alloc, seg);
-            return TL_ENOMEM;
-        }
-        seg->page_prefix_counts[0] = 0;
-        for (uint32_t i = 0; i < seg->page_count; i++) {
-            seg->page_prefix_counts[i + 1] =
-                seg->page_prefix_counts[i] + seg->catalog.pages[i].count;
+        st = build_prefix_counts(seg);
+        if (st != TL_OK) {
+            segment_destroy(seg);
+            return st;
         }
     }
 
@@ -448,8 +413,6 @@ void tl_segment_release(tl_segment_t* seg) {
  *===========================================================================*/
 
 #ifdef TL_DEBUG
-
-#include "../internal/tl_intervals.h"
 
 bool tl_segment_validate(const tl_segment_t* seg) {
     if (seg == NULL) {

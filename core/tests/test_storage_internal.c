@@ -28,6 +28,7 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 static tl_status_t test_segment_build_l0(tl_alloc_ctx_t* alloc,
                                           const tl_record_t* records,
@@ -242,11 +243,6 @@ TEST_DECLARE(storage_page_builder_single_page) {
     TEST_ASSERT_EQ(5, page->count);
     TEST_ASSERT_EQ(0, page->min_ts);
     TEST_ASSERT_EQ(40, page->max_ts);
-    /*
-     * Verify page is marked fully live.
-     * NOTE: TL_PAGE_FULLY_LIVE = 0, so we must use equality (not bitwise AND).
-     */
-    TEST_ASSERT_EQ(TL_PAGE_FULLY_LIVE, page->flags);
 
     tl_page_destroy(page, &alloc);
     tl__alloc_destroy(&alloc);
@@ -1657,6 +1653,124 @@ TEST_DECLARE(storage_segment_build_small_page_bytes_clamped) {
 }
 
 /*===========================================================================
+ * Segment Builder ENOMEM Fault Injection
+ *
+ * Sweeps the failing allocation across every allocation the builders make so
+ * each consolidated segment_destroy() cleanup path runs: tombstone alloc,
+ * partial page array, prefix-count alloc. Leak regressions surface under the
+ * ASan/LSan Debug build.
+ *===========================================================================*/
+
+typedef struct storage_fail_alloc_ctx {
+    size_t fail_after_n;   /* 1-based allocation index to fail; 0 = never */
+    size_t alloc_count;
+} storage_fail_alloc_ctx_t;
+
+static bool storage_fail_should_fail(storage_fail_alloc_ctx_t* ctx) {
+    ctx->alloc_count++;
+    return ctx->fail_after_n > 0 && ctx->alloc_count == ctx->fail_after_n;
+}
+
+static void* storage_fail_malloc(void* ctx, size_t size) {
+    storage_fail_alloc_ctx_t* fa = (storage_fail_alloc_ctx_t*)ctx;
+    return storage_fail_should_fail(fa) ? NULL : malloc(size);
+}
+
+static void* storage_fail_calloc(void* ctx, size_t count, size_t size) {
+    storage_fail_alloc_ctx_t* fa = (storage_fail_alloc_ctx_t*)ctx;
+    return storage_fail_should_fail(fa) ? NULL : calloc(count, size);
+}
+
+static void* storage_fail_realloc(void* ctx, void* ptr, size_t size) {
+    storage_fail_alloc_ctx_t* fa = (storage_fail_alloc_ctx_t*)ctx;
+    return storage_fail_should_fail(fa) ? NULL : realloc(ptr, size);
+}
+
+static void storage_fail_free(void* ctx, void* ptr) {
+    (void)ctx;
+    free(ptr);
+}
+
+TEST_DECLARE(storage_segment_build_l0_enomem_every_alloc_cleanup) {
+    tl_record_t records[TL_MIN_PAGE_ROWS * 3];
+    const size_t n = sizeof(records) / sizeof(records[0]);
+    for (size_t i = 0; i < n; i++) {
+        records[i].ts = (tl_ts_t)(i * 10);
+        records[i].handle = (tl_handle_t)(i + 1);
+    }
+    tl_interval_t tombs[2] = {
+        {5, 10, false, 1},
+        {20, 25, false, 1},
+    };
+
+    for (size_t fail_n = 1;; fail_n++) {
+        storage_fail_alloc_ctx_t fail_ctx = { .fail_after_n = fail_n };
+        tl_allocator_t user_alloc = {
+            .ctx = &fail_ctx,
+            .malloc_fn = storage_fail_malloc,
+            .calloc_fn = storage_fail_calloc,
+            .realloc_fn = storage_fail_realloc,
+            .free_fn = storage_fail_free,
+        };
+        tl_alloc_ctx_t alloc;
+        tl__alloc_init(&alloc, &user_alloc);
+
+        tl_segment_t* seg = NULL;
+        /* Tiny target_page_bytes forces multiple pages so the failure point
+         * sweeps through a partially built page array. */
+        tl_status_t st = tl_segment_build_l0(&alloc, records, n, tombs, 2,
+                                             1, 1, &seg);
+        if (st == TL_OK) {
+            /* fail_n exceeded the builder's total allocations: done. */
+            TEST_ASSERT(fail_ctx.alloc_count < fail_n);
+            TEST_ASSERT_NOT_NULL(seg);
+            tl_segment_release(seg);
+            tl__alloc_destroy(&alloc);
+            break;
+        }
+        TEST_ASSERT_STATUS(TL_ENOMEM, st);
+        TEST_ASSERT_NULL(seg);
+        tl__alloc_destroy(&alloc);
+    }
+}
+
+TEST_DECLARE(storage_segment_build_l1_enomem_every_alloc_cleanup) {
+    tl_record_t records[TL_MIN_PAGE_ROWS * 3];
+    const size_t n = sizeof(records) / sizeof(records[0]);
+    for (size_t i = 0; i < n; i++) {
+        records[i].ts = (tl_ts_t)(i * 10);
+        records[i].handle = (tl_handle_t)(i + 1);
+    }
+
+    for (size_t fail_n = 1;; fail_n++) {
+        storage_fail_alloc_ctx_t fail_ctx = { .fail_after_n = fail_n };
+        tl_allocator_t user_alloc = {
+            .ctx = &fail_ctx,
+            .malloc_fn = storage_fail_malloc,
+            .calloc_fn = storage_fail_calloc,
+            .realloc_fn = storage_fail_realloc,
+            .free_fn = storage_fail_free,
+        };
+        tl_alloc_ctx_t alloc;
+        tl__alloc_init(&alloc, &user_alloc);
+
+        tl_segment_t* seg = NULL;
+        tl_status_t st = tl_segment_build_l1(&alloc, records, n, 1,
+                                             0, 1000, false, 1, &seg);
+        if (st == TL_OK) {
+            TEST_ASSERT(fail_ctx.alloc_count < fail_n);
+            TEST_ASSERT_NOT_NULL(seg);
+            tl_segment_release(seg);
+            tl__alloc_destroy(&alloc);
+            break;
+        }
+        TEST_ASSERT_STATUS(TL_ENOMEM, st);
+        TEST_ASSERT_NULL(seg);
+        tl__alloc_destroy(&alloc);
+    }
+}
+
+/*===========================================================================
  * Debug Validation Tests (Internal API)
  *
  * These validation functions are only available in debug builds.
@@ -1854,6 +1968,8 @@ void run_storage_internal_tests(void) {
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_seq_contract);
     RUN_TEST(storage_segment_build_l0_invalid_tombstone_order_contract);
     RUN_TEST(storage_segment_build_small_page_bytes_clamped);
+    RUN_TEST(storage_segment_build_l0_enomem_every_alloc_cleanup);
+    RUN_TEST(storage_segment_build_l1_enomem_every_alloc_cleanup);
 
 #ifdef TL_DEBUG
     /* Debug validation tests (5 tests) */

@@ -711,11 +711,11 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
 }
 
 /*===========================================================================*/
-/* Debug Validation */
+/* Validation */
 /*===========================================================================*/
 
-#ifdef TL_DEBUG
-
+/* Compiled unconditionally (not just TL_DEBUG): tl_segment_build_l0 uses it
+ * for its release-mode canonical-form EINVAL contract (CLAUDE.md invariant #5). */
 bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len) {
     if (len == 0) {
         return true;
@@ -759,6 +759,8 @@ bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len) {
 
     return true;
 }
+
+#ifdef TL_DEBUG
 
 bool tl_intervals_validate(const tl_intervals_t* iv) {
     if (iv == NULL) {

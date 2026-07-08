@@ -13,17 +13,7 @@
  */
 static void init_page_bounds(tl_segment_iter_t* it) {
     const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
-    const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
-    const tl_page_t* page = meta->page;
-
-    /* Bitmask test (not equality) so future page flags do not
-     * accidentally suppress visibility. An empty range here causes the
-     * outer loop to advance to the next page. */
-    if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
-        it->row_idx = 0;
-        it->row_end = 0;
-        return;
-    }
+    const tl_page_t* page = tl_page_catalog_get(cat, it->page_idx)->page;
 
     /* Binary search for row boundaries within this page */
     it->row_idx = tl_page_lower_bound(page, it->t1);
@@ -118,39 +108,30 @@ tl_status_t tl_segment_iter_next(tl_segment_iter_t* it, tl_record_t* out) {
         return TL_EOF;
     }
 
-    for (;;) {
-        if (it->row_idx >= it->row_end) {
-            if (!advance_to_next_page(it)) {
-                it->done = true;
-                return TL_EOF;
-            }
+    if (it->row_idx >= it->row_end) {
+        if (!advance_to_next_page(it)) {
+            it->done = true;
+            return TL_EOF;
         }
-
-        const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
-        const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
-        const tl_page_t* page = meta->page;
-
-        /* Skip deleted rows on PARTIAL_DELETED pages */
-        if (tl_page_row_is_deleted(page, it->row_idx)) {
-            it->row_idx++;
-            continue;
-        }
-
-        tl_record_t rec;
-        tl_page_get_record(page, it->row_idx, &rec);
-        if (out != NULL) {
-            *out = rec;
-        }
-
-        it->row_idx++;
-        if (it->row_idx >= it->row_end) {
-            if (!advance_to_next_page(it)) {
-                it->done = true;
-            }
-        }
-
-        return TL_OK;
     }
+
+    const tl_page_catalog_t* cat = tl_segment_catalog(it->seg);
+    const tl_page_t* page = tl_page_catalog_get(cat, it->page_idx)->page;
+
+    tl_record_t rec;
+    tl_page_get_record(page, it->row_idx, &rec);
+    if (out != NULL) {
+        *out = rec;
+    }
+
+    it->row_idx++;
+    if (it->row_idx >= it->row_end) {
+        if (!advance_to_next_page(it)) {
+            it->done = true;
+        }
+    }
+
+    return TL_OK;
 }
 
 void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
@@ -193,30 +174,24 @@ void tl_segment_iter_seek(tl_segment_iter_t* it, tl_ts_t target) {
     }
 
     it->page_idx = new_page_idx;
-    const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
-    const tl_page_t* page = meta->page;
+    const tl_page_t* page = tl_page_catalog_get(cat, it->page_idx)->page;
 
-    if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
-        it->row_idx = 0;
-        it->row_end = 0;
+    size_t new_row_idx = tl_page_lower_bound(page, target);
+
+    /* Forward-only contract: when staying on the same page, the
+     * cursor must never move backwards even if the binary search
+     * resolves to an earlier row (callers may have already
+     * consumed records past lower_bound(target)). */
+    if (it->page_idx == old_page_idx && new_row_idx < old_row_idx) {
+        new_row_idx = old_row_idx;
+    }
+
+    it->row_idx = new_row_idx;
+
+    if (it->t2_unbounded) {
+        it->row_end = page->count;
     } else {
-        size_t new_row_idx = tl_page_lower_bound(page, target);
-
-        /* Forward-only contract: when staying on the same page, the
-         * cursor must never move backwards even if the binary search
-         * resolves to an earlier row (callers may have already
-         * consumed records past lower_bound(target)). */
-        if (it->page_idx == old_page_idx && new_row_idx < old_row_idx) {
-            new_row_idx = old_row_idx;
-        }
-
-        it->row_idx = new_row_idx;
-
-        if (it->t2_unbounded) {
-            it->row_end = page->count;
-        } else {
-            it->row_end = tl_page_lower_bound(page, it->t2);
-        }
+        it->row_end = tl_page_lower_bound(page, it->t2);
     }
 
     /* If this page has no rows in range, advance to next page */

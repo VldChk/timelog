@@ -110,11 +110,6 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
     /* Collect all matching records */
     tl_record_t rec;
     while (idx < page->count) {
-        if (tl_page_row_is_deleted(page, idx)) {
-            idx++;
-            continue;
-        }
-
         tl_page_get_record(page, idx, &rec);
         if (rec.ts != ts) {
             break;
@@ -165,13 +160,6 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
         /* Defensive: a page ending before ts should already have been
          * skipped by find_first_ge. */
         if (meta->max_ts < ts) {
-            page_idx++;
-            continue;
-        }
-
-        /* Use a bitmask test so adding future page flags does not
-         * silently change visibility. */
-        if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
             page_idx++;
             continue;
         }

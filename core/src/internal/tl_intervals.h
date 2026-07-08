@@ -249,10 +249,9 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
                                   tl_ts_t* out);
 
 /*---------------------------------------------------------------------------
- * Validation (Debug)
+ * Validation
  *---------------------------------------------------------------------------*/
 
-#ifdef TL_DEBUG
 /**
  * Verify the canonical-form invariants on a raw interval array. Shared by
  * segment and memview validators so they all enforce the same rules:
@@ -261,12 +260,17 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
  *   3. They are pairwise non-overlapping (prev->end <= cur->start).
  *   4. They are coalesced (prev->end != cur->start).
  *   5. No bounded interval follows an unbounded one.
+ *   6. Every interval carries a non-zero max_seq.
+ *
+ * Compiled in release builds too: tl_segment_build_l0 depends on it for the
+ * invariant-mandated canonical-form EINVAL contract.
  *
  * @param data May be NULL when len == 0.
  * @return true on a valid array, false on any invariant violation.
  */
 bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len);
 
+#ifdef TL_DEBUG
 /** Convenience wrapper that validates the array embedded in iv. */
 bool tl_intervals_validate(const tl_intervals_t* iv);
 #endif

@@ -1,4 +1,5 @@
 #include "tl_page.h"
+#include "../internal/tl_search.h"
 #include <string.h>  /* memcpy */
 
 /*===========================================================================
@@ -103,10 +104,6 @@ tl_status_t tl_page_build(tl_alloc_ctx_t* alloc,
     page->count = (uint32_t)count;
     page->min_ts = records[0].ts;
     page->max_ts = records[count - 1].ts;
-    page->flags = TL_PAGE_FULLY_LIVE;
-    page->row_del = NULL;
-    page->row_del_kind = TL_ROWDEL_NONE;
-    page->reserved = 0;
 
     *out = page;
     return TL_OK;
@@ -129,38 +126,7 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc) {
 
 size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target) {
     TL_ASSERT(page != NULL);
-
-    if (page->count == 0) {
-        return 0;
-    }
-
-    const tl_ts_t* ts = page->ts;
-    size_t n = page->count;
-
-    /* Branchless (cmov) for page-sized arrays; branchy fallback above the size
-     * gate. Identical result: first i in [0,n) with ts[i] >= target (else n). */
-    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
-        size_t base = 0;
-        size_t length = n;
-        while (length > 0) {
-            size_t half = length / 2;
-            base += (size_t)(ts[base + half] < target) * (length - half);
-            length = half;
-        }
-        return base;
-    }
-
-    size_t lo = 0;
-    size_t hi = n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (ts[mid] < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
+    return tl_ts_lower_bound(page->ts, page->count, target);
 }
 
 /*===========================================================================
@@ -189,22 +155,6 @@ bool tl_page_validate(const tl_page_t* page) {
         if (page->ts[i] < page->ts[i - 1]) {
             return false;
         }
-    }
-
-    /* FULLY_DELETED and PARTIAL_DELETED are mutually exclusive by design. */
-    uint32_t del_bits = page->flags & (TL_PAGE_FULLY_DELETED | TL_PAGE_PARTIAL_DELETED);
-    if (del_bits == (TL_PAGE_FULLY_DELETED | TL_PAGE_PARTIAL_DELETED)) {
-        return false;
-    }
-
-    /* The current builder only emits live pages; row-level delete metadata
-     * is reserved for a future format. */
-    if (page->flags != TL_PAGE_FULLY_LIVE) {
-        return false;
-    }
-
-    if (page->row_del != NULL) {
-        return false;
     }
 
     return true;
@@ -291,7 +241,6 @@ tl_status_t tl_page_catalog_push(tl_page_catalog_t* cat, tl_page_t* page) {
     meta->min_ts = page->min_ts;
     meta->max_ts = page->max_ts;
     meta->count = page->count;
-    meta->flags = page->flags;
     meta->page = page;
 
     cat->n_pages++;
@@ -390,9 +339,6 @@ bool tl_page_catalog_validate(const tl_page_catalog_t* cat) {
             return false;
         }
         if (m->count != m->page->count) {
-            return false;
-        }
-        if (m->flags != m->page->flags) {
             return false;
         }
 
