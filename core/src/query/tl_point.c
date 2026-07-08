@@ -272,6 +272,14 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
     return TL_OK;
 }
 
+/** One segment's tombstone skyline seq at ts; 0 if ts is out of bounds. */
+static tl_seq_t segment_tomb_seq_at(const tl_segment_t* seg, tl_ts_t ts) {
+    if (ts < seg->min_ts || ts > seg->max_ts) {
+        return 0;
+    }
+    return tl_intervals_imm_max_seq(tl_segment_tombstones_imm(seg), ts);
+}
+
 /**
  * Maximum tombstone seq covering `ts` across every source in the
  * snapshot. Bounds-prunes sources whose [min_ts, max_ts] excludes ts.
@@ -308,14 +316,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     }
 
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
-
-        if (ts < seg->min_ts || ts > seg->max_ts) {
-            continue;
-        }
-
-        tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        seq = segment_tomb_seq_at(tl_manifest_l0_get(manifest, i), ts);
         if (seq > max_seq) {
             max_seq = seq;
         }
@@ -324,14 +325,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     /* L1 segments are tombstone-free by invariant, but check
      * defensively to stay correct if that ever changes. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-
-        if (ts < seg->min_ts || ts > seg->max_ts) {
-            continue;
-        }
-
-        tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        seq = segment_tomb_seq_at(tl_manifest_l1_get(manifest, i), ts);
         if (seq > max_seq) {
             max_seq = seq;
         }

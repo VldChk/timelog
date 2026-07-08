@@ -5,8 +5,7 @@
 #include "../internal/tl_alloc.h"
 #include "tl_snapshot.h"
 #include "tl_segment_iter.h"
-#include "tl_memrun_iter.h"
-#include "tl_active_iter.h"
+#include "tl_delta_iter.h"
 
 /*===========================================================================
  * Query Plan
@@ -29,14 +28,14 @@
 /*---------------------------------------------------------------------------
  * Iterator Source Types
  *
- * Tagged-union envelope that lets the merge iterator drive segment,
- * memrun, and active-memview iterators through one polymorphic API.
+ * Tagged-union envelope that lets the merge iterator drive segment and
+ * delta (sealed memrun / active memview) iterators through one
+ * polymorphic API.
  *---------------------------------------------------------------------------*/
 
 typedef enum tl_iter_kind {
     TL_ITER_SEGMENT,    /* Segment iterator */
-    TL_ITER_MEMRUN,     /* Sealed memrun iterator */
-    TL_ITER_ACTIVE      /* Active memview iterator */
+    TL_ITER_DELTA       /* Delta iterator (sealed memrun or active memview) */
 } tl_iter_kind_t;
 
 typedef struct tl_iter_source {
@@ -44,8 +43,7 @@ typedef struct tl_iter_source {
 
     union {
         tl_segment_iter_t segment;
-        tl_memrun_iter_t  memrun;
-        tl_active_iter_t  active;
+        tl_delta_iter_t   delta;
     } iter;
 
     /* For priority in merge: newer sources have higher priority.
@@ -84,6 +82,12 @@ typedef struct tl_plan {
      * Intervals are COPIED into this array. */
     tl_interval_t*  tombstones;
     size_t          tomb_count;
+
+    /* True iff the active memview was added as a source (per-record
+     * watermarks). Set ONLY when the active source is actually added
+     * (an immediately-exhausted active memview is dropped and must not
+     * disable the merge iterator's skip-ahead optimization). */
+    bool            has_active_source;
 } tl_plan_t;
 
 /*===========================================================================

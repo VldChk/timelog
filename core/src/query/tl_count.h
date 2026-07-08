@@ -13,18 +13,16 @@
 /*===========================================================================
  * Count Helpers (Shared between tl_snapshot.c and tl_timelog.c)
  *
- * These provide O(S * T * log P) record counting without row-level scanning.
- * Two flavors:
- *   - Full-extent: counts all visible records in a source (for tl_stats)
- *   - Range-intersected: counts visible records in query/source overlap
- *     (for count API)
+ * These provide O(S * T * log P) record counting without row-level scanning,
+ * intersected with a query range [t1, t2) or [t1, +inf). Full-extent counts
+ * (tl_stats) use the same helpers with the unbounded range (TL_TS_MIN, 0, true).
  *
  * Tombstone deduction uses watermark-aware semantics:
  *   - tomb_seq > source_watermark    tombstone is newer, deduct records
  *   - tomb_seq <= source_watermark   already applied, skip tombstone
  *
  * Active buffers use per-record watermarks (seqs[]) since they lack a single
- * source-level watermark.
+ * source-level watermark; OOO runs use a run-level watermark.
  *===========================================================================*/
 
 /*---------------------------------------------------------------------------
@@ -142,98 +140,7 @@ TL_INLINE bool tl__memrun_record_bounds(const tl_memrun_t* mr,
 }
 
 /*---------------------------------------------------------------------------
- * Full-Extent Visible Counting (for tl_stats)
- *---------------------------------------------------------------------------*/
-
-/** Count visible records in a segment (full extent, tombstone-deducted). */
-TL_INLINE uint64_t tl__visible_records_in_segment(
-        const tl_segment_t* seg,
-        const tl_interval_t* tombs,
-        size_t tomb_count) {
-    if (!tl_segment_has_records(seg)) {
-        return 0;
-    }
-
-    tl_ts_t src_start = tl_segment_record_min_ts(seg);
-    tl_ts_t src_end = tl_segment_record_max_ts(seg);
-    bool src_end_unbounded = (src_end == TL_TS_MAX);
-    tl_ts_t src_end_exclusive = src_end_unbounded ? 0 : (src_end + 1);
-
-    uint64_t gross = src_end_unbounded
-        ? tl_count_records_in_segment_since(seg, src_start)
-        : tl_count_records_in_segment_range(seg, src_start, src_end_exclusive);
-
-    tl_seq_t watermark = tl_segment_applied_seq(seg);
-    for (size_t i = 0; i < tomb_count; i++) {
-        const tl_interval_t* f = &tombs[i];
-        if (f->max_seq <= watermark) {
-            continue;
-        }
-
-        tl_ts_t ov_lo = 0, ov_hi = 0;
-        bool ov_hi_unbounded = false;
-        if (!tl__range_overlap_half_open(src_start, src_end_exclusive, src_end_unbounded,
-                                         f->start, f->end, f->end_unbounded,
-                                         &ov_lo, &ov_hi, &ov_hi_unbounded)) {
-            continue;
-        }
-
-        uint64_t dec = ov_hi_unbounded
-            ? tl_count_records_in_segment_since(seg, ov_lo)
-            : tl_count_records_in_segment_range(seg, ov_lo, ov_hi);
-        TL_ASSERT(dec <= gross);
-        gross = (dec <= gross) ? (gross - dec) : 0;
-    }
-
-    return gross;
-}
-
-/** Count visible records in a memrun (full extent, tombstone-deducted). */
-TL_INLINE uint64_t tl__visible_records_in_memrun(
-        const tl_memrun_t* mr,
-        const tl_interval_t* tombs,
-        size_t tomb_count) {
-    tl_ts_t src_min = 0, src_max = 0;
-    if (!tl__memrun_record_bounds(mr, &src_min, &src_max)) {
-        return 0;
-    }
-
-    bool src_end_unbounded = (src_max == TL_TS_MAX);
-    tl_ts_t src_end_exclusive = src_end_unbounded ? 0 : (src_max + 1);
-
-    uint64_t gross = tl__count_records_in_memrun_range(mr,
-                                                        src_min,
-                                                        src_end_exclusive,
-                                                        src_end_unbounded);
-
-    tl_seq_t watermark = tl_memrun_applied_seq(mr);
-    for (size_t i = 0; i < tomb_count; i++) {
-        const tl_interval_t* f = &tombs[i];
-        if (f->max_seq <= watermark) {
-            continue;
-        }
-
-        tl_ts_t ov_lo = 0, ov_hi = 0;
-        bool ov_hi_unbounded = false;
-        if (!tl__range_overlap_half_open(src_min, src_end_exclusive, src_end_unbounded,
-                                         f->start, f->end, f->end_unbounded,
-                                         &ov_lo, &ov_hi, &ov_hi_unbounded)) {
-            continue;
-        }
-
-        uint64_t dec = tl__count_records_in_memrun_range(mr,
-                                                         ov_lo,
-                                                         ov_hi,
-                                                         ov_hi_unbounded);
-        TL_ASSERT(dec <= gross);
-        gross = (dec <= gross) ? (gross - dec) : 0;
-    }
-
-    return gross;
-}
-
-/*---------------------------------------------------------------------------
- * Range-Intersected Visible Counting (for count API)
+ * Range-Intersected Visible Counting (for count API and tl_stats)
  *---------------------------------------------------------------------------*/
 
 /**
@@ -366,7 +273,9 @@ TL_INLINE uint64_t tl__visible_records_in_memrun_range(
  * per-record checking.
  *
  * @param data      Sorted record array
- * @param seqs      Per-record watermark array (parallel to data)
+ * @param seqs      Per-record watermark array (parallel to data), or NULL
+ *                  to use the source-level watermark for every record
+ * @param watermark Source-level watermark; used only when seqs == NULL
  * @param len       Array length
  * @param t1        Range start (inclusive)
  * @param t2        Range end (exclusive); ignored if t2_unbounded
@@ -377,6 +286,7 @@ TL_INLINE uint64_t tl__visible_records_in_memrun_range(
 TL_INLINE uint64_t tl__count_visible_sorted_range(
         const tl_record_t* data,
         const tl_seq_t* seqs,
+        tl_seq_t watermark,
         size_t len,
         tl_ts_t t1,
         tl_ts_t t2,
@@ -404,7 +314,8 @@ TL_INLINE uint64_t tl__count_visible_sorted_range(
     uint64_t visible = 0;
     for (size_t i = lo; i < hi; i++) {
         tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&cur, data[i].ts);
-        if (tomb_seq == 0 || tomb_seq <= seqs[i]) {
+        tl_seq_t w = (seqs != NULL) ? seqs[i] : watermark;
+        if (tomb_seq == 0 || tomb_seq <= w) {
             visible++;
         }
     }
@@ -439,6 +350,7 @@ TL_INLINE uint64_t tl__count_active_visible_range(
     total += tl__count_visible_sorted_range(
         tl_memview_run_data(mv),
         tl_memview_run_seqs(mv),
+        0,
         tl_memview_run_len(mv),
         t1, t2, t2_unbounded,
         skyline);
@@ -449,47 +361,24 @@ TL_INLINE uint64_t tl__count_active_visible_range(
     total += tl__count_visible_sorted_range(
         tl_memview_ooo_head_data(mv),
         tl_memview_ooo_head_seqs(mv),
+        0,
         tl_memview_ooo_head_len(mv),
         t1, t2, t2_unbounded,
         skyline);
 
-    /* Active OOO runs (each run is individually sorted) */
+    /* Active OOO runs (each run is individually sorted). OOO runs have
+     * a run-level watermark instead of per-record seqs. */
     const tl_ooorunset_t* runset = tl_memview_ooo_runs(mv);
     if (runset != NULL) {
         for (size_t i = 0; i < tl_ooorunset_count(runset); i++) {
             const tl_ooorun_t* run = tl_ooorunset_run_at(runset, i);
-            if (tl_ooorun_len(run) == 0) {
-                continue;
-            }
-
-            /* OOO runs have a source-level watermark, not per-record seqs.
-             * Must check each record against tombstone cursor individually. */
-            tl_seq_t run_watermark = tl_ooorun_applied_seq(run);
-            const tl_record_t* rdata = tl_ooorun_records(run);
-            size_t rlen = tl_ooorun_len(run);
-
-            size_t lo = tl_record_lower_bound(rdata, rlen, t1);
-            size_t hi = t2_unbounded ? rlen
-                                     : tl_record_lower_bound(rdata, rlen, t2);
-            if (hi <= lo) {
-                continue;
-            }
-
-            if (skyline.len == 0) {
-                total += (uint64_t)(hi - lo);
-                continue;
-            }
-
-            /* Cursor-based per-record check using run-level watermark */
-            tl_intervals_cursor_t cur;
-            tl_intervals_cursor_init(&cur, skyline);
-
-            for (size_t j = lo; j < hi; j++) {
-                tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&cur, rdata[j].ts);
-                if (tomb_seq == 0 || tomb_seq <= run_watermark) {
-                    total++;
-                }
-            }
+            total += tl__count_visible_sorted_range(
+                tl_ooorun_records(run),
+                NULL,
+                tl_ooorun_applied_seq(run),
+                tl_ooorun_len(run),
+                t1, t2, t2_unbounded,
+                skyline);
         }
     }
 

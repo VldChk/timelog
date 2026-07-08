@@ -186,6 +186,20 @@ void tl_snapshot_release_internal(tl_snapshot_t* snap) {
  * Tombstone Collection
  *===========================================================================*/
 
+/** Add one segment's tombstones to `out` if they overlap the range. */
+static tl_status_t collect_segment_tombstones(const tl_segment_t* seg,
+                                              tl_intervals_t* out,
+                                              tl_ts_t t1, tl_ts_t t2,
+                                              bool t2_unbounded) {
+    if (!tl_segment_has_tombstones(seg) ||
+        !tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
+                           t1, t2, t2_unbounded)) {
+        return TL_OK;
+    }
+    return tl_tombstones_add_intervals(out, tl_segment_tombstones_imm(seg),
+                                       t1, t2, t2_unbounded);
+}
+
 tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
                                            tl_intervals_t* out,
                                            tl_ts_t t1, tl_ts_t t2,
@@ -225,39 +239,18 @@ tl_status_t tl_snapshot_collect_tombstones(const tl_snapshot_t* snap,
 
     /* L0 segment tombstones */
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
-
-        bool overlaps = false;
-        if (tl_segment_has_tombstones(seg)) {
-            overlaps = tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
-                                         t1, t2, t2_unbounded);
-        }
-        if (!overlaps) {
-            continue;
-        }
-
-        st = tl_tombstones_add_intervals(out, tl_segment_tombstones_imm(seg),
-                                         t1, t2, t2_unbounded);
+        st = collect_segment_tombstones(tl_manifest_l0_get(manifest, i),
+                                        out, t1, t2, t2_unbounded);
         if (st != TL_OK) {
             return st;
         }
     }
 
-    /* Defensive: include any L1 tombstones if present. */
+    /* Defensive: L1 segments are tombstone-free by invariant, but
+     * include any L1 tombstones to stay correct if that ever changes. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-
-        bool overlaps = false;
-        if (tl_segment_has_tombstones(seg)) {
-            overlaps = tl_range_overlaps(seg->tomb_min_ts, seg->tomb_max_ts,
-                                         t1, t2, t2_unbounded);
-        }
-        if (!overlaps) {
-            continue;
-        }
-
-        st = tl_tombstones_add_intervals(out, tl_segment_tombstones_imm(seg),
-                                         t1, t2, t2_unbounded);
+        st = collect_segment_tombstones(tl_manifest_l1_get(manifest, i),
+                                        out, t1, t2, t2_unbounded);
         if (st != TL_OK) {
             return st;
         }

@@ -91,23 +91,24 @@ static tl_status_t add_memrun_source(tl_plan_t* plan,
     }
 
     tl_iter_source_t* src = &plan->sources[plan->source_count];
-    src->kind = TL_ITER_MEMRUN;
+    src->kind = TL_ITER_DELTA;
     src->priority = priority;
     src->watermark = tl_memrun_applied_seq(mr);
 
-    tl_status_t init_st = tl_memrun_iter_init(&src->iter.memrun, mr,
-                                              plan->t1, plan->t2, plan->t2_unbounded,
-                                              plan->alloc);
+    tl_status_t init_st = tl_delta_iter_init_memrun(&src->iter.delta, mr,
+                                                    plan->t1, plan->t2,
+                                                    plan->t2_unbounded,
+                                                    plan->alloc);
     if (init_st != TL_OK) {
-        tl_memrun_iter_destroy(&src->iter.memrun);
+        tl_delta_iter_destroy(&src->iter.delta);
         return init_st;
     }
 
     /* Only add if not immediately exhausted */
-    if (!tl_memrun_iter_done(&src->iter.memrun)) {
+    if (!tl_delta_iter_done(&src->iter.delta)) {
         plan->source_count++;
     } else {
-        tl_memrun_iter_destroy(&src->iter.memrun);
+        tl_delta_iter_destroy(&src->iter.delta);
     }
 
     return TL_OK;
@@ -122,50 +123,30 @@ static tl_status_t add_active_source(tl_plan_t* plan,
     }
 
     tl_iter_source_t* src = &plan->sources[plan->source_count];
-    src->kind = TL_ITER_ACTIVE;
+    src->kind = TL_ITER_DELTA;
     src->priority = UINT32_MAX;  /* Active is always highest priority */
     src->watermark = 0;
 
-    tl_status_t init_st = tl_active_iter_init(&src->iter.active, mv,
-                                              plan->t1, plan->t2, plan->t2_unbounded,
-                                              plan->alloc);
+    tl_status_t init_st = tl_delta_iter_init_memview(&src->iter.delta, mv,
+                                                     plan->t1, plan->t2,
+                                                     plan->t2_unbounded,
+                                                     plan->alloc);
     if (init_st != TL_OK) {
-        tl_active_iter_destroy(&src->iter.active);
+        tl_delta_iter_destroy(&src->iter.delta);
         return init_st;
     }
 
-    /* Only add if not immediately exhausted */
-    if (!tl_active_iter_done(&src->iter.active)) {
+    /* Only add if not immediately exhausted. has_active_source is set
+     * ONLY here: an immediately-exhausted active memview must not
+     * disable the merge iterator's skip-ahead optimization. */
+    if (!tl_delta_iter_done(&src->iter.delta)) {
         plan->source_count++;
+        plan->has_active_source = true;
     } else {
-        tl_active_iter_destroy(&src->iter.active);
+        tl_delta_iter_destroy(&src->iter.delta);
     }
 
     return TL_OK;
-}
-
-static tl_status_t add_segment_tombstones(tl_intervals_t* accum,
-                                           const tl_segment_t* seg,
-                                           tl_ts_t t1, tl_ts_t t2,
-                                           bool t2_unbounded) {
-    tl_intervals_imm_t tombs = tl_segment_tombstones_imm(seg);
-    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
-}
-
-static tl_status_t add_memrun_tombstones(tl_intervals_t* accum,
-                                          const tl_memrun_t* mr,
-                                          tl_ts_t t1, tl_ts_t t2,
-                                          bool t2_unbounded) {
-    tl_intervals_imm_t tombs = tl_memrun_tombs_imm(mr);
-    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
-}
-
-static tl_status_t add_active_tombstones(tl_intervals_t* accum,
-                                          const tl_memview_t* mv,
-                                          tl_ts_t t1, tl_ts_t t2,
-                                          bool t2_unbounded) {
-    tl_intervals_imm_t tombs = tl_memview_tombs_imm(mv);
-    return tl_tombstones_add_intervals(accum, tombs, t1, t2, t2_unbounded);
 }
 
 /*===========================================================================
@@ -228,7 +209,8 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
 
         /* L1 segments are tombstone-free by invariant; collect
          * defensively to remain correct if that ever changes. */
-        st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
+        st = tl_tombstones_add_intervals(&tombs, tl_segment_tombstones_imm(seg),
+                                         t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -253,8 +235,20 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_source(plan, seg, seg->generation);
         if (st != TL_OK) goto fail;
 
-        st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
+        st = tl_tombstones_add_intervals(&tombs, tl_segment_tombstones_imm(seg),
+                                         t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
+    }
+
+    /* Memruns rank above any L0 segment by starting from one past the
+     * newest L0 generation, then ordering memruns among themselves by
+     * FIFO index. Loop-invariant: depends only on the manifest. */
+    uint32_t memrun_base_priority = 0;
+    if (tl_manifest_l0_count(manifest) > 0) {
+        uint32_t newest_gen = tl_manifest_l0_get(
+            manifest, tl_manifest_l0_count(manifest) - 1)->generation;
+        memrun_base_priority = (newest_gen == UINT32_MAX) ? UINT32_MAX
+                                                          : (newest_gen + 1);
     }
 
     /* Sealed memruns: held in FIFO order, so a higher index means a
@@ -272,31 +266,18 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             continue;
         }
 
-        /* Memruns rank above any L0 segment by starting from one past
-         * the newest L0 generation, then ordering memruns among
-         * themselves by FIFO index. */
-        uint32_t base_priority = 0;
-        if (tl_manifest_l0_count(manifest) > 0) {
-            uint32_t newest_gen = tl_manifest_l0_get(
-                manifest, tl_manifest_l0_count(manifest) - 1)->generation;
-            base_priority = (newest_gen == UINT32_MAX) ? UINT32_MAX : (newest_gen + 1);
-        }
-
         /* Saturating addition keeps relative ordering correct even at
          * the extreme upper end of the priority space. */
-        uint32_t priority;
-        if (i > UINT32_MAX) {
-            priority = UINT32_MAX;
-        } else if (base_priority > UINT32_MAX - (uint32_t)i) {
-            priority = UINT32_MAX;
-        } else {
-            priority = base_priority + (uint32_t)i;
-        }
+        uint32_t priority =
+            (memrun_base_priority > UINT32_MAX - (uint32_t)i)
+                ? UINT32_MAX
+                : (memrun_base_priority + (uint32_t)i);
 
         st = add_memrun_source(plan, mr, priority);
         if (st != TL_OK) goto fail;
 
-        st = add_memrun_tombstones(&tombs, mr, t1, t2, t2_unbounded);
+        st = tl_tombstones_add_intervals(&tombs, tl_memrun_tombs_imm(mr),
+                                         t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -310,7 +291,8 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
             if (st != TL_OK) goto fail;
         }
 
-        st = add_active_tombstones(&tombs, mv, t1, t2, t2_unbounded);
+        st = tl_tombstones_add_intervals(&tombs, tl_memview_tombs_imm(mv),
+                                         t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
 
@@ -344,10 +326,8 @@ void tl_plan_destroy(tl_plan_t* plan) {
     if (plan->sources != NULL) {
         for (size_t i = 0; i < plan->source_count; i++) {
             tl_iter_source_t* src = &plan->sources[i];
-            if (src->kind == TL_ITER_ACTIVE) {
-                tl_active_iter_destroy(&src->iter.active);
-            } else if (src->kind == TL_ITER_MEMRUN) {
-                tl_memrun_iter_destroy(&src->iter.memrun);
+            if (src->kind == TL_ITER_DELTA) {
+                tl_delta_iter_destroy(&src->iter.delta);
             }
         }
         tl__free(plan->alloc, plan->sources);
@@ -355,6 +335,7 @@ void tl_plan_destroy(tl_plan_t* plan) {
     }
     plan->source_count = 0;
     plan->source_capacity = 0;
+    plan->has_active_source = false;
 
     if (plan->tombstones != NULL) {
         tl__free(plan->alloc, plan->tombstones);

@@ -27,8 +27,7 @@
 #include "tl_merge_iter.h"
 #include "tl_flush.h"
 #include "internal/tl_records.h"
-#include "query/tl_active_iter.h"
-#include "query/tl_memrun_iter.h"
+#include "query/tl_delta_iter.h"  /* tl_delta_iter (C1) */
 
 #include <string.h>
 #include <stdint.h>
@@ -1839,23 +1838,23 @@ TEST_DECLARE(delta_memrun_iter_merges_run_and_runs) {
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 2, ooo_runs, NULL, 0, &mr));
 
-    tl_memrun_iter_t it;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
+    tl_delta_iter_t it;
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_init_memrun(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
     TEST_ASSERT_EQ(2, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
     TEST_ASSERT_EQ(99, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(30, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_EOF, tl_delta_iter_next(&it, &rec, NULL));
 
-    tl_memrun_iter_destroy(&it);
+    tl_delta_iter_destroy(&it);
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -1897,21 +1896,21 @@ TEST_DECLARE(delta_memrun_iter_merges_multiple_runs) {
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, run, 1, ooo_runs, NULL, 0, &mr));
 
-    tl_memrun_iter_t it;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
+    tl_delta_iter_t it;
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_init_memrun(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(5, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(15, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(20, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_EOF, tl_delta_iter_next(&it, &rec, NULL));
 
-    tl_memrun_iter_destroy(&it);
+    tl_delta_iter_destroy(&it);
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -1943,19 +1942,19 @@ TEST_DECLARE(delta_memrun_iter_generation_tie_break) {
     tl_memrun_t* mr = NULL;
     TEST_ASSERT_STATUS(TL_OK, tl_memrun_create(&alloc, NULL, 0, ooo_runs, NULL, 0, &mr));
 
-    tl_memrun_iter_t it;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&it, mr, 0, 100, false, &alloc));
+    tl_delta_iter_t it;
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_init_memrun(&it, mr, 0, 100, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
     TEST_ASSERT_EQ(1, rec.handle);
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(10, rec.ts);
     TEST_ASSERT_EQ(2, rec.handle);
-    TEST_ASSERT_STATUS(TL_EOF, tl_memrun_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_EOF, tl_delta_iter_next(&it, &rec, NULL));
 
-    tl_memrun_iter_destroy(&it);
+    tl_delta_iter_destroy(&it);
     tl_memrun_release(mr);
     tl__alloc_destroy(&alloc);
 }
@@ -1985,23 +1984,23 @@ TEST_DECLARE(delta_active_iter_merges_run_head_runs) {
     TEST_ASSERT_STATUS(TL_OK, tl_memview_capture(&mv, &mt, &mu, &alloc));
     tl_memview_sort_head(&mv);
 
-    tl_active_iter_t it;
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_init(&it, &mv, 0, 200, false, &alloc));
+    tl_delta_iter_t it;
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_init_memview(&it, &mv, 0, 200, false, &alloc));
 
     tl_record_t rec;
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(30, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(50, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(60, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(80, rec.ts);
-    TEST_ASSERT_STATUS(TL_OK, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_next(&it, &rec, NULL));
     TEST_ASSERT_EQ(100, rec.ts);
-    TEST_ASSERT_STATUS(TL_EOF, tl_active_iter_next(&it, &rec, NULL));
+    TEST_ASSERT_STATUS(TL_EOF, tl_delta_iter_next(&it, &rec, NULL));
 
-    tl_active_iter_destroy(&it);
+    tl_delta_iter_destroy(&it);
     tl_memview_destroy(&mv);
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
@@ -2037,10 +2036,11 @@ TEST_DECLARE(delta_kmerge_iter_propagates_source_error) {
     TEST_ASSERT_NOT_NULL(plan.sources);
 
     tl_iter_source_t* src = &plan.sources[0];
-    src->kind = TL_ITER_MEMRUN;
+    src->kind = TL_ITER_DELTA;
     src->priority = 0;
-    TEST_ASSERT_STATUS(TL_OK, tl_memrun_iter_init(&src->iter.memrun,
-                                                  mr, 0, 100, false, &alloc));
+    src->watermark = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_delta_iter_init_memrun(&src->iter.delta,
+                                                      mr, 0, 100, false, &alloc));
 
     tl_kmerge_iter_t it;
     TEST_ASSERT_STATUS(TL_OK, tl_kmerge_iter_init(&it, &plan, &alloc));
@@ -2051,7 +2051,7 @@ TEST_DECLARE(delta_kmerge_iter_propagates_source_error) {
     TEST_ASSERT(tl_kmerge_iter_done(&it));
 
     tl_kmerge_iter_destroy(&it);
-    tl_memrun_iter_destroy(&src->iter.memrun);
+    tl_delta_iter_destroy(&src->iter.delta);
     tl_memrun_release(mr);
     TL_FREE(&alloc, plan.sources);
     tl__alloc_destroy(&alloc);

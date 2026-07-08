@@ -19,7 +19,6 @@
 #include "query/tl_filter.h"
 #include "query/tl_point.h"
 #include "query/tl_segment_range.h"
-#include "query/tl_count.h"
 #include "maint/tl_compaction.h"
 #include "maint/tl_adaptive.h"
 
@@ -2018,64 +2017,28 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
     out->segments_l0 = tl_manifest_l0_count(manifest);
     out->segments_l1 = tl_manifest_l1_count(manifest);
 
-    /* Count pages and tombstone-visible records without scanning rows:
-     * each segment carries enough metadata for an O(pages + tombstones)
-     * estimate, which is good enough for diagnostic stats. */
+    /* Count pages without scanning rows. */
     uint64_t total_pages = 0;
-    uint64_t immutable_visible_records = 0;
-
-    tl_intervals_t skyline;
-    tl_intervals_init(&skyline, snap->alloc);
-    tl_status_t skyline_st = tl_snapshot_collect_tombstones(snap,
-                                                            &skyline,
-                                                            TL_TS_MIN,
-                                                            0,
-                                                            true);
-    if (skyline_st != TL_OK) {
-        tl_intervals_destroy(&skyline);
-        return skyline_st;
-    }
-
-    tl_intervals_imm_t skyline_imm = tl_intervals_as_imm(&skyline);
-    const tl_interval_t* skyline_data = skyline_imm.data;
-    size_t skyline_len = skyline_imm.len;
-
     for (uint32_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
-        total_pages += seg->page_count;
-        immutable_visible_records += tl__visible_records_in_segment(seg,
-                                                                    skyline_data,
-                                                                    skyline_len);
+        total_pages += tl_manifest_l0_get(manifest, i)->page_count;
     }
-
     for (uint32_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-        total_pages += seg->page_count;
-        immutable_visible_records += tl__visible_records_in_segment(seg,
-                                                                    skyline_data,
-                                                                    skyline_len);
+        total_pages += tl_manifest_l1_get(manifest, i)->page_count;
     }
-
     out->pages_total = total_pages;
 
-    uint64_t total_records = immutable_visible_records;
-
-    /* The active and OOO buffers are mutable, so we must filter record by
-     * record against the live tombstone skyline. */
-    total_records += tl__count_active_visible_range(memview, skyline_imm,
-                                                     TL_TS_MIN, 0, true);
-
-    /* Sealed memruns are immutable; the watermark-aware counter can short
-     * circuit using their precomputed page bounds. */
-    for (size_t i = 0; i < tl_memview_sealed_len(memview); i++) {
-        const tl_memrun_t* mr = tl_memview_sealed_get(memview, i);
-        total_records += tl__visible_records_in_memrun(mr,
-                                                        skyline_data,
-                                                        skyline_len);
+    /* Tombstone-visible record estimate: identical to the unbounded
+     * count query — the full-extent counting helpers were the range
+     * variants specialized to [TL_TS_MIN, +inf) (B5). Iterating the
+     * manifest again is fine on this cold diagnostics path. */
+    tl_status_t count_st = tl_snapshot_count_range_internal(snap,
+                                                            TL_TS_MIN,
+                                                            0,
+                                                            true,
+                                                            &out->records_estimate);
+    if (count_st != TL_OK) {
+        return count_st;
     }
-
-    out->records_estimate = total_records;
-    tl_intervals_destroy(&skyline);
 
     /* Reports the raw, pre-tombstone min/max stored on the snapshot. For
      * the bounds of currently-visible records call tl_min_ts/tl_max_ts. */
