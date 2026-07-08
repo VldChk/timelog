@@ -84,11 +84,6 @@ typedef struct tl_plan {
      * Intervals are COPIED into this array. */
     tl_interval_t*  tombstones;
     size_t          tomb_count;
-    size_t          tomb_capacity;
-
-    /* Plan statistics */
-    size_t          segments_pruned;
-    size_t          memruns_pruned;
 } tl_plan_t;
 
 /*===========================================================================

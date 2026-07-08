@@ -93,10 +93,6 @@ TL_INLINE tl_ts_t tl_ooorun_max_ts(const tl_ooorun_t* run) {
     return run->max_ts;
 }
 
-TL_INLINE uint64_t tl_ooorun_gen(const tl_ooorun_t* run) {
-    return run->gen;
-}
-
 TL_INLINE tl_seq_t tl_ooorun_applied_seq(const tl_ooorun_t* run) {
     return run->applied_seq;
 }

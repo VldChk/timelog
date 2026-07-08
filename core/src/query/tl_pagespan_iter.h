@@ -115,17 +115,21 @@ enum {
     TL_PAGESPAN_SEGMENTS_ONLY    = 1u << 0,  /**< Ignore memview/memtable */
     TL_PAGESPAN_INCLUDE_L0       = 1u << 1,  /**< Include L0 segments */
     TL_PAGESPAN_INCLUDE_L1       = 1u << 2,  /**< Include L1 segments */
-    TL_PAGESPAN_VISIBLE_ONLY     = 1u << 3,  /**< Reserved; returns EINVAL */
-    TL_PAGESPAN_REQUIRE_ZEROCOPY = 1u << 4   /**< Must not allocate staging */
+    TL_PAGESPAN_VISIBLE_ONLY     = 1u << 3   /**< Reserved; returns EINVAL */
 };
 
 /**
- * Default flag set: segments only, include both L0 and L1, require
- * zero-copy.
+ * Default flag set: segments only, include both L0 and L1.
+ *
+ * NOTE: the never-read TL_PAGESPAN_REQUIRE_ZEROCOPY bit (1u << 4) was
+ * removed, so DEFAULT's numeric value shifted. Safe today: this is an
+ * internal compile-time symbol and pagespan_open rejects only
+ * VISIBLE_ONLY; any future strict unknown-bit validation must account
+ * for callers compiled with the old bit 4.
  */
 #define TL_PAGESPAN_DEFAULT \
     (TL_PAGESPAN_SEGMENTS_ONLY | TL_PAGESPAN_INCLUDE_L0 | \
-     TL_PAGESPAN_INCLUDE_L1 | TL_PAGESPAN_REQUIRE_ZEROCOPY)
+     TL_PAGESPAN_INCLUDE_L1)
 
 /*===========================================================================
  * Iterator API

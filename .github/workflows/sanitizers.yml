@@ -36,7 +36,6 @@ jobs:
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-asan --target timelog_e2e_build --config Debug -j 2
@@ -146,7 +145,6 @@ jobs:
           -DTIMELOG_SANITIZER=thread
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-tsan --target timelog_e2e_build --config Debug -j 2
@@ -227,7 +225,6 @@ jobs:
           -DTIMELOG_SANITIZER=thread
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-tsan-ft --target timelog_e2e_build --config RelWithDebInfo -j 2

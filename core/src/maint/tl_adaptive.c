@@ -227,7 +227,7 @@ void tl_adaptive_update_density(tl_adaptive_state_t* state,
     state->flush_count++;
 
     /* Skip if no records */
-    if (!metrics->has_records || metrics->record_count == 0) {
+    if (metrics->record_count == 0) {
         return;
     }
 
@@ -382,27 +382,4 @@ void tl_adaptive_record_failure(tl_adaptive_state_t* state) {
     if (state->consecutive_failures < UINT32_MAX) {
         state->consecutive_failures++;
     }
-}
-
-/*===========================================================================
- * Advisory Resize Query
- *
- * Hint for the scheduler: "is a resize potentially worthwhile right now?".
- * Adaptive state is protected by maint_mu. This helper is advisory, but it
- * still takes the lock so the no-GIL build has no production C data races.
- *===========================================================================*/
-
-bool tl_adaptive_wants_resize(const tl_timelog_t* tl) {
-    TL_ASSERT(tl != NULL);
-
-    if (tl->config.adaptive.target_records == 0) {
-        return false;
-    }
-
-    tl_timelog_t* tl_mut = (tl_timelog_t*)tl;
-    tl_mutex_lock(&tl_mut->maint_mu);
-    bool wants = !tl_mut->window_grid_frozen &&
-        tl_mut->adaptive.flush_count >= tl_mut->config.adaptive.warmup_flushes;
-    tl_mutex_unlock(&tl_mut->maint_mu);
-    return wants;
 }

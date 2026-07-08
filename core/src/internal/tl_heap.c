@@ -1,5 +1,4 @@
 #include "tl_heap.h"
-#include <string.h>
 
 /*===========================================================================
  * Internal Helpers
@@ -183,37 +182,6 @@ const tl_heap_entry_t* tl_heap_peek(const tl_heap_t* h) {
     }
 
     return &h->data[0];
-}
-
-tl_status_t tl_heap_build(tl_heap_t* h, const tl_heap_entry_t* entries, size_t n) {
-    TL_ASSERT(h != NULL);
-
-    tl_heap_clear(h);
-
-    if (n == 0) {
-        return TL_OK;
-    }
-
-    TL_ASSERT(entries != NULL);
-
-    tl_status_t s = tl_heap_reserve(h, n);
-    if (s != TL_OK) {
-        return s;
-    }
-
-    memcpy(h->data, entries, n * sizeof(tl_heap_entry_t));
-    h->len = n;
-
-    /* Floyd's bottom-up heapify: sift down every non-leaf node starting
-     * from the last parent. Runs in O(n) versus O(n log n) for repeated
-     * push, because most nodes need only a shallow sift. */
-    if (n > 1) {
-        for (size_t i = n / 2; i > 0; i--) {
-            sift_down(h, i - 1);
-        }
-    }
-
-    return TL_OK;
 }
 
 void tl_heap_replace_top(tl_heap_t* h, const tl_heap_entry_t* new_entry) {

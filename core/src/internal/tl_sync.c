@@ -2,16 +2,6 @@
 #include "tl_locks.h"
 #include "tl_log.h"
 
-/*
- * Forward declaration for pthread_setname_np: on glibc the prototype lives
- * behind _GNU_SOURCE, which strict C17 builds (-std=c17) do not set. Bring
- * it in explicitly so debug thread naming compiles under -Werror without
- * forcing every translation unit to be GNU-flavoured.
- */
-#if defined(TL_DEBUG) && defined(__linux__)
-extern int pthread_setname_np(pthread_t thread, const char* name);
-#endif
-
 /*===========================================================================
  * Thread-Local Lock Tracker (Debug Mode Only)
  *===========================================================================*/
@@ -83,12 +73,6 @@ bool tl_mutex_trylock(tl_mutex_t* mu) {
     return false;
 }
 
-#ifdef TL_DEBUG
-bool tl_mutex_is_held(const tl_mutex_t* mu) {
-    return mu && mu->owner == GetCurrentThreadId();
-}
-#endif
-
 /*---------------------------------------------------------------------------
  * Condition Variable
  *---------------------------------------------------------------------------*/
@@ -134,11 +118,6 @@ bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms) {
 void tl_cond_signal(tl_cond_t* cv) {
     TL_ASSERT(cv != NULL);
     WakeConditionVariable(&cv->cond);
-}
-
-void tl_cond_broadcast(tl_cond_t* cv) {
-    TL_ASSERT(cv != NULL);
-    WakeAllConditionVariable(&cv->cond);
 }
 
 /*---------------------------------------------------------------------------
@@ -209,60 +188,6 @@ tl_status_t tl_thread_join(tl_thread_t* thread, void** result) {
     return TL_OK;
 }
 
-uint64_t tl_thread_self_id(void) {
-    return (uint64_t)GetCurrentThreadId();
-}
-
-#ifdef TL_DEBUG
-/*
- * SetThreadDescription is resolved at runtime via GetProcAddress because
- * it only exists on Windows 10 1607+. InitOnceExecuteOnce makes the
- * lookup race-free when several threads call tl_thread_set_name() during
- * startup.
- */
-typedef HRESULT (WINAPI *SetThreadDescriptionFn)(HANDLE, PCWSTR);
-
-static INIT_ONCE g_thread_name_init_once = INIT_ONCE_STATIC_INIT;
-static SetThreadDescriptionFn g_set_thread_desc_fn = NULL;
-
-static BOOL CALLBACK thread_name_init_callback(
-    PINIT_ONCE init_once,
-    PVOID parameter,
-    PVOID* context)
-{
-    (void)init_once;
-    (void)parameter;
-    (void)context;
-
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (kernel32) {
-        g_set_thread_desc_fn = (SetThreadDescriptionFn)GetProcAddress(
-            kernel32, "SetThreadDescription");
-    }
-    return TRUE;
-}
-
-void tl_thread_set_name(const char* name) {
-    if (name == NULL) return;
-
-    InitOnceExecuteOnce(&g_thread_name_init_once, thread_name_init_callback, NULL, NULL);
-
-    if (g_set_thread_desc_fn) {
-        /* Thread names are ASCII; a byte-by-byte widening avoids dragging
-         * in MultiByteToWideChar and is safe because the source charset
-         * is constrained. Bound the loop to leave room for the NUL. */
-        wchar_t wname[64];
-        int i = 0;
-        while (i < 63 && name[i]) {
-            wname[i] = (wchar_t)(unsigned char)name[i];
-            i++;
-        }
-        wname[i] = L'\0';
-        g_set_thread_desc_fn(GetCurrentThread(), wname);
-    }
-}
-#endif
-
 void tl_thread_yield(void) {
     SwitchToThread();
 }
@@ -289,7 +214,6 @@ uint64_t tl_monotonic_ms(void) {
 #include <sys/time.h>
 #include <sched.h>
 #include <unistd.h>
-#include <string.h>
 
 /*---------------------------------------------------------------------------
  * POSIX Capability Detection
@@ -389,12 +313,6 @@ bool tl_mutex_trylock(tl_mutex_t* mu) {
     }
     return false;
 }
-
-#ifdef TL_DEBUG
-bool tl_mutex_is_held(const tl_mutex_t* mu) {
-    return mu && mu->locked && pthread_equal(mu->owner, pthread_self());
-}
-#endif
 
 /*---------------------------------------------------------------------------
  * Condition Variable
@@ -515,11 +433,6 @@ void tl_cond_signal(tl_cond_t* cv) {
     pthread_cond_signal(&cv->cond);
 }
 
-void tl_cond_broadcast(tl_cond_t* cv) {
-    TL_ASSERT(cv != NULL);
-    pthread_cond_broadcast(&cv->cond);
-}
-
 /*---------------------------------------------------------------------------
  * Thread
  *---------------------------------------------------------------------------*/
@@ -554,38 +467,6 @@ tl_status_t tl_thread_join(tl_thread_t* thread, void** result) {
     }
     return TL_OK;
 }
-
-uint64_t tl_thread_self_id(void) {
-    /*
-     * pthread_t is opaque and on some platforms not integer-convertible,
-     * so cast-to-uint would be undefined. memcpy extracts a stable bit
-     * pattern that is fine for log output and lock tracking. For thread
-     * equality checks, callers must use pthread_equal() instead.
-     */
-    pthread_t self = pthread_self();
-    uint64_t id = 0;
-    size_t copy_size = sizeof(self) < sizeof(id) ? sizeof(self) : sizeof(id);
-    memcpy(&id, &self, copy_size);
-    return id;
-}
-
-#ifdef TL_DEBUG
-void tl_thread_set_name(const char* name) {
-    if (name == NULL) return;
-
-#if defined(__APPLE__)
-    /* macOS exposes the single-arg form; the target is always the caller. */
-    pthread_setname_np(name);
-#elif defined(__linux__)
-    /* Linux requires an explicit thread argument; names are truncated to
-     * 15 bytes plus a NUL by the kernel. */
-    pthread_setname_np(pthread_self(), name);
-#else
-    /* Other POSIX systems lack a portable API; thread naming is a no-op. */
-    (void)name;
-#endif
-}
-#endif
 
 void tl_thread_yield(void) {
     sched_yield();

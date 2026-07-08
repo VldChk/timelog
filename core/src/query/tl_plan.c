@@ -216,12 +216,10 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
 
         if (!t2_unbounded && seg->min_ts >= t2) {
-            plan->segments_pruned += (tl_manifest_l1_count(manifest) - i);
             break;
         }
 
         if (!tl_range_overlaps(seg->min_ts, seg->max_ts, t1, t2, t2_unbounded)) {
-            plan->segments_pruned++;
             continue;
         }
 
@@ -233,9 +231,6 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         st = add_segment_tombstones(&tombs, seg, t1, t2, t2_unbounded);
         if (st != TL_OK) goto fail;
     }
-
-    /* Account for everything skipped by the binary search. */
-    plan->segments_pruned += l1_start;
 
     /* L0: segments may overlap each other; merge priority comes from
      * generation (newer flushes have higher generation). */
@@ -252,7 +247,6 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
                                           t1, t2, t2_unbounded);
         }
         if (!overlaps) {
-            plan->segments_pruned++;
             continue;
         }
 
@@ -270,13 +264,11 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
         const tl_memrun_t* mr = tl_memview_sealed_get(mv, i);
 
         if (!tl_memrun_has_records(mr) && !tl_memrun_has_tombstones(mr)) {
-            plan->memruns_pruned++;
             continue;
         }
 
         if (!tl_range_overlaps(tl_memrun_min_ts(mr), tl_memrun_max_ts(mr),
                                t1, t2, t2_unbounded)) {
-            plan->memruns_pruned++;
             continue;
         }
 
@@ -333,7 +325,6 @@ tl_status_t tl_plan_build(tl_plan_t* plan,
     }
 
     plan->tombstones = tl_intervals_take(&tombs, &plan->tomb_count);
-    plan->tomb_capacity = plan->tomb_count;
 
     tl_intervals_destroy(&tombs);
 
@@ -370,5 +361,4 @@ void tl_plan_destroy(tl_plan_t* plan) {
         plan->tombstones = NULL;
     }
     plan->tomb_count = 0;
-    plan->tomb_capacity = 0;
 }

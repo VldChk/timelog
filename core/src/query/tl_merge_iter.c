@@ -125,7 +125,6 @@ tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
 
     memset(it, 0, sizeof(*it));
     it->plan = plan;
-    it->alloc = alloc;
     it->error = TL_OK;
 
     tl_heap_init(&it->heap, alloc);

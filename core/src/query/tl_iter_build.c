@@ -33,7 +33,6 @@ tl_status_t tl_iter_build_submerge(tl_submerge_t* merge,
                                     const tl_record_t* head_data,
                                     const tl_seq_t* head_seqs,
                                     size_t head_len,
-                                    tl_seq_t head_watermark,
                                     tl_ts_t t1,
                                     tl_ts_t t2,
                                     bool t2_unbounded) {
@@ -81,7 +80,7 @@ tl_status_t tl_iter_build_submerge(tl_submerge_t* merge,
                              head_data, head_seqs, head_len,
                              t1, t2, t2_unbounded,
                              (uint32_t)(1 + run_count),
-                             head_seqs != NULL ? 0 : head_watermark);
+                             0);
     }
 
     merge->src_count = idx;

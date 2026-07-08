@@ -2,13 +2,10 @@
  * bench_search_lower_bound.c - advisory microbench (NOT part of test_timelog)
  *
  * Repeatable seam evidence for the size-gated branchless search. This bench
- * calls all five changed production seams and imports the production
+ * calls both production seams and imports the production
  * TL_LOWER_BOUND_BRANCHLESS_MAX constant:
  *   - tl_record_lower_bound()
- *   - tl_recvec_lower_bound()
- *   - tl_recvec_upper_bound()
  *   - tl_page_lower_bound()
- *   - tl_page_upper_bound()
  *
  * Build & run:
  *   cmake --build build-rel --target bench_search_lower_bound
@@ -26,7 +23,6 @@
 #include <time.h>
 
 #include "internal/tl_alloc.h"
-#include "internal/tl_recvec.h"
 #include "internal/tl_search.h"
 #include "storage/tl_page.h"
 
@@ -35,19 +31,9 @@ static inline size_t branchy_record(const tl_record_t* a, size_t n, tl_ts_t x) {
     while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (a[m].ts < x) lo = m + 1; else hi = m; }
     return lo;
 }
-static inline size_t branchy_record_upper(const tl_record_t* a, size_t n, tl_ts_t x) {
-    size_t lo = 0, hi = n;
-    while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (a[m].ts <= x) lo = m + 1; else hi = m; }
-    return lo;
-}
 static inline size_t branchy_ts_lower(const tl_ts_t* a, size_t n, tl_ts_t x) {
     size_t lo = 0, hi = n;
     while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (a[m] < x) lo = m + 1; else hi = m; }
-    return lo;
-}
-static inline size_t branchy_ts_upper(const tl_ts_t* a, size_t n, tl_ts_t x) {
-    size_t lo = 0, hi = n;
-    while (lo < hi) { size_t m = lo + (hi - lo) / 2; if (a[m] <= x) lo = m + 1; else hi = m; }
     return lo;
 }
 static long ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -134,95 +120,9 @@ int main(void) {
         tl_alloc_ctx_t alloc;
         tl__alloc_init(&alloc, NULL);
 
-        tl_recvec_t rv;
-        tl_recvec_init(&rv, &alloc);
-        if (tl_recvec_reserve(&rv, n) != TL_OK) {
-            fprintf(stderr, "failed to reserve recvec n=%zu\n", n);
-            tl_recvec_destroy(&rv);
-            tl__alloc_destroy(&alloc);
-            free(a);
-            free(q);
-            return 2;
-        }
-        for (size_t i = 0; i < n; i++) {
-            if (tl_recvec_push(&rv, a[i].ts, a[i].handle) != TL_OK) {
-                fprintf(stderr, "failed to push recvec n=%zu\n", n);
-                tl_recvec_destroy(&rv);
-                tl__alloc_destroy(&alloc);
-                free(a);
-                free(q);
-                return 2;
-            }
-        }
-        for (size_t i = 0; i < 4096; i++) {
-            if (branchy_record(a, n, q[i]) != tl_recvec_lower_bound(&rv, q[i])) {
-                fprintf(stderr, "MISMATCH recvec_lower n=%zu\n", n);
-                return 2;
-            }
-            if (branchy_record_upper(a, n, q[i]) != tl_recvec_upper_bound(&rv, q[i])) {
-                fprintf(stderr, "MISMATCH recvec_upper n=%zu\n", n);
-                return 2;
-            }
-        }
-
-        bb = 1e30; bg = 1e30;
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += branchy_record(a, n, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bb) { bb = d; }
-        }
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += tl_recvec_lower_bound(&rv, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bg) { bg = d; }
-        }
-        printf("%-22s %-10zu %12.2f %12.2f %8.2fx\n", "recvec_lower", n, bb, bg, bb / bg);
-        warn_if_slow(&warnings, "recvec_lower", n, bb, bg);
-
-        bb = 1e30; bg = 1e30;
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += branchy_record_upper(a, n, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bb) { bb = d; }
-        }
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += tl_recvec_upper_bound(&rv, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bg) { bg = d; }
-        }
-        printf("%-22s %-10zu %12.2f %12.2f %8.2fx\n", "recvec_upper", n, bb, bg, bb / bg);
-        warn_if_slow(&warnings, "recvec_upper", n, bb, bg);
-
-        size_t pbytes = n * sizeof(tl_record_t) + 4096;
-        if (pbytes < TL_DEFAULT_TARGET_PAGE_BYTES) {
-            pbytes = TL_DEFAULT_TARGET_PAGE_BYTES;
-        }
-        tl_page_builder_t pb;
-        tl_page_builder_init(&pb, &alloc, pbytes);
         tl_page_t* page = NULL;
-        if (tl_page_builder_build(&pb, a, n, &page) != TL_OK || page == NULL) {
+        if (tl_page_build(&alloc, a, n, &page) != TL_OK || page == NULL) {
             fprintf(stderr, "failed to build page n=%zu\n", n);
-            tl_recvec_destroy(&rv);
             tl__alloc_destroy(&alloc);
             free(a);
             free(q);
@@ -231,10 +131,6 @@ int main(void) {
         for (size_t i = 0; i < 4096; i++) {
             if (branchy_ts_lower(page->ts, page->count, q[i]) != tl_page_lower_bound(page, q[i])) {
                 fprintf(stderr, "MISMATCH page_lower n=%zu\n", n);
-                return 2;
-            }
-            if (branchy_ts_upper(page->ts, page->count, q[i]) != tl_page_upper_bound(page, q[i])) {
-                fprintf(stderr, "MISMATCH page_upper n=%zu\n", n);
                 return 2;
             }
         }
@@ -263,32 +159,7 @@ int main(void) {
         printf("%-22s %-10zu %12.2f %12.2f %8.2fx\n", "page_lower", n, bb, bg, bb / bg);
         warn_if_slow(&warnings, "page_lower", n, bb, bg);
 
-        bb = 1e30; bg = 1e30;
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += branchy_ts_upper(page->ts, page->count, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bb) { bb = d; }
-        }
-        for (int r = 0; r < 7; r++) {
-            long t = ns();
-            size_t ac = 0;
-            for (size_t i = 0; i < M; i++) {
-                ac += tl_page_upper_bound(page, q[i]);
-            }
-            sink ^= ac;
-            double d = (double)(ns() - t) / (double)M;
-            if (d < bg) { bg = d; }
-        }
-        printf("%-22s %-10zu %12.2f %12.2f %8.2fx\n", "page_upper", n, bb, bg, bb / bg);
-        warn_if_slow(&warnings, "page_upper", n, bb, bg);
-
         tl_page_destroy(page, &alloc);
-        tl_recvec_destroy(&rv);
         tl__alloc_destroy(&alloc);
         free(a);
     }

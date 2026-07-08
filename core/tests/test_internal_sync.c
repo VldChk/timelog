@@ -2,10 +2,10 @@
  * test_internal_sync.c - Internal Synchronization Primitive Tests
  *
  * Tests for low-level synchronization primitives:
- * - Atomic operations (u32, u64, ptr)
+ * - Atomic operations (u32, u64)
  * - Mutex (init, destroy, lock, unlock, trylock)
  * - Condition variables (init, destroy, wait, timedwait, signal)
- * - Seqlock (init, write cycle, validation)
+ * - Seqlock (init, write cycle)
  * - Threads (create, join, multiple)
  * - Lock ordering (debug builds only)
  *
@@ -61,7 +61,7 @@ TEST_DECLARE(sync_atomic_fetch_add) {
     TEST_ASSERT_EQ(10, old);
     TEST_ASSERT_EQ(15, tl_atomic_load_relaxed_u32(&val));
 
-    old = tl_atomic_inc_u32(&val);
+    old = tl_atomic_fetch_add_u32(&val, 1, TL_MO_ACQ_REL);
     TEST_ASSERT_EQ(15, old);
     TEST_ASSERT_EQ(16, tl_atomic_load_relaxed_u32(&val));
 }
@@ -74,7 +74,7 @@ TEST_DECLARE(sync_atomic_fetch_sub) {
     TEST_ASSERT_EQ(20, old);
     TEST_ASSERT_EQ(13, tl_atomic_load_relaxed_u32(&val));
 
-    old = tl_atomic_dec_u32(&val);
+    old = tl_atomic_fetch_sub_u32(&val, 1, TL_MO_ACQ_REL);
     TEST_ASSERT_EQ(13, old);
     TEST_ASSERT_EQ(12, tl_atomic_load_relaxed_u32(&val));
 }
@@ -101,18 +101,6 @@ TEST_DECLARE(sync_atomic_cas_failure) {
     TEST_ASSERT(!success);
     TEST_ASSERT_EQ(100, expected); /* Updated to actual value */
     TEST_ASSERT_EQ(100, tl_atomic_load_relaxed_u32(&val)); /* Unchanged */
-}
-
-TEST_DECLARE(sync_atomic_ptr_exchange) {
-    int a = 1, b = 2;
-    tl_atomic_ptr ptr;
-    tl_atomic_init_ptr(&ptr, &a);
-
-    TEST_ASSERT_EQ(&a, tl_atomic_load_acquire_ptr(&ptr));
-
-    void* old = tl_atomic_exchange_ptr(&ptr, &b, TL_MO_ACQ_REL);
-    TEST_ASSERT_EQ(&a, old);
-    TEST_ASSERT_EQ(&b, tl_atomic_load_acquire_ptr(&ptr));
 }
 
 /*===========================================================================
@@ -286,48 +274,26 @@ TEST_DECLARE(sync_seqlock_init) {
     tl_seqlock_t sl;
     tl_seqlock_init(&sl);
 
-    uint64_t seq = tl_seqlock_current(&sl);
-    TEST_ASSERT_EQ(0, seq);
-    TEST_ASSERT(tl_seqlock_is_even(seq));
+    TEST_ASSERT_EQ(0, tl_atomic_load_relaxed_u64(&sl.seq)); /* Even idle value */
 }
 
 TEST_DECLARE(sync_seqlock_write_cycle) {
     tl_seqlock_t sl;
     tl_seqlock_init(&sl);
 
-    /* Before write */
-    uint64_t seq0 = tl_seqlock_read(&sl);
-    TEST_ASSERT(tl_seqlock_is_even(seq0));
+    /* Before write: even */
+    uint64_t seq0 = tl_atomic_load_relaxed_u64(&sl.seq);
+    TEST_ASSERT_EQ(0, seq0 & 1);
 
-    /* Begin write */
+    /* Begin write: odd */
     tl_seqlock_write_begin(&sl);
-    uint64_t seq1 = tl_seqlock_current(&sl);
-    TEST_ASSERT(!tl_seqlock_is_even(seq1)); /* Odd during write */
+    TEST_ASSERT_EQ(1, tl_atomic_load_relaxed_u64(&sl.seq) & 1);
 
-    /* End write */
+    /* End write: even again, incremented by 2 */
     tl_seqlock_write_end(&sl);
-    uint64_t seq2 = tl_seqlock_read(&sl);
-    TEST_ASSERT(tl_seqlock_is_even(seq2));
-    TEST_ASSERT_EQ(seq0 + 2, seq2); /* Incremented by 2 */
-}
-
-TEST_DECLARE(sync_seqlock_validate) {
-    tl_seqlock_t sl;
-    tl_seqlock_init(&sl);
-
-    uint64_t seq1 = tl_seqlock_read(&sl);
-
-    /* No change - should validate */
-    uint64_t seq2 = tl_seqlock_read(&sl);
-    TEST_ASSERT(tl_seqlock_validate(seq1, seq2));
-
-    /* Simulate write */
-    tl_seqlock_write_begin(&sl);
-    tl_seqlock_write_end(&sl);
-
-    /* Changed - should not validate */
-    uint64_t seq3 = tl_seqlock_read(&sl);
-    TEST_ASSERT(!tl_seqlock_validate(seq1, seq3));
+    uint64_t seq2 = tl_atomic_load_relaxed_u64(&sl.seq);
+    TEST_ASSERT_EQ(0, seq2 & 1);
+    TEST_ASSERT_EQ(seq0 + 2, seq2);
 }
 
 /*===========================================================================
@@ -337,7 +303,7 @@ TEST_DECLARE(sync_seqlock_validate) {
 static void* sync_thread_increment(void* arg) {
     tl_atomic_u32* counter = (tl_atomic_u32*)arg;
     for (int i = 0; i < 1000; i++) {
-        tl_atomic_inc_u32(counter);
+        tl_atomic_fetch_add_u32(counter, 1, TL_MO_ACQ_REL);
     }
     return (void*)(intptr_t)42;
 }
@@ -430,14 +396,13 @@ TEST_DECLARE(sync_close_destroys_locks) {
  *===========================================================================*/
 
 void run_internal_sync_tests(void) {
-    /* Atomics (7 tests) */
+    /* Atomics */
     RUN_TEST(sync_atomic_u32_load_store);
     RUN_TEST(sync_atomic_u64_load_store);
     RUN_TEST(sync_atomic_fetch_add);
     RUN_TEST(sync_atomic_fetch_sub);
     RUN_TEST(sync_atomic_cas_success);
     RUN_TEST(sync_atomic_cas_failure);
-    RUN_TEST(sync_atomic_ptr_exchange);
 
     /* Mutex (3 tests) */
     RUN_TEST(sync_mutex_init_destroy);
@@ -449,10 +414,9 @@ void run_internal_sync_tests(void) {
     RUN_TEST(sync_cond_signal_wakeup);
     RUN_TEST(sync_cond_timedwait_timeout);
 
-    /* Seqlock (3 tests) */
+    /* Seqlock */
     RUN_TEST(sync_seqlock_init);
     RUN_TEST(sync_seqlock_write_cycle);
-    RUN_TEST(sync_seqlock_validate);
 
     /* Threads (2 tests) */
     RUN_TEST(sync_thread_create_join);
@@ -466,6 +430,4 @@ void run_internal_sync_tests(void) {
     /* Integration (2 tests) */
     RUN_TEST(sync_open_initializes_locks);
     RUN_TEST(sync_close_destroys_locks);
-
-    /* Total: 20 tests in release, 21 in debug */
 }

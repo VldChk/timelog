@@ -108,20 +108,3 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
     *out_end = end;
     *end_unbounded = false;
 }
-
-/*===========================================================================
- * Window Bounds for Timestamp
- *===========================================================================*/
-
-tl_status_t tl_window_bounds_for_ts(tl_ts_t ts, tl_ts_t window_size,
-                                     tl_ts_t window_origin,
-                                     tl_ts_t* out_start, tl_ts_t* out_end,
-                                     bool* end_unbounded) {
-    int64_t wid;
-    tl_status_t status = tl_window_id_for_ts(ts, window_size, window_origin, &wid);
-    if (status != TL_OK) {
-        return status;
-    }
-    tl_window_bounds(wid, window_size, window_origin, out_start, out_end, end_unbounded);
-    return TL_OK;
-}

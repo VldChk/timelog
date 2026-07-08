@@ -72,35 +72,6 @@ tl_status_t tl_recvec_reserve(tl_recvec_t* rv, size_t min_cap) {
     return TL_OK;
 }
 
-tl_status_t tl_recvec_shrink_to_fit(tl_recvec_t* rv) {
-    TL_ASSERT(rv != NULL);
-
-    if (rv->len == rv->cap) {
-        return TL_OK;
-    }
-
-    if (rv->len == 0) {
-        if (rv->data != NULL) {
-            tl__free(rv->alloc, rv->data);
-            rv->data = NULL;
-        }
-        rv->cap = 0;
-        return TL_OK;
-    }
-
-    tl_record_t* new_data = tl__realloc(rv->alloc, rv->data,
-                                         rv->len * sizeof(tl_record_t));
-    if (new_data == NULL) {
-        /* The original allocation is still valid; leave capacity unchanged
-         * so the caller can continue to use the vector. */
-        return TL_ENOMEM;
-    }
-
-    rv->data = new_data;
-    rv->cap = rv->len;
-    return TL_OK;
-}
-
 /*===========================================================================
  * Insertion
  *===========================================================================*/
@@ -145,63 +116,6 @@ tl_status_t tl_recvec_push_n(tl_recvec_t* rv, const tl_record_t* records, size_t
     memcpy(&rv->data[rv->len], records, n * sizeof(tl_record_t));
     rv->len += n;
     return TL_OK;
-}
-
-tl_status_t tl_recvec_insert(tl_recvec_t* rv, size_t idx, tl_ts_t ts, tl_handle_t handle) {
-    TL_ASSERT(rv != NULL);
-
-    if (idx > rv->len) {
-        return TL_EINVAL;
-    }
-
-    if (rv->len == SIZE_MAX) {
-        return TL_ENOMEM;
-    }
-
-    tl_status_t s = tl_recvec_reserve(rv, rv->len + 1);
-    if (s != TL_OK) {
-        return s;
-    }
-
-    if (idx < rv->len) {
-        memmove(&rv->data[idx + 1], &rv->data[idx],
-                (rv->len - idx) * sizeof(tl_record_t));
-    }
-
-    rv->data[idx].ts = ts;
-    rv->data[idx].handle = handle;
-    rv->len++;
-    return TL_OK;
-}
-
-/*===========================================================================
- * Sorting
- *===========================================================================*/
-
-/**
- * Comparator that orders records by (ts, handle) ascending. Uses explicit
- * comparisons rather than subtraction because tl_ts_t spans the full
- * signed int64 range, so (a - b) would overflow for distant timestamps.
- */
-static int cmp_record_ts(const void* a, const void* b) {
-    const tl_record_t* ra = (const tl_record_t*)a;
-    const tl_record_t* rb = (const tl_record_t*)b;
-
-    if (ra->ts < rb->ts) return -1;
-    if (ra->ts > rb->ts) return 1;
-    if (ra->handle < rb->handle) return -1;
-    if (ra->handle > rb->handle) return 1;
-    return 0;
-}
-
-void tl_recvec_sort(tl_recvec_t* rv) {
-    TL_ASSERT(rv != NULL);
-
-    if (rv->len <= 1) {
-        return;
-    }
-
-    qsort(rv->data, rv->len, sizeof(tl_record_t), cmp_record_ts);
 }
 
 /*===========================================================================*/
@@ -257,82 +171,6 @@ tl_status_t tl_recvec_sort_with_seqs(tl_recvec_t* rv, tl_seq_t* seqs) {
 
     tl__free(rv->alloc, tmp);
     return TL_OK;
-}
-
-/*===========================================================================
- * Binary Search
- *===========================================================================*/
-
-size_t tl_recvec_lower_bound(const tl_recvec_t* rv, tl_ts_t ts) {
-    TL_ASSERT(rv != NULL);
-
-    size_t n = rv->len;
-
-    /* Branchless (cmov) for memtable/page-sized runs; branchy fallback above the
-     * size gate. Identical: first i in [0,n) with data[i].ts >= ts (else n). */
-    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
-        size_t base = 0;
-        size_t length = n;
-        while (length > 0) {
-            size_t half = length / 2;
-            base += (size_t)(rv->data[base + half].ts < ts) * (length - half);
-            length = half;
-        }
-        return base;
-    }
-
-    size_t lo = 0;
-    size_t hi = n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (rv->data[mid].ts < ts) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-size_t tl_recvec_upper_bound(const tl_recvec_t* rv, tl_ts_t ts) {
-    TL_ASSERT(rv != NULL);
-
-    size_t n = rv->len;
-
-    /* Branchless (cmov) for memtable/page-sized runs; branchy fallback above the
-     * size gate. Identical: first i in [0,n) with data[i].ts > ts (else n). */
-    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
-        size_t base = 0;
-        size_t length = n;
-        while (length > 0) {
-            size_t half = length / 2;
-            base += (size_t)(rv->data[base + half].ts <= ts) * (length - half);
-            length = half;
-        }
-        return base;
-    }
-
-    size_t lo = 0;
-    size_t hi = n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (rv->data[mid].ts <= ts) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-void tl_recvec_range_bounds(const tl_recvec_t* rv, tl_ts_t t1, tl_ts_t t2,
-                            size_t* lo, size_t* hi) {
-    TL_ASSERT(rv != NULL);
-    TL_ASSERT(lo != NULL);
-    TL_ASSERT(hi != NULL);
-
-    *lo = tl_recvec_lower_bound(rv, t1);
-    *hi = tl_recvec_lower_bound(rv, t2);
 }
 
 /*===========================================================================

@@ -74,11 +74,6 @@ void tl_point_result_destroy(tl_point_result_t* result);
  * Accessors
  *===========================================================================*/
 
-/** Check if result is empty. */
-TL_INLINE bool tl_point_result_empty(const tl_point_result_t* result) {
-    return result->count == 0;
-}
-
 /** Get record by index. */
 TL_INLINE const tl_record_t* tl_point_result_get(const tl_point_result_t* result,
                                                   size_t idx) {

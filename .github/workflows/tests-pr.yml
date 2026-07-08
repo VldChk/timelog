@@ -38,7 +38,6 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build --target timelog_e2e_build --config Release -j 2
@@ -165,7 +164,6 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build --target timelog_e2e_build --config Release -j 2

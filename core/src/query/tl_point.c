@@ -96,12 +96,14 @@ static tl_status_t collect_from_sorted(tl_point_result_t* result,
     return TL_OK;
 }
 
-/** Collect matching records from a page. */
+/** Collect matching records from a page.
+ *
+ * Tombstone visibility is decided by the caller: collect_from_segment
+ * returns early when tomb_seq > seg->applied_seq, so every record in a
+ * page it visits is visible. */
 static tl_status_t collect_from_page(tl_point_result_t* result,
                                       const tl_page_t* page,
-                                      tl_ts_t ts,
-                                      tl_seq_t watermark,
-                                      tl_seq_t tomb_seq) {
+                                      tl_ts_t ts) {
     /* Binary search to find first occurrence */
     size_t idx = tl_page_lower_bound(page, ts);
 
@@ -116,10 +118,6 @@ static tl_status_t collect_from_page(tl_point_result_t* result,
         tl_page_get_record(page, idx, &rec);
         if (rec.ts != ts) {
             break;
-        }
-        if (tomb_seq > watermark) {
-            idx++;
-            continue;
         }
         tl_status_t st = add_record(result, rec.ts, rec.handle);
         if (st != TL_OK) {
@@ -178,8 +176,7 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
             continue;
         }
 
-        tl_status_t st = collect_from_page(result, meta->page, ts,
-                                           seg->applied_seq, tomb_seq);
+        tl_status_t st = collect_from_page(result, meta->page, ts);
         if (st != TL_OK) {
             return st;
         }

@@ -192,17 +192,6 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt,
                                           tl_ts_t t1, tl_ts_t t2,
                                           tl_seq_t seq);
 
-/**
- * Insert an unbounded tombstone [t1, +inf).
- *
- * Updates on success: epoch++, active_bytes_est += sizeof(tl_interval_t)
- *
- * @return TL_OK, TL_ENOMEM
- */
-tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt,
-                                                    tl_ts_t t1,
-                                                    tl_seq_t seq);
-
 /*===========================================================================
  * Seal Operations
  *

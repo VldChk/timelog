@@ -9,17 +9,14 @@
  * Pattern: a 64-bit counter that is incremented twice around every
  * publication — once before the visible mutation (making the counter odd
  * to advertise "writer in progress"), once after (returning it to even).
- * Readers sample the counter before and after capturing state; equal even
- * values guarantee the capture observed a single coherent moment in time.
  *
  * Protocol (writer): lock writer_mu, increment to odd, mutate, increment
- * to even, unlock. Protocol (reader): lock writer_mu, read seq1, capture
- * manifest + memview, read seq2, unlock; retry if seq1 != seq2 or odd.
+ * to even, unlock.
  *
- * The reader path still holds writer_mu because memview capture touches
- * memtable state that the seqlock alone cannot protect. The seqlock
- * counter doubles as a consistency check and as a hook for future
- * lock-free optimisations on the read side.
+ * Snapshot acquisition serialises on writer_mu (which every publisher also
+ * holds), so no standalone reader-side retry loop exists today; the write
+ * window remains as a publication marker and a hook for future lock-free
+ * optimisations on the read side.
  *===========================================================================*/
 
 /*
@@ -81,34 +78,6 @@ TL_INLINE void tl_seqlock_write_end(tl_seqlock_t* sl) {
     TL_ASSERT((tl_atomic_load_relaxed_u64(&sl->seq) & 1) == 1);
 #endif
     tl_atomic_fetch_add_u64(&sl->seq, 1, TL_MO_RELEASE);
-}
-
-/** Snapshot the current sequence number with acquire ordering. */
-TL_INLINE uint64_t tl_seqlock_read(const tl_seqlock_t* sl) {
-    TL_ASSERT(sl != NULL);
-    return tl_atomic_load_acquire_u64(&sl->seq);
-}
-
-/** Even counter == no publication is in progress. */
-TL_INLINE bool tl_seqlock_is_even(uint64_t seq) {
-    return (seq & 1) == 0;
-}
-
-/**
- * Two-sample consistency check.
- * @param seq1 Counter sampled before the read.
- * @param seq2 Counter sampled after the read.
- * @return true when both samples are equal and even (no publication
- *         crossed the read).
- */
-TL_INLINE bool tl_seqlock_validate(uint64_t seq1, uint64_t seq2) {
-    return (seq1 == seq2) && tl_seqlock_is_even(seq1);
-}
-
-/** Relaxed read for diagnostics and metrics; do not use for consistency. */
-TL_INLINE uint64_t tl_seqlock_current(const tl_seqlock_t* sl) {
-    TL_ASSERT(sl != NULL);
-    return tl_atomic_load_relaxed_u64(&sl->seq);
 }
 
 #endif /* TL_SEQLOCK_H */

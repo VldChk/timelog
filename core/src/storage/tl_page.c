@@ -19,25 +19,15 @@ size_t tl_page_builder_compute_capacity(size_t target_page_bytes) {
     return (cap < TL_MIN_PAGE_ROWS) ? TL_MIN_PAGE_ROWS : cap;
 }
 
-void tl_page_builder_init(tl_page_builder_t* pb, tl_alloc_ctx_t* alloc,
-                          size_t target_page_bytes) {
-    TL_ASSERT(pb != NULL);
-    TL_ASSERT(alloc != NULL);
-
-    pb->alloc = alloc;
-    pb->target_page_bytes = target_page_bytes;
-    pb->records_per_page = tl_page_builder_compute_capacity(target_page_bytes);
-}
-
 /*
  * The page header, the ts[] array, and the h[] array all live inside a single
  * backing allocation so that destruction is a single free() and so the SoA
  * data sits next to its metadata in cache.
  */
-tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
-                                   const tl_record_t* records, size_t count,
-                                   tl_page_t** out) {
-    TL_ASSERT(pb != NULL);
+tl_status_t tl_page_build(tl_alloc_ctx_t* alloc,
+                          const tl_record_t* records, size_t count,
+                          tl_page_t** out) {
+    TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);
 
     if (count == 0) {
@@ -94,13 +84,12 @@ tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
     }
     size_t total_size = h_offset + h_array_size;
 
-    void* backing = tl__malloc(pb->alloc, total_size);
+    void* backing = tl__malloc(alloc, total_size);
     if (backing == NULL) {
         return TL_ENOMEM;
     }
 
-    memset(backing, 0, sizeof(tl_page_t));
-
+    /* Every tl_page_t field is assigned below; no zeroing needed. */
     tl_page_t* page = (tl_page_t*)backing;
     page->ts = (tl_ts_t*)((char*)backing + ts_offset);
     page->h = (tl_handle_t*)((char*)backing + h_offset);
@@ -166,42 +155,6 @@ size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target) {
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         if (ts[mid] < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
-
-size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target) {
-    TL_ASSERT(page != NULL);
-
-    if (page->count == 0) {
-        return 0;
-    }
-
-    const tl_ts_t* ts = page->ts;
-    size_t n = page->count;
-
-    /* Branchless (cmov) for page-sized arrays; branchy fallback above the size
-     * gate. Identical result: first i in [0,n) with ts[i] > target (else n). */
-    if (n <= TL_LOWER_BOUND_BRANCHLESS_MAX) {
-        size_t base = 0;
-        size_t length = n;
-        while (length > 0) {
-            size_t half = length / 2;
-            base += (size_t)(ts[base + half] <= target) * (length - half);
-            length = half;
-        }
-        return base;
-    }
-
-    size_t lo = 0;
-    size_t hi = n;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (ts[mid] <= target) {
             lo = mid + 1;
         } else {
             hi = mid;

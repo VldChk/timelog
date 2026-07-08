@@ -282,10 +282,6 @@ TL_INLINE const tl_page_catalog_t* tl_segment_catalog(const tl_segment_t* seg) {
     return &seg->catalog;
 }
 
-TL_INLINE const uint64_t* tl_segment_page_prefix_counts(const tl_segment_t* seg) {
-    return seg->page_prefix_counts;
-}
-
 TL_INLINE uint64_t tl_segment_page_prefix_sum(const tl_segment_t* seg,
                                               size_t first,
                                               size_t last) {
@@ -297,15 +293,10 @@ TL_INLINE uint64_t tl_segment_page_prefix_sum(const tl_segment_t* seg,
         return 0;
     }
 
-    if (seg->page_prefix_counts != NULL) {
-        return seg->page_prefix_counts[last] - seg->page_prefix_counts[first];
-    }
-
-    uint64_t total = 0;
-    for (size_t i = first; i < last; i++) {
-        total += seg->catalog.pages[i].count;
-    }
-    return total;
+    /* Builders either allocate prefix counts or fail wholesale, so any
+     * published segment with pages carries a non-NULL prefix array. */
+    TL_ASSERT(seg->page_prefix_counts != NULL);
+    return seg->page_prefix_counts[last] - seg->page_prefix_counts[first];
 }
 
 /**

@@ -42,9 +42,6 @@ typedef struct tl_kmerge_iter {
     /* Skip-ahead optimization state */
     tl_seq_t        max_watermark;
     bool            has_variable_watermark;
-
-    /* Allocator (borrowed) */
-    tl_alloc_ctx_t* alloc;
 } tl_kmerge_iter_t;
 
 /*===========================================================================

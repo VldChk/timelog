@@ -16,20 +16,6 @@
  *===========================================================================*/
 
 /**
- * True when ts falls inside the open upper end of the range — i.e. when
- * ts < t2 in the bounded case, and always true when the range is
- * unbounded. This is the fundamental "still inside range" predicate.
- */
-TL_INLINE bool tl_ts_before_end(tl_ts_t ts, tl_ts_t t2, bool t2_unbounded) {
-    return t2_unbounded || ts < t2;
-}
-
-/** Iteration stop condition: ts has reached or passed the end bound. */
-TL_INLINE bool tl_ts_at_or_past_end(tl_ts_t ts, tl_ts_t t2, bool t2_unbounded) {
-    return !t2_unbounded && ts >= t2;
-}
-
-/**
  * True if the closed interval [min_ts, max_ts] overlaps the half-open range
  * [t1, t2) (or [t1, +inf) when unbounded). Used by query planning to prune
  * segments and pages whose bounds cannot intersect the query range.
@@ -45,15 +31,6 @@ TL_INLINE bool tl_range_overlaps(tl_ts_t min_ts, tl_ts_t max_ts,
  */
 TL_INLINE bool tl_range_is_empty(tl_ts_t t1, tl_ts_t t2, bool t2_unbounded) {
     return !t2_unbounded && t1 >= t2;
-}
-
-/**
- * First timestamp inside the overlap between an interval starting at
- * min_ts and a range starting at t1. Caller is expected to have already
- * confirmed an overlap exists via tl_range_overlaps().
- */
-TL_INLINE tl_ts_t tl_range_overlap_start(tl_ts_t min_ts, tl_ts_t t1) {
-    return (min_ts > t1) ? min_ts : t1;
 }
 
 #endif /* TL_RANGE_H */

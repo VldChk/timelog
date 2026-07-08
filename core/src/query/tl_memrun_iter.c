@@ -49,7 +49,6 @@ tl_status_t tl_memrun_iter_init(tl_memrun_iter_t* it,
                                             NULL,
                                             NULL,
                                             0,
-                                            0,
                                             t1,
                                             t2,
                                             t2_unbounded);

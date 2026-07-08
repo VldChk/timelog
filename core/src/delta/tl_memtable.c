@@ -792,23 +792,6 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt, tl_ts_t t1, tl_ts_t 
     return st;
 }
 
-tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt, tl_ts_t t1,
-                                                    tl_seq_t seq) {
-    TL_ASSERT(mt != NULL);
-    TL_ASSERT(seq > 0);
-
-    size_t before_len = tl_intervals_len(&mt->active_tombs);
-    tl_status_t st = tl_intervals_insert_unbounded(&mt->active_tombs, t1, seq);
-
-    if (st == TL_OK) {
-        mt->epoch++;
-        size_t after_len = tl_intervals_len(&mt->active_tombs);
-        memtable_adjust_tomb_bytes(mt, before_len, after_len);
-    }
-
-    return st;
-}
-
 /*===========================================================================
  * Seal Operations
  *===========================================================================*/

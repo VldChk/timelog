@@ -112,10 +112,8 @@ static tl_status_t build_pages(tl_segment_t* seg,
                                 const tl_record_t* records, size_t record_count,
                                 size_t target_page_bytes) {
     tl_alloc_ctx_t* alloc = seg->alloc;
-    tl_page_builder_t pb;
-    tl_page_builder_init(&pb, alloc, target_page_bytes);
 
-    size_t cap = pb.records_per_page;
+    size_t cap = tl_page_builder_compute_capacity(target_page_bytes);
     /* Overflow-safe ceiling division */
     size_t n_pages = record_count / cap + (record_count % cap != 0 ? 1 : 0);
 
@@ -142,7 +140,7 @@ static tl_status_t build_pages(tl_segment_t* seg,
         }
 
         tl_page_t* page = NULL;
-        st = tl_page_builder_build(&pb, &records[offset], chunk, &page);
+        st = tl_page_build(alloc, &records[offset], chunk, &page);
         if (st != TL_OK) {
             goto rollback;
         }
@@ -240,18 +238,11 @@ tl_status_t tl_segment_build_l0(tl_alloc_ctx_t* alloc,
         return TL_ENOMEM;
     }
 
+    /* TL_NEW is calloc-backed: window/bounds/prefix fields start zeroed. */
     seg->alloc = alloc;
     seg->level = TL_SEG_L0;
     seg->generation = generation;
     seg->applied_seq = applied_seq;
-    seg->window_start = 0;
-    seg->window_end = 0;
-    seg->window_end_unbounded = false;
-    seg->record_min_ts = 0;
-    seg->record_max_ts = 0;
-    seg->tomb_min_ts = 0;
-    seg->tomb_max_ts = 0;
-    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     tl_page_catalog_init(&seg->catalog, alloc);
@@ -361,6 +352,7 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
         return TL_ENOMEM;
     }
 
+    /* TL_NEW is calloc-backed: tombstones/bounds/prefix fields start zeroed. */
     seg->alloc = alloc;
     seg->level = TL_SEG_L1;
     seg->generation = generation;
@@ -368,12 +360,6 @@ tl_status_t tl_segment_build_l1(tl_alloc_ctx_t* alloc,
     seg->window_start = window_start;
     seg->window_end = window_end;
     seg->window_end_unbounded = window_end_unbounded;
-    seg->tombstones = NULL;
-    seg->record_min_ts = 0;
-    seg->record_max_ts = 0;
-    seg->tomb_min_ts = 0;
-    seg->tomb_max_ts = 0;
-    seg->page_prefix_counts = NULL;
     tl_atomic_init_u32(&seg->refcnt, 1);
 
     tl_page_catalog_init(&seg->catalog, alloc);

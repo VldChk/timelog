@@ -66,11 +66,6 @@ void tl_mutex_unlock(tl_mutex_t* mu);
 /** @return true if the mutex was acquired, false if already held. */
 bool tl_mutex_trylock(tl_mutex_t* mu);
 
-#ifdef TL_DEBUG
-/** Debug-only ownership query, used to assert lock-order invariants. */
-bool tl_mutex_is_held(const tl_mutex_t* mu);
-#endif
-
 /*===========================================================================
  * Condition Variable
  *
@@ -113,7 +108,6 @@ void tl_cond_wait(tl_cond_t* cv, tl_mutex_t* mu);
 bool tl_cond_timedwait(tl_cond_t* cv, tl_mutex_t* mu, uint32_t timeout_ms);
 
 void tl_cond_signal(tl_cond_t* cv);
-void tl_cond_broadcast(tl_cond_t* cv);
 
 /*===========================================================================
  * Thread
@@ -147,21 +141,6 @@ tl_status_t tl_thread_create(tl_thread_t* thread, tl_thread_fn fn, void* arg);
 
 /** Block until the thread exits, optionally returning its result. */
 tl_status_t tl_thread_join(tl_thread_t* thread, void** result);
-
-/** Opaque identifier for the calling thread; debug/diagnostic use only. */
-uint64_t tl_thread_self_id(void);
-
-#ifdef TL_DEBUG
-/**
- * Tag the current thread with a human-readable name so it shows up in
- * debuggers, profilers, and tools like htop. Each platform imposes its
- * own length limit and the name will be silently truncated to fit:
- * Linux pthread_setname_np caps at 15 chars, macOS at 63, Windows
- * (SetThreadDescription) requires Windows 10 1607 or newer and is a
- * no-op on older releases.
- */
-void tl_thread_set_name(const char* name);
-#endif
 
 /*===========================================================================
  * Yield and Sleep

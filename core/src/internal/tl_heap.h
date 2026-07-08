@@ -10,7 +10,7 @@
  * Backs the K-way merge used on the read path. Entries are ordered by
  * (timestamp, tie_break_key); equal timestamps are broken by tie_break_key
  * so the merge output remains deterministic. Push, pop, and peek run in
- * O(log K); bulk construction via heapify is O(K).
+ * O(log K).
  *
  * Used by the segment merge iterator and the memview iterator (the latter
  * merges the active run, OOO runs, and sealed memruns).
@@ -77,16 +77,6 @@ tl_status_t tl_heap_pop(tl_heap_t* h, tl_heap_entry_t* out);
 const tl_heap_entry_t* tl_heap_peek(const tl_heap_t* h);
 
 /**
- * Bulk-build a heap from an array of entries using Floyd's O(K) heapify
- * rather than the O(K log K) cost of repeated push.
- *
- * @param entries Source entries; copied into the heap.
- * @param n       Number of entries.
- * @return TL_OK on success, TL_ENOMEM on allocation failure.
- */
-tl_status_t tl_heap_build(tl_heap_t* h, const tl_heap_entry_t* entries, size_t n);
-
-/**
  * Replace the top entry with new_entry and sift down. Equivalent to
  * pop+push without the extra log K work of restoring the heap twice.
  * Precondition: the heap is not empty.
@@ -96,10 +86,6 @@ void tl_heap_replace_top(tl_heap_t* h, const tl_heap_entry_t* new_entry);
 /*---------------------------------------------------------------------------
  * Accessors
  *---------------------------------------------------------------------------*/
-
-TL_INLINE size_t tl_heap_len(const tl_heap_t* h) {
-    return h->len;
-}
 
 TL_INLINE bool tl_heap_is_empty(const tl_heap_t* h) {
     return h->len == 0;

@@ -19,10 +19,9 @@ typedef struct tl_alloc_ctx {
     bool           is_default;  /* True if using libc defaults */
 
 #ifdef TL_DEBUG
-    /* Debug tracking */
+    /* Debug tracking, read by the leak warning in tl__alloc_destroy(). */
     tl_atomic_u64  total_allocated;
     tl_atomic_u64  allocation_count;
-    tl_atomic_u64  peak_allocated;
 #endif
 } tl_alloc_ctx_t;
 
@@ -96,14 +95,6 @@ void* tl__realloc(tl_alloc_ctx_t* ctx, void* ptr, size_t new_size);
 void* tl__mallocarray(tl_alloc_ctx_t* ctx, size_t count, size_t size);
 
 /**
- * Reallocate array with overflow check.
- *
- * Returns NULL if count == 0, size == 0, or (count * size) overflows.
- * If count == 0 or size == 0, frees ptr and returns NULL.
- */
-void* tl__reallocarray(tl_alloc_ctx_t* ctx, void* ptr, size_t count, size_t size);
-
-/**
  * Free memory.
  *
  * @param ctx Allocator context
@@ -169,6 +160,12 @@ TL_INLINE size_t tl__grow_capacity(size_t current, size_t required, size_t min_c
 /**
  * Allocate typed object.
  * Usage: tl_page_t* page = TL_NEW(ctx, tl_page_t);
+ *
+ * NOTE: TL_NEW is calloc-backed and this is load-bearing: builder error
+ * paths (e.g. the segment builders' destroy-on-failure cleanup) rely on
+ * TL_NEW returning zero-initialised memory so that partially constructed
+ * objects have NULL pointers and zero counts. Do not switch this to a
+ * plain malloc without auditing every TL_NEW error path.
  */
 #define TL_NEW(ctx, type) \
     ((type*)tl__calloc((ctx), 1, sizeof(type)))
@@ -186,15 +183,5 @@ TL_INLINE size_t tl__grow_capacity(size_t current, size_t required, size_t min_c
  */
 #define TL_FREE(ctx, ptr) \
     do { tl__free((ctx), (void*)(ptr)); (ptr) = NULL; } while(0)
-
-/*===========================================================================
- * Debug Statistics (Debug Builds Only)
- *===========================================================================*/
-
-#ifdef TL_DEBUG
-size_t tl__alloc_get_total(const tl_alloc_ctx_t* ctx);
-size_t tl__alloc_get_count(const tl_alloc_ctx_t* ctx);
-size_t tl__alloc_get_peak(const tl_alloc_ctx_t* ctx);
-#endif
 
 #endif /* TL_ALLOC_H */

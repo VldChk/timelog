@@ -49,12 +49,28 @@ static tl_status_t test_intervals_insert_unbounded(tl_intervals_t* iv,
 #define tl_intervals_insert test_intervals_insert
 #define tl_intervals_insert_unbounded test_intervals_insert_unbounded
 
+/* The mutable contains/union wrappers were removed as dead production code;
+ * exercise the live imm primitives through equivalent shims. */
+static bool test_intervals_contains(const tl_intervals_t* iv, tl_ts_t ts) {
+    return tl_intervals_imm_max_seq(tl_intervals_as_imm(iv), ts) > 0;
+}
+
+static tl_status_t test_intervals_union(tl_intervals_t* out,
+                                        const tl_intervals_t* a,
+                                        const tl_intervals_t* b) {
+    return tl_intervals_union_imm(out, tl_intervals_as_imm(a),
+                                  tl_intervals_as_imm(b));
+}
+
+#define tl_intervals_contains test_intervals_contains
+#define tl_intervals_union test_intervals_union
+
 static bool tl_intervals_cursor_is_deleted(tl_intervals_cursor_t* cur, tl_ts_t ts) {
     return tl_intervals_cursor_max_seq(cur, ts) > 0;
 }
 
 /*===========================================================================
- * Record Vector Tests (16 tests)
+ * Record Vector Tests
  *===========================================================================*/
 
 TEST_DECLARE(ds_recvec_init_empty) {
@@ -113,41 +129,6 @@ TEST_DECLARE(ds_recvec_push_growth) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(ds_recvec_lower_bound_empty) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    TEST_ASSERT_EQ(0, tl_recvec_lower_bound(&rv, 50));
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_recvec_lower_bound_found) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    /* Push sorted: 10, 20, 30, 40, 50 */
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 10, 0));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 0));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 30, 0));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 40, 0));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 50, 0));
-
-    TEST_ASSERT_EQ(0, tl_recvec_lower_bound(&rv, 5));   /* Before all */
-    TEST_ASSERT_EQ(0, tl_recvec_lower_bound(&rv, 10));  /* Exact match */
-    TEST_ASSERT_EQ(1, tl_recvec_lower_bound(&rv, 15));  /* Between */
-    TEST_ASSERT_EQ(2, tl_recvec_lower_bound(&rv, 30));  /* Exact match */
-    TEST_ASSERT_EQ(5, tl_recvec_lower_bound(&rv, 100)); /* After all */
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
 /*===========================================================================
  * Math Helper Tests
  *===========================================================================*/
@@ -174,82 +155,6 @@ TEST_DECLARE(ds_math_overflow_i64) {
     TEST_ASSERT(tl_mul_overflow_i64(INT64_MIN, -1, &out));
     TEST_ASSERT(!tl_mul_overflow_i64(0, INT64_MIN, &out));
     TEST_ASSERT_EQ(0, out);
-}
-
-TEST_DECLARE(ds_recvec_upper_bound) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    /* Push with duplicates: 10, 20, 20, 20, 30 */
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 10, 0));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 1));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 2));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 20, 3));
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, 30, 0));
-
-    TEST_ASSERT_EQ(0, tl_recvec_upper_bound(&rv, 5));
-    TEST_ASSERT_EQ(1, tl_recvec_upper_bound(&rv, 10));
-    TEST_ASSERT_EQ(4, tl_recvec_upper_bound(&rv, 20)); /* After all 20s */
-    TEST_ASSERT_EQ(5, tl_recvec_upper_bound(&rv, 30));
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_recvec_range_bounds) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    /* 10, 20, 30, 40, 50 */
-    for (tl_ts_t ts = 10; ts <= 50; ts += 10) {
-        TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, ts, 0));
-    }
-
-    size_t lo, hi;
-
-    /* [15, 35) => indices 1..3 (records 20, 30) */
-    tl_recvec_range_bounds(&rv, 15, 35, &lo, &hi);
-    TEST_ASSERT_EQ(1, lo);
-    TEST_ASSERT_EQ(3, hi);
-
-    /* [10, 50) => indices 0..4 */
-    tl_recvec_range_bounds(&rv, 10, 50, &lo, &hi);
-    TEST_ASSERT_EQ(0, lo);
-    TEST_ASSERT_EQ(4, hi);
-
-    /* [100, 200) => empty */
-    tl_recvec_range_bounds(&rv, 100, 200, &lo, &hi);
-    TEST_ASSERT_EQ(5, lo);
-    TEST_ASSERT_EQ(5, hi);
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_recvec_insert_middle) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    tl_recvec_push(&rv, 10, 0);
-    tl_recvec_push(&rv, 30, 0);
-
-    /* Insert 20 at index 1 */
-    tl_status_t s = tl_recvec_insert(&rv, 1, 20, 0);
-    TEST_ASSERT_STATUS(TL_OK, s);
-    TEST_ASSERT_EQ(3, tl_recvec_len(&rv));
-
-    TEST_ASSERT_EQ(10, tl_recvec_get(&rv, 0)->ts);
-    TEST_ASSERT_EQ(20, tl_recvec_get(&rv, 1)->ts);
-    TEST_ASSERT_EQ(30, tl_recvec_get(&rv, 2)->ts);
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
 }
 
 TEST_DECLARE(ds_recvec_clear_and_reuse) {
@@ -347,45 +252,6 @@ TEST_DECLARE(ds_recvec_push_n_zero) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(ds_recvec_insert_invalid_idx) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    tl_recvec_push(&rv, 10, 0);
-    TEST_ASSERT_EQ(1, tl_recvec_len(&rv));
-
-    /* idx > len should fail */
-    TEST_ASSERT_STATUS(TL_EINVAL, tl_recvec_insert(&rv, 5, 20, 0));
-    TEST_ASSERT_EQ(1, tl_recvec_len(&rv)); /* Unchanged */
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_recvec_shrink_to_fit_empty) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-
-    /* Add and remove to get capacity without length */
-    for (size_t i = 0; i < 100; i++) {
-        tl_recvec_push(&rv, (tl_ts_t)i, 0);
-    }
-    tl_recvec_clear(&rv);
-    TEST_ASSERT(rv.cap >= 100);
-
-    /* shrink_to_fit when len=0 should free storage */
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_shrink_to_fit(&rv));
-    TEST_ASSERT_EQ(0, rv.cap);
-    TEST_ASSERT_NULL(rv.data);
-
-    tl_recvec_destroy(&rv);
-    tl__alloc_destroy(&alloc);
-}
-
 TEST_DECLARE(ds_recvec_destroy_idempotent) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -423,7 +289,7 @@ TEST_DECLARE(ds_recvec_sort_with_seqs_tie_breaker) {
 }
 
 /*===========================================================================
- * Interval Set Tests (24 tests, 1 debug-only)
+ * Interval Set Tests
  *===========================================================================*/
 
 TEST_DECLARE(ds_intervals_init_empty) {
@@ -984,37 +850,6 @@ TEST_DECLARE(ds_intervals_clip_unbounded) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(ds_intervals_covered_span_bounded) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_intervals_t iv;
-    tl_intervals_init(&iv, &alloc);
-
-    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30)); /* span = 20 */
-    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 50, 70)); /* span = 20 */
-
-    TEST_ASSERT_EQ(40, tl_intervals_covered_span(&iv));
-
-    tl_intervals_destroy(&iv);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_intervals_covered_span_unbounded) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_intervals_t iv;
-    tl_intervals_init(&iv, &alloc);
-
-    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert(&iv, 10, 30));
-    TEST_ASSERT_STATUS(TL_OK, tl_intervals_insert_unbounded(&iv, 50));
-
-    /* Unbounded => returns TL_TS_MAX (saturated) */
-    TEST_ASSERT_EQ(TL_TS_MAX, tl_intervals_covered_span(&iv));
-
-    tl_intervals_destroy(&iv);
-    tl__alloc_destroy(&alloc);
-}
-
 TEST_DECLARE(ds_intervals_cursor_basic) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -1144,7 +979,7 @@ TEST_DECLARE(ds_intervals_validate_correct) {
 #endif
 
 /*===========================================================================
- * Min-Heap Tests (11 tests)
+ * Min-Heap Tests
  *===========================================================================*/
 
 TEST_DECLARE(ds_heap_init_empty) {
@@ -1153,7 +988,7 @@ TEST_DECLARE(ds_heap_init_empty) {
     tl_heap_t h;
     tl_heap_init(&h, &alloc);
 
-    TEST_ASSERT_EQ(0, tl_heap_len(&h));
+    TEST_ASSERT_EQ(0, h.len);
     TEST_ASSERT(tl_heap_is_empty(&h));
     TEST_ASSERT_NULL(tl_heap_peek(&h));
 
@@ -1169,7 +1004,7 @@ TEST_DECLARE(ds_heap_push_pop_single) {
 
     tl_heap_entry_t e = { .ts = 100, .tie_break_key = 0, .handle = 42, .iter = NULL };
     TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
-    TEST_ASSERT_EQ(1, tl_heap_len(&h));
+    TEST_ASSERT_EQ(1, h.len);
 
     const tl_heap_entry_t* top = tl_heap_peek(&h);
     TEST_ASSERT_NOT_NULL(top);
@@ -1213,7 +1048,7 @@ TEST_DECLARE(ds_heap_ordering) {
         e.handle = (tl_handle_t)ts;
         TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     }
-    TEST_ASSERT_EQ(5, tl_heap_len(&h));
+    TEST_ASSERT_EQ(5, h.len);
 
     /* Pop should be in order */
     tl_heap_entry_t out;
@@ -1264,38 +1099,6 @@ TEST_DECLARE(ds_heap_tie_break_by_component) {
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(ds_heap_build_heapify) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_heap_t h;
-    tl_heap_init(&h, &alloc);
-
-    tl_heap_entry_t entries[5] = {
-        { .ts = 30, .tie_break_key = 0, .handle = 0, .iter = NULL },
-        { .ts = 10, .tie_break_key = 1, .handle = 0, .iter = NULL },
-        { .ts = 50, .tie_break_key = 2, .handle = 0, .iter = NULL },
-        { .ts = 20, .tie_break_key = 3, .handle = 0, .iter = NULL },
-        { .ts = 40, .tie_break_key = 4, .handle = 0, .iter = NULL },
-    };
-
-    TEST_ASSERT_STATUS(TL_OK, tl_heap_build(&h, entries, 5));
-    TEST_ASSERT_EQ(5, tl_heap_len(&h));
-
-    /* Verify min is 10 */
-    TEST_ASSERT_EQ(10, tl_heap_peek(&h)->ts);
-
-    /* Pop all and verify order */
-    tl_heap_entry_t out;
-    tl_ts_t prev = INT64_MIN;
-    while (tl_heap_pop(&h, &out) == TL_OK) {
-        TEST_ASSERT(out.ts >= prev);
-        prev = out.ts;
-    }
-
-    tl_heap_destroy(&h);
-    tl__alloc_destroy(&alloc);
-}
-
 TEST_DECLARE(ds_heap_replace_top) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
@@ -1339,7 +1142,7 @@ TEST_DECLARE(ds_heap_stress) {
         TEST_ASSERT_STATUS(TL_OK, tl_heap_push(&h, &e));
     }
 
-    TEST_ASSERT_EQ(1000, tl_heap_len(&h));
+    TEST_ASSERT_EQ(1000, h.len);
 
     /* Pop all and verify sorted */
     tl_heap_entry_t out;
@@ -1351,21 +1154,6 @@ TEST_DECLARE(ds_heap_stress) {
         count++;
     }
     TEST_ASSERT_EQ(1000, count);
-
-    tl_heap_destroy(&h);
-    tl__alloc_destroy(&alloc);
-}
-
-TEST_DECLARE(ds_heap_build_empty) {
-    tl_alloc_ctx_t alloc;
-    tl__alloc_init(&alloc, NULL);
-    tl_heap_t h;
-    tl_heap_init(&h, &alloc);
-
-    /* Build with n=0 should produce empty heap */
-    TEST_ASSERT_STATUS(TL_OK, tl_heap_build(&h, NULL, 0));
-    TEST_ASSERT(tl_heap_is_empty(&h));
-    TEST_ASSERT_NULL(tl_heap_peek(&h));
 
     tl_heap_destroy(&h);
     tl__alloc_destroy(&alloc);
@@ -1418,29 +1206,22 @@ TEST_DECLARE(ds_heap_replace_top_becomes_smallest) {
  *===========================================================================*/
 
 void run_internal_data_structures_tests(void) {
-    /* Record Vector tests (16 tests) */
+    /* Record Vector tests */
     RUN_TEST(ds_recvec_init_empty);
     RUN_TEST(ds_recvec_push_single);
     RUN_TEST(ds_recvec_push_growth);
-    RUN_TEST(ds_recvec_lower_bound_empty);
-    RUN_TEST(ds_recvec_lower_bound_found);
-    RUN_TEST(ds_recvec_upper_bound);
-    RUN_TEST(ds_recvec_range_bounds);
-    RUN_TEST(ds_recvec_insert_middle);
     RUN_TEST(ds_recvec_clear_and_reuse);
     RUN_TEST(ds_recvec_take_ownership);
     RUN_TEST(ds_recvec_take_empty);
     RUN_TEST(ds_recvec_reserve_zero);
     RUN_TEST(ds_recvec_push_n_zero);
-    RUN_TEST(ds_recvec_insert_invalid_idx);
-    RUN_TEST(ds_recvec_shrink_to_fit_empty);
     RUN_TEST(ds_recvec_destroy_idempotent);
     RUN_TEST(ds_recvec_sort_with_seqs_tie_breaker);
 
     /* Math helper tests */
     RUN_TEST(ds_math_overflow_i64);
 
-    /* Interval Set tests (30 tests, 1 debug-only) */
+    /* Interval Set tests */
     RUN_TEST(ds_intervals_init_empty);
     RUN_TEST(ds_intervals_insert_single);
     RUN_TEST(ds_intervals_insert_empty_is_noop);
@@ -1466,8 +1247,6 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_intervals_unbounded_absorbs_successors);
     RUN_TEST(ds_intervals_union_with_unbounded);
     RUN_TEST(ds_intervals_clip_unbounded);
-    RUN_TEST(ds_intervals_covered_span_bounded);
-    RUN_TEST(ds_intervals_covered_span_unbounded);
     RUN_TEST(ds_intervals_cursor_basic);
     RUN_TEST(ds_intervals_cursor_unbounded);
     RUN_TEST(ds_intervals_cursor_skip_to);
@@ -1477,18 +1256,14 @@ void run_internal_data_structures_tests(void) {
     RUN_TEST(ds_intervals_validate_correct);
 #endif
 
-    /* Min-Heap tests (11 tests) */
+    /* Min-Heap tests */
     RUN_TEST(ds_heap_init_empty);
     RUN_TEST(ds_heap_push_pop_single);
     RUN_TEST(ds_heap_pop_empty);
     RUN_TEST(ds_heap_ordering);
     RUN_TEST(ds_heap_tie_break_by_component);
-    RUN_TEST(ds_heap_build_heapify);
     RUN_TEST(ds_heap_replace_top);
     RUN_TEST(ds_heap_stress);
-    RUN_TEST(ds_heap_build_empty);
     RUN_TEST(ds_heap_destroy_idempotent);
     RUN_TEST(ds_heap_replace_top_becomes_smallest);
-
-    /* Total: 54 tests in release, 55 in debug */
 }

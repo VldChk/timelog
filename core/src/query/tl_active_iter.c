@@ -40,7 +40,6 @@ tl_status_t tl_active_iter_init(tl_active_iter_t* it,
                                             tl_memview_ooo_head_data(mv),
                                             tl_memview_ooo_head_seqs(mv),
                                             head_len,
-                                            0,
                                             t1,
                                             t2,
                                             t2_unbounded);

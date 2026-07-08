@@ -204,33 +204,11 @@ TL_INLINE const tl_memview_t* tl_memview_shared_view(const tl_memview_shared_t* 
     return mv != NULL ? &mv->view : NULL;
 }
 
-TL_INLINE uint64_t tl_memview_shared_epoch(const tl_memview_shared_t* mv) {
-    return mv != NULL ? mv->epoch : 0;
-}
-
 /**
  * Check if memview has any data (records or tombstones).
  */
 TL_INLINE bool tl_memview_has_data(const tl_memview_t* mv) {
     return mv->has_data;
-}
-
-/**
- * Get minimum timestamp across all components.
- * Only valid if has_data is true.
- */
-TL_INLINE tl_ts_t tl_memview_min_ts(const tl_memview_t* mv) {
-    TL_ASSERT(mv->has_data);
-    return mv->min_ts;
-}
-
-/**
- * Get maximum timestamp across all components.
- * Only valid if has_data is true.
- */
-TL_INLINE tl_ts_t tl_memview_max_ts(const tl_memview_t* mv) {
-    TL_ASSERT(mv->has_data);
-    return mv->max_ts;
 }
 
 /**

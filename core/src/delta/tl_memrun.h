@@ -211,10 +211,6 @@ TL_INLINE bool tl_memrun_has_tombstones(const tl_memrun_t* mr) {
     return mr->tombs_len > 0;
 }
 
-TL_INLINE bool tl_memrun_is_empty(const tl_memrun_t* mr) {
-    return mr->run_len == 0 && mr->ooo_total_len == 0 && mr->tombs_len == 0;
-}
-
 TL_INLINE tl_ts_t tl_memrun_min_ts(const tl_memrun_t* mr) {
     return mr->min_ts;
 }
@@ -238,10 +234,6 @@ TL_INLINE const tl_ooorunset_t* tl_memrun_ooo_runs(const tl_memrun_t* mr) {
 TL_INLINE const tl_ooorun_t* tl_memrun_ooo_run_at(const tl_memrun_t* mr, size_t idx) {
     TL_ASSERT(mr->ooo_runs != NULL);
     return mr->ooo_runs->runs[idx];
-}
-
-TL_INLINE const tl_interval_t* tl_memrun_tombs_data(const tl_memrun_t* mr) {
-    return mr->tombs;
 }
 
 TL_INLINE tl_seq_t tl_memrun_applied_seq(const tl_memrun_t* mr) {

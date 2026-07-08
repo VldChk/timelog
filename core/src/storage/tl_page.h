@@ -82,24 +82,10 @@ typedef struct tl_page {
 } tl_page_t;
 
 /*===========================================================================
- * Page Builder
+ * Page Building
  *
  * Constructs immutable pages from a sorted record stream.
  *===========================================================================*/
-
-typedef struct tl_page_builder {
-    tl_alloc_ctx_t* alloc;
-    size_t          target_page_bytes;
-    size_t          records_per_page;   /* Computed from target_page_bytes */
-} tl_page_builder_t;
-
-/*---------------------------------------------------------------------------
- * Lifecycle
- *---------------------------------------------------------------------------*/
-
-/** Initialize page builder with target page size. */
-void tl_page_builder_init(tl_page_builder_t* pb, tl_alloc_ctx_t* alloc,
-                          size_t target_page_bytes);
 
 /*---------------------------------------------------------------------------
  * Capacity Computation
@@ -125,7 +111,7 @@ size_t tl_page_builder_compute_capacity(size_t target_page_bytes);
  *
  * Precondition: records are sorted by timestamp (non-decreasing).
  *
- * @param pb      Page builder
+ * @param alloc   Allocator context
  * @param records Sorted record array
  * @param count   Number of records (must be > 0, must be <= UINT32_MAX)
  * @param out     Output page pointer
@@ -137,9 +123,9 @@ size_t tl_page_builder_compute_capacity(size_t target_page_bytes);
  * Note: count is size_t for API consistency, but tl_page_t.count is uint32_t.
  * Values > UINT32_MAX are rejected to prevent silent truncation.
  */
-tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
-                                   const tl_record_t* records, size_t count,
-                                   tl_page_t** out);
+tl_status_t tl_page_build(tl_alloc_ctx_t* alloc,
+                          const tl_record_t* records, size_t count,
+                          tl_page_t** out);
 
 /*---------------------------------------------------------------------------
  * Page Destruction
@@ -160,10 +146,6 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc);
  * For range queries [t1, t2), the read path uses:
  * - row_start = lower_bound(t1)  -> first ts >= t1
  * - row_end   = lower_bound(t2)  -> first ts >= t2 (exclusive boundary)
- *
- * For point queries (all records with ts == target):
- * - start = lower_bound(target)
- * - end   = upper_bound(target)
  *===========================================================================*/
 
 /**
@@ -173,14 +155,6 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc);
  * Complexity: O(log count)
  */
 size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target);
-
-/**
- * Find first row index where ts[i] > target.
- * Returns page->count if all ts <= target.
- *
- * Complexity: O(log count)
- */
-size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target);
 
 /*===========================================================================
  * Record Access

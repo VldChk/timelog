@@ -64,15 +64,6 @@ static bool approx_eq(double a, double b, double tol) {
     return fabs(a - b) <= tol;
 }
 
-static void init_advisory_timelog(tl_timelog_t* tl) {
-    memset(tl, 0, sizeof(*tl));
-    TEST_ASSERT_STATUS(TL_OK, tl_mutex_init(&tl->maint_mu));
-}
-
-static void destroy_advisory_timelog(tl_timelog_t* tl) {
-    tl_mutex_destroy(&tl->maint_mu);
-}
-
 /*===========================================================================
  * Configuration Validation Tests
  *===========================================================================*/
@@ -400,8 +391,7 @@ TEST_DECLARE(adapt_density_first_sample) {
     tl_flush_metrics_t metrics = {
         .record_count = 1000,
         .min_ts = 0,
-        .max_ts = 999,  /* span = 1000 */
-        .has_records = true
+        .max_ts = 999   /* span = 1000 */
     };
 
     tl_adaptive_update_density(&state, &cfg, &metrics);
@@ -425,8 +415,7 @@ TEST_DECLARE(adapt_density_ewma_smoothing) {
     tl_flush_metrics_t metrics = {
         .record_count = 2000,
         .min_ts = 0,
-        .max_ts = 999,  /* span = 1000, density = 2.0 */
-        .has_records = true
+        .max_ts = 999   /* span = 1000, density = 2.0 */
     };
 
     tl_adaptive_update_density(&state, &cfg, &metrics);
@@ -445,8 +434,7 @@ TEST_DECLARE(adapt_density_empty_ignored) {
     tl_flush_metrics_t metrics = {
         .record_count = 0,
         .min_ts = 0,
-        .max_ts = 0,
-        .has_records = false
+        .max_ts = 0
     };
 
     tl_adaptive_update_density(&state, &cfg, &metrics);
@@ -466,8 +454,7 @@ TEST_DECLARE(adapt_density_negative_span) {
     tl_flush_metrics_t metrics = {
         .record_count = 1000,
         .min_ts = 1000,
-        .max_ts = 500,  /* Invalid: max < min */
-        .has_records = true
+        .max_ts = 500   /* Invalid: max < min */
     };
 
     tl_adaptive_update_density(&state, &cfg, &metrics);
@@ -483,8 +470,7 @@ TEST_DECLARE(adapt_density_overflow_span) {
     tl_flush_metrics_t metrics = {
         .record_count = 1000,
         .min_ts = TL_TS_MIN,
-        .max_ts = TL_TS_MAX,  /* span would overflow */
-        .has_records = true
+        .max_ts = TL_TS_MAX   /* span would overflow */
     };
 
     tl_adaptive_update_density(&state, &cfg, &metrics);
@@ -611,75 +597,6 @@ TEST_DECLARE(adapt_fallback_candidate_zero) {
     tl_ts_t result = tl_adaptive_compute_candidate(&state, &cfg, 5000);
     /* Very small candidate will be clamped to min_window or fail */
     TEST_ASSERT(result > 0);
-}
-
-/*===========================================================================
- * Advisory Resize Query
- *===========================================================================*/
-
-TEST_DECLARE(adapt_wants_resize_disabled) {
-    tl_timelog_t tl;
-    init_advisory_timelog(&tl);
-
-    tl.window_grid_frozen = false;
-    tl.config.adaptive.target_records = 0;  /* disabled */
-    tl.config.adaptive.warmup_flushes = 3;
-    tl.adaptive.flush_count = 100;
-
-    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
-    destroy_advisory_timelog(&tl);
-}
-
-TEST_DECLARE(adapt_wants_resize_grid_frozen) {
-    tl_timelog_t tl;
-    init_advisory_timelog(&tl);
-
-    tl.window_grid_frozen = true;
-    tl.config.adaptive.target_records = 1000;
-    tl.config.adaptive.warmup_flushes = 3;
-    tl.adaptive.flush_count = 100;
-
-    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
-    destroy_advisory_timelog(&tl);
-}
-
-TEST_DECLARE(adapt_wants_resize_warmup_not_met) {
-    tl_timelog_t tl;
-    init_advisory_timelog(&tl);
-
-    tl.window_grid_frozen = false;
-    tl.config.adaptive.target_records = 1000;
-    tl.config.adaptive.warmup_flushes = 4;
-    tl.adaptive.flush_count = 3;
-
-    TEST_ASSERT(!tl_adaptive_wants_resize(&tl));
-    destroy_advisory_timelog(&tl);
-}
-
-TEST_DECLARE(adapt_wants_resize_warmup_met) {
-    tl_timelog_t tl;
-    init_advisory_timelog(&tl);
-
-    tl.window_grid_frozen = false;
-    tl.config.adaptive.target_records = 1000;
-    tl.config.adaptive.warmup_flushes = 4;
-    tl.adaptive.flush_count = 4;
-
-    TEST_ASSERT(tl_adaptive_wants_resize(&tl));
-    destroy_advisory_timelog(&tl);
-}
-
-TEST_DECLARE(adapt_wants_resize_zero_warmup) {
-    tl_timelog_t tl;
-    init_advisory_timelog(&tl);
-
-    tl.window_grid_frozen = false;
-    tl.config.adaptive.target_records = 1000;
-    tl.config.adaptive.warmup_flushes = 0;
-    tl.adaptive.flush_count = 0;
-
-    TEST_ASSERT(tl_adaptive_wants_resize(&tl));
-    destroy_advisory_timelog(&tl);
 }
 
 /*===========================================================================
@@ -1197,13 +1114,6 @@ void run_adaptive_internal_tests(void) {
     RUN_TEST(adapt_fallback_stale);
     RUN_TEST(adapt_fallback_stale_zero);
     RUN_TEST(adapt_fallback_candidate_zero);
-
-    /* Advisory Resize Query */
-    RUN_TEST(adapt_wants_resize_disabled);
-    RUN_TEST(adapt_wants_resize_grid_frozen);
-    RUN_TEST(adapt_wants_resize_warmup_not_met);
-    RUN_TEST(adapt_wants_resize_warmup_met);
-    RUN_TEST(adapt_wants_resize_zero_warmup);
 
     /* Full Computation */
     RUN_TEST(adapt_compute_basic);

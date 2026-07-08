@@ -17,8 +17,6 @@ option(TIMELOG_BUILD_PYTHON "Build CPython bindings from the top-level build" ON
 option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
 option(TIMELOG_STAGE_PYTHON_MODULE
     "Copy built _timelog extension into python/timelog for in-repo imports" ON)
-option(TIMELOG_BUILD_PY_FACADE_TESTS
-    "Add target to run python/tests via pytest (requires pytest installed)" OFF)
 option(TIMELOG_STRICT_WARNINGS
     "Treat compiler warnings as errors for core targets" ON)
 option(TIMELOG_BUILD_CORE_TESTS
@@ -258,14 +256,6 @@ if(TIMELOG_BUILD_CORE_TESTS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
     )
 
-    # Clang on Windows (non-MSVC driver) does not pull CRT libs by default.
-    if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
-        target_link_libraries(test_timelog PRIVATE
-            $<$<CONFIG:Debug>:msvcrtd.lib vcruntimed.lib ucrtd.lib legacy_stdio_definitions.lib oldnames.lib>
-            $<$<NOT:$<CONFIG:Debug>>:msvcrt.lib vcruntime.lib ucrt.lib legacy_stdio_definitions.lib oldnames.lib>
-        )
-    endif()
-
     # Enable test hooks for deterministic failpoint testing (Phase 9)
     target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
 
@@ -306,7 +296,7 @@ endif()
 # =============================================================================
 
 if(TIMELOG_BUILD_PYTHON)
-    # Expose repository root for bindings/cpython standalone-aware CMake.
+    # Expose repository root to the bindings/cpython subdirectory.
     set(TIMELOG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
     if(NOT DEFINED TIMELOG_PYTHON_PACKAGE_DIR)
         set(TIMELOG_PYTHON_PACKAGE_DIR
@@ -346,47 +336,6 @@ if(TIMELOG_BUILD_PYTHON)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         COMMENT "Run all registered core and binding tests"
     )
-
-    if(TIMELOG_BUILD_PY_FACADE_TESTS)
-        add_custom_target(timelog_python_facade_tests
-            COMMAND ${CMAKE_COMMAND} -E env
-                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-                    "${Python3_EXECUTABLE}" -m pytest
-                    "${CMAKE_CURRENT_SOURCE_DIR}/python/tests" -q
-            DEPENDS _timelog
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-            COMMENT "Run Python facade tests with staged extension module"
-        )
-    endif()
-endif()
-
-# Ensure ASan runtime DLL is discoverable when using Clang on Windows.
-if (TIMELOG_BUILD_CORE_TESTS AND WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
-    execute_process(
-        COMMAND ${CMAKE_C_COMPILER} --print-resource-dir
-        OUTPUT_VARIABLE _clang_res_dir
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-
-    if (_clang_res_dir)
-        get_filename_component(_clang_ver "${_clang_res_dir}" NAME)
-        get_filename_component(_clang_lib_dir "${_clang_res_dir}" DIRECTORY)
-        get_filename_component(_clang_lib_root "${_clang_lib_dir}" DIRECTORY)
-        get_filename_component(_clang_root "${_clang_lib_root}" DIRECTORY)
-
-        set(_clang_rt_dir "${_clang_res_dir}/lib/windows")
-
-        if (CMAKE_SIZEOF_VOID_P EQUAL 8)
-            set(_clang_rt_dir_alt "${_clang_root}/x64/lib/clang/${_clang_ver}/lib/windows")
-            if (EXISTS "${_clang_rt_dir_alt}/clang_rt.asan_dynamic-x86_64.dll")
-                set(_clang_rt_dir "${_clang_rt_dir_alt}")
-            endif()
-        endif()
-
-        set_tests_properties(timelog_tests PROPERTIES
-            ENVIRONMENT "PATH=${_clang_rt_dir};$ENV{PATH}"
-        )
-    endif()
 endif()
 
 # =============================================================================

@@ -62,31 +62,18 @@ struct tl_iter {
  * Status Code Strings
  *===========================================================================*/
 
-static const char* status_strings[] = {
-    "success",                          /* TL_OK = 0 */
-    "end of iteration",                 /* TL_EOF = 1 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 2-9 unused */
-    "invalid argument",                 /* TL_EINVAL = 10 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 11-19 unused */
-    "invalid state",                    /* TL_ESTATE = 20 */
-    "resource busy",                    /* TL_EBUSY = 21 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 22-29 unused */
-    "out of memory",                    /* TL_ENOMEM = 30 */
-    "arithmetic overflow",              /* TL_EOVERFLOW = 31 */
-};
-
-#define STATUS_STRINGS_COUNT (sizeof(status_strings) / sizeof(status_strings[0]))
-
 const char* tl_strerror(tl_status_t s) {
-    if (s == TL_EINTERNAL) {
-        return "internal error";
+    switch (s) {
+        case TL_OK:        return "success";
+        case TL_EOF:       return "end of iteration";
+        case TL_EINVAL:    return "invalid argument";
+        case TL_ESTATE:    return "invalid state";
+        case TL_EBUSY:     return "resource busy";
+        case TL_ENOMEM:    return "out of memory";
+        case TL_EOVERFLOW: return "arithmetic overflow";
+        case TL_EINTERNAL: return "internal error";
+        default:           return "unknown error";
     }
-
-    if ((size_t)s < STATUS_STRINGS_COUNT && status_strings[s] != NULL) {
-        return status_strings[s];
-    }
-
-    return "unknown error";
 }
 
 /*===========================================================================
@@ -510,6 +497,38 @@ static void tl__range_end_from_inclusive_max(tl_ts_t max_inclusive,
 }
 
 /**
+ * Single seal attempt shared by both tries in handle_seal_with_backpressure.
+ * On TL_OK: transfers the dropped-record buffer to the caller and requests
+ * a worker wake-up. On failure: frees any partial drop buffer and returns
+ * the raw seal status for the caller to map.
+ */
+static tl_status_t try_seal_once(tl_timelog_t* tl,
+                                 bool* need_signal,
+                                 tl_record_t** out_dropped,
+                                 size_t* out_dropped_len) {
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    tl_status_t seal_st = tl_memtable_seal_ex(&tl->memtable,
+                                               &tl->memtable_mu,
+                                               NULL,
+                                               tl->op_seq,
+                                               &dropped,
+                                               &dropped_len);
+    if (seal_st == TL_OK) {
+        tl_atomic_inc_u64(&tl->seals_total);
+        *need_signal = true;
+        *out_dropped = dropped;
+        *out_dropped_len = dropped_len;
+        return TL_OK;
+    }
+
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
+    }
+    return seal_st;
+}
+
+/**
  * Seal the active run if the memtable is full, applying backpressure when
  * the sealed-run queue has no room.
  *
@@ -532,11 +551,12 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
                                                   bool* need_signal,
                                                   tl_record_t** out_dropped,
                                                   size_t* out_dropped_len) {
+    TL_ASSERT(out_dropped != NULL);
+    TL_ASSERT(out_dropped_len != NULL);
+
     *need_signal = false;
-    if (out_dropped != NULL && out_dropped_len != NULL) {
-        *out_dropped = NULL;
-        *out_dropped_len = 0;
-    }
+    *out_dropped = NULL;
+    *out_dropped_len = 0;
 
     if (!tl_memtable_should_seal(&tl->memtable)) {
         return TL_OK;
@@ -546,28 +566,10 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         tl_atomic_inc_u64(&tl->ooo_budget_hits);
     }
 
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
-    tl_status_t seal_st = tl_memtable_seal_ex(&tl->memtable,
-                                               &tl->memtable_mu,
-                                               NULL,
-                                               tl->op_seq,
-                                               &dropped,
-                                               &dropped_len);
+    tl_status_t seal_st = try_seal_once(tl, need_signal,
+                                        out_dropped, out_dropped_len);
     if (seal_st == TL_OK) {
-        tl_atomic_inc_u64(&tl->seals_total);
-        *need_signal = true;
-        if (out_dropped != NULL && out_dropped_len != NULL) {
-            *out_dropped = dropped;
-            *out_dropped_len = dropped_len;
-        } else if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
         return TL_OK;
-    }
-
-    if (dropped != NULL) {
-        tl__free(&tl->alloc, dropped);
     }
 
     if (seal_st != TL_EBUSY) {
@@ -602,28 +604,9 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         return TL_EBUSY;
     }
 
-    dropped = NULL;
-    dropped_len = 0;
-    seal_st = tl_memtable_seal_ex(&tl->memtable,
-                                   &tl->memtable_mu,
-                                   NULL,
-                                   tl->op_seq,
-                                   &dropped,
-                                   &dropped_len);
+    seal_st = try_seal_once(tl, need_signal, out_dropped, out_dropped_len);
     if (seal_st == TL_OK) {
-        tl_atomic_inc_u64(&tl->seals_total);
-        *need_signal = true;
-        if (out_dropped != NULL && out_dropped_len != NULL) {
-            *out_dropped = dropped;
-            *out_dropped_len = dropped_len;
-        } else if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
         return TL_OK;
-    }
-
-    if (dropped != NULL) {
-        tl__free(&tl->alloc, dropped);
     }
 
     /* Write succeeded but seal could not complete. Return EBUSY rather than
@@ -1069,9 +1052,8 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
         size_t run_len = tl_memrun_run_len(mr);
         size_t ooo_len = tl_memrun_ooo_len(mr);
         metrics.record_count = (uint64_t)(run_len + ooo_len);
-        metrics.has_records = (metrics.record_count > 0);
 
-        if (metrics.has_records) {
+        if (metrics.record_count > 0) {
             const tl_record_t* run = tl_memrun_run_data(mr);
             tl_ts_t ooo_min = mr->ooo_min_ts;
             tl_ts_t ooo_max = mr->ooo_max_ts;
@@ -1734,8 +1716,7 @@ typedef enum tl_work_t {
     TL_WORK_NONE               = 0,
     TL_WORK_FLUSH              = 1u << 0,
     TL_WORK_COMPACT_EXPLICIT   = 1u << 1,
-    TL_WORK_COMPACT_HEURISTIC  = 1u << 2,
-    TL_WORK_RESHAPE_L0         = 1u << 3  /* Reserved for future use. */
+    TL_WORK_COMPACT_HEURISTIC  = 1u << 2
 } tl_work_t;
 
 static void* tl__maint_worker_entry(void* arg) {
