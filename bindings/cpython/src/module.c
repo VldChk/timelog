@@ -37,18 +37,47 @@ static const char module_doc[] =
 
 const char TlPy_TimelogModuleName[] = "timelog._timelog";
 
-static const char* const managed_export_names[] = {
-    "TimelogError",
-    "TimelogBusyError",
-    "Timelog",
-    "TimelogIter",
-    "PageSpan",
-    "PageSpanIter",
-    "PageSpanObjectsView",
+/*
+ * Single source of truth for the managed module exports: export, remove,
+ * snapshot, and restore all key off this table, so the name list and the
+ * exported state slots cannot drift. The export set deliberately includes
+ * the two exceptions and excludes the non-exported ObjectsViewIter.
+ */
+typedef struct {
+    const char* name;
+    size_t offset;                      /* offsetof into tl_py_module_state_t */
+    tl_py_module_failpoint_t failpoint;
+    const char* stage;
+} timelog_export_desc_t;
+
+static const timelog_export_desc_t timelog_export_table[] = {
+    {"TimelogError", offsetof(tl_py_module_state_t, exc_timelog_error),
+     TL_PY_MODULE_FAIL_NONE, NULL},
+    {"TimelogBusyError", offsetof(tl_py_module_state_t, exc_timelog_busy_error),
+     TL_PY_MODULE_FAIL_NONE, NULL},
+    {"Timelog", offsetof(tl_py_module_state_t, type_timelog),
+     TL_PY_MODULE_FAIL_AFTER_EXPORT_TIMELOG, "after Timelog export"},
+    {"TimelogIter", offsetof(tl_py_module_state_t, type_timelog_iter),
+     TL_PY_MODULE_FAIL_AFTER_EXPORT_ITER, "after TimelogIter export"},
+    {"PageSpan", offsetof(tl_py_module_state_t, type_pagespan),
+     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN, "after PageSpan export"},
+    {"PageSpanIter", offsetof(tl_py_module_state_t, type_pagespan_iter),
+     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_ITER, "after PageSpanIter export"},
+    {"PageSpanObjectsView",
+     offsetof(tl_py_module_state_t, type_pagespan_objects_view),
+     TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_OBJECTS_VIEW,
+     "after PageSpanObjectsView export"},
 };
 
 #define TIMELOG_MANAGED_EXPORT_COUNT \
-    (sizeof(managed_export_names) / sizeof(managed_export_names[0]))
+    (sizeof(timelog_export_table) / sizeof(timelog_export_table[0]))
+
+/* Current value of the export slot described by `d` (read-only). */
+static PyObject* timelog_export_value(const tl_py_module_state_t* st,
+                                      const timelog_export_desc_t* d)
+{
+    return *(PyObject* const*)((const char*)st + d->offset);
+}
 
 #ifdef TL_PY_MODULE_TEST_HOOKS
 static tl_py_module_failpoint_t tl_py_module_failpoint = TL_PY_MODULE_FAIL_NONE;
@@ -169,11 +198,6 @@ static int timelog_clear(PyObject* module)
     return 0;
 }
 
-static void timelog_free(void* module)
-{
-    (void)module;
-}
-
 static void timelog_remove_managed_exports(PyObject* module)
 {
     PyObject* module_dict = PyModule_GetDict(module);
@@ -184,8 +208,9 @@ static void timelog_remove_managed_exports(PyObject* module)
     }
 
     TL_PY_PRESERVE_EXC_BEGIN;
-    for (i = 0; i < sizeof(managed_export_names) / sizeof(managed_export_names[0]); i++) {
-        if (PyDict_DelItemString(module_dict, managed_export_names[i]) < 0) {
+    for (i = 0; i < TIMELOG_MANAGED_EXPORT_COUNT; i++) {
+        if (PyDict_DelItemString(module_dict,
+                                 timelog_export_table[i].name) < 0) {
             PyErr_Clear();
         }
     }
@@ -276,13 +301,6 @@ static int timelog_maybe_fail(int failpoint, const char* stage)
 #endif
 
 typedef struct {
-    const char* name;
-    PyObject* value;
-    tl_py_module_failpoint_t failpoint;
-    const char* stage;
-} timelog_export_entry_t;
-
-typedef struct {
     PyObject* old_value;
     int existed;
 } timelog_export_snapshot_t;
@@ -299,7 +317,8 @@ static int timelog_snapshot_exports(PyObject* module,
     }
 
     for (i = 0; i < n; i++) {
-        PyObject* old = PyDict_GetItemString(module_dict, managed_export_names[i]);
+        PyObject* old = PyDict_GetItemString(module_dict,
+                                             timelog_export_table[i].name);
         snapshots[i].old_value = old != NULL ? Py_NewRef(old) : NULL;
         snapshots[i].existed = old != NULL;
     }
@@ -332,12 +351,13 @@ static void timelog_restore_exports(PyObject* module,
     TL_PY_PRESERVE_EXC_BEGIN;
     for (i = 0; i < n; i++) {
         if (snapshots[i].existed) {
-            if (PyDict_SetItemString(module_dict, managed_export_names[i],
+            if (PyDict_SetItemString(module_dict, timelog_export_table[i].name,
                                      snapshots[i].old_value) < 0) {
                 PyErr_Clear();
             }
         } else {
-            if (PyDict_DelItemString(module_dict, managed_export_names[i]) < 0) {
+            if (PyDict_DelItemString(module_dict,
+                                     timelog_export_table[i].name) < 0) {
                 PyErr_Clear();
             }
         }
@@ -348,24 +368,6 @@ static void timelog_restore_exports(PyObject* module,
 
 static int timelog_export_public_refs(PyObject* module, tl_py_module_state_t* st)
 {
-    timelog_export_entry_t entries[] = {
-        {"TimelogError", st->exc_timelog_error, TL_PY_MODULE_FAIL_NONE, NULL},
-        {"TimelogBusyError", st->exc_timelog_busy_error, TL_PY_MODULE_FAIL_NONE, NULL},
-        {"Timelog", st->type_timelog, TL_PY_MODULE_FAIL_AFTER_EXPORT_TIMELOG,
-         "after Timelog export"},
-        {"TimelogIter", st->type_timelog_iter, TL_PY_MODULE_FAIL_AFTER_EXPORT_ITER,
-         "after TimelogIter export"},
-        {"PageSpan", st->type_pagespan, TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN,
-         "after PageSpan export"},
-        {"PageSpanIter", st->type_pagespan_iter, TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_ITER,
-         "after PageSpanIter export"},
-        {"PageSpanObjectsView", st->type_pagespan_objects_view,
-         TL_PY_MODULE_FAIL_AFTER_EXPORT_PAGESPAN_OBJECTS_VIEW,
-        "after PageSpanObjectsView export"},
-    };
-    _Static_assert(sizeof(entries) / sizeof(entries[0]) ==
-                   TIMELOG_MANAGED_EXPORT_COUNT,
-                   "managed_export_names and entries must stay in lockstep");
     timelog_export_snapshot_t snapshots[
         TIMELOG_MANAGED_EXPORT_COUNT
     ];
@@ -378,12 +380,14 @@ static int timelog_export_public_refs(PyObject* module, tl_py_module_state_t* st
         return -1;
     }
 
-    for (i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
-        if (PyModule_AddObjectRef(module, entries[i].name, entries[i].value) < 0) {
+    for (i = 0; i < TIMELOG_MANAGED_EXPORT_COUNT; i++) {
+        const timelog_export_desc_t* d = &timelog_export_table[i];
+        if (PyModule_AddObjectRef(module, d->name,
+                                  timelog_export_value(st, d)) < 0) {
             goto error;
         }
-        if (entries[i].failpoint != TL_PY_MODULE_FAIL_NONE &&
-            timelog_maybe_fail(entries[i].failpoint, entries[i].stage) < 0) {
+        if (d->failpoint != TL_PY_MODULE_FAIL_NONE &&
+            timelog_maybe_fail(d->failpoint, d->stage) < 0) {
             goto error;
         }
     }
@@ -506,17 +510,12 @@ static struct PyModuleDef timelog_module = {
     timelog_slots,                        /* m_slots */
     timelog_traverse,                     /* m_traverse */
     timelog_clear,                        /* m_clear */
-    timelog_free                          /* m_free */
+    NULL                                  /* m_free (nothing to free) */
 };
 
 PyMODINIT_FUNC PyInit__timelog(void)
 {
     return PyModuleDef_Init(&timelog_module);
-}
-
-int TlPy_ModuleMatchesTimelogDef(PyObject* module)
-{
-    return module != NULL && PyModule_GetDef(module) == &timelog_module;
 }
 
 tl_py_module_state_t* TlPy_StateFromType(PyTypeObject* type)

@@ -2,15 +2,10 @@
 # Timelog Python Bindings (CPython Extension)
 # =============================================================================
 #
-# This CMakeLists.txt can be used in two ways:
-# 1. Included from the root timelog CMakeLists.txt via add_subdirectory()
-# 2. Built standalone for development/testing
+# Included from the root timelog CMakeLists.txt via add_subdirectory() when
+# TIMELOG_BUILD_PYTHON=ON (the default). There is no standalone build mode;
+# configure the repository root:
 #
-# Build (standalone):
-#   cmake -B build -DPYTHON_EXECUTABLE=python3
-#   cmake --build build
-#
-# Build (from root):
 #   cmake -B build -DTIMELOG_BUILD_PYTHON=ON
 #   cmake --build build
 #
@@ -18,52 +13,6 @@
 cmake_minimum_required(VERSION 3.15)
 if(POLICY CMP0177)
     cmake_policy(SET CMP0177 NEW)
-endif()
-
-# If building standalone, set up project
-if(NOT TARGET timelog)
-    project(timelog_python VERSION 1.0.0 LANGUAGES C)
-
-    set(CMAKE_C_STANDARD 17)
-    set(CMAKE_C_STANDARD_REQUIRED ON)
-    set(CMAKE_C_EXTENSIONS OFF)
-
-    # Need to find parent timelog library
-    # Assume it's built in ../.. relative to this file
-    set(TIMELOG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
-
-    # Import timelog as an interface library pointing to built static lib
-    add_library(timelog STATIC IMPORTED)
-
-    # Find the library - check multiple locations for Windows/Unix builds
-    if(WIN32)
-        # Windows: Check build_x64/Release, build_x64/Debug, build/Release, build/Debug
-        if(EXISTS "${TIMELOG_ROOT}/build_x64/Release/timelog.lib")
-            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build_x64/Release/timelog.lib")
-        elseif(EXISTS "${TIMELOG_ROOT}/build_x64/Debug/timelog.lib")
-            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build_x64/Debug/timelog.lib")
-        elseif(EXISTS "${TIMELOG_ROOT}/build/Release/timelog.lib")
-            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/Release/timelog.lib")
-        elseif(EXISTS "${TIMELOG_ROOT}/build/Debug/timelog.lib")
-            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/Debug/timelog.lib")
-        else()
-            message(FATAL_ERROR "Cannot find timelog.lib - build core library first")
-        endif()
-    else()
-        # Unix: Check build/libtimelog.a
-        if(EXISTS "${TIMELOG_ROOT}/build/libtimelog.a")
-            set(TIMELOG_LIB_PATH "${TIMELOG_ROOT}/build/libtimelog.a")
-        else()
-            message(FATAL_ERROR "Cannot find libtimelog.a - build core library first")
-        endif()
-    endif()
-
-    set_target_properties(timelog PROPERTIES
-        IMPORTED_LOCATION "${TIMELOG_LIB_PATH}"
-        INTERFACE_INCLUDE_DIRECTORIES "${TIMELOG_ROOT}/core/include"
-    )
-
-    message(STATUS "Standalone build: linking against ${TIMELOG_LIB_PATH}")
 endif()
 
 # Root build enables warnings-as-errors globally for core. Disable that policy
@@ -186,9 +135,6 @@ if(NOT DEFINED TIMELOG_PYTHON_PACKAGE_DIR)
     )
 endif()
 
-option(TIMELOG_STAGE_PYTHON_MODULE
-    "Copy built _timelog extension into the in-repo python/timelog directory" ON)
-
 # Include directories
 # NOTE: B4 requires access to internal headers in core/src
 target_include_directories(_timelog PRIVATE
@@ -236,8 +182,7 @@ endif()
 
 # Optional: build a test executable for the handle context
 # This allows testing the lock-free queue and pin tracking without Python
-option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
-
+# (TIMELOG_BUILD_PY_TESTS is declared by the root CMakeLists.txt.)
 if(TIMELOG_BUILD_PY_TESTS)
     # Embedded-Python C tests may run under launcher shims (e.g. pyenv) where
     # executable dirname is not a valid CPython home. Resolve a stable prefix

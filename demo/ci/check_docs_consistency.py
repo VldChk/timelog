@@ -95,7 +95,7 @@ REQUIRED_BINDING_PATTERNS = {
     ),
     "bulk_append": re.compile(
         r'\{\s*"bulk_append"\s*,\s*\(PyCFunction\).*?PyTimelog_bulk_append\s*,\s*'
-        r'METH_FASTCALL\s*\|\s*METH_KEYWORDS',
+        r'METH_VARARGS\s*\|\s*METH_KEYWORDS',
         re.DOTALL,
     ),
 }

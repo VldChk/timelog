@@ -369,7 +369,7 @@ TEST(raise_formatted_empty_format_still_sets_status_text)
     Py_DECREF(module);
 }
 
-TEST(raise_formatted_long_message_truncates_safely)
+TEST(raise_formatted_long_message_is_preserved)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
@@ -392,8 +392,9 @@ TEST(raise_formatted_long_message_truncates_safely)
     ASSERT_NOT_NULL(exc_text);
     text = PyUnicode_AsUTF8(exc_text);
     ASSERT(text != NULL);
-    ASSERT(strncmp(text, long_msg, 64) == 0);
-    ASSERT(strlen(text) < 512);
+    /* PyErr_FormatV imposes no fixed buffer: the FULL message survives. */
+    ASSERT(strcmp(text, long_msg) == 0);
+    ASSERT(strlen(text) == sizeof(long_msg) - 1);
 
     Py_XDECREF(exc_text);
     Py_XDECREF(exc_type);
@@ -426,7 +427,7 @@ int main(void)
     run_raise_unknown_uses_timelog_error();
     run_raise_formatted_appends_status_message();
     run_raise_formatted_empty_format_still_sets_status_text();
-    run_raise_formatted_long_message_truncates_safely();
+    run_raise_formatted_long_message_is_preserved();
     run_runtime_fallback_without_state_uses_runtimeerror();
 
     printf("\\nSummary: %d run, %d failed\\n", tests_run, tests_failed);

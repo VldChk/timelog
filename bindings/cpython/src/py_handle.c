@@ -26,7 +26,6 @@
 #include <inttypes.h> /* PRIu64 for portable uint64_t formatting */
 #include <stdio.h>    /* fprintf, stderr */
 #include <stdlib.h>   /* malloc, free - NOT Python allocators in on_drop */
-#include <string.h>   /* memset */
 
 #ifdef MS_WINDOWS
 #  include <windows.h>
@@ -76,16 +75,6 @@ struct tl_py_live_table {
 };
 typedef struct tl_py_live_table tl_py_live_table_t;
 
-/*
- * Returns 1 if the current thread has an attached Python thread state that
- * belongs to the same interpreter that owns this ctx.
- *
- * Under free-threaded CPython the right precondition for Python C-API
- * access is "an attached thread state on the owning interpreter", not
- * "GIL held". On 3.13+ we query the thread state directly. On 3.12
- * (where free-threaded builds do not exist) the GIL-presence check is
- * equivalent.
- */
 /*
  * The interpreter owning the currently-attached Python thread state, or NULL
  * if none is attached. On 3.13+ this asks the right free-threaded question
@@ -311,9 +300,6 @@ tl_py_process_retired_list(tl_py_handle_ctx_t* ctx,
 
         tl_py_drop_node_t* node = list;
         list = node->next;
-        if (list == NULL) {
-            list_tail = NULL;
-        }
 
         tl_py_live_note_drop(ctx, node->obj);
 
@@ -407,15 +393,10 @@ static tl_status_t tl_py_live_ensure(tl_py_handle_ctx_t* ctx, size_t needed)
  * Compile-Time Validation
  *===========================================================================*/
 
-/**
- * Verify that we have proper C11/C17 atomics.
- * The Python.h include already requires a modern compiler, so this should
- * always succeed. If not, we need to add MSVC intrinsics fallback.
- */
-#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
-    #error "C11 or later required for stdatomic.h"
-#endif
-
+/* LOAD-BEARING: the binding requires C11 atomics (MSVC wheels compile with
+ * /experimental:c11atomics). This is the single guard enforcing it; keep it
+ * even if this file is refactored, or MSVC builds without the flag fail
+ * later and less legibly at the first _Atomic use. */
 #if defined(__STDC_NO_ATOMICS__)
     #error "Compiler does not support C11 atomics"
 #endif
@@ -679,6 +660,8 @@ uint64_t tl_py_pins_count(const tl_py_handle_ctx_t* ctx)
 
 void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 {
+    (void)ts;  /* Fixed by the core on_drop contract; not stored. */
+
     if (on_drop_ctx == NULL) {
         /* Misconfiguration: callback registered without context. Silent fail. */
         return;
@@ -696,7 +679,6 @@ void tl_py_on_drop_handle(void* on_drop_ctx, tl_ts_t ts, tl_handle_t handle)
 
     /* Initialize fields before CAS publication. */
     node->obj = tl_py_handle_decode(handle);
-    node->ts = ts;
 
     /* Single-node push (head == tail); ACQ_REL rationale in tl_py_retired_push. */
     tl_py_retired_push(ctx, node, node);
