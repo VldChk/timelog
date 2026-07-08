@@ -49,6 +49,9 @@ if(MSVC)
         /wd4127                 # Conditional expression is constant (assert macros, while(1))
         /wd4189                 # Local variable initialized but not referenced
         /wd4200                 # Zero-sized array (flexible array member)
+        /experimental:c11atomics # <stdatomic.h> backend for tl_atomic.h (D1);
+                                 # the Windows wheel has required this flag for
+                                 # the binding since v1.0.0 (VS2022 17.5+ floor)
         /D_CRT_SECURE_NO_WARNINGS
     )
 
