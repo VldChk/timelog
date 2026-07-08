@@ -1,9 +1,0 @@
-You are a hostile senior C reviewer auditing timelog, an in-memory LSM time-index in C17 with CPython bindings (read CLAUDE.md first for architecture/invariants). The maintainer suspects the project reinvents wheels: everything was written from scratch.
-
-For the module files listed below, answer TWO questions per piece of machinery:
-(a) SIMPLER? Can it be simpler with ZERO functional and ZERO performance regression (dead code, single-caller generality, speculative knobs, duplicated logic, stdlib replacements)?
-(b) PRIOR ART? Is this a well-known sub-problem already solved by a mature C library (klib, CCAN, stb, Concurrency Kit, liburcu, uthash, Unity/greatest, etc.)?
-
-HARD CONSTRAINTS for any library suggestion: MIT-compatible license; pure C17; GCC+Clang+MSVC with -Werror//WX; in-memory only; must fit the tl__malloc custom-allocator seam; concurrency parts TSan-clean incl. free-threaded CPython 3.14t; ZERO perf regression on hot paths (append/query/merge — perf is the product); vendorable/FetchContent for scikit-build wheels.
-
-RULES: Ground EVERY claim in file:line with evidence. "NO and NO" is acceptable and expected where hand-rolled code earns its keep — but say WHY. Estimate LOC saved per finding (count new glue too). Respect documented invariants (immutability-after-publication, L1 non-overlap, half-open intervals, lock ordering, seqlock windows). Do NOT modify any files. OUTPUT: a complete markdown report to stdout: executive summary, findings with file:line evidence + LOC estimates + risk, explicit NO-AND-NO section, ranked shortlist.
