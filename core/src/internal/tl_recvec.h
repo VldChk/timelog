@@ -127,7 +127,9 @@ TL_INLINE const tl_record_t* tl_recvec_data(const tl_recvec_t* rv) {
  * state; the caller becomes responsible for freeing the buffer via
  * tl__free() against the same allocator used to construct the vector.
  *
- * @return Array pointer (NULL when the vector was empty).
+ * @return Raw array pointer. May be non-NULL with *out_len == 0 when
+ *         capacity was reserved but nothing was pushed; NULL only when the
+ *         vector never allocated.
  */
 tl_record_t* tl_recvec_take(tl_recvec_t* rv, size_t* out_len);
 

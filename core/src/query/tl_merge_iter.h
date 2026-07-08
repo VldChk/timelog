@@ -14,8 +14,8 @@
  * iterator). Each next() pops the minimum-timestamp entry, advances the
  * source it came from, and pushes the replacement entry.
  *
- * Distinct from the simple two-way merge used by flush; that lives in
- * tl_flush.h and is unrelated.
+ * Distinct from the flush build's internal k-way merge (tl_flush.c), which
+ * merges memrun sources directly over tl_heap without an iterator layer.
  *
  * Tie-Breaking (implementation detail, not a public guarantee):
  * - On timestamp ties, sources are ordered by tie_break_key (priority

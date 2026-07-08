@@ -91,47 +91,6 @@ tl_status_t tl_memrun_init(tl_memrun_t* mr,
     return TL_OK;
 }
 
-tl_status_t tl_memrun_create(tl_alloc_ctx_t* alloc,
-                              tl_record_t* run, size_t run_len,
-                              tl_ooorunset_t* ooo_runs,
-                              tl_interval_t* tombs, size_t tombs_len,
-                              tl_seq_t applied_seq,
-                              tl_memrun_t** out) {
-    TL_ASSERT(alloc != NULL);
-    TL_ASSERT(out != NULL);
-
-    *out = NULL;
-
-    if (run_len == 0 && ooo_runs == NULL && tombs_len == 0) {
-        return TL_EINVAL;
-    }
-    if (run_len > 0 && run == NULL) {
-        return TL_EINVAL;
-    }
-    if (ooo_runs != NULL && ooo_runs->count == 0) {
-        return TL_EINVAL;
-    }
-    if (tombs_len > 0 && tombs == NULL) {
-        return TL_EINVAL;
-    }
-
-    tl_memrun_t* mr = NULL;
-    tl_status_t st = tl_memrun_alloc(alloc, &mr);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    st = tl_memrun_init(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len,
-                        applied_seq);
-    if (st != TL_OK) {
-        tl__free(alloc, mr);
-        return st;
-    }
-
-    *out = mr;
-    return TL_OK;
-}
-
 tl_status_t tl_memrun_alloc(tl_alloc_ctx_t* alloc, tl_memrun_t** out) {
     TL_ASSERT(alloc != NULL);
     TL_ASSERT(out != NULL);

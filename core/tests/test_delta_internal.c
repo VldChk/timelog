@@ -2,7 +2,7 @@
  * test_delta_internal.c - Delta Layer Internal Tests
  *
  * These tests verify invariants and internal API behavior for the delta
- * layer: memrun, memtable, merge iterator, and flush builder.
+ * layer: memrun, memtable, memview, and flush builder.
  *
  * CLASSIFICATION: Implementation tests, not public API contract tests.
  *
@@ -108,16 +108,61 @@ static tl_status_t test_memtable_insert_tombstone(tl_memtable_t* mt,
 static tl_status_t test_memtable_seal(tl_memtable_t* mt,
                                        tl_mutex_t* mu,
                                        tl_cond_t* cond) {
-    return tl_memtable_seal(mt, mu, cond, delta_next_seq());
+    return tl_memtable_seal_ex(mt, mu, cond, delta_next_seq(), NULL, NULL);
 }
 
+/* Test-local convenience constructor: production uses the two-phase
+ * tl_memrun_alloc + tl_memrun_init directly. */
 static tl_status_t test_memrun_create(tl_alloc_ctx_t* alloc,
                                        tl_record_t* run, size_t run_len,
                                        tl_ooorunset_t* ooo_runs,
                                        tl_interval_t* tombs, size_t tombs_len,
                                        tl_memrun_t** out) {
-    return tl_memrun_create(alloc, run, run_len, ooo_runs, tombs, tombs_len,
-                            delta_next_seq(), out);
+    *out = NULL;
+
+    tl_memrun_t* mr = NULL;
+    tl_status_t st = tl_memrun_alloc(alloc, &mr);
+    if (st != TL_OK) {
+        return st;
+    }
+
+    st = tl_memrun_init(mr, alloc, run, run_len, ooo_runs, tombs, tombs_len,
+                        delta_next_seq());
+    if (st != TL_OK) {
+        tl__free(alloc, mr);
+        return st;
+    }
+
+    *out = mr;
+    return TL_OK;
+}
+
+/* Test-local runset constructor: production only ever appends one run at a
+ * time via tl_ooorunset_append. */
+static tl_status_t test_ooorunset_create(tl_alloc_ctx_t* alloc,
+                                          tl_ooorun_t* const* runs,
+                                          size_t count,
+                                          tl_ooorunset_t** out) {
+    *out = NULL;
+    if (count == 0 || runs == NULL) {
+        return TL_EINVAL;
+    }
+
+    tl_ooorunset_t* set = NULL;
+    for (size_t i = 0; i < count; i++) {
+        tl_ooorunset_t* next = NULL;
+        tl_status_t st = tl_ooorunset_append(alloc, set, runs[i], &next);
+        if (set != NULL) {
+            tl_ooorunset_release(set);
+        }
+        if (st != TL_OK) {
+            return st;
+        }
+        set = next;
+    }
+
+    *out = set;
+    return TL_OK;
 }
 
 #define tl_memtable_insert test_memtable_insert
@@ -125,6 +170,7 @@ static tl_status_t test_memrun_create(tl_alloc_ctx_t* alloc,
 #define tl_memtable_insert_tombstone test_memtable_insert_tombstone
 #define tl_memtable_seal test_memtable_seal
 #define tl_memrun_create test_memrun_create
+#define tl_ooorunset_create test_ooorunset_create
 
 static tl_status_t make_ooo_runset(tl_alloc_ctx_t* alloc,
                                    tl_record_t* records, size_t len,
@@ -888,7 +934,7 @@ TEST_DECLARE(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sin
     tl__alloc_destroy(&alloc);
 }
 
-TEST_DECLARE(delta_memtable_ooo_flush_counts_tombs_after_sorting_head) {
+TEST_DECLARE(delta_memtable_ooo_flush_gate_detects_tombs_unsorted_head) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
@@ -906,8 +952,9 @@ TEST_DECLARE(delta_memtable_ooo_flush_counts_tombs_after_sorting_head) {
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 50));
 
     /* This insert reaches the opportunistic OOO-head flush threshold. The
-     * no-sink path must still detect the newer tombstone covering ts=10 even
-     * though the head order is [100, 10, 150]. */
+     * no-sink gate's conservative overlap scan must still detect the newer
+     * tombstone covering ts=10 even though the head order is [100, 10, 150],
+     * and preserve the head for seal to drop exactly. */
     TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 150, 150));
     TEST_ASSERT_EQ(3, tl_memtable_ooo_head_len(&mt));
     TEST_ASSERT_EQ(0, tl_ooorunset_count(mt.ooo_runs));
@@ -923,6 +970,76 @@ TEST_DECLARE(delta_memtable_ooo_flush_counts_tombs_after_sorting_head) {
     if (dropped != NULL) {
         tl__free(&alloc, dropped);
     }
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_memtable_ooo_flush_gate_conservative_skip) {
+    /* The unsorted-head gate is a conservative range-overlap scan: a newer
+     * tombstone inside the head's ts range skips the opportunistic flush even
+     * when it covers no head record. Seal then drops nothing, and the
+     * reserved-but-empty drop buffer must normalize to NULL. */
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    mt.ooo_chunk_records = 3;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 1000, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 3));
+    TEST_ASSERT(!mt.ooo_head_sorted);
+
+    /* Tombstone inside [10, 100] that covers neither 10 nor 100 nor 20. */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 40, 60));
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 20, 4));
+    TEST_ASSERT_EQ(3, tl_memtable_ooo_head_len(&mt));
+    TEST_ASSERT_EQ(0, tl_ooorunset_count(mt.ooo_runs));
+
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_seal_ex(&mt, &mu, NULL, delta_next_seq(),
+                                                  &dropped, &dropped_len));
+    TEST_ASSERT_EQ(0, dropped_len);
+    TEST_ASSERT_NULL(dropped);
+
+    tl_memtable_destroy(&mt);
+    tl_mutex_destroy(&mu);
+    tl__alloc_destroy(&alloc);
+}
+
+TEST_DECLARE(delta_memtable_ooo_flush_gate_ignores_older_tombs) {
+    /* Tombstones older than every head record cannot drop anything (drops
+     * need tomb seq strictly greater), so the gate must let the opportunistic
+     * flush proceed even though the tombstone overlaps the head's ts range. */
+    tl_alloc_ctx_t alloc;
+    tl__alloc_init(&alloc, NULL);
+
+    tl_memtable_t mt;
+    tl_mutex_t mu;
+    tl_mutex_init(&mu);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_init(&mt, &alloc, 4096, 4096, 4));
+
+    mt.ooo_chunk_records = 3;
+
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 1000, 1));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert_tombstone(&mt, 0, 500));
+
+    /* All OOO head records postdate the tombstone. */
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 100, 2));
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 10, 3));
+    TEST_ASSERT(!mt.ooo_head_sorted);
+    TEST_ASSERT_STATUS(TL_OK, tl_memtable_insert(&mt, 20, 4));
+
+    TEST_ASSERT_EQ(0, tl_memtable_ooo_head_len(&mt));
+    TEST_ASSERT_EQ(1, tl_ooorunset_count(mt.ooo_runs));
+
     tl_memtable_destroy(&mt);
     tl_mutex_destroy(&mu);
     tl__alloc_destroy(&alloc);
@@ -1892,130 +2009,8 @@ TEST_DECLARE(delta_active_iter_merges_run_head_runs) {
 }
 
 /*===========================================================================
- * Merge Iterator Tests (Internal API)
- *
- * These test the internal merge iterator used for combining sorted runs.
- * The merge iterator is not exposed in the public API.
+ * Query K-Merge Error Propagation (H-16)
  *===========================================================================*/
-
-TEST_DECLARE(delta_merge_iter_empty_both) {
-    tl_merge_iter_t it;
-    tl_merge_iter_init(&it, NULL, 0, NULL, 0);
-    TEST_ASSERT(tl_merge_iter_done(&it));
-    TEST_ASSERT_NULL(tl_merge_iter_next(&it));
-}
-
-TEST_DECLARE(delta_merge_iter_single_input) {
-    tl_record_t a[2] = {
-        {.ts = 10, .handle = 1},
-        {.ts = 20, .handle = 2},
-    };
-
-    tl_merge_iter_t it;
-    tl_merge_iter_init(&it, a, 2, NULL, 0);
-    TEST_ASSERT(!tl_merge_iter_done(&it));
-    TEST_ASSERT_EQ(2, tl_merge_iter_remaining(&it));
-
-    const tl_record_t* r1 = tl_merge_iter_next(&it);
-    TEST_ASSERT_NOT_NULL(r1);
-    TEST_ASSERT_EQ(10, r1->ts);
-
-    const tl_record_t* r2 = tl_merge_iter_next(&it);
-    TEST_ASSERT_NOT_NULL(r2);
-    TEST_ASSERT_EQ(20, r2->ts);
-
-    TEST_ASSERT(tl_merge_iter_done(&it));
-    TEST_ASSERT_NULL(tl_merge_iter_next(&it));
-}
-
-TEST_DECLARE(delta_merge_iter_two_inputs) {
-    tl_record_t a[2] = {
-        {.ts = 10, .handle = 1},
-        {.ts = 30, .handle = 2},
-    };
-    tl_record_t b[2] = {
-        {.ts = 20, .handle = 3},
-        {.ts = 40, .handle = 4},
-    };
-
-    tl_merge_iter_t it;
-    tl_merge_iter_init(&it, a, 2, b, 2);
-
-    const tl_record_t* r;
-
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(10, r->ts);
-
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(20, r->ts);
-
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(30, r->ts);
-
-    r = tl_merge_iter_next(&it);
-    TEST_ASSERT_EQ(40, r->ts);
-
-    TEST_ASSERT(tl_merge_iter_done(&it));
-}
-
-/**
- * SPEC-COMPLIANT TEST: Merge iterator preserves all duplicates.
- *
- * Per timelog.h:16 and Software Design Spec Section 1:
- *   "Duplicates (same timestamp) are allowed; tie order is UNSPECIFIED"
- *
- * This test verifies:
- * 1. All 4 records are returned (2 at ts=10, 2 at ts=20)
- * 2. Records with same timestamp are grouped together
- * 3. NO assertion on which handle comes first within a group
- *
- * Previous version (func_merge_iter_stability) asserted specific tie-order
- * which was a SPEC VIOLATION. A valid implementation could return ties in
- * any order and still be correct.
- */
-TEST_DECLARE(delta_merge_iter_preserves_all_duplicates) {
-    tl_record_t a[2] = {
-        {.ts = 10, .handle = 1},
-        {.ts = 20, .handle = 2},
-    };
-    tl_record_t b[2] = {
-        {.ts = 10, .handle = 100}, /* Same ts as a[0] */
-        {.ts = 20, .handle = 200}, /* Same ts as a[1] */
-    };
-
-    tl_merge_iter_t it;
-    tl_merge_iter_init(&it, a, 2, b, 2);
-
-    /* Collect all records */
-    tl_record_t results[4];
-    size_t count = 0;
-    while (!tl_merge_iter_done(&it) && count < 4) {
-        const tl_record_t* r = tl_merge_iter_next(&it);
-        if (r) results[count++] = *r;
-    }
-
-    TEST_ASSERT_EQ(4, count);
-
-    /* Verify ts=10 group (both present, order unspecified) */
-    bool found_ts10_h1 = false, found_ts10_h100 = false;
-    for (size_t i = 0; i < 2; i++) {
-        TEST_ASSERT_EQ(10, results[i].ts);  /* First two should be ts=10 */
-        if (results[i].handle == 1) found_ts10_h1 = true;
-        if (results[i].handle == 100) found_ts10_h100 = true;
-    }
-    TEST_ASSERT(found_ts10_h1);
-    TEST_ASSERT(found_ts10_h100);
-
-    /* Verify ts=20 group (both present, order unspecified) */
-    bool found_ts20_h2 = false, found_ts20_h200 = false;
-    for (size_t i = 2; i < 4; i++) {
-        TEST_ASSERT_EQ(20, results[i].ts);  /* Last two should be ts=20 */
-        if (results[i].handle == 2) found_ts20_h2 = true;
-        if (results[i].handle == 200) found_ts20_h200 = true;
-    }
-TEST_ASSERT(found_ts20_h2);
-TEST_ASSERT(found_ts20_h200);
-}
 
 #ifdef TL_TEST_HOOKS
 TEST_DECLARE(delta_kmerge_iter_propagates_source_error) {
@@ -3306,7 +3301,9 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memtable_insert_batch_alloc_failure_no_partial);
     RUN_TEST(delta_memtable_flush_head_enomem_returns_ebusy);
     RUN_TEST(delta_memtable_ooo_flush_with_tombs_preserves_head_without_drop_sink);
-    RUN_TEST(delta_memtable_ooo_flush_counts_tombs_after_sorting_head);
+    RUN_TEST(delta_memtable_ooo_flush_gate_detects_tombs_unsorted_head);
+    RUN_TEST(delta_memtable_ooo_flush_gate_conservative_skip);
+    RUN_TEST(delta_memtable_ooo_flush_gate_ignores_older_tombs);
     RUN_TEST(delta_memview_captures_head_sorted_and_pins_runs);
     RUN_TEST(delta_memview_captures_concurrent_pins);
     RUN_TEST(delta_memview_copy_sealed_ring_order);
@@ -3341,11 +3338,7 @@ void run_delta_internal_tests(void) {
     RUN_TEST(delta_memrun_iter_generation_tie_break);
     RUN_TEST(delta_active_iter_merges_run_head_runs);
 
-    /* Merge iterator tests (4 tests) */
-    RUN_TEST(delta_merge_iter_empty_both);
-    RUN_TEST(delta_merge_iter_single_input);
-    RUN_TEST(delta_merge_iter_two_inputs);
-    RUN_TEST(delta_merge_iter_preserves_all_duplicates); /* Fixed spec violation */
+    /* Query k-merge error propagation (H-16) */
 #ifdef TL_TEST_HOOKS
     RUN_TEST(delta_kmerge_iter_propagates_source_error);
 #endif

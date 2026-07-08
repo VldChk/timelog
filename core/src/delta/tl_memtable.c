@@ -226,92 +226,6 @@ static void ooo_head_note_append(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t hand
     mt->ooo_head_last_handle = handle;
 }
 
-static tl_status_t memtable_collect_drop(tl_memtable_t* mt,
-                                         tl_record_t** dropped,
-                                         size_t* dropped_len,
-                                         size_t* dropped_cap,
-                                         tl_ts_t ts,
-                                         tl_handle_t handle) {
-    if (dropped == NULL || dropped_len == NULL || dropped_cap == NULL) {
-        return TL_OK;
-    }
-
-    if (*dropped_len == SIZE_MAX) {
-        return TL_EOVERFLOW;
-    }
-    if (*dropped_len >= *dropped_cap) {
-        size_t needed = *dropped_len + 1;
-        size_t new_cap = (*dropped_cap == 0) ? 64 : *dropped_cap;
-        while (new_cap < needed) {
-            if (new_cap > SIZE_MAX / 2) {
-                new_cap = needed;
-                break;
-            }
-            new_cap *= 2;
-        }
-        tl_status_t reserve_st = TL_OK;
-        if (new_cap < needed ||
-            tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
-            reserve_st = TL_EOVERFLOW;
-        } else {
-            tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
-                                               new_cap * sizeof(tl_record_t));
-            if (new_arr == NULL) {
-                reserve_st = TL_ENOMEM;
-            } else {
-                *dropped = new_arr;
-                *dropped_cap = new_cap;
-            }
-        }
-        if (reserve_st != TL_OK) {
-            return reserve_st;
-        }
-    }
-
-    (*dropped)[*dropped_len].ts = ts;
-    (*dropped)[*dropped_len].handle = handle;
-    (*dropped_len)++;
-    return TL_OK;
-}
-
-static tl_status_t memtable_reserve_drops(tl_memtable_t* mt,
-                                          tl_record_t** dropped,
-                                          size_t* dropped_cap,
-                                          size_t needed) {
-    if (needed == 0) {
-        return TL_OK;
-    }
-    if (dropped == NULL || dropped_cap == NULL) {
-        return TL_OK;
-    }
-    if (needed <= *dropped_cap) {
-        return TL_OK;
-    }
-
-    size_t new_cap = (*dropped_cap == 0) ? 64 : *dropped_cap;
-    while (new_cap < needed) {
-        if (new_cap > SIZE_MAX / 2) {
-            new_cap = needed;
-            break;
-        }
-        new_cap *= 2;
-    }
-    if (new_cap < needed ||
-        tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
-        return TL_EOVERFLOW;
-    }
-
-    tl_record_t* new_arr = tl__realloc(mt->alloc, *dropped,
-                                       new_cap * sizeof(tl_record_t));
-    if (new_arr == NULL) {
-        return TL_ENOMEM;
-    }
-
-    *dropped = new_arr;
-    *dropped_cap = new_cap;
-    return TL_OK;
-}
-
 static tl_status_t memtable_count_sorted_tomb_drops(const tl_record_t* records,
                                                     const tl_seq_t* seqs,
                                                     size_t len,
@@ -341,66 +255,54 @@ static tl_status_t memtable_count_sorted_tomb_drops(const tl_record_t* records,
     return TL_OK;
 }
 
-static tl_status_t memtable_count_tomb_drops(tl_memtable_t* mt,
-                                             const tl_record_t* records,
-                                             const tl_seq_t* seqs,
-                                             size_t len,
-                                             tl_intervals_imm_t tombs,
-                                             bool already_sorted,
-                                             size_t* out_count) {
-    TL_ASSERT(mt != NULL);
-    TL_ASSERT(out_count != NULL);
-
-    if (already_sorted || len <= 1 || tombs.len == 0) {
-        return memtable_count_sorted_tomb_drops(records, seqs, len, tombs,
-                                               out_count);
-    }
-    if (records == NULL || seqs == NULL) {
-        return TL_EINTERNAL;
-    }
-    if (tl__alloc_would_overflow(len, sizeof(tl_record_t)) ||
-        tl__alloc_would_overflow(len, sizeof(tl_seq_t))) {
-        return TL_EOVERFLOW;
+/*
+ * Conservative opportunistic-flush gate for an unsorted OOO head: true if any
+ * tombstone newer than the oldest head record overlaps the head's timestamp
+ * range. O(H + T), no allocation, no sort. May return true when the exact
+ * per-record count would be zero (e.g. a tombstone punching a hole between
+ * head records); such false positives only delay the flush until seal, which
+ * counts and drops exactly, and the head stays bounded by the OOO budget /
+ * forced seal.
+ */
+static bool memtable_head_tombs_may_drop(const tl_memtable_t* mt,
+                                         tl_intervals_imm_t tombs) {
+    size_t head_len = tl_recvec_len(&mt->ooo_head);
+    if (tombs.len == 0 || head_len == 0) {
+        return false;
     }
 
-    size_t bytes = len * sizeof(tl_record_t);
-    size_t seq_bytes = len * sizeof(tl_seq_t);
-    tl_record_t* copy = tl__malloc(mt->alloc, bytes);
-    if (copy == NULL) {
-        return TL_ENOMEM;
-    }
-    tl_seq_t* copy_seqs = tl__malloc(mt->alloc, seq_bytes);
-    if (copy_seqs == NULL) {
-        tl__free(mt->alloc, copy);
-        return TL_ENOMEM;
+    /* Only last_ts is tracked incrementally; compute min/max in one scan. */
+    const tl_record_t* head = tl_recvec_data(&mt->ooo_head);
+    tl_ts_t head_min = head[0].ts;
+    tl_ts_t head_max = head[0].ts;
+    for (size_t i = 1; i < head_len; i++) {
+        head_min = TL_MIN(head_min, head[i].ts);
+        head_max = TL_MAX(head_max, head[i].ts);
     }
 
-    memcpy(copy, records, bytes);
-    memcpy(copy_seqs, seqs, seq_bytes);
+    /* Seqs append monotonically, so seqs[0] is the oldest seq in the head; a
+     * tombstone at or below it cannot drop anything (drops need strict >). */
+    tl_seq_t head_min_seq = tl_seqvec_data(&mt->ooo_head_seqs)[0];
 
-    tl_recvec_t tmp = {
-        .data = copy,
-        .len = len,
-        .cap = len,
-        .alloc = mt->alloc
-    };
-    tl_status_t st = tl_recvec_sort_with_seqs(&tmp, copy_seqs);
-    if (st == TL_OK) {
-        st = memtable_count_sorted_tomb_drops(copy, copy_seqs, len, tombs,
-                                             out_count);
+    for (size_t i = 0; i < tombs.len; i++) {
+        const tl_interval_t* tomb = &tombs.data[i];
+        if (tomb->start > head_max) {
+            break; /* Intervals sorted by start: no later overlap possible. */
+        }
+        if (tomb->max_seq <= head_min_seq) {
+            continue;
+        }
+        if (tomb->end_unbounded || tomb->end > head_min) {
+            return true;
+        }
     }
-
-    tl__free(mt->alloc, copy_seqs);
-    tl__free(mt->alloc, copy);
-    return st;
+    return false;
 }
 
 static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
                                            bool required,
                                            tl_seq_t applied_seq,
-                                           tl_record_t** dropped,
-                                           size_t* dropped_len,
-                                           size_t* dropped_cap) {
+                                           tl_recvec_t* dropped) {
     size_t head_len = tl_recvec_len(&mt->ooo_head);
     if (head_len == 0) {
         return TL_OK;
@@ -411,24 +313,29 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
         return TL_EBUSY;
     }
 
-    bool collect_drops = (dropped != NULL &&
-                          dropped_len != NULL &&
-                          dropped_cap != NULL);
+    bool collect_drops = (dropped != NULL);
     if (!required && !collect_drops) {
         tl_intervals_imm_t tombs = tl_intervals_as_imm(&mt->active_tombs);
-        size_t tomb_drops = 0;
-        tl_status_t count_st = memtable_count_tomb_drops(
-            mt,
-            tl_recvec_data(&mt->ooo_head),
-            tl_seqvec_data(&mt->ooo_head_seqs),
-            head_len,
-            tombs,
-            mt->ooo_head_sorted,
-            &tomb_drops);
-        if (count_st != TL_OK) {
-            return count_st;
+        bool may_drop;
+        if (mt->ooo_head_sorted || head_len <= 1) {
+            /* Sorted head: exact zero-alloc cursor count. */
+            size_t tomb_drops = 0;
+            tl_status_t count_st = memtable_count_sorted_tomb_drops(
+                tl_recvec_data(&mt->ooo_head),
+                tl_seqvec_data(&mt->ooo_head_seqs),
+                head_len,
+                tombs,
+                &tomb_drops);
+            if (count_st != TL_OK) {
+                return count_st;
+            }
+            may_drop = (tomb_drops > 0);
+        } else {
+            /* Unsorted head: conservative overlap scan instead of copy+sorting
+             * the head just to count (the flush below would sort it again). */
+            may_drop = memtable_head_tombs_may_drop(mt, tombs);
         }
-        if (tomb_drops > 0) {
+        if (may_drop) {
             /* Opportunistic flushes have no callback sink. Keep the head in its
              * per-record-sequence form rather than either dropping callbacks or
              * collapsing tomb-covered records into a uniform-watermark OOO run. */
@@ -485,9 +392,8 @@ static tl_status_t memtable_flush_ooo_head(tl_memtable_t* mt,
                 tomb_seq = tl_intervals_cursor_max_seq(&cur, copy[i].ts);
             }
             if (tomb_seq > copy_seqs[i]) {
-                tl_status_t drop_st = memtable_collect_drop(mt, dropped, dropped_len,
-                                                            dropped_cap, copy[i].ts,
-                                                            copy[i].handle);
+                tl_status_t drop_st = tl_recvec_push(dropped, copy[i].ts,
+                                                     copy[i].handle);
                 if (drop_st != TL_OK) {
                     tl__free(mt->alloc, copy_seqs);
                     tl__free(mt->alloc, copy);
@@ -622,8 +528,7 @@ tl_status_t tl_memtable_insert(tl_memtable_t* mt, tl_ts_t ts, tl_handle_t handle
      * insert itself is already committed, so a flush failure only surfaces as
      * TL_EBUSY (the record IS in the log). */
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
-        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
-                                                       NULL, NULL, NULL);
+        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq, NULL);
         if (flush_st != TL_OK) {
             return TL_EBUSY;
         }
@@ -761,8 +666,7 @@ tl_status_t tl_memtable_insert_batch(tl_memtable_t* mt,
     memtable_add_record_bytes(mt, inserted);
 
     if (tl_recvec_len(&mt->ooo_head) >= mt->ooo_chunk_records) {
-        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq,
-                                                       NULL, NULL, NULL);
+        tl_status_t flush_st = memtable_flush_ooo_head(mt, false, seq, NULL);
         if (flush_st != TL_OK) {
             /* Records are already in the log; flush failure is signalled as
              * backpressure so the caller can retry the maintenance step. */
@@ -850,10 +754,6 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         *out_dropped_len = 0;
     }
 
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
-    size_t dropped_cap = 0;
-
     if (tl_memtable_is_active_empty(mt)) {
         return TL_OK;
     }
@@ -868,67 +768,76 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     }
     TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
 
+    tl_status_t st = TL_OK;
+    tl_memrun_t* mr = NULL;
+    tl_record_t* run = NULL;
+    tl_seq_t* run_seqs = NULL;
+    tl_interval_t* tombs = NULL;
+    tl_ooorunset_t* ooo_runs = NULL;
+    tl_recvec_t dropped_vec;
+    tl_recvec_init(&dropped_vec, mt->alloc);
+
     /* Allocate the memrun shell before detaching the active arrays so that an
      * ENOMEM here leaves the writer-visible state intact and retryable. */
-    tl_memrun_t* mr = NULL;
-    tl_status_t alloc_st = tl_memrun_alloc(mt->alloc, &mr);
-    if (alloc_st != TL_OK) {
-        return TL_ENOMEM;
+    st = tl_memrun_alloc(mt->alloc, &mr);
+    if (st != TL_OK) {
+        goto cleanup;
     }
 
+    /* Size the drop buffer BEFORE any mutation so every push after the active
+     * arrays are detached cannot need a failing allocation (failure-atomicity:
+     * active state is PRESERVED on ENOMEM/EBUSY). The sorted active run and a
+     * sorted OOO head get exact zero-alloc cursor counts; an unsorted head
+     * uses head_len as a trivially correct upper bound instead of copy+sorting
+     * it just to count — the mandatory head flush below sorts the same data
+     * anyway. The over-reservation is bounded by one OOO chunk and is freed
+     * with the drop buffer. */
     tl_intervals_imm_t active_tombs = tl_intervals_as_imm(&mt->active_tombs);
-    size_t ooo_drop_count = 0;
-    size_t active_drop_count = 0;
-    tl_status_t count_st = memtable_count_tomb_drops(
-        mt,
-        tl_recvec_data(&mt->ooo_head),
-        tl_seqvec_data(&mt->ooo_head_seqs),
-        tl_recvec_len(&mt->ooo_head),
-        active_tombs,
-        mt->ooo_head_sorted,
-        &ooo_drop_count);
-    if (count_st != TL_OK) {
-        tl__free(mt->alloc, mr);
-        return count_st;
+    size_t head_len = tl_recvec_len(&mt->ooo_head);
+    size_t ooo_drop_bound = 0;
+    if (active_tombs.len > 0 && head_len > 0) {
+        if (mt->ooo_head_sorted || head_len <= 1) {
+            st = memtable_count_sorted_tomb_drops(
+                tl_recvec_data(&mt->ooo_head),
+                tl_seqvec_data(&mt->ooo_head_seqs),
+                head_len,
+                active_tombs,
+                &ooo_drop_bound);
+            if (st != TL_OK) {
+                goto cleanup;
+            }
+        } else {
+            ooo_drop_bound = head_len;
+        }
     }
-    count_st = memtable_count_tomb_drops(
-        mt,
+    size_t active_drop_count = 0;
+    st = memtable_count_sorted_tomb_drops(
         tl_recvec_data(&mt->active_run),
         tl_seqvec_data(&mt->active_run_seqs),
         tl_recvec_len(&mt->active_run),
         active_tombs,
-        true,
         &active_drop_count);
-    if (count_st != TL_OK) {
-        tl__free(mt->alloc, mr);
-        return count_st;
+    if (st != TL_OK) {
+        goto cleanup;
     }
 
-    if (ooo_drop_count > SIZE_MAX - active_drop_count) {
-        tl__free(mt->alloc, mr);
-        return TL_EOVERFLOW;
+    if (ooo_drop_bound > SIZE_MAX - active_drop_count) {
+        st = TL_EOVERFLOW;
+        goto cleanup;
     }
-    size_t needed_drops = ooo_drop_count + active_drop_count;
+    size_t needed_drops = ooo_drop_bound + active_drop_count;
     if (needed_drops > 0) {
-        tl_status_t reserve_st = memtable_reserve_drops(mt, &dropped,
-                                                        &dropped_cap,
-                                                        needed_drops);
-        if (reserve_st != TL_OK) {
-            tl__free(mt->alloc, mr);
-            return reserve_st;
+        st = tl_recvec_reserve(&dropped_vec, needed_drops);
+        if (st != TL_OK) {
+            goto cleanup;
         }
     }
 
     /* Drain the OOO head into a final sorted run so the sealed memrun contains
      * a complete, immutable picture of pending out-of-order writes. */
-    tl_status_t flush_st = memtable_flush_ooo_head(mt, true, applied_seq,
-                                                   &dropped, &dropped_len, &dropped_cap);
-    if (flush_st != TL_OK) {
-        if (dropped != NULL) {
-            tl__free(mt->alloc, dropped);
-        }
-        tl__free(mt->alloc, mr);
-        return flush_st;
+    st = memtable_flush_ooo_head(mt, true, applied_seq, &dropped_vec);
+    if (st != TL_OK) {
+        goto cleanup;
     }
 
     /* Detach the active arrays into the memrun; from this point on the
@@ -937,21 +846,16 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     size_t run_seqs_len = 0;
     size_t tombs_len = 0;
 
-    tl_record_t* run = tl_recvec_take(&mt->active_run, &run_len);
-    tl_seq_t* run_seqs = tl_seqvec_take(&mt->active_run_seqs, &run_seqs_len);
-    tl_interval_t* tombs = tl_intervals_take(&mt->active_tombs, &tombs_len);
-    tl_ooorunset_t* ooo_runs = mt->ooo_runs;
+    run = tl_recvec_take(&mt->active_run, &run_len);
+    run_seqs = tl_seqvec_take(&mt->active_run_seqs, &run_seqs_len);
+    tombs = tl_intervals_take(&mt->active_tombs, &tombs_len);
+    ooo_runs = mt->ooo_runs;
     mt->ooo_runs = NULL;
 
     if (run_len != run_seqs_len ||
         (run_len > 0 && (run == NULL || run_seqs == NULL))) {
-        tl__free(mt->alloc, run);
-        tl__free(mt->alloc, run_seqs);
-        if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-        tl__free(mt->alloc, tombs);
-        tl__free(mt->alloc, dropped);
-        tl__free(mt->alloc, mr);
-        return TL_EINTERNAL;
+        st = TL_EINTERNAL;
+        goto cleanup;
     }
 
     if (run_len > 0 && tombs_len > 0) {
@@ -962,17 +866,10 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         for (size_t i = 0; i < run_len; i++) {
             tl_seq_t tomb_seq = tl_intervals_cursor_max_seq(&cur, run[i].ts);
             if (tomb_seq > run_seqs[i]) {
-                tl_status_t drop_st = memtable_collect_drop(mt, &dropped, &dropped_len,
-                                                            &dropped_cap, run[i].ts,
-                                                            run[i].handle);
-                if (drop_st != TL_OK) {
-                    tl__free(mt->alloc, run);
-                    tl__free(mt->alloc, run_seqs);
-                    if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-                    tl__free(mt->alloc, tombs);
-                    tl__free(mt->alloc, dropped);
-                    tl__free(mt->alloc, mr);
-                    return drop_st;
+                /* Reserved above: this push never needs to allocate. */
+                st = tl_recvec_push(&dropped_vec, run[i].ts, run[i].handle);
+                if (st != TL_OK) {
+                    goto cleanup;
                 }
                 continue;
             }
@@ -981,27 +878,25 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
         run_len = out_len;
     }
 
-    if (run_seqs != NULL) {
-        tl__free(mt->alloc, run_seqs);
-        run_seqs = NULL;
-    }
+    tl__free(mt->alloc, run_seqs);
+    run_seqs = NULL;
 
-    tl_status_t init_st = tl_memrun_init(mr, mt->alloc,
-                                         run, run_len,
-                                         ooo_runs,
-                                         tombs, tombs_len,
-                                         applied_seq);
-    if (init_st != TL_OK) {
+    st = tl_memrun_init(mr, mt->alloc,
+                        run, run_len,
+                        ooo_runs,
+                        tombs, tombs_len,
+                        applied_seq);
+    if (st != TL_OK) {
         /* Invariant violation reaching this point means the arrays are no
-         * longer reachable from the memtable: free them here so they do not
-         * leak, even though the caller will lose the data. */
-        tl__free(mt->alloc, run);
-        if (ooo_runs != NULL) tl_ooorunset_release(ooo_runs);
-        tl__free(mt->alloc, tombs);
-        tl__free(mt->alloc, dropped);
-        tl__free(mt->alloc, mr);
-        return TL_EINTERNAL;
+         * longer reachable from the memtable: free them (via cleanup) so they
+         * do not leak, even though the caller will lose the data. */
+        st = TL_EINTERNAL;
+        goto cleanup;
     }
+    /* The memrun now owns the detached arrays. */
+    run = NULL;
+    tombs = NULL;
+    ooo_runs = NULL;
 
     /* Publish: re-check capacity under the lock since concurrent flushers may
      * have changed the queue between the pre-check and now. */
@@ -1009,8 +904,9 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     if (mt->sealed_len >= mt->sealed_max_runs) {
         TL_UNLOCK(mu, TL_LOCK_MEMTABLE_MU);
         tl_memrun_release(mr);
-        tl__free(mt->alloc, dropped);
-        return TL_EBUSY;
+        mr = NULL;
+        st = TL_EBUSY;
+        goto cleanup;
     }
     TL_ASSERT(mt->sealed_len < mt->sealed_max_runs);
     size_t idx = tl_memtable_sealed_index(mt, mt->sealed_len);
@@ -1030,18 +926,33 @@ tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* co
     }
 
     if (out_dropped != NULL && out_dropped_len != NULL) {
+        size_t dropped_len = 0;
+        tl_record_t* dropped = tl_recvec_take(&dropped_vec, &dropped_len);
+        if (dropped_len == 0 && dropped != NULL) {
+            /* The upper-bound reservation can leave a non-NULL but empty
+             * buffer; normalize so *out_dropped is NULL exactly when nothing
+             * was dropped. */
+            tl__free(mt->alloc, dropped);
+            dropped = NULL;
+        }
         *out_dropped = dropped;
         *out_dropped_len = dropped_len;
     } else {
-        tl__free(mt->alloc, dropped);
+        tl_recvec_destroy(&dropped_vec);
     }
 
     return TL_OK;
-}
 
-tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
-                              tl_seq_t applied_seq) {
-    return tl_memtable_seal_ex(mt, mu, cond, applied_seq, NULL, NULL);
+cleanup:
+    tl__free(mt->alloc, run);
+    tl__free(mt->alloc, run_seqs);
+    if (ooo_runs != NULL) {
+        tl_ooorunset_release(ooo_runs);
+    }
+    tl__free(mt->alloc, tombs);
+    tl_recvec_destroy(&dropped_vec);
+    tl__free(mt->alloc, mr);
+    return st;
 }
 
 /*===========================================================================

@@ -60,11 +60,6 @@ void tl_ooorun_release(tl_ooorun_t* run);
  * Runset Lifecycle
  *===========================================================================*/
 
-tl_status_t tl_ooorunset_create(tl_alloc_ctx_t* alloc,
-                                 tl_ooorun_t* const* runs,
-                                 size_t count,
-                                 tl_ooorunset_t** out);
-
 tl_status_t tl_ooorunset_append(tl_alloc_ctx_t* alloc,
                                  tl_ooorunset_t* old_set,
                                  tl_ooorun_t* run,
