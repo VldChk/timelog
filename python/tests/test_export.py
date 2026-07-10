@@ -124,7 +124,7 @@ def test_to_dict_works_without_numpy(log, monkeypatch):
     assert set(log.to_dict()) == {0, 1, 2}
 
 
-def test_to_dict_chunk_boundaries(log, monkeypatch):
+def test_to_dict_chunk_boundaries(monkeypatch):
     monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", 7)
     for n in (6, 7, 8, 15):
         lg = Timelog()
@@ -295,7 +295,7 @@ def test_to_numpy_missing_numpy(log, monkeypatch):
         log.to_numpy()
 
 
-def test_to_numpy_chunk_boundaries(log, monkeypatch):
+def test_to_numpy_chunk_boundaries(monkeypatch):
     monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", 7)
     for n in (6, 7, 8, 15):
         lg = Timelog()
@@ -304,6 +304,67 @@ def test_to_numpy_chunk_boundaries(log, monkeypatch):
         np.testing.assert_array_equal(ts, np.arange(n))
         np.testing.assert_array_equal(vals, np.arange(n, dtype=np.float64))
         lg.close()
+
+
+def test_export_consumption_is_chunked(log, monkeypatch):
+    # Chunking is a load-bearing property (bounds GIL monopolization), not
+    # just an implementation detail: spy on the islice binding to prove both
+    # methods consume via _EXPORT_CHUNK-sized chunks read at call time.
+    # (Mutation review: a hardcoded-chunk or monolithic rewrite passed the
+    # boundary tests, which only check outputs.)
+    from itertools import islice as _real_islice
+
+    fill(log, 20)
+    calls = []
+
+    def spy(iterable, limit):
+        calls.append(limit)
+        return _real_islice(iterable, limit)
+
+    monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", 7)
+    monkeypatch.setattr(timelog_module, "_islice", spy)
+    ts, _ = log.to_numpy()
+    assert len(ts) == 20
+    assert calls == [7, 7, 6]                        # ceil(20/7) chunks
+    calls.clear()
+    assert len(log.to_dict()) == 20
+    assert calls and all(limit == 7 for limit in calls)
+    assert len(calls) >= 3
+
+
+@pytest.mark.parametrize("bad_chunk", [0, -1])
+def test_export_invalid_chunk_fails_fast(log, monkeypatch, bad_chunk):
+    # A broken private knob must raise, not hang (0 would spin forever).
+    fill(log, 3)
+    monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", bad_chunk)
+    with pytest.raises(ValueError):
+        log.to_numpy()
+    with pytest.raises(ValueError):
+        log.to_dict()
+
+
+def test_to_numpy_error_row_note_across_chunks(log, monkeypatch):
+    # Row indexing is global, not per-chunk (mutation review: a chunk-local
+    # row formula passed the single-chunk row tests).
+    monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", 7)
+    for i in range(20):
+        log[i] = "bad" if i == 13 else float(i)
+    with pytest.raises(ValueError) as exc_info:
+        log.to_numpy()
+    assert any("row 13 of 20" in n for n in getattr(exc_info.value, "__notes__", []))
+
+
+@pytest.mark.parametrize("exc_type", [RuntimeError, LookupError])
+def test_to_numpy_custom_exception_gets_note(log, exc_type):
+    # The row note is attached whatever the conversion failure's type is —
+    # a custom __float__ can raise anything (Exception-wide net).
+    log[1] = 1.0
+    log[2] = _RaisingValue(exc_type("custom boom"))
+    with pytest.raises(exc_type) as exc_info:
+        log.to_numpy()
+    assert any("row 1 of 2" in n for n in getattr(exc_info.value, "__notes__", []))
+    log.close()
+    assert log.closed
 
 
 class _AppendingValue:

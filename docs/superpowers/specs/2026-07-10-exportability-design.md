@@ -49,9 +49,13 @@ uninterruptible C call: it monopolizes the GIL for the whole export (measured
 documented 461× ingest collapse in `pytimelog_make_iter`. Both methods
 therefore consume the iterator in chunks of 65,536 records (~5 ms of work,
 matching the GIL switch interval; eval-loop switch points run between chunks).
-Measured: identical throughput (75.1 vs 74.5 ns/rec), max thread-scheduling
-gap 5.3 ms vs 72 ms, transient memory 16 B/rec vs 32 B/rec. On free-threaded
-builds the chunking is simply harmless.
+Measured: identical throughput (75.1 vs 74.5 ns/rec), transient memory
+16 B/rec vs 32 B/rec. Implementation review refined the fairness numbers:
+`to_numpy`'s max scheduling gap is ~5-7 ms; `to_dict` additionally pays one
+table-sized dict rehash inside `update()` that grows with the result
+(18 ms @1M, 41 ms @4M rows) — unfixable in pure Python (dicts cannot be
+presized), still 3-5x better than the monolithic 56-72 ms stalls. On
+free-threaded builds the chunking is simply harmless (gaps ≈ idle baseline).
 
 ## API contract
 
@@ -65,7 +69,8 @@ builds the chunking is simply harmless.
   `"iuf"`), else `TypeError`. This forecloses silent data mangling found in
   review: `dtype=str` → every value becomes `''`; `'U2'` → truncation;
   subarray dtypes → 2-D return. Conversion semantics within numeric dtypes are
-  numpy's (e.g. `dtype=np.int64` floors floats) — documented, not re-validated.
+  numpy's (e.g. `dtype=np.int64` truncates floats toward zero) — documented,
+  not re-validated.
 - Bounds behave exactly like `log[t1:t2]` slicing: `None` = open end,
   reversed bounds yield empty arrays, half-open `[t1, t2)`. Consequence
   (review-confirmed, needs one docs line): a record AT `TL_TS_MAX` is included

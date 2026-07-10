@@ -25,8 +25,11 @@ import tomllib as _tomllib
 
 # Export consumption chunk: ~5ms of np.fromiter/dict.update work per chunk so
 # a large export cannot monopolize the GIL for its whole duration (a monolithic
-# fromiter/dict(it) is one uninterruptible C call; measured 72ms stall at 1M
-# rows vs 5.3ms chunked, at identical throughput).
+# fromiter/dict(it) is one uninterruptible C call; measured 71-72ms stall at 1M
+# rows, at identical throughput). Chunked, to_numpy's gap stays ~5-7ms;
+# to_dict additionally pays one table-sized dict rehash inside update() that
+# grows with the result (18ms @1M, 41ms @4M rows) — unfixable in pure Python
+# (dicts cannot be presized), still 3-5x better than monolithic.
 _EXPORT_CHUNK = 65536
 
 
@@ -673,6 +676,8 @@ class Timelog(_CTimelog):
         specific winner, avoid duplicate timestamps or pick explicitly from
         ``point(ts)``.
         """
+        if _EXPORT_CHUNK < 1:
+            raise ValueError("_EXPORT_CHUNK must be >= 1")
         it = _slice_to_iter(self, slice(t1, t2))
         try:
             d = {}
@@ -712,6 +717,8 @@ class Timelog(_CTimelog):
                 f"(integer or float), not {value_dtype!r}"
             )
         pair_dtype = np.dtype([("ts", np.int64), ("value", value_dtype)])
+        if _EXPORT_CHUNK < 1:
+            raise ValueError("_EXPORT_CHUNK must be >= 1")
         it = _slice_to_iter(self, slice(t1, t2))
         try:
             n = len(it)
@@ -725,9 +732,12 @@ class Timelog(_CTimelog):
                     timestamps[pos:pos + k] = chunk["ts"]
                     values[pos:pos + k] = chunk["value"]
                     pos += k
-            except (TypeError, ValueError, OverflowError) as exc:
-                # Skips pre-consumption errors (row -1) and iterator-closed
-                # exhaustion, where a row label would mislabel the failure.
+            except Exception as exc:
+                # Any conversion failure gets the row note, whatever its type
+                # (a custom __float__ can raise anything). The guard skips
+                # pre-consumption errors (row -1) and closed iterators —
+                # engine errors and exhaustion auto-close, so a row label
+                # cannot mislabel those failures.
                 row = n - len(it) - 1
                 if row >= 0 and not it.closed:
                     exc.add_note(
