@@ -220,6 +220,21 @@ nil. These are export-API numbers, not a regression gate.
    ASan ctest (no C changes, but run anyway), docs checker, lint, perf rerun
    of the benchmark table.
 
+## Validation results (2026-07-10, final implementation `41e955f`)
+
+- pytest 3.13.12: 283 passed / 20 skipped (interpreter-specific legs)
+- pytest 3.14.3: 291 passed / 12 skipped; subinterpreters 8/8
+- pytest 3.14.3t (free-threaded): 302 passed / 1 skipped (incl. stress)
+- compat harness freethreading leg (3.14t): pass 11/11
+- ctest Debug ASan/UBSan+LSan (CI suppressions): 23/23 — C core untouched
+- docs consistency + Layer A static checkers: pass
+- Hostile implementation review (2× Claude + Codex): 12s hammer campaigns
+  (OOO writers + export loopers + maintenance + close-spam) clean on 3.13 and
+  3.14t; mutation testing of the suite → 2 gaps found and closed
+- Final perf (1M records, best of 3): to_numpy 71.3 ns/rec (float),
+  79.3 (int→f8), 72.4 (int→i8); to_dict 60.4 ns/rec; max heartbeat gap
+  5.4 ms (to_numpy) / 13.9 ms (to_dict, rehash-dominated)
+
 ## Requirements traceability
 
 | Owner requirement | Where satisfied |
