@@ -72,9 +72,10 @@ builds the chunking is simply harmless.
   only via `t2=None`; no bounded `t2` can include it.
 - Empty range → `(np.empty(0, int64), np.empty(0, dtype))`.
 - Duplicate timestamps: all records are exported (multimap).
-- `bool` values convert to 1.0/0.0 (payloads; the key-side bool rejection
-  applies to timestamps only). Default `float64` loses integer precision above
-  2^53 — documented; big-int users pass `dtype=np.int64`.
+- Value conversion follows numpy: `bool` → 1.0/0.0, `None` → NaN under float
+  dtypes (the ecosystem's missing-value convention; `np.float64(None)` is
+  `nan`) and TypeError under integer dtypes. Default `float64` loses integer
+  precision above 2^53 — documented; big-int users pass `dtype=np.int64`.
 - Non-convertible value → the original exception propagates **unmodified in
   type and args**, with a row-index note attached via `exc.add_note(...)`
   (never `type(exc)(msg)` — crashes on subclasses with non-trivial

@@ -18,9 +18,16 @@ Example::
 from __future__ import annotations
 
 from importlib import metadata as _importlib_metadata
+from itertools import islice as _islice
 from pathlib import Path as _Path
 from typing import Iterator
 import tomllib as _tomllib
+
+# Export consumption chunk: ~5ms of np.fromiter/dict.update work per chunk so
+# a large export cannot monopolize the GIL for its whole duration (a monolithic
+# fromiter/dict(it) is one uninterruptible C call; measured 72ms stall at 1M
+# rows vs 5.3ms chunked, at identical throughput).
+_EXPORT_CHUNK = 65536
 
 
 def _resolve_local_version() -> str | None:
@@ -646,6 +653,91 @@ class Timelog(_CTimelog):
         if t1 is None or t2 is None:
             raise ValueError("views() requires both t1 and t2, or neither")
         return self.page_spans(_coerce_ts(t1), _coerce_ts(t2), kind=kind)
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def to_dict(self, t1=None, t2=None):
+        """Export records as ``{timestamp: object}``.
+
+        Bounds behave exactly like ``log[t1:t2]`` slicing: ``None`` = open
+        end, half-open ``[t1, t2)``, reversed bounds yield ``{}``. The export
+        is snapshot-isolated and holds a reader pin for its duration
+        (``close()`` raises until it finishes). Values are returned as-is.
+
+        Duplicate timestamps collapse to ONE value: the last in iteration
+        order. Which record wins is deterministic for a given storage state
+        but otherwise UNSPECIFIED — out-of-order ingestion and background
+        compaction can reorder equal-timestamp records. If you need a
+        specific winner, avoid duplicate timestamps or pick explicitly from
+        ``point(ts)``.
+        """
+        it = _slice_to_iter(self, slice(t1, t2))
+        try:
+            d = {}
+            while len(it):
+                d.update(_islice(it, _EXPORT_CHUNK))
+            return d
+        finally:
+            it.close()
+
+    def to_numpy(self, t1=None, t2=None, *, dtype=None):
+        """Export records as a ``(timestamps, values)`` pair of numpy arrays.
+
+        Returns two fresh, contiguous 1-D arrays: ``timestamps`` is int64;
+        ``values`` is float64 unless ``dtype`` overrides it. ``dtype`` must
+        be a scalar numeric dtype (integer or float kind); conversion
+        semantics within it are numpy's (e.g. ``dtype=np.int64`` truncates
+        floats). Value conversion follows numpy: ``bool`` becomes 1.0/0.0,
+        ``None`` becomes NaN under float dtypes (TypeError under integer
+        dtypes), and ints beyond 2**53 lose precision under the default —
+        pass ``dtype=np.int64`` for exact big-int payloads. A non-convertible
+        value raises its original exception with the failing row index
+        attached as a note. Shape-compatible with ``bulk_append``.
+
+        Bounds behave exactly like ``log[t1:t2]`` slicing; a record at
+        ``TL_TS_MAX`` is included only when ``t2`` is None. Empty ranges
+        return empty arrays. Snapshot-isolated; holds a reader pin for the
+        duration (``close()`` raises until it finishes). Duplicate
+        timestamps are all exported (multimap). numpy is imported lazily —
+        ``to_dict`` works without it.
+        """
+        import numpy as np
+
+        value_dtype = np.dtype(np.float64 if dtype is None else dtype)
+        if value_dtype.kind not in "iuf":
+            raise TypeError(
+                f"to_numpy() dtype must be a scalar numeric dtype "
+                f"(integer or float), not {value_dtype!r}"
+            )
+        pair_dtype = np.dtype([("ts", np.int64), ("value", value_dtype)])
+        it = _slice_to_iter(self, slice(t1, t2))
+        try:
+            n = len(it)
+            timestamps = np.empty(n, np.int64)
+            values = np.empty(n, value_dtype)
+            pos = 0
+            try:
+                while pos < n:
+                    k = min(_EXPORT_CHUNK, n - pos)
+                    chunk = np.fromiter(_islice(it, k), dtype=pair_dtype, count=k)
+                    timestamps[pos:pos + k] = chunk["ts"]
+                    values[pos:pos + k] = chunk["value"]
+                    pos += k
+            except (TypeError, ValueError, OverflowError) as exc:
+                # Skips pre-consumption errors (row -1) and iterator-closed
+                # exhaustion, where a row label would mislabel the failure.
+                row = n - len(it) - 1
+                if row >= 0 and not it.closed:
+                    exc.add_note(
+                        f"to_numpy(): raised while converting the value "
+                        f"at row {row} of {n}"
+                    )
+                raise
+            return timestamps, values
+        finally:
+            it.close()
 
 
 __all__ = [
