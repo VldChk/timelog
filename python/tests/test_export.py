@@ -22,7 +22,12 @@ import timelog as timelog_module
 from timelog import Timelog, TimelogError
 from timelog._api import TL_TS_MIN, TL_TS_MAX
 
-np = pytest.importorskip("numpy")
+try:  # numpy gates ONLY the to_numpy tests, never the module: the to_dict
+    import numpy as np  # contract tests must always run (numpy is optional)
+except ImportError:  # pragma: no cover - exercised on numpy-less CI legs
+    np = None
+
+requires_numpy = pytest.mark.skipif(np is None, reason="numpy not installed")
 
 
 @pytest.fixture
@@ -144,6 +149,7 @@ def test_to_dict_releases_pin(log):
 # to_numpy
 # ---------------------------------------------------------------------------
 
+@requires_numpy
 def test_to_numpy_basic(log):
     fill(log, 10)
     ts, vals = log.to_numpy()
@@ -155,6 +161,7 @@ def test_to_numpy_basic(log):
     np.testing.assert_array_equal(vals, np.arange(10, dtype=np.float64))
 
 
+@requires_numpy
 def test_to_numpy_payload_types(log):
     log[1] = 3          # int
     log[2] = 2.5        # float
@@ -163,6 +170,7 @@ def test_to_numpy_payload_types(log):
     np.testing.assert_array_equal(vals, [3.0, 2.5, 1.0])
 
 
+@requires_numpy
 def test_to_numpy_bounds(log):
     fill(log, 10)
     ts, vals = log.to_numpy(3, 7)
@@ -176,11 +184,13 @@ def test_to_numpy_bounds(log):
     assert ts.dtype == np.int64 and vals.dtype == np.float64
 
 
+@requires_numpy
 def test_to_numpy_empty(log):
     ts, vals = log.to_numpy()
     assert len(ts) == 0 and len(vals) == 0
 
 
+@requires_numpy
 def test_to_numpy_duplicates_all_exported(log):
     for v in (1.0, 2.0, 3.0):
         log[5] = v
@@ -189,6 +199,7 @@ def test_to_numpy_duplicates_all_exported(log):
     assert sorted(vals) == [1.0, 2.0, 3.0]
 
 
+@requires_numpy
 def test_to_numpy_tombstone_filtering(log):
     fill(log, 10)
     log.delete(3, 7)
@@ -196,6 +207,7 @@ def test_to_numpy_tombstone_filtering(log):
     np.testing.assert_array_equal(ts, [0, 1, 2, 7, 8, 9])
 
 
+@requires_numpy
 def test_to_numpy_ts_extremes(log):
     log[TL_TS_MIN] = 1.0
     log[0] = 2.0
@@ -206,6 +218,7 @@ def test_to_numpy_ts_extremes(log):
     np.testing.assert_array_equal(ts, [TL_TS_MIN, 0])
 
 
+@requires_numpy
 def test_to_numpy_dtype_int64_roundtrip(log):
     big = 2**60 + 1                                  # not float64-representable
     log[1] = big
@@ -215,6 +228,7 @@ def test_to_numpy_dtype_int64_roundtrip(log):
     assert vals[0] == big and vals[1] == -(2**60)
 
 
+@requires_numpy
 def test_to_numpy_dtype_guard():
     lg = Timelog()
     try:
@@ -227,6 +241,7 @@ def test_to_numpy_dtype_guard():
 
 
 @pytest.mark.parametrize("row", [0, 2, 4])
+@requires_numpy
 def test_to_numpy_conversion_error_row_note(log, row):
     for i in range(5):
         log[i] = "bad" if i == row else float(i)
@@ -253,6 +268,7 @@ class _RaisingValue:
         raise self._exc
 
 
+@requires_numpy
 def test_to_numpy_error_type_and_args_preserved(log):
     original = _TwoArgError(42, "boom")
     log[1] = 1.0
@@ -264,6 +280,7 @@ def test_to_numpy_error_type_and_args_preserved(log):
     assert any("row 1 of 2" in n for n in getattr(exc_info.value, "__notes__", []))
 
 
+@requires_numpy
 def test_to_numpy_overflow_gets_note(log):
     log[1] = 10**400
     with pytest.raises(OverflowError) as exc_info:
@@ -271,6 +288,7 @@ def test_to_numpy_overflow_gets_note(log):
     assert any("row 0 of 1" in n for n in getattr(exc_info.value, "__notes__", []))
 
 
+@requires_numpy
 def test_to_numpy_none_payload(log):
     # numpy's conversion semantics: None -> NaN under float dtypes (the
     # ecosystem's missing-value convention), TypeError under integer dtypes.
@@ -282,6 +300,7 @@ def test_to_numpy_none_payload(log):
     assert any("row 0 of 1" in n for n in getattr(exc_info.value, "__notes__", []))
 
 
+@requires_numpy
 def test_to_numpy_closed_log_raises(log):
     log.close()
     with pytest.raises(TimelogError):
@@ -295,6 +314,7 @@ def test_to_numpy_missing_numpy(log, monkeypatch):
         log.to_numpy()
 
 
+@requires_numpy
 def test_to_numpy_chunk_boundaries(monkeypatch):
     monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", 7)
     for n in (6, 7, 8, 15):
@@ -306,6 +326,7 @@ def test_to_numpy_chunk_boundaries(monkeypatch):
         lg.close()
 
 
+@requires_numpy
 def test_export_consumption_is_chunked(log, monkeypatch):
     # Chunking is a load-bearing property (bounds GIL monopolization), not
     # just an implementation detail: spy on the islice binding to prove both
@@ -338,11 +359,13 @@ def test_export_invalid_chunk_fails_fast(log, monkeypatch, bad_chunk):
     fill(log, 3)
     monkeypatch.setattr(timelog_module, "_EXPORT_CHUNK", bad_chunk)
     with pytest.raises(ValueError):
-        log.to_numpy()
-    with pytest.raises(ValueError):
         log.to_dict()
+    if np is not None:  # numpy-less builds raise ImportError before the guard
+        with pytest.raises(ValueError):
+            log.to_numpy()
 
 
+@requires_numpy
 def test_to_numpy_error_row_note_across_chunks(log, monkeypatch):
     # Row indexing is global, not per-chunk (mutation review: a chunk-local
     # row formula passed the single-chunk row tests).
@@ -355,6 +378,7 @@ def test_to_numpy_error_row_note_across_chunks(log, monkeypatch):
 
 
 @pytest.mark.parametrize("exc_type", [RuntimeError, LookupError])
+@requires_numpy
 def test_to_numpy_custom_exception_gets_note(log, exc_type):
     # The row note is attached whatever the conversion failure's type is —
     # a custom __float__ can raise anything (Exception-wide net).
@@ -378,6 +402,7 @@ class _AppendingValue:
         return 7.0
 
 
+@requires_numpy
 def test_to_numpy_snapshot_isolation_against_reentrant_writes():
     lg = Timelog()
     try:
@@ -392,6 +417,7 @@ def test_to_numpy_snapshot_isolation_against_reentrant_writes():
         lg.close()
 
 
+@requires_numpy
 def test_to_numpy_close_blocked_during_export():
     lg = Timelog()
 
@@ -407,6 +433,7 @@ def test_to_numpy_close_blocked_during_export():
     lg.close()
 
 
+@requires_numpy
 def test_to_numpy_concurrent_exports(log):
     fill(log, 50_000)
     results = []
@@ -431,6 +458,7 @@ def test_to_numpy_concurrent_exports(log):
 
 
 @pytest.mark.stress
+@requires_numpy
 def test_export_1m_smoke():
     import time
 

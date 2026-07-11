@@ -161,7 +161,7 @@ For "first timestamp >= x", use `next_ts(x - 1)` (guard `x > TL_TS_MIN`).
 ## Export API
 
 - `to_dict(t1=None, t2=None)` -> `{timestamp: object}`
-- `to_numpy(t1=None, t2=None, dtype=None)` -> `(timestamps, values)` numpy arrays
+- `to_numpy(t1=None, t2=None, *, dtype=None)` -> `(timestamps, values)` numpy arrays (`dtype` is keyword-only)
 
 `Contract`
 - Bounds behave exactly like `log[t1:t2]` slicing: `None` = open end,
