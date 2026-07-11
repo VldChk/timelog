@@ -51,6 +51,8 @@ REQUIRED_PY_METHODS = [
     "for_streaming",
     "for_bulk_ingest",
     "for_low_latency",
+    "to_dict",
+    "to_numpy",
 ]
 
 # Methods exposed through the C extension base class rather than as Python

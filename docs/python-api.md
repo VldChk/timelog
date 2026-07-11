@@ -158,6 +158,36 @@ For "first timestamp >= x", use `next_ts(x - 1)` (guard `x > TL_TS_MIN`).
   the data.
 - `retired_queue_len` (property) -> objects awaiting deferred release.
 
+## Export API
+
+- `to_dict(t1=None, t2=None)` -> `{timestamp: object}`
+- `to_numpy(t1=None, t2=None, *, dtype=None)` -> `(timestamps, values)` numpy arrays (`dtype` is keyword-only)
+
+`Contract`
+- Bounds behave exactly like `log[t1:t2]` slicing: `None` = open end,
+  half-open `[t1, t2)`, reversed bounds yield an empty result. A record at
+  `TL_TS_MAX` is exported only when `t2` is `None` (no bounded `t2` can
+  include it).
+- Both exports are snapshot-isolated and hold a reader pin for their whole
+  duration: a concurrent `close()` raises until the export finishes.
+- `to_dict` collapses duplicate timestamps to ONE value (the last in
+  iteration order). Which record wins is deterministic for a given storage
+  state but otherwise unspecified — out-of-order ingestion and background
+  compaction can reorder equal-timestamp records. Need a specific winner?
+  Avoid duplicate timestamps or pick explicitly from `point(ts)`.
+- `to_numpy` returns two fresh contiguous 1-D arrays: `int64` timestamps and
+  `float64` values unless `dtype` overrides it. `dtype` must be a scalar
+  numeric dtype (integer/float kind); anything else raises `TypeError`.
+  Value conversion follows numpy: `bool` → 1.0/0.0, `None` → NaN under float
+  dtypes (TypeError under integer dtypes), ints beyond 2^53 lose precision
+  under the default — pass `dtype=np.int64` for exact big-int payloads.
+  Duplicate timestamps are all exported (multimap). A non-convertible value
+  raises its original exception with the failing row index attached as a
+  note (PEP 678). The output is shape-compatible with `bulk_append`
+  (values come back converted, not as the original objects).
+- numpy is an optional dependency, imported lazily by `to_numpy` only;
+  `to_dict` works without it.
+
 ## Zero-Copy Views
 
 - `views(t1=None, t2=None, kind="segment")`
