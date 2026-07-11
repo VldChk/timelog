@@ -172,7 +172,7 @@ static struct PyModuleDef timelog_module = {
     timelog_slots,
     timelog_traverse,
     timelog_clear,
-    timelog_free,
+    NULL,  /* m_free: nothing to free */
 };
 ```
 
@@ -440,7 +440,7 @@ Existing code already releases `core_lock` before reacquiring Python execution a
 | `tl_py_handle_ctx.live_*` | `live_lock` | Mutate and scan under lock; move references out before decref. |
 | `tl_py_handle_ctx.retired_head`, `pins`, retired/drained metrics | atomics | Maintenance-thread safe; no Python C API allowed. |
 | `tl_pagespan_owner.refcnt` | atomic refcount in core | Required for free-threaded `views()` / `PageSpan` lifetime. |
-| `PyTimelogIter.closed`, `iter`, `pinned_snapshot`, `owner`, `remaining_count`, `remaining_valid` | object critical section | Same iterator instance remains semantically non-thread-safe; this protection prevents races/UAF during accidental overlap. |
+| `PyTimelogIter.closed`, `iter`, `pinned_snapshot`, `owner`, `remaining_count` | object critical section | Same iterator instance remains semantically non-thread-safe; this protection prevents races/UAF during accidental overlap. |
 | `PyPageSpan.closed`, `exports` | object critical section | `close()`, buffer acquire/release, and property access can overlap in free-threaded builds. |
 | `PyPageSpan.ts`, `h`, `len`, `first_ts`, `last_ts` | immutable after construction; invalidated only under PageSpan critical section | Readers must observe either open+valid or closed+invalid state. |
 | `PyPageSpanIter.closed`, `iter`, `timelog` | object critical section | Same iterator instance remains semantically non-thread-safe. |

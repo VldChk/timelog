@@ -8,6 +8,7 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <assert.h>  /* For internal-contract asserts */
 #include <stdint.h>  /* For SIZE_MAX */
 #include <string.h>  /* For memset */
 
@@ -31,27 +32,18 @@ static void pagespan_cleanup(PyPageSpan* self);
 
 PyObject* PyPageSpan_FromView(tl_pagespan_view_t* view, PyObject* timelog)
 {
-    /* On failure, caller must call tl_pagespan_view_release(). */
-    if (view == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "view is NULL");
-        return NULL;
-    }
-    if (view->owner == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "view->owner is NULL");
-        return NULL;
-    }
-    if (timelog == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "timelog is NULL");
-        return NULL;
-    }
+    /* On failure, caller must call tl_pagespan_view_release().
+     *
+     * Internal contract (single caller: PyPageSpanIter_iternext): the view
+     * was freshly filled by tl_pagespan_iter_next (owner set by core
+     * contract) and timelog was captured under the iterator's CS while
+     * open — asserts, not runtime checks. */
+    assert(view != NULL && view->owner != NULL && timelog != NULL);
     tl_py_module_state_t* mod_st = TlPy_StateFromObject(timelog);
     if (mod_st == NULL) {
         return NULL;
     }
-    if (!TlPyTimelog_Check(timelog, mod_st)) {
-        PyErr_SetString(PyExc_TypeError, "expected PyTimelog");
-        return NULL;
-    }
+    assert(TlPyTimelog_Check(timelog, mod_st));
 
     /* Allocate GC-tracked Python object. */
     PyTypeObject* span_type = (PyTypeObject*)mod_st->type_pagespan;
@@ -148,10 +140,9 @@ static void pagespan_release_detached(tl_pagespan_owner_t* owner,
         tl_pagespan_owner_decref(owner);
     }
     if (timelog != NULL) {
-        PyObject *exc_type, *exc_value, *exc_tb;
-        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+        TL_PY_PRESERVE_EXC_BEGIN;
         Py_DECREF(timelog);
-        PyErr_Restore(exc_type, exc_value, exc_tb);
+        TL_PY_PRESERVE_EXC_END;
     }
 }
 
@@ -329,12 +320,6 @@ static PyObject* PyPageSpan_close(PyPageSpan* self, PyObject* noargs)
     Py_RETURN_NONE;
 }
 
-static PyObject* PyPageSpan_enter(PyPageSpan* self, PyObject* noargs)
-{
-    (void)noargs;
-    return Py_NewRef((PyObject*)self);
-}
-
 static PyObject* PyPageSpan_exit(PyPageSpan* self, PyObject* args)
 {
     (void)args;
@@ -353,21 +338,16 @@ static PyObject* PyPageSpan_objects(PyPageSpan* self, PyObject* noargs)
 {
     (void)noargs;
 
+    /* Fail early on a closed span. (h is never NULL while open: the core
+     * always fills it and detach clears it only together with closed=1
+     * under this same CS.) */
     int closed;
-    int h_missing;
     TL_PY_OBJ_LOCK(self);
     closed = self->closed;
-    h_missing = (self->h == NULL);
     TL_PY_OBJ_UNLOCK();
 
     if (closed) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
-        return NULL;
-    }
-    if (h_missing) {
-        /* Fail early rather than on first access. */
-        PyErr_SetString(PyExc_RuntimeError,
-            "handles not available in this span");
         return NULL;
     }
 
@@ -455,57 +435,15 @@ static PyObject* PyPageSpan_get_timestamps(PyPageSpan* self, void* closure)
 {
     (void)closure;
 
-    int closed;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    TL_PY_OBJ_UNLOCK();
-
-    if (closed) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
-        return NULL;
-    }
-
-    /* PyMemoryView_FromObject calls bf_getbuffer which re-takes the CS
-     * and re-checks closed atomically with exports++. */
+    /* PyMemoryView_FromObject calls bf_getbuffer, which takes the CS and
+     * checks closed atomically with exports++, raising the byte-identical
+     * ValueError("PageSpan is closed") — no pre-check needed. */
     return PyMemoryView_FromObject((PyObject*)self);
 }
 
-static PyObject* PyPageSpan_get_start_ts(PyPageSpan* self, void* closure)
-{
-    (void)closure;
-
-    /* first_ts is immutable after construction; only closed needs CS. */
-    int closed;
-    tl_ts_t first;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    first = self->first_ts;
-    TL_PY_OBJ_UNLOCK();
-
-    if (closed) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
-        return NULL;
-    }
-    return PyLong_FromLongLong((long long)first);
-}
-
-static PyObject* PyPageSpan_get_end_ts(PyPageSpan* self, void* closure)
-{
-    (void)closure;
-
-    int closed;
-    tl_ts_t last;
-    TL_PY_OBJ_LOCK(self);
-    closed = self->closed;
-    last = self->last_ts;
-    TL_PY_OBJ_UNLOCK();
-
-    if (closed) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
-        return NULL;
-    }
-    return PyLong_FromLongLong((long long)last);
-}
+/* first_ts/last_ts are immutable after construction; only closed needs CS. */
+TL_PY_DEFINE_SPAN_TS_GETTER(PyPageSpan_get_start_ts, PyPageSpan, first_ts)
+TL_PY_DEFINE_SPAN_TS_GETTER(PyPageSpan_get_end_ts, PyPageSpan, last_ts)
 
 static PyObject* PyPageSpan_get_last_ts(PyPageSpan* self, void* closure)
 {
@@ -528,7 +466,7 @@ static PyMethodDef PyPageSpan_methods[] = {
     {"copy_timestamps", (PyCFunction)PyPageSpan_copy_timestamps, METH_NOARGS,
      "copy_timestamps() -> list[int]\n\n"
      "Return a copy of timestamps as a Python list."},
-    {"__enter__", (PyCFunction)PyPageSpan_enter, METH_NOARGS,
+    {"__enter__", (PyCFunction)tl_py_enter_self, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyPageSpan_exit, METH_VARARGS,
      "Context manager exit (closes span if no buffers exported)."},

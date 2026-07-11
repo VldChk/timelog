@@ -429,15 +429,6 @@ tl_status_t tl_pagespan_iter_next(
             const tl_page_meta_t* meta = tl_page_catalog_get(cat, it->page_idx);
             const tl_page_t* page = meta->page;
 
-            /* This iterator only supports fully-live pages; partial
-             * deletion or unknown flag combinations indicate either
-             * corruption or a page format added without updating this
-             * code path. Fail loudly rather than silently returning
-             * the wrong rows. */
-            if (page->flags != TL_PAGE_FULLY_LIVE) {
-                return TL_EINTERNAL;
-            }
-
             size_t row_start = tl_page_lower_bound(page, it->t1);
             size_t row_end = tl_page_lower_bound(page, it->t2);
 

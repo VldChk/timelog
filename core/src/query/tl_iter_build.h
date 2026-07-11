@@ -22,7 +22,6 @@ tl_status_t tl_iter_build_submerge(tl_submerge_t* merge,
                                     const tl_record_t* head_data,
                                     const tl_seq_t* head_seqs,
                                     size_t head_len,
-                                    tl_seq_t head_watermark,
                                     tl_ts_t t1,
                                     tl_ts_t t2,
                                     bool t2_unbounded);

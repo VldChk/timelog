@@ -377,20 +377,6 @@ static tl_seq_t intervals_max_seq_internal(const tl_interval_t* data, size_t len
     return 0;
 }
 
-bool tl_intervals_contains(const tl_intervals_t* iv, tl_ts_t ts) {
-    TL_ASSERT(iv != NULL);
-    return intervals_max_seq_internal(iv->data, iv->len, ts) != 0;
-}
-
-bool tl_intervals_imm_contains(tl_intervals_imm_t iv, tl_ts_t ts) {
-    return intervals_max_seq_internal(iv.data, iv.len, ts) != 0;
-}
-
-tl_seq_t tl_intervals_max_seq(const tl_intervals_t* iv, tl_ts_t ts) {
-    TL_ASSERT(iv != NULL);
-    return intervals_max_seq_internal(iv->data, iv->len, ts);
-}
-
 tl_seq_t tl_intervals_imm_max_seq(tl_intervals_imm_t iv, tl_ts_t ts) {
     return intervals_max_seq_internal(iv.data, iv.len, ts);
 }
@@ -573,20 +559,6 @@ static tl_status_t intervals_union_impl(tl_intervals_t* out,
     return TL_OK;
 }
 
-tl_status_t tl_intervals_union(tl_intervals_t* out,
-                               const tl_intervals_t* a,
-                               const tl_intervals_t* b) {
-    TL_ASSERT(out != NULL);
-    TL_ASSERT(a != NULL);
-    TL_ASSERT(b != NULL);
-
-    if (out == a || out == b) {
-        return TL_EINVAL;
-    }
-
-    return intervals_union_impl(out, a->data, a->len, b->data, b->len);
-}
-
 tl_status_t tl_intervals_union_imm(tl_intervals_t* out,
                                    tl_intervals_imm_t a,
                                    tl_intervals_imm_t b) {
@@ -676,31 +648,6 @@ tl_interval_t* tl_intervals_take(tl_intervals_t* iv, size_t* out_len) {
     return data;
 }
 
-tl_ts_t tl_intervals_covered_span(const tl_intervals_t* iv) {
-    TL_ASSERT(iv != NULL);
-
-    uint64_t total = 0;
-
-    for (size_t i = 0; i < iv->len; i++) {
-        const tl_interval_t* cur = &iv->data[i];
-
-        if (cur->end_unbounded) {
-            return TL_TS_MAX;
-        }
-
-        uint64_t span = (uint64_t)cur->end - (uint64_t)cur->start;
-        if (span > UINT64_MAX - total) {
-            return TL_TS_MAX;
-        }
-        total += span;
-        if (total > (uint64_t)TL_TS_MAX) {
-            return TL_TS_MAX;
-        }
-    }
-
-    return (tl_ts_t)total;
-}
-
 /*===========================================================================*/
 /* Cursor Operations */
 /*===========================================================================*/
@@ -764,11 +711,11 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
 }
 
 /*===========================================================================*/
-/* Debug Validation */
+/* Validation */
 /*===========================================================================*/
 
-#ifdef TL_DEBUG
-
+/* Compiled unconditionally (not just TL_DEBUG): tl_segment_build_l0 uses it
+ * for its release-mode canonical-form EINVAL contract (CLAUDE.md invariant #5). */
 bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len) {
     if (len == 0) {
         return true;
@@ -812,6 +759,8 @@ bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len) {
 
     return true;
 }
+
+#ifdef TL_DEBUG
 
 bool tl_intervals_validate(const tl_intervals_t* iv) {
     if (iv == NULL) {

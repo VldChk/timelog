@@ -106,7 +106,6 @@ typedef struct tl_memtable      tl_memtable_t;
 typedef struct tl_memrun        tl_memrun_t;
 typedef struct tl_memview       tl_memview_t;
 typedef struct tl_flush_ctx     tl_flush_ctx_t;
-typedef struct tl_merge_iter    tl_merge_iter_t;
 
 /* Tombstones */
 typedef struct tl_interval      tl_interval_t;

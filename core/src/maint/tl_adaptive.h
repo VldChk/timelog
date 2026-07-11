@@ -80,7 +80,6 @@ typedef struct tl_flush_metrics {
     uint64_t    record_count;   /* run_len + ooo_len */
     tl_ts_t     min_ts;         /* Min of record timestamps */
     tl_ts_t     max_ts;         /* Max of record timestamps */
-    bool        has_records;    /* record_count > 0 */
 } tl_flush_metrics_t;
 
 /*===========================================================================
@@ -180,25 +179,6 @@ tl_ts_t tl_adaptive_compute_candidate(const tl_adaptive_state_t* state,
 
 void tl_adaptive_record_success(tl_adaptive_state_t* state);
 void tl_adaptive_record_failure(tl_adaptive_state_t* state);
-
-/*===========================================================================
- * Advisory Resize Query
- *
- * Returns true if adaptive segmentation has sufficient samples to potentially
- * resize the window. Used by scheduler to decide if compaction should run.
- *
- * This is an advisory function only - actual resize decision happens in
- * tl_adaptive_compute_candidate() which includes warmup checks, staleness,
- * hysteresis, etc.
- *
- * Thread Safety: Locks the timelog maintenance mutex while reading adaptive
- * state. Callers must not already hold maint_mu.
- *
- * @param tl  Timelog instance (must not be NULL)
- * @return true if resize might be beneficial, false otherwise
- *===========================================================================*/
-
-bool tl_adaptive_wants_resize(const tl_timelog_t* tl);
 
 /*===========================================================================
  * Internal Computation Helpers (Exposed for Testing)

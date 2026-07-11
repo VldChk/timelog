@@ -65,8 +65,7 @@ static void tl_py_pagespan_on_release(void* user)
     }
 
     /* Preserve exception state across Py_DECREF (may run __del__). */
-    PyObject *exc_type, *exc_value, *exc_tb;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    TL_PY_PRESERVE_EXC_BEGIN;
 
     /* Exit pins (may drain retired objects via Py_DECREF). */
     if (hook_ctx->ctx != NULL) {
@@ -80,7 +79,7 @@ static void tl_py_pagespan_on_release(void* user)
     }
 
     PyMem_Free(hook_ctx);
-    PyErr_Restore(exc_type, exc_value, exc_tb);
+    TL_PY_PRESERVE_EXC_END;
 }
 
 /*===========================================================================
@@ -231,10 +230,9 @@ static void pagespaniter_release_resources(tl_pagespan_iter_t* iter,
     }
     if (timelog != NULL) {
         /* Preserve exception state across Py_DECREF (may run __del__). */
-        PyObject *exc_type, *exc_value, *exc_tb;
-        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+        TL_PY_PRESERVE_EXC_BEGIN;
         Py_DECREF(timelog);
-        PyErr_Restore(exc_type, exc_value, exc_tb);
+        TL_PY_PRESERVE_EXC_END;
     }
 }
 
@@ -348,12 +346,6 @@ static PyObject* PyPageSpanIter_close(PyPageSpanIter* self, PyObject* noargs)
     Py_RETURN_NONE;
 }
 
-static PyObject* PyPageSpanIter_enter(PyPageSpanIter* self, PyObject* noargs)
-{
-    (void)noargs;
-    return Py_NewRef((PyObject*)self);
-}
-
 static PyObject* PyPageSpanIter_exit(PyPageSpanIter* self, PyObject* args)
 {
     (void)args;
@@ -374,7 +366,7 @@ TL_PY_DEFINE_CLOSED_GETTER(PyPageSpanIter_get_closed, PyPageSpanIter)
 static PyMethodDef PyPageSpanIter_methods[] = {
     {"close", (PyCFunction)PyPageSpanIter_close, METH_NOARGS,
      "close() -> None\n\nRelease iterator resources. Idempotent."},
-    {"__enter__", (PyCFunction)PyPageSpanIter_enter, METH_NOARGS,
+    {"__enter__", (PyCFunction)tl_py_enter_self, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyPageSpanIter_exit, METH_VARARGS,
      "Context manager exit (closes iterator)."},

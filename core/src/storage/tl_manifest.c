@@ -39,16 +39,8 @@ tl_status_t tl_manifest_create(tl_alloc_ctx_t* alloc, tl_manifest_t** out) {
         return TL_ENOMEM;
     }
 
+    /* TL_NEW is calloc-backed: pointer/count/bounds fields start zeroed. */
     m->version = 1;
-    m->l0 = NULL;
-    m->n_l0 = 0;
-    m->cap_l0 = 0;
-    m->l1 = NULL;
-    m->n_l1 = 0;
-    m->cap_l1 = 0;
-    m->has_bounds = false;
-    m->min_ts = 0;
-    m->max_ts = 0;
     m->alloc = alloc;
     tl_atomic_init_u32(&m->refcnt, 1);
 
@@ -487,18 +479,14 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
     m->version = (mb->base != NULL) ? mb->base->version + 1 : 1;
     tl_atomic_init_u32(&m->refcnt, 1);
 
+    /* TL_NEW is calloc-backed: l0/l1/n_l0/n_l1 start zeroed. */
     if (new_l0_count > 0) {
         m->l0 = TL_NEW_ARRAY(alloc, tl_segment_t*, new_l0_count);
         if (m->l0 == NULL) {
             TL_FREE(alloc, m);
             return TL_ENOMEM;
         }
-        m->cap_l0 = (uint32_t)new_l0_count;
-    } else {
-        m->l0 = NULL;
-        m->cap_l0 = 0;
     }
-    m->n_l0 = 0;
 
     if (new_l1_count > 0) {
         m->l1 = TL_NEW_ARRAY(alloc, tl_segment_t*, new_l1_count);
@@ -507,12 +495,7 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
             TL_FREE(alloc, m);
             return TL_ENOMEM;
         }
-        m->cap_l1 = (uint32_t)new_l1_count;
-    } else {
-        m->l1 = NULL;
-        m->cap_l1 = 0;
     }
-    m->n_l1 = 0;
 
     /* L0 ordering is flush order: surviving base segments first (preserving
      * generation order), new additions appended after. */
@@ -532,8 +515,7 @@ tl_status_t tl_manifest_builder_build(tl_manifest_builder_t* mb,
         TL_ASSERT(mb->add_l0_len == 0);
     }
 
-    /* L1 will be re-sorted by window_start below; the order in which we
-     * insert here only matters for the cap_l1 sanity assertion. */
+    /* L1 will be re-sorted by window_start below. */
     if (new_l1_count > 0) {
         if (mb->base != NULL) {
             for (uint32_t i = 0; i < mb->base->n_l1; i++) {

@@ -35,11 +35,8 @@ static tl_status_t source_next(tl_iter_source_t* src, tl_record_t* out,
         }
         return st;
     }
-    if (src->kind == TL_ITER_MEMRUN) {
-        return tl_memrun_iter_next(&src->iter.memrun, out, out_watermark);
-    }
-    if (src->kind == TL_ITER_ACTIVE) {
-        return tl_active_iter_next(&src->iter.active, out, out_watermark);
+    if (src->kind == TL_ITER_DELTA) {
+        return tl_delta_iter_next(&src->iter.delta, out, out_watermark);
     }
     /* Should never reach here - all enum values handled above */
     TL_ASSERT(false && "Invalid source kind");
@@ -51,11 +48,8 @@ static bool source_done(const tl_iter_source_t* src) {
     if (src->kind == TL_ITER_SEGMENT) {
         return tl_segment_iter_done(&src->iter.segment);
     }
-    if (src->kind == TL_ITER_MEMRUN) {
-        return tl_memrun_iter_done(&src->iter.memrun);
-    }
-    if (src->kind == TL_ITER_ACTIVE) {
-        return tl_active_iter_done(&src->iter.active);
+    if (src->kind == TL_ITER_DELTA) {
+        return tl_delta_iter_done(&src->iter.delta);
     }
     /* Should never reach here - all enum values handled above */
     TL_ASSERT(false && "Invalid source kind");
@@ -68,11 +62,8 @@ static tl_status_t source_seek(tl_iter_source_t* src, tl_ts_t target) {
         tl_segment_iter_seek(&src->iter.segment, target);
         return TL_OK;
     }
-    if (src->kind == TL_ITER_MEMRUN) {
-        return tl_memrun_iter_seek(&src->iter.memrun, target);
-    }
-    if (src->kind == TL_ITER_ACTIVE) {
-        return tl_active_iter_seek(&src->iter.active, target);
+    if (src->kind == TL_ITER_DELTA) {
+        return tl_delta_iter_seek(&src->iter.delta, target);
     }
     /* Should never reach here - all enum values handled above */
     TL_ASSERT(false && "Invalid source kind");
@@ -125,7 +116,6 @@ tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
 
     memset(it, 0, sizeof(*it));
     it->plan = plan;
-    it->alloc = alloc;
     it->error = TL_OK;
 
     tl_heap_init(&it->heap, alloc);
@@ -136,15 +126,14 @@ tl_status_t tl_kmerge_iter_init(tl_kmerge_iter_t* it,
         return TL_OK;
     }
 
-    /* Compute skip-ahead metadata */
+    /* Compute skip-ahead metadata. The plan records whether the active
+     * memview was added as a source (per-record watermarks); its
+     * source-level watermark is set to 0 at plan build, so folding it
+     * unconditionally cannot raise the max. */
     it->max_watermark = 0;
-    it->has_variable_watermark = false;
+    it->has_variable_watermark = plan->has_active_source;
     for (size_t i = 0; i < plan->source_count; i++) {
         const tl_iter_source_t* src = tl_plan_source(plan, i);
-        if (src->kind == TL_ITER_ACTIVE) {
-            it->has_variable_watermark = true;
-            continue;
-        }
         if (src->watermark > it->max_watermark) {
             it->max_watermark = src->watermark;
         }

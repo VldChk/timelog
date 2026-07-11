@@ -70,15 +70,10 @@ static int tl_py_iter_test_should_fail_next_batch(void)
     return 0;
 }
 #else
-static int tl_py_iter_test_should_fail_iternext(void)
-{
-    return 0;
-}
-
-static int tl_py_iter_test_should_fail_next_batch(void)
-{
-    return 0;
-}
+/* Production builds pass no hook at all: pytimelogiter_step guards
+ * `test_fail_hook != NULL`, so the branch folds away at compile time. */
+#define tl_py_iter_test_should_fail_iternext NULL
+#define tl_py_iter_test_should_fail_next_batch NULL
 #endif
 
 /*===========================================================================
@@ -162,8 +157,7 @@ static void pytimelogiter_release_resources(
         tl_snapshot_release(snap);
     }
 
-    PyObject *exc_type, *exc_value, *exc_tb;
-    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    TL_PY_PRESERVE_EXC_BEGIN;
 
     if (handle_ctx) {
         tl_py_pins_exit_and_maybe_drain(handle_ctx);
@@ -177,7 +171,7 @@ static void pytimelogiter_release_resources(
 
     Py_XDECREF(owner);
 
-    PyErr_Restore(exc_type, exc_value, exc_tb);
+    TL_PY_PRESERVE_EXC_END;
 }
 
 static void pytimelogiter_cleanup(PyTimelogIter* self)
@@ -270,7 +264,7 @@ static PyObject* pytimelogiter_step(PyTimelogIter* self,
              * close()+drain. (Lone INCREF of a distinct object under a
              * single-object CS — permitted, see py_compat.h.) */
             obj = Py_NewRef(tl_py_handle_decode(rec.handle));
-            if (self->remaining_valid && self->remaining_count > 0) {
+            if (self->remaining_count > 0) {
                 self->remaining_count--;
             }
         } else {
@@ -343,12 +337,6 @@ static PyObject* PyTimelogIter_close(PyTimelogIter* self, PyObject* noargs)
     (void)noargs;
     pytimelogiter_cleanup(self);
     Py_RETURN_NONE;
-}
-
-static PyObject* PyTimelogIter_enter(PyTimelogIter* self, PyObject* noargs)
-{
-    (void)noargs;
-    return Py_NewRef((PyObject*)self);
 }
 
 static PyObject* PyTimelogIter_exit(PyTimelogIter* self, PyObject* args)
@@ -425,18 +413,10 @@ fail:
 
 static Py_ssize_t PyTimelogIter_len(PyTimelogIter* self)
 {
-    int valid;
     uint64_t count;
     TL_PY_OBJ_LOCK(self);
-    valid = self->remaining_valid;
     count = self->remaining_count;
     TL_PY_OBJ_UNLOCK();
-
-    if (!valid) {
-        PyErr_SetString(PyExc_RuntimeError,
-            "iterator remaining length is unavailable");
-        return -1;
-    }
 
     if (count > (uint64_t)PY_SSIZE_T_MAX) {
         PyErr_SetString(PyExc_OverflowError,
@@ -488,7 +468,7 @@ static PyMethodDef PyTimelogIter_methods[] = {
      "Return up to n records. Empty list on exhaustion."},
     {"view", (PyCFunction)PyTimelogIter_view, METH_NOARGS,
      "view() -> PageSpanIter\n\nReturn a PageSpanIter for the same time range."},
-    {"__enter__", (PyCFunction)PyTimelogIter_enter, METH_NOARGS,
+    {"__enter__", (PyCFunction)tl_py_enter_self, METH_NOARGS,
      "Context manager entry."},
     {"__exit__", (PyCFunction)PyTimelogIter_exit, METH_VARARGS,
      "Context manager exit (closes iterator)."},
@@ -511,22 +491,17 @@ static PyObject* PyTimelogIter_repr(PyTimelogIter* self)
      * precomputed remaining count are already on hand. */
     int closed;
     uint64_t remaining;
-    int remaining_valid;
     tl_ts_t t1, t2;
 
     TL_PY_OBJ_LOCK(self);
     closed = self->closed;
     remaining = self->remaining_count;
-    remaining_valid = self->remaining_valid;
     t1 = self->range_t1;
     t2 = self->range_t2;
     TL_PY_OBJ_UNLOCK();
 
     if (closed) {
         return PyUnicode_FromString("<TimelogIter closed>");
-    }
-    if (!remaining_valid) {
-        return PyUnicode_FromString("<TimelogIter>");
     }
     if (t2 == TL_TS_MAX) {           /* normalized unbounded upper bound */
         return PyUnicode_FromFormat(

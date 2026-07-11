@@ -5,6 +5,7 @@
 #include "../internal/tl_seqlock.h"
 #include "../internal/tl_heap.h"
 #include "../internal/tl_recvec.h"
+#include "../internal/tl_tombstone_utils.h"
 #include "../query/tl_segment_iter.h"
 #include "../query/tl_snapshot.h"
 #include "../storage/tl_window.h"
@@ -176,30 +177,6 @@ static void tl__validate_l1_non_overlap(const tl_manifest_t* m) {
  * Delete Debt Computation (Internal)
  *===========================================================================*/
 
-/** Union immutable tombstones into mutable accumulator via temp buffer. */
-static tl_status_t tl__tombs_union_into(tl_intervals_t* accum,
-                                         tl_intervals_imm_t add,
-                                         tl_alloc_ctx_t* alloc) {
-    if (add.len == 0) {
-        return TL_OK;
-    }
-
-    tl_intervals_t temp;
-    tl_intervals_init(&temp, alloc);
-
-    tl_status_t st = tl_intervals_union_imm(&temp,
-                                             tl_intervals_as_imm(accum),
-                                             add);
-    if (st != TL_OK) {
-        tl_intervals_destroy(&temp);
-        return st;
-    }
-
-    tl_intervals_destroy(accum);
-    *accum = temp;
-    return TL_OK;
-}
-
 /** Compute max delete debt ratio across all windows. */
 static double tl__compute_delete_debt(const tl_timelog_t* tl,
                                        const tl_manifest_t* m,
@@ -211,8 +188,8 @@ static double tl__compute_delete_debt(const tl_timelog_t* tl,
         const tl_segment_t* seg = tl_manifest_l0_get(m, i);
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            tl_status_t union_st = tl__tombs_union_into(&tombs, seg_tombs,
-                                                        (tl_alloc_ctx_t*)&tl->alloc);
+            tl_status_t union_st = tl_tombstones_add_intervals(&tombs, seg_tombs,
+                                                               TL_TS_MIN, 0, true);
             if (union_st != TL_OK) {
                 tl_intervals_destroy(&tombs);
                 return 1.0;
@@ -466,25 +443,16 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
         return TL_OK;
     }
 
-    size_t overlap_count = 0;
-    for (uint32_t i = 0; i < n_l1; i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(m, i);
-        if (tl__l1_overlaps_window_range(seg, output_first_wstart,
-                                          output_last_wend, output_last_unbounded)) {
-            overlap_count++;
-        }
-    }
-
-    if (overlap_count == 0) {
-        return TL_OK;
-    }
-
-    if (tl__alloc_would_overflow(overlap_count, sizeof(tl_segment_t*))) {
+    /* One pass: allocate n_l1 pointers upfront (matching the L0 selection
+     * style) so each segment's window overlap is evaluated exactly once.
+     * The transient over-allocation is 8 bytes per non-overlapping L1
+     * segment; ctx_destroy tolerates len < allocation. */
+    if (tl__alloc_would_overflow((size_t)n_l1, sizeof(tl_segment_t*))) {
         return TL_EOVERFLOW;
     }
 
     ctx->input_l1 = (tl_segment_t**)tl__malloc(ctx->alloc,
-                                                overlap_count * sizeof(tl_segment_t*));
+                                                (size_t)n_l1 * sizeof(tl_segment_t*));
     if (ctx->input_l1 == NULL) {
         return TL_ENOMEM;
     }
@@ -500,50 +468,30 @@ static tl_status_t tl__compact_select_l1(tl_compact_ctx_t* ctx,
     return TL_OK;
 }
 
+/* Saturating size arithmetic (C17 + MSVC, so no <stdckdint.h>). The estimate
+ * feeds only the greedy byte cap in selection, so clamping to SIZE_MAX on
+ * overflow is exact enough: the exact saturation point is unobservable. */
+static size_t tl__sat_add(size_t a, size_t b) {
+    return (a > SIZE_MAX - b) ? SIZE_MAX : a + b;
+}
+
+/* uint64_t count input: record_count is uint64_t; the u64 comparison is also
+ * correct for the narrower page/tombstone counts on 32-bit size_t hosts. */
+static size_t tl__sat_mul_u64(uint64_t count, size_t elem_size) {
+    return (count > SIZE_MAX / elem_size) ? SIZE_MAX
+                                          : (size_t)count * elem_size;
+}
+
 static size_t tl__segment_estimate_bytes(const tl_segment_t* seg) {
-    size_t est = 0;
-
-    if (seg->record_count > SIZE_MAX / sizeof(tl_record_t)) {
-        return SIZE_MAX;
-    }
-    est = (size_t)seg->record_count * sizeof(tl_record_t);
-
-    /* page_count is uint32_t; on 64-bit size_t this multiplication
-     * cannot overflow, but stay safe on 32-bit hosts. */
-    size_t page_count_limit = SIZE_MAX / sizeof(tl_page_meta_t);
-    if (page_count_limit < UINT32_MAX &&
-        (size_t)seg->page_count > page_count_limit) {
-        return SIZE_MAX;
-    }
-    size_t page_meta_bytes = (size_t)seg->page_count * sizeof(tl_page_meta_t);
-    if (est > SIZE_MAX - page_meta_bytes) {
-        return SIZE_MAX;
-    }
-    est += page_meta_bytes;
-
+    size_t est = tl__sat_mul_u64(seg->record_count, sizeof(tl_record_t));
+    est = tl__sat_add(est, tl__sat_mul_u64(seg->page_count,
+                                           sizeof(tl_page_meta_t)));
     if (seg->tombstones != NULL) {
-        size_t tomb_count_limit = SIZE_MAX / sizeof(tl_interval_t);
-        if (tomb_count_limit < UINT32_MAX &&
-            (size_t)seg->tombstones->n > tomb_count_limit) {
-            return SIZE_MAX;
-        }
-        size_t tomb_bytes = (size_t)seg->tombstones->n * sizeof(tl_interval_t);
-        if (est > SIZE_MAX - tomb_bytes) {
-            return SIZE_MAX;
-        }
-        est += tomb_bytes;
-        if (est > SIZE_MAX - sizeof(tl_tombstones_t)) {
-            return SIZE_MAX;
-        }
-        est += sizeof(tl_tombstones_t);
+        est = tl__sat_add(est, tl__sat_mul_u64(seg->tombstones->n,
+                                               sizeof(tl_interval_t)));
+        est = tl__sat_add(est, sizeof(tl_tombstones_t));
     }
-
-    if (est > SIZE_MAX - sizeof(tl_segment_t)) {
-        return SIZE_MAX;
-    }
-    est += sizeof(tl_segment_t);
-
-    return est;
+    return tl__sat_add(est, sizeof(tl_segment_t));
 }
 
 /**
@@ -990,7 +938,8 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         const tl_segment_t* seg = ctx->input_l0[i];
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            st = tl__tombs_union_into(&ctx->tombs, seg_tombs, ctx->alloc);
+            st = tl_tombstones_add_intervals(&ctx->tombs, seg_tombs,
+                                             TL_TS_MIN, 0, true);
             if (st != TL_OK) return st;
         }
     }
@@ -1001,7 +950,8 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         const tl_segment_t* seg = ctx->input_l1[i];
         if (tl_segment_has_tombstones(seg)) {
             tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-            st = tl__tombs_union_into(&ctx->tombs, seg_tombs, ctx->alloc);
+            st = tl_tombstones_add_intervals(&ctx->tombs, seg_tombs,
+                                             TL_TS_MIN, 0, true);
             if (st != TL_OK) return st;
         }
     }
@@ -1064,29 +1014,16 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
         return TL_ENOMEM;
     }
 
-    if (total_inputs > SIZE_MAX / sizeof(tl_seq_t)) {
-        tl__free(ctx->alloc, iters);
-        return TL_EOVERFLOW;
-    }
-
-    tl_seq_t* watermarks = tl__malloc(ctx->alloc, total_inputs * sizeof(tl_seq_t));
-    if (watermarks == NULL) {
-        tl__free(ctx->alloc, iters);
-        return TL_ENOMEM;
-    }
-
     /* Iterate the full timestamp range of each input. */
     size_t iter_idx = 0;
     for (size_t i = 0; i < ctx->input_l0_len; i++) {
         tl_segment_iter_init(&iters[iter_idx], ctx->input_l0[i],
                               TL_TS_MIN, 0, true);  /* [TL_TS_MIN, +inf) */
-        watermarks[iter_idx] = tl_segment_applied_seq(ctx->input_l0[i]);
         iter_idx++;
     }
     for (size_t i = 0; i < ctx->input_l1_len; i++) {
         tl_segment_iter_init(&iters[iter_idx], ctx->input_l1[i],
                               TL_TS_MIN, 0, true);
-        watermarks[iter_idx] = tl_segment_applied_seq(ctx->input_l1[i]);
         iter_idx++;
     }
 
@@ -1095,12 +1032,13 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
     tl_heap_init(&heap, ctx->alloc);
     st = tl_heap_reserve(&heap, total_inputs);
     if (st != TL_OK) {
-        tl__free(ctx->alloc, watermarks);
         tl__free(ctx->alloc, iters);
         return st;
     }
 
-    /* Prime heap with first record from each iterator */
+    /* Prime heap with first record from each iterator. The per-source
+     * watermark is just the segment's applied_seq (trivial inline); heap
+     * refills below reuse min_entry.watermark, so no side array is needed. */
     for (size_t i = 0; i < total_inputs; i++) {
         tl_record_t rec;
         if (tl_segment_iter_next(&iters[i], &rec) == TL_OK) {
@@ -1108,13 +1046,12 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
                 .ts = rec.ts,
                 .handle = rec.handle,
                 .tie_break_key = (uint32_t)i,
-                .watermark = watermarks[i],
+                .watermark = tl_segment_applied_seq(iters[i].seg),
                 .iter = &iters[i]
             };
             st = tl_heap_push(&heap, &entry);
             if (st != TL_OK) {
                 tl_heap_destroy(&heap);
-                tl__free(ctx->alloc, watermarks);
                 tl__free(ctx->alloc, iters);
                 return st;
             }
@@ -1241,7 +1178,6 @@ tl_status_t tl_compact_merge(tl_compact_ctx_t* ctx) {
 cleanup:
     tl_recvec_destroy(&window_records);
     tl_heap_destroy(&heap);
-    tl__free(ctx->alloc, watermarks);
     tl__free(ctx->alloc, iters);
     return st;
 }
@@ -1388,31 +1324,28 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
     }
     TL_UNLOCK_MAINT(tl);
 
-    tl_compact_ctx_t ctx;
-    tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
-
-    tl_status_t st;
-
-    st = tl_compact_select(&ctx);
-    if (st != TL_OK) {
-        tl_compact_ctx_destroy(&ctx);
-        return st;
-    }
-
-    st = tl_compact_merge(&ctx);
-    if (st != TL_OK) {
-        tl_compact_ctx_destroy(&ctx);
-        return st;
-    }
-
-    /* Bounded retry loop: TL_EBUSY means the manifest moved under us
-     * between select and publish, so we discard the merge result and
-     * redo selection + merge against the fresh manifest. */
-    tl_status_t publish_st = TL_EBUSY;
+    /* Bounded retry loop: each attempt runs select -> merge -> publish
+     * against the manifest current at selection time. TL_EBUSY from
+     * publish means the manifest moved under us, so the merge result is
+     * discarded and the whole cycle redone from a fresh selection.
+     * Exhaustion always returns TL_EBUSY per the header contract;
+     * select/merge failures on any attempt propagate as-is. */
     for (int attempt = 0; attempt < max_retries; attempt++) {
-        publish_st = tl_compact_publish(&ctx);
-        if (publish_st != TL_EBUSY) {
-            if (publish_st == TL_OK) {
+        tl_compact_ctx_t ctx;
+        tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
+
+        tl_status_t st = tl_compact_select(&ctx);
+        if (st == TL_OK) {
+            st = tl_compact_merge(&ctx);
+        }
+        if (st != TL_OK) {
+            tl_compact_ctx_destroy(&ctx);
+            return st;
+        }
+
+        st = tl_compact_publish(&ctx);
+        if (st != TL_EBUSY) {
+            if (st == TL_OK) {
                 /* Drop callbacks fire only after publish succeeds: at this
                  * point the records are truly retired from the live
                  * manifest. Firing earlier would let user code free a
@@ -1447,37 +1380,23 @@ tl_status_t tl_compact_one(tl_timelog_t* tl, int max_retries) {
                 }
             }
             tl_compact_ctx_destroy(&ctx);
-            return publish_st;
+            return st;
         }
 
-        /* EBUSY: count and retry. */
+        /* EBUSY: count the missed publish; a retry is counted only when
+         * another attempt actually follows. */
         tl_atomic_inc_u64(&tl->compaction_publish_ebusy);
         if (attempt + 1 < max_retries) {
             tl_atomic_inc_u64(&tl->compaction_retries);
         }
-
         tl_compact_ctx_destroy(&ctx);
-        tl_compact_ctx_init(&ctx, tl, &tl->alloc, candidate_window);
-
-        st = tl_compact_select(&ctx);
-        if (st != TL_OK) {
-            tl_compact_ctx_destroy(&ctx);
-            return st;
-        }
-
-        st = tl_compact_merge(&ctx);
-        if (st != TL_OK) {
-            tl_compact_ctx_destroy(&ctx);
-            return st;
-        }
     }
 
     /* Retries exhausted: tell the adaptive policy to back off next time. */
-    tl_compact_ctx_destroy(&ctx);
     if (tl->config.adaptive.target_records > 0) {
         TL_LOCK_MAINT(tl);
         tl_adaptive_record_failure(&tl->adaptive);
         TL_UNLOCK_MAINT(tl);
     }
-    return publish_st;
+    return TL_EBUSY;
 }

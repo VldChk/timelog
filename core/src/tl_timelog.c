@@ -12,13 +12,13 @@
 #include "delta/tl_memrun.h"
 #include "delta/tl_flush.h"
 #include "storage/tl_manifest.h"
+#include "storage/tl_window.h"
 #include "query/tl_snapshot.h"
 #include "query/tl_plan.h"
 #include "query/tl_merge_iter.h"
 #include "query/tl_filter.h"
 #include "query/tl_point.h"
 #include "query/tl_segment_range.h"
-#include "query/tl_count.h"
 #include "maint/tl_compaction.h"
 #include "maint/tl_adaptive.h"
 
@@ -62,47 +62,23 @@ struct tl_iter {
  * Status Code Strings
  *===========================================================================*/
 
-static const char* status_strings[] = {
-    "success",                          /* TL_OK = 0 */
-    "end of iteration",                 /* TL_EOF = 1 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 2-9 unused */
-    "invalid argument",                 /* TL_EINVAL = 10 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 11-19 unused */
-    "invalid state",                    /* TL_ESTATE = 20 */
-    "resource busy",                    /* TL_EBUSY = 21 */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, /* 22-29 unused */
-    "out of memory",                    /* TL_ENOMEM = 30 */
-    "arithmetic overflow",              /* TL_EOVERFLOW = 31 */
-};
-
-#define STATUS_STRINGS_COUNT (sizeof(status_strings) / sizeof(status_strings[0]))
-
 const char* tl_strerror(tl_status_t s) {
-    if (s == TL_EINTERNAL) {
-        return "internal error";
+    switch (s) {
+        case TL_OK:        return "success";
+        case TL_EOF:       return "end of iteration";
+        case TL_EINVAL:    return "invalid argument";
+        case TL_ESTATE:    return "invalid state";
+        case TL_EBUSY:     return "resource busy";
+        case TL_ENOMEM:    return "out of memory";
+        case TL_EOVERFLOW: return "arithmetic overflow";
+        case TL_EINTERNAL: return "internal error";
+        default:           return "unknown error";
     }
-
-    if ((size_t)s < STATUS_STRINGS_COUNT && status_strings[s] != NULL) {
-        return status_strings[s];
-    }
-
-    return "unknown error";
 }
 
 /*===========================================================================
  * Configuration Defaults
  *===========================================================================*/
-
-/** Default window size of one hour, expressed in the configured time unit. */
-static tl_ts_t default_window_size(tl_time_unit_t unit) {
-    switch (unit) {
-        case TL_TIME_S:  return TL_WINDOW_1H_S;
-        case TL_TIME_MS: return TL_WINDOW_1H_MS;
-        case TL_TIME_US: return TL_WINDOW_1H_US;
-        case TL_TIME_NS: return TL_WINDOW_1H_NS;
-        default:         return TL_WINDOW_1H_MS;
-    }
-}
 
 tl_status_t tl_config_init_defaults(tl_config_t* cfg) {
     if (cfg == NULL) {
@@ -203,7 +179,7 @@ static void normalize_config(tl_timelog_t* tl) {
 
     /* Derived defaults (depend on base config resolved above). */
     tl->effective_window_size = (cfg->window_size == 0)
-        ? default_window_size(cfg->time_unit) : cfg->window_size;
+        ? tl_window_default_size(cfg->time_unit) : cfg->window_size;
     tl->effective_ooo_budget = (cfg->ooo_budget_bytes == 0)
         ? cfg->memtable_max_bytes / 10 : cfg->ooo_budget_bytes;
 
@@ -218,52 +194,41 @@ static void normalize_config(tl_timelog_t* tl) {
 static tl_status_t init_locks(tl_timelog_t* tl) {
     tl_status_t s;
 
+    /* Goto-cleanup ladder (house pattern): each label tears down exactly
+     * the primitives initialised before the failed step, in reverse order. */
     s = tl_mutex_init(&tl->writer_mu);
     if (s != TL_OK) return s;
 
     s = tl_mutex_init(&tl->flush_mu);
-    if (s != TL_OK) {
-        tl_mutex_destroy(&tl->writer_mu);
-        return s;
-    }
+    if (s != TL_OK) goto fail_flush_mu;
 
     s = tl_mutex_init(&tl->maint_mu);
-    if (s != TL_OK) {
-        tl_mutex_destroy(&tl->flush_mu);
-        tl_mutex_destroy(&tl->writer_mu);
-        return s;
-    }
+    if (s != TL_OK) goto fail_maint_mu;
 
     s = tl_cond_init(&tl->maint_cond);
-    if (s != TL_OK) {
-        tl_mutex_destroy(&tl->maint_mu);
-        tl_mutex_destroy(&tl->flush_mu);
-        tl_mutex_destroy(&tl->writer_mu);
-        return s;
-    }
+    if (s != TL_OK) goto fail_maint_cond;
 
     s = tl_mutex_init(&tl->memtable_mu);
-    if (s != TL_OK) {
-        tl_cond_destroy(&tl->maint_cond);
-        tl_mutex_destroy(&tl->maint_mu);
-        tl_mutex_destroy(&tl->flush_mu);
-        tl_mutex_destroy(&tl->writer_mu);
-        return s;
-    }
+    if (s != TL_OK) goto fail_memtable_mu;
 
     s = tl_cond_init(&tl->memtable_cond);
-    if (s != TL_OK) {
-        tl_mutex_destroy(&tl->memtable_mu);
-        tl_cond_destroy(&tl->maint_cond);
-        tl_mutex_destroy(&tl->maint_mu);
-        tl_mutex_destroy(&tl->flush_mu);
-        tl_mutex_destroy(&tl->writer_mu);
-        return s;
-    }
+    if (s != TL_OK) goto fail_memtable_cond;
 
     tl_seqlock_init(&tl->view_seq);
 
     return TL_OK;
+
+fail_memtable_cond:
+    tl_mutex_destroy(&tl->memtable_mu);
+fail_memtable_mu:
+    tl_cond_destroy(&tl->maint_cond);
+fail_maint_cond:
+    tl_mutex_destroy(&tl->maint_mu);
+fail_maint_mu:
+    tl_mutex_destroy(&tl->flush_mu);
+fail_flush_mu:
+    tl_mutex_destroy(&tl->writer_mu);
+    return s;
 }
 
 static void destroy_locks(tl_timelog_t* tl) {
@@ -316,9 +281,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
 
     status = init_locks(tl);
     if (status != TL_OK) {
-        tl__alloc_destroy(&tl->alloc);
-        temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
-        return status;
+        goto fail_locks;
     }
 
     status = tl_memtable_init(&tl->memtable,
@@ -327,20 +290,13 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
                                tl->effective_ooo_budget,
                                tl->config.sealed_max_runs);
     if (status != TL_OK) {
-        destroy_locks(tl);
-        tl__alloc_destroy(&tl->alloc);
-        temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
-        return status;
+        goto fail_memtable;
     }
     tl->op_seq = 0;
 
     status = tl_manifest_create(&tl->alloc, &tl->manifest);
     if (status != TL_OK) {
-        tl_memtable_destroy(&tl->memtable);
-        destroy_locks(tl);
-        tl__alloc_destroy(&tl->alloc);
-        temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
-        return status;
+        goto fail_manifest;
     }
     tl->next_gen = 1;
     tl->memview_cache = NULL;
@@ -377,14 +333,7 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
     if (tl->config.maintenance_mode == TL_MAINT_BACKGROUND) {
         status = tl_maint_start(tl);
         if (status != TL_OK) {
-            /* Worker startup failed: tear everything we just built back down
-             * so tl_open() leaves no half-initialised state behind. */
-            tl_manifest_release(tl->manifest);
-            tl_memtable_destroy(&tl->memtable);
-            destroy_locks(tl);
-            tl__alloc_destroy(&tl->alloc);
-            temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
-            return status;
+            goto fail_worker;
         }
     }
 
@@ -396,6 +345,19 @@ tl_status_t tl_open(const tl_config_t* cfg, tl_timelog_t** out) {
 
     *out = tl;
     return TL_OK;
+
+    /* Failure ladder: tear everything we just built back down, in reverse
+     * order of construction, so tl_open() leaves no half-initialised state. */
+fail_worker:
+    tl_manifest_release(tl->manifest);
+fail_manifest:
+    tl_memtable_destroy(&tl->memtable);
+fail_memtable:
+    destroy_locks(tl);
+fail_locks:
+    tl__alloc_destroy(&tl->alloc);
+    temp_alloc.alloc.free_fn(temp_alloc.alloc.ctx, tl);
+    return status;
 }
 
 void tl_close(tl_timelog_t* tl) {
@@ -510,6 +472,38 @@ static void tl__range_end_from_inclusive_max(tl_ts_t max_inclusive,
 }
 
 /**
+ * Single seal attempt shared by both tries in handle_seal_with_backpressure.
+ * On TL_OK: transfers the dropped-record buffer to the caller and requests
+ * a worker wake-up. On failure: frees any partial drop buffer and returns
+ * the raw seal status for the caller to map.
+ */
+static tl_status_t try_seal_once(tl_timelog_t* tl,
+                                 bool* need_signal,
+                                 tl_record_t** out_dropped,
+                                 size_t* out_dropped_len) {
+    tl_record_t* dropped = NULL;
+    size_t dropped_len = 0;
+    tl_status_t seal_st = tl_memtable_seal_ex(&tl->memtable,
+                                               &tl->memtable_mu,
+                                               NULL,
+                                               tl->op_seq,
+                                               &dropped,
+                                               &dropped_len);
+    if (seal_st == TL_OK) {
+        tl_atomic_inc_u64(&tl->seals_total);
+        *need_signal = true;
+        *out_dropped = dropped;
+        *out_dropped_len = dropped_len;
+        return TL_OK;
+    }
+
+    if (dropped != NULL) {
+        tl__free(&tl->alloc, dropped);
+    }
+    return seal_st;
+}
+
+/**
  * Seal the active run if the memtable is full, applying backpressure when
  * the sealed-run queue has no room.
  *
@@ -532,11 +526,12 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
                                                   bool* need_signal,
                                                   tl_record_t** out_dropped,
                                                   size_t* out_dropped_len) {
+    TL_ASSERT(out_dropped != NULL);
+    TL_ASSERT(out_dropped_len != NULL);
+
     *need_signal = false;
-    if (out_dropped != NULL && out_dropped_len != NULL) {
-        *out_dropped = NULL;
-        *out_dropped_len = 0;
-    }
+    *out_dropped = NULL;
+    *out_dropped_len = 0;
 
     if (!tl_memtable_should_seal(&tl->memtable)) {
         return TL_OK;
@@ -546,28 +541,10 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         tl_atomic_inc_u64(&tl->ooo_budget_hits);
     }
 
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
-    tl_status_t seal_st = tl_memtable_seal_ex(&tl->memtable,
-                                               &tl->memtable_mu,
-                                               NULL,
-                                               tl->op_seq,
-                                               &dropped,
-                                               &dropped_len);
+    tl_status_t seal_st = try_seal_once(tl, need_signal,
+                                        out_dropped, out_dropped_len);
     if (seal_st == TL_OK) {
-        tl_atomic_inc_u64(&tl->seals_total);
-        *need_signal = true;
-        if (out_dropped != NULL && out_dropped_len != NULL) {
-            *out_dropped = dropped;
-            *out_dropped_len = dropped_len;
-        } else if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
         return TL_OK;
-    }
-
-    if (dropped != NULL) {
-        tl__free(&tl->alloc, dropped);
     }
 
     if (seal_st != TL_EBUSY) {
@@ -602,28 +579,9 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
         return TL_EBUSY;
     }
 
-    dropped = NULL;
-    dropped_len = 0;
-    seal_st = tl_memtable_seal_ex(&tl->memtable,
-                                   &tl->memtable_mu,
-                                   NULL,
-                                   tl->op_seq,
-                                   &dropped,
-                                   &dropped_len);
+    seal_st = try_seal_once(tl, need_signal, out_dropped, out_dropped_len);
     if (seal_st == TL_OK) {
-        tl_atomic_inc_u64(&tl->seals_total);
-        *need_signal = true;
-        if (out_dropped != NULL && out_dropped_len != NULL) {
-            *out_dropped = dropped;
-            *out_dropped_len = dropped_len;
-        } else if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
         return TL_OK;
-    }
-
-    if (dropped != NULL) {
-        tl__free(&tl->alloc, dropped);
     }
 
     /* Write succeeded but seal could not complete. Return EBUSY rather than
@@ -631,31 +589,29 @@ static tl_status_t handle_seal_with_backpressure(tl_timelog_t* tl,
     return TL_EBUSY;
 }
 
-tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
-    TL_CHECK_OPEN(tl);
-
+/**
+ * Shared write-path epilogue for the four write entrypoints.
+ *
+ * Called with writer_mu held; releases it. Seal/backpressure decisions
+ * happen under writer_mu, but condvar signalling and user callbacks run
+ * after it is released — the lock order forbids taking maint_mu under
+ * writer_mu, and on_drop_handle may call into arbitrary user code. The
+ * deferred order (unlock -> flush request -> drop callbacks) is contract.
+ *
+ * @param insert_st TL_OK or TL_EBUSY from the insert (EBUSY means the
+ *        write IS committed — never retried, never rolled back). Since
+ *        handle_seal_with_backpressure returns only TL_OK/TL_EBUSY, the
+ *        combine below reduces to `return seal_st` when insert_st is
+ *        TL_OK, matching the delete entrypoints exactly.
+ *
+ * Kept small and static so it inlines; the append hot path is
+ * benchmark-gated (audit C3).
+ */
+static tl_status_t tl__finish_write(tl_timelog_t* tl, tl_status_t insert_st) {
     bool need_signal = false;
     tl_record_t* dropped = NULL;
     size_t dropped_len = 0;
 
-    TL_LOCK_WRITER(tl);
-
-    tl_seq_t seq = 0;
-    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
-    if (seq_st != TL_OK) {
-        TL_UNLOCK_WRITER(tl);
-        return seq_st;
-    }
-    tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle, seq);
-    if (insert_st != TL_OK && insert_st != TL_EBUSY) {
-        TL_UNLOCK_WRITER(tl);
-        return insert_st;
-    }
-
-    /* Seal/backpressure decisions happen under writer_mu but condvar
-     * signalling and user callbacks must run after we release it (the lock
-     * order forbids taking maint_mu under writer_mu, and on_drop_handle may
-     * call into arbitrary user code). */
     tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal,
                                                         &dropped, &dropped_len);
 
@@ -673,6 +629,26 @@ tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
     return seal_st;
 }
 
+tl_status_t tl_append(tl_timelog_t* tl, tl_ts_t ts, tl_handle_t handle) {
+    TL_CHECK_OPEN(tl);
+
+    TL_LOCK_WRITER(tl);
+
+    tl_seq_t seq = 0;
+    tl_status_t seq_st = tl__next_op_seq(tl, &seq);
+    if (seq_st != TL_OK) {
+        TL_UNLOCK_WRITER(tl);
+        return seq_st;
+    }
+    tl_status_t insert_st = tl_memtable_insert(&tl->memtable, ts, handle, seq);
+    if (insert_st != TL_OK && insert_st != TL_EBUSY) {
+        TL_UNLOCK_WRITER(tl);
+        return insert_st;
+    }
+
+    return tl__finish_write(tl, insert_st);
+}
+
 tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
                             size_t n, uint32_t flags) {
     TL_CHECK_OPEN(tl);
@@ -682,10 +658,6 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
     if (records == NULL) {
         return TL_EINVAL;
     }
-
-    bool need_signal = false;
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
 
     TL_LOCK_WRITER(tl);
 
@@ -703,21 +675,8 @@ tl_status_t tl_append_batch(tl_timelog_t* tl, const tl_record_t* records,
          * so the caller may safely retry the entire batch. */
         return insert_st;
     }
-    tl_status_t seal_st = handle_seal_with_backpressure(tl, &need_signal,
-                                                        &dropped, &dropped_len);
 
-    TL_UNLOCK_WRITER(tl);
-
-    if (need_signal) {
-        tl__maint_request_flush(tl);
-    }
-    tl__emit_drop_callbacks(tl, dropped, dropped_len);
-
-    if (insert_st == TL_EBUSY || seal_st == TL_EBUSY) {
-        return TL_EBUSY;
-    }
-
-    return seal_st;
+    return tl__finish_write(tl, insert_st);
 }
 
 tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
@@ -730,11 +689,6 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
         return TL_EINVAL;
     }
 
-    tl_status_t st;
-    bool need_signal = false;
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
-
     TL_LOCK_WRITER(tl);
 
     tl_seq_t seq = 0;
@@ -743,30 +697,17 @@ tl_status_t tl_delete_range(tl_timelog_t* tl, tl_ts_t t1, tl_ts_t t2) {
         TL_UNLOCK_WRITER(tl);
         return seq_st;
     }
-    st = tl_memtable_insert_tombstone(&tl->memtable, t1, t2, seq);
+    tl_status_t st = tl_memtable_insert_tombstone(&tl->memtable, t1, t2, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
         return st;
     }
 
-    st = handle_seal_with_backpressure(tl, &need_signal, &dropped, &dropped_len);
-    TL_UNLOCK_WRITER(tl);
-
-    if (need_signal) {
-        tl__maint_request_flush(tl);
-    }
-    tl__emit_drop_callbacks(tl, dropped, dropped_len);
-
-    return st;
+    return tl__finish_write(tl, TL_OK);
 }
 
 tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
     TL_CHECK_OPEN(tl);
-
-    tl_status_t st;
-    bool need_signal = false;
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
 
     if (cutoff == TL_TS_MIN) {
         return TL_OK;
@@ -780,22 +721,13 @@ tl_status_t tl_delete_before(tl_timelog_t* tl, tl_ts_t cutoff) {
         TL_UNLOCK_WRITER(tl);
         return seq_st;
     }
-    st = tl_memtable_insert_tombstone(&tl->memtable, TL_TS_MIN, cutoff, seq);
+    tl_status_t st = tl_memtable_insert_tombstone(&tl->memtable, TL_TS_MIN, cutoff, seq);
     if (st != TL_OK) {
         TL_UNLOCK_WRITER(tl);
         return st;
     }
 
-    st = handle_seal_with_backpressure(tl, &need_signal, &dropped, &dropped_len);
-
-    TL_UNLOCK_WRITER(tl);
-
-    if (need_signal) {
-        tl__maint_request_flush(tl);
-    }
-    tl__emit_drop_callbacks(tl, dropped, dropped_len);
-
-    return st;
+    return tl__finish_write(tl, TL_OK);
 }
 
 /*===========================================================================
@@ -996,16 +928,7 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
 
     if (seg == NULL) {
         flush_discard_memrun(tl, mr);
-        if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
-            for (size_t i = 0; i < dropped_len; i++) {
-                tl->config.on_drop_handle(tl->config.on_drop_ctx,
-                                          dropped[i].ts,
-                                          dropped[i].handle);
-            }
-        }
-        if (dropped != NULL) {
-            tl__free(&tl->alloc, dropped);
-        }
+        tl__emit_drop_callbacks(tl, dropped, dropped_len);
         return TL_OK;
     }
 
@@ -1016,15 +939,10 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
         st = flush_publish(tl, mr, seg);
         if (st != TL_EBUSY) {
             if (st == TL_OK) {
-                if (dropped_len > 0 && tl->config.on_drop_handle != NULL) {
-                    for (size_t i = 0; i < dropped_len; i++) {
-                        tl->config.on_drop_handle(tl->config.on_drop_ctx,
-                                                  dropped[i].ts,
-                                                  dropped[i].handle);
-                    }
-                }
-            }
-            if (dropped != NULL) {
+                tl__emit_drop_callbacks(tl, dropped, dropped_len);
+            } else if (dropped != NULL) {
+                /* Publish failed: records were never published, so no drop
+                 * callbacks by contract — free only. */
                 tl__free(&tl->alloc, dropped);
             }
             return st;
@@ -1032,7 +950,9 @@ static tl_status_t flush_one_memrun(tl_timelog_t* tl, tl_memrun_t* mr) {
     }
 
     /* Retries exhausted: discard the segment we built and surface EBUSY so
-     * the caller (or worker loop) can rebuild against a newer manifest. */
+     * the caller (or worker loop) can rebuild against a newer manifest.
+     * Free-only, NOT tl__emit_drop_callbacks: nothing was published, and
+     * on_drop_handle fires only after a successful manifest publish. */
     tl_segment_release(seg);
     if (dropped != NULL) {
         tl__free(&tl->alloc, dropped);
@@ -1069,9 +989,8 @@ static tl_status_t tl__flush_one(tl_timelog_t* tl) {
         size_t run_len = tl_memrun_run_len(mr);
         size_t ooo_len = tl_memrun_ooo_len(mr);
         metrics.record_count = (uint64_t)(run_len + ooo_len);
-        metrics.has_records = (metrics.record_count > 0);
 
-        if (metrics.has_records) {
+        if (metrics.record_count > 0) {
             const tl_record_t* run = tl_memrun_run_data(mr);
             tl_ts_t ooo_min = mr->ooo_min_ts;
             tl_ts_t ooo_max = mr->ooo_max_ts;
@@ -1347,25 +1266,10 @@ tl_status_t tl_iter_range(const tl_snapshot_t* snap, tl_ts_t t1, tl_ts_t t2,
     if (snap == NULL || out == NULL) {
         return TL_EINVAL;
     }
-    if (t1 >= t2) {
-        /* Half-open [t1, t2) with t1 >= t2 is empty. Return a valid but
-         * already-exhausted iterator so callers can use a single code path. */
-        tl_iter_t* it = TL_NEW(snap->alloc, tl_iter_t);
-        if (it == NULL) {
-            return TL_ENOMEM;
-        }
-        memset(it, 0, sizeof(*it));
-        it->snapshot = (tl_snapshot_t*)snap;
-        it->alloc = snap->alloc;
-        it->done = true;
-        it->initialized = true;
-#ifdef TL_DEBUG
-        tl_snapshot_iter_created((tl_snapshot_t*)snap);
-#endif
-        *out = it;
-        return TL_OK;
-    }
 
+    /* Half-open [t1, t2) with t1 >= t2 is empty: tl_plan_build short-circuits
+     * it before any source allocation and iter_create_internal then returns a
+     * valid, already-exhausted iterator — no special case needed here. */
     return iter_create_internal((tl_snapshot_t*)snap, t1, t2, false, out);
 }
 
@@ -1573,17 +1477,11 @@ tl_status_t tl_snapshot_count_range(const tl_snapshot_t* snap,
  * Timestamp Navigation
  *===========================================================================*/
 
-tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
-    if (snap == NULL || out == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (!snap->has_data) {
-        return TL_EOF;
-    }
-
+/** First visible record at or after t1 (shared by tl_min_ts / tl_next_ts). */
+static tl_status_t tl__nav_first_since(const tl_snapshot_t* snap, tl_ts_t t1,
+                                       tl_ts_t* out) {
     tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_since(snap, TL_TS_MIN, &it);
+    tl_status_t st = tl_iter_since(snap, t1, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -1598,20 +1496,18 @@ tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
     return st;
 }
 
-tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
-    if (snap == NULL || out == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (!snap->has_data) {
-        return TL_EOF;
-    }
-
-    /* The merge iterator is forward-only, so finding max requires walking
-     * the entire visible set. Cheaper than maintaining a reverse iterator
-     * for an infrequent operation. */
+/**
+ * Last visible record of [TL_TS_MIN, t2) — or of the full set when
+ * t2_unbounded (shared by tl_max_ts / tl_prev_ts). The merge iterator is
+ * forward-only, so this walks the entire visible range; cheaper than
+ * maintaining a reverse iterator for documented O(N) diagnostics.
+ */
+static tl_status_t tl__nav_last_of_scan(const tl_snapshot_t* snap, tl_ts_t t2,
+                                        bool t2_unbounded, tl_ts_t* out) {
     tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_since(snap, TL_TS_MIN, &it);
+    tl_status_t st = t2_unbounded
+        ? tl_iter_since(snap, TL_TS_MIN, &it)
+        : tl_iter_range(snap, TL_TS_MIN, t2, &it);
     if (st != TL_OK) {
         return st;
     }
@@ -1635,11 +1531,32 @@ tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
     return TL_OK;
 }
 
+tl_status_t tl_min_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
+    if (snap == NULL || out == NULL) {
+        return TL_EINVAL;
+    }
+    if (!snap->has_data) {
+        return TL_EOF;
+    }
+
+    return tl__nav_first_since(snap, TL_TS_MIN, out);
+}
+
+tl_status_t tl_max_ts(const tl_snapshot_t* snap, tl_ts_t* out) {
+    if (snap == NULL || out == NULL) {
+        return TL_EINVAL;
+    }
+    if (!snap->has_data) {
+        return TL_EOF;
+    }
+
+    return tl__nav_last_of_scan(snap, 0, true, out);
+}
+
 tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     if (snap == NULL || out == NULL) {
         return TL_EINVAL;
     }
-
     if (!snap->has_data) {
         return TL_EOF;
     }
@@ -1649,60 +1566,23 @@ tl_status_t tl_next_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
         return TL_EOF;
     }
 
-    tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_since(snap, next, &it);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    tl_record_t rec;
-    st = tl_iter_next(it, &rec);
-    if (st == TL_OK) {
-        *out = rec.ts;
-    }
-
-    tl_iter_destroy(it);
-    return st;
+    return tl__nav_first_since(snap, next, out);
 }
 
 tl_status_t tl_prev_ts(const tl_snapshot_t* snap, tl_ts_t ts, tl_ts_t* out) {
     if (snap == NULL || out == NULL) {
         return TL_EINVAL;
     }
-
     if (!snap->has_data) {
         return TL_EOF;
     }
-
     if (ts == TL_TS_MIN) {
         return TL_EOF;
     }
 
-    /* Forward-only iteration over [TL_TS_MIN, ts): the last record yielded
-     * is the predecessor of ts. */
-    tl_iter_t* it = NULL;
-    tl_status_t st = tl_iter_range(snap, TL_TS_MIN, ts, &it);
-    if (st != TL_OK) {
-        return st;
-    }
-
-    tl_record_t rec;
-    tl_ts_t last_ts = 0;
-    bool found = false;
-
-    while (tl_iter_next(it, &rec) == TL_OK) {
-        last_ts = rec.ts;
-        found = true;
-    }
-
-    tl_iter_destroy(it);
-
-    if (!found) {
-        return TL_EOF;
-    }
-
-    *out = last_ts;
-    return TL_OK;
+    /* Forward scan of [TL_TS_MIN, ts): the last record yielded is the
+     * predecessor of ts. */
+    return tl__nav_last_of_scan(snap, ts, false, out);
 }
 
 /*===========================================================================
@@ -1734,8 +1614,7 @@ typedef enum tl_work_t {
     TL_WORK_NONE               = 0,
     TL_WORK_FLUSH              = 1u << 0,
     TL_WORK_COMPACT_EXPLICIT   = 1u << 1,
-    TL_WORK_COMPACT_HEURISTIC  = 1u << 2,
-    TL_WORK_RESHAPE_L0         = 1u << 3  /* Reserved for future use. */
+    TL_WORK_COMPACT_HEURISTIC  = 1u << 2
 } tl_work_t;
 
 static void* tl__maint_worker_entry(void* arg) {
@@ -2059,64 +1938,28 @@ tl_status_t tl_stats(const tl_snapshot_t* snap, tl_stats_t* out) {
     out->segments_l0 = tl_manifest_l0_count(manifest);
     out->segments_l1 = tl_manifest_l1_count(manifest);
 
-    /* Count pages and tombstone-visible records without scanning rows:
-     * each segment carries enough metadata for an O(pages + tombstones)
-     * estimate, which is good enough for diagnostic stats. */
+    /* Count pages without scanning rows. */
     uint64_t total_pages = 0;
-    uint64_t immutable_visible_records = 0;
-
-    tl_intervals_t skyline;
-    tl_intervals_init(&skyline, snap->alloc);
-    tl_status_t skyline_st = tl_snapshot_collect_tombstones(snap,
-                                                            &skyline,
-                                                            TL_TS_MIN,
-                                                            0,
-                                                            true);
-    if (skyline_st != TL_OK) {
-        tl_intervals_destroy(&skyline);
-        return skyline_st;
-    }
-
-    tl_intervals_imm_t skyline_imm = tl_intervals_as_imm(&skyline);
-    const tl_interval_t* skyline_data = skyline_imm.data;
-    size_t skyline_len = skyline_imm.len;
-
     for (uint32_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
-        total_pages += seg->page_count;
-        immutable_visible_records += tl__visible_records_in_segment(seg,
-                                                                    skyline_data,
-                                                                    skyline_len);
+        total_pages += tl_manifest_l0_get(manifest, i)->page_count;
     }
-
     for (uint32_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-        total_pages += seg->page_count;
-        immutable_visible_records += tl__visible_records_in_segment(seg,
-                                                                    skyline_data,
-                                                                    skyline_len);
+        total_pages += tl_manifest_l1_get(manifest, i)->page_count;
     }
-
     out->pages_total = total_pages;
 
-    uint64_t total_records = immutable_visible_records;
-
-    /* The active and OOO buffers are mutable, so we must filter record by
-     * record against the live tombstone skyline. */
-    total_records += tl__count_active_visible_range(memview, skyline_imm,
-                                                     TL_TS_MIN, 0, true);
-
-    /* Sealed memruns are immutable; the watermark-aware counter can short
-     * circuit using their precomputed page bounds. */
-    for (size_t i = 0; i < tl_memview_sealed_len(memview); i++) {
-        const tl_memrun_t* mr = tl_memview_sealed_get(memview, i);
-        total_records += tl__visible_records_in_memrun(mr,
-                                                        skyline_data,
-                                                        skyline_len);
+    /* Tombstone-visible record estimate: identical to the unbounded
+     * count query — the full-extent counting helpers were the range
+     * variants specialized to [TL_TS_MIN, +inf) (B5). Iterating the
+     * manifest again is fine on this cold diagnostics path. */
+    tl_status_t count_st = tl_snapshot_count_range_internal(snap,
+                                                            TL_TS_MIN,
+                                                            0,
+                                                            true,
+                                                            &out->records_estimate);
+    if (count_st != TL_OK) {
+        return count_st;
     }
-
-    out->records_estimate = total_records;
-    tl_intervals_destroy(&skyline);
 
     /* Reports the raw, pre-tombstone min/max stored on the snapshot. For
      * the bounds of currently-visible records call tl_min_ts/tl_max_ts. */

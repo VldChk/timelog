@@ -111,16 +111,8 @@ tl_status_t tl_intervals_insert_unbounded(tl_intervals_t* iv,
  *---------------------------------------------------------------------------*/
 
 /**
- * Check if timestamp ts is contained in any interval (max_seq > 0).
- * @return true if ts is in [start, end) for some interval, false otherwise
- */
-bool tl_intervals_contains(const tl_intervals_t* iv, tl_ts_t ts);
-bool tl_intervals_imm_contains(tl_intervals_imm_t iv, tl_ts_t ts);
-
-/**
  * Get max tombstone seq covering ts (0 if none).
  */
-tl_seq_t tl_intervals_max_seq(const tl_intervals_t* iv, tl_ts_t ts);
 tl_seq_t tl_intervals_imm_max_seq(tl_intervals_imm_t iv, tl_ts_t ts);
 
 /*---------------------------------------------------------------------------
@@ -128,16 +120,9 @@ tl_seq_t tl_intervals_imm_max_seq(tl_intervals_imm_t iv, tl_ts_t ts);
  *---------------------------------------------------------------------------*/
 
 /**
- * Compute union of two interval sets into output.
+ * Compute union of two immutable interval sets into output.
  * Output is cleared first.
  * @return TL_OK on success, TL_ENOMEM on allocation failure
- */
-tl_status_t tl_intervals_union(tl_intervals_t* out,
-                               const tl_intervals_t* a,
-                               const tl_intervals_t* b);
-
-/**
- * Union variant with immutable inputs.
  */
 tl_status_t tl_intervals_union_imm(tl_intervals_t* out,
                                    tl_intervals_imm_t a,
@@ -213,15 +198,6 @@ TL_INLINE tl_intervals_imm_t tl_intervals_as_imm(const tl_intervals_t* iv) {
  */
 tl_interval_t* tl_intervals_take(tl_intervals_t* iv, size_t* out_len);
 
-/**
- * Sum of (end - start) across all intervals, used as the compaction
- * policy's delete-debt metric. Saturating arithmetic: an unbounded
- * interval or a sum overflow yields TL_TS_MAX, which the policy treats
- * as "infinite debt" and forces compaction. Call after clipping to a
- * bounded window if you want a finite answer.
- */
-tl_ts_t tl_intervals_covered_span(const tl_intervals_t* iv);
-
 /*---------------------------------------------------------------------------
  * Cursor-Based Iteration
  *
@@ -273,10 +249,9 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
                                   tl_ts_t* out);
 
 /*---------------------------------------------------------------------------
- * Validation (Debug)
+ * Validation
  *---------------------------------------------------------------------------*/
 
-#ifdef TL_DEBUG
 /**
  * Verify the canonical-form invariants on a raw interval array. Shared by
  * segment and memview validators so they all enforce the same rules:
@@ -285,12 +260,17 @@ bool tl_intervals_cursor_skip_to(tl_intervals_cursor_t* cur, tl_ts_t ts,
  *   3. They are pairwise non-overlapping (prev->end <= cur->start).
  *   4. They are coalesced (prev->end != cur->start).
  *   5. No bounded interval follows an unbounded one.
+ *   6. Every interval carries a non-zero max_seq.
+ *
+ * Compiled in release builds too: tl_segment_build_l0 depends on it for the
+ * invariant-mandated canonical-form EINVAL contract.
  *
  * @param data May be NULL when len == 0.
  * @return true on a valid array, false on any invariant violation.
  */
 bool tl_intervals_arr_validate(const tl_interval_t* data, size_t len);
 
+#ifdef TL_DEBUG
 /** Convenience wrapper that validates the array embedded in iv. */
 bool tl_intervals_validate(const tl_intervals_t* iv);
 #endif

@@ -96,30 +96,23 @@ static tl_status_t collect_from_sorted(tl_point_result_t* result,
     return TL_OK;
 }
 
-/** Collect matching records from a page. */
+/** Collect matching records from a page.
+ *
+ * Tombstone visibility is decided by the caller: collect_from_segment
+ * returns early when tomb_seq > seg->applied_seq, so every record in a
+ * page it visits is visible. */
 static tl_status_t collect_from_page(tl_point_result_t* result,
                                       const tl_page_t* page,
-                                      tl_ts_t ts,
-                                      tl_seq_t watermark,
-                                      tl_seq_t tomb_seq) {
+                                      tl_ts_t ts) {
     /* Binary search to find first occurrence */
     size_t idx = tl_page_lower_bound(page, ts);
 
     /* Collect all matching records */
     tl_record_t rec;
     while (idx < page->count) {
-        if (tl_page_row_is_deleted(page, idx)) {
-            idx++;
-            continue;
-        }
-
         tl_page_get_record(page, idx, &rec);
         if (rec.ts != ts) {
             break;
-        }
-        if (tomb_seq > watermark) {
-            idx++;
-            continue;
         }
         tl_status_t st = add_record(result, rec.ts, rec.handle);
         if (st != TL_OK) {
@@ -171,15 +164,7 @@ static tl_status_t collect_from_segment(tl_point_result_t* result,
             continue;
         }
 
-        /* Use a bitmask test so adding future page flags does not
-         * silently change visibility. */
-        if ((meta->flags & TL_PAGE_FULLY_DELETED) != 0) {
-            page_idx++;
-            continue;
-        }
-
-        tl_status_t st = collect_from_page(result, meta->page, ts,
-                                           seg->applied_seq, tomb_seq);
+        tl_status_t st = collect_from_page(result, meta->page, ts);
         if (st != TL_OK) {
             return st;
         }
@@ -287,6 +272,14 @@ static tl_status_t collect_from_memview(tl_point_result_t* result,
     return TL_OK;
 }
 
+/** One segment's tombstone skyline seq at ts; 0 if ts is out of bounds. */
+static tl_seq_t segment_tomb_seq_at(const tl_segment_t* seg, tl_ts_t ts) {
+    if (ts < seg->min_ts || ts > seg->max_ts) {
+        return 0;
+    }
+    return tl_intervals_imm_max_seq(tl_segment_tombstones_imm(seg), ts);
+}
+
 /**
  * Maximum tombstone seq covering `ts` across every source in the
  * snapshot. Bounds-prunes sources whose [min_ts, max_ts] excludes ts.
@@ -323,14 +316,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     }
 
     for (size_t i = 0; i < tl_manifest_l0_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l0_get(manifest, i);
-
-        if (ts < seg->min_ts || ts > seg->max_ts) {
-            continue;
-        }
-
-        tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        seq = segment_tomb_seq_at(tl_manifest_l0_get(manifest, i), ts);
         if (seq > max_seq) {
             max_seq = seq;
         }
@@ -339,14 +325,7 @@ static tl_seq_t max_tomb_seq_at(const tl_snapshot_t* snap, tl_ts_t ts) {
     /* L1 segments are tombstone-free by invariant, but check
      * defensively to stay correct if that ever changes. */
     for (size_t i = 0; i < tl_manifest_l1_count(manifest); i++) {
-        const tl_segment_t* seg = tl_manifest_l1_get(manifest, i);
-
-        if (ts < seg->min_ts || ts > seg->max_ts) {
-            continue;
-        }
-
-        tl_intervals_imm_t seg_tombs = tl_segment_tombstones_imm(seg);
-        seq = tl_intervals_imm_max_seq(seg_tombs, ts);
+        seq = segment_tomb_seq_at(tl_manifest_l1_get(manifest, i), ts);
         if (seq > max_seq) {
             max_seq = seq;
         }

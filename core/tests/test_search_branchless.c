@@ -1,14 +1,13 @@
 /*===========================================================================
- * test_search_branchless.c - Branchless lower/upper-bound differential tests
+ * test_search_branchless.c - Branchless lower-bound differential tests
  *
  * Validates that the size-gated branchless (cmov) search forms in
  *   tl_record_lower_bound        (internal/tl_search.h, AoS)
- *   tl_recvec_lower/upper_bound   (internal/tl_recvec.c, AoS)
- *   tl_page_lower/upper_bound     (storage/tl_page.c, SoA)
+ *   tl_page_lower_bound          (storage/tl_page.c, SoA)
  * are BIT-IDENTICAL to a reference branchy binary search, across sizes that
  * span the branchless<->branchy gate (TL_LOWER_BOUND_BRANCHLESS_MAX = 262144),
- * for both predicates, duplicate/equality runs, signed timestamp extremes, and
- * boundary targets around the branchless gate.
+ * duplicate/equality runs, signed timestamp extremes, and boundary targets
+ * around the branchless gate.
  *
  * Symbols prefixed "blq_" to stay unique.
  *===========================================================================*/
@@ -16,7 +15,6 @@
 #include "test_harness.h"
 #include "timelog/timelog.h"
 #include "internal/tl_alloc.h"
-#include "internal/tl_recvec.h"
 #include "internal/tl_search.h"
 #include "internal/tl_defs.h"
 #include "storage/tl_page.h"
@@ -30,13 +28,6 @@ static size_t blq_ref_lower(const tl_ts_t* k, size_t n, tl_ts_t target) {
         if (k[mid] < target) lo = mid + 1; else hi = mid; }
     return lo;
 }
-static size_t blq_ref_upper(const tl_ts_t* k, size_t n, tl_ts_t target) {
-    size_t lo = 0, hi = n;
-    while (lo < hi) { size_t mid = lo + (hi - lo) / 2;
-        if (k[mid] <= target) lo = mid + 1; else hi = mid; }
-    return lo;
-}
-
 /* Build the target sweep for a sorted key array keys[i] = 2*i (gaps so
  * "between" targets exist). Returns count; fills out[] (cap >= 16). */
 static size_t blq_targets(size_t n, tl_ts_t* out) {
@@ -83,32 +74,9 @@ TEST_DECLARE(blq_record_lower_differential) {
     }
 }
 
-TEST_DECLARE(blq_recvec_lower_upper_differential) {
-    tl_alloc_ctx_t alloc; tl__alloc_init(&alloc, NULL);
-    tl_ts_t targets[16];
-    for (size_t si = 0; si < BLQ_NSIZES; si++) {
-        size_t n = blq_sizes[si];
-        tl_recvec_t rv; tl_recvec_init(&rv, &alloc);
-        TEST_ASSERT_STATUS(TL_OK, tl_recvec_reserve(&rv, n ? n : 1));
-        tl_ts_t* keys = (tl_ts_t*)malloc((n ? n : 1) * sizeof(tl_ts_t));
-        TEST_ASSERT(keys != NULL);
-        for (size_t i = 0; i < n; i++) {
-            TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, (tl_ts_t)(2 * i), i));
-            keys[i] = (tl_ts_t)(2 * i);
-        }
-        size_t tc = blq_targets(n, targets);
-        for (size_t t = 0; t < tc; t++) {
-            TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, targets[t]), tl_recvec_lower_bound(&rv, targets[t]));
-            TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, targets[t]), tl_recvec_upper_bound(&rv, targets[t]));
-        }
-        free(keys); tl_recvec_destroy(&rv);
-    }
-    tl__alloc_destroy(&alloc);
-}
-
-/* Page differential: build real pages and compare lower/upper bound. Includes a
- * size above the gate (target_page_bytes sized to hold it in one page). */
-TEST_DECLARE(blq_page_lower_upper_differential) {
+/* Page differential: build real pages and compare lower bound. Includes a
+ * size above the branchless gate (all records land in one page). */
+TEST_DECLARE(blq_page_lower_differential) {
     tl_alloc_ctx_t alloc; tl__alloc_init(&alloc, NULL);
     tl_ts_t targets[16];
     const size_t page_sizes[] = { 1, 2, 3, 255, 256, 4096, BLQ_GATE + 1 };
@@ -118,17 +86,12 @@ TEST_DECLARE(blq_page_lower_upper_differential) {
         tl_ts_t* keys = (tl_ts_t*)malloc(n * sizeof(tl_ts_t));
         TEST_ASSERT(recs != NULL && keys != NULL);
         for (size_t i = 0; i < n; i++) { recs[i].ts = (tl_ts_t)(2 * i); recs[i].handle = i; keys[i] = (tl_ts_t)(2 * i); }
-        /* page bytes big enough to hold all n records in ONE page */
-        size_t pbytes = n * 16 + 4096;
-        if (pbytes < TL_DEFAULT_TARGET_PAGE_BYTES) pbytes = TL_DEFAULT_TARGET_PAGE_BYTES;
-        tl_page_builder_t pb; tl_page_builder_init(&pb, &alloc, pbytes);
         tl_page_t* page = NULL;
-        TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, recs, n, &page));
+        TEST_ASSERT_STATUS(TL_OK, tl_page_build(&alloc, recs, n, &page));
         TEST_ASSERT(page != NULL);
         size_t tc = blq_targets(n, targets);
         for (size_t t = 0; t < tc; t++) {
             TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, targets[t]), tl_page_lower_bound(page, targets[t]));
-            TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, targets[t]), tl_page_upper_bound(page, targets[t]));
         }
         tl_page_destroy(page, &alloc);
         free(recs); free(keys);
@@ -155,17 +118,8 @@ TEST_DECLARE(blq_duplicate_extreme_differential) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_reserve(&rv, n));
-    for (size_t i = 0; i < n; i++) {
-        TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, keys[i], i));
-    }
-
-    tl_page_builder_t pb;
-    tl_page_builder_init(&pb, &alloc, TL_DEFAULT_TARGET_PAGE_BYTES);
     tl_page_t* page = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, recs, n, &page));
+    TEST_ASSERT_STATUS(TL_OK, tl_page_build(&alloc, recs, n, &page));
     TEST_ASSERT(page != NULL);
 
     for (size_t i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
@@ -173,17 +127,10 @@ TEST_DECLARE(blq_duplicate_extreme_differential) {
         TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
                             tl_record_lower_bound(recs, n, target));
         TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
-                            tl_recvec_lower_bound(&rv, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, target),
-                            tl_recvec_upper_bound(&rv, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
                             tl_page_lower_bound(page, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, target),
-                            tl_page_upper_bound(page, target));
     }
 
     tl_page_destroy(page, &alloc);
-    tl_recvec_destroy(&rv);
     tl__alloc_destroy(&alloc);
 }
 
@@ -202,17 +149,8 @@ TEST_DECLARE(blq_gate_duplicate_differential) {
     tl_alloc_ctx_t alloc;
     tl__alloc_init(&alloc, NULL);
 
-    tl_recvec_t rv;
-    tl_recvec_init(&rv, &alloc);
-    TEST_ASSERT_STATUS(TL_OK, tl_recvec_reserve(&rv, n));
-    for (size_t i = 0; i < n; i++) {
-        TEST_ASSERT_STATUS(TL_OK, tl_recvec_push(&rv, keys[i], i));
-    }
-
-    tl_page_builder_t pb;
-    tl_page_builder_init(&pb, &alloc, n * sizeof(tl_record_t) + 4096);
     tl_page_t* page = NULL;
-    TEST_ASSERT_STATUS(TL_OK, tl_page_builder_build(&pb, recs, n, &page));
+    TEST_ASSERT_STATUS(TL_OK, tl_page_build(&alloc, recs, n, &page));
     TEST_ASSERT(page != NULL);
 
     const tl_ts_t targets[] = {
@@ -225,17 +163,10 @@ TEST_DECLARE(blq_gate_duplicate_differential) {
         TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
                             tl_record_lower_bound(recs, n, target));
         TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
-                            tl_recvec_lower_bound(&rv, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, target),
-                            tl_recvec_upper_bound(&rv, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_lower(keys, n, target),
                             tl_page_lower_bound(page, target));
-        TEST_ASSERT_EQ_SIZE(blq_ref_upper(keys, n, target),
-                            tl_page_upper_bound(page, target));
     }
 
     tl_page_destroy(page, &alloc);
-    tl_recvec_destroy(&rv);
     tl__alloc_destroy(&alloc);
     free(recs);
     free(keys);
@@ -243,8 +174,7 @@ TEST_DECLARE(blq_gate_duplicate_differential) {
 
 void run_search_branchless_tests(void) {
     RUN_TEST(blq_record_lower_differential);
-    RUN_TEST(blq_recvec_lower_upper_differential);
-    RUN_TEST(blq_page_lower_upper_differential);
+    RUN_TEST(blq_page_lower_differential);
     RUN_TEST(blq_duplicate_extreme_differential);
     RUN_TEST(blq_gate_duplicate_differential);
 }

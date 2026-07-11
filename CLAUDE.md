@@ -260,7 +260,9 @@ Trigger check → Selection (window-based) → K-way merge (OFF-LOCK) → Public
 
 **Strict Publish Protocol (H-17):**
 - Publication uses bounded retries (3 attempts) with `TL_EBUSY` on manifest change
-- Metrics: `compaction_publish_ebusy` (final EBUSY), `compaction_retries` (interim retries)
+- Metrics: `compaction_publish_ebusy` (incremented on EVERY publish attempt returning
+  TL_EBUSY — a 3-attempt exhaustion adds +3), `compaction_retries` (interim retries only,
+  i.e. EBUSY attempts followed by another attempt — same exhaustion adds +2)
 - STRICT mode: Returns EBUSY if manifest changed; REBASE mode: Rebuilds and retries
 
 **Delete Debt Calculation (H-18):**
@@ -450,12 +452,14 @@ span->exports--;
 
 ### Exception State Preservation
 
-All cleanup paths must preserve exception state across `Py_DECREF` calls:
+All cleanup paths must preserve exception state across `Py_DECREF` calls.
+Use the project macros from `bindings/cpython/include/timelogpy/py_module_state.h`
+(they wrap the 3.12+ `PyErr_GetRaisedException` / `PyErr_SetRaisedException` APIs;
+the deprecated `PyErr_Fetch`/`PyErr_Restore` pair is not used in binding sources):
 ```c
-PyObject *exc_type, *exc_value, *exc_tb;
-PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+TL_PY_PRESERVE_EXC_BEGIN;
 // Py_DECREF operations that may run __del__
-PyErr_Restore(exc_type, exc_value, exc_tb);
+TL_PY_PRESERVE_EXC_END;
 ```
 
 ### Handle Ownership and on_drop_handle

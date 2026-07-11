@@ -13,6 +13,10 @@ tl_ts_t tl_window_default_size(tl_time_unit_t unit) {
     case TL_TIME_US: return TL_WINDOW_1H_US;
     case TL_TIME_NS: return TL_WINDOW_1H_NS;
     default:
+        /* Production-unreachable: tl_open's validate_config rejects any
+         * time_unit outside [TL_TIME_S, TL_TIME_NS] before normalize_config
+         * calls this. The 1H_S fallback contract is pinned by
+         * test_storage_internal.c. */
         return TL_WINDOW_1H_S;
     }
 }
@@ -107,21 +111,4 @@ void tl_window_bounds(int64_t window_id, tl_ts_t window_size, tl_ts_t window_ori
     *out_start = start;
     *out_end = end;
     *end_unbounded = false;
-}
-
-/*===========================================================================
- * Window Bounds for Timestamp
- *===========================================================================*/
-
-tl_status_t tl_window_bounds_for_ts(tl_ts_t ts, tl_ts_t window_size,
-                                     tl_ts_t window_origin,
-                                     tl_ts_t* out_start, tl_ts_t* out_end,
-                                     bool* end_unbounded) {
-    int64_t wid;
-    tl_status_t status = tl_window_id_for_ts(ts, window_size, window_origin, &wid);
-    if (status != TL_OK) {
-        return status;
-    }
-    tl_window_bounds(wid, window_size, window_origin, out_start, out_end, end_unbounded);
-    return TL_OK;
 }

@@ -192,23 +192,12 @@ tl_status_t tl_memtable_insert_tombstone(tl_memtable_t* mt,
                                           tl_ts_t t1, tl_ts_t t2,
                                           tl_seq_t seq);
 
-/**
- * Insert an unbounded tombstone [t1, +inf).
- *
- * Updates on success: epoch++, active_bytes_est += sizeof(tl_interval_t)
- *
- * @return TL_OK, TL_ENOMEM
- */
-tl_status_t tl_memtable_insert_tombstone_unbounded(tl_memtable_t* mt,
-                                                    tl_ts_t t1,
-                                                    tl_seq_t seq);
-
 /*===========================================================================
  * Seal Operations
  *
  * Lock requirements:
  * - Caller MUST hold writer_mu externally (protects active state)
- * - memtable_mu is acquired INTERNALLY by tl_memtable_seal for queue operations
+ * - memtable_mu is acquired INTERNALLY by tl_memtable_seal_ex for queue operations
  *
  * CRITICAL INVARIANT: On TL_ENOMEM or TL_EBUSY, active state is PRESERVED.
  * Caller can retry later without data loss.
@@ -240,7 +229,9 @@ bool tl_memtable_should_seal(const tl_memtable_t* mt);
 bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt);
 
 /**
- * Seal active state into a memrun and push to sealed queue.
+ * Seal active state into a memrun and push to sealed queue, optionally
+ * collecting tombstone-dropped records that became unreachable during
+ * mandatory head flush / active-run filtering.
  *
  * Failure-safe: every error path that runs before the memrun is published
  * leaves the active buffers untouched, so the caller may retry without losing
@@ -248,22 +239,16 @@ bool tl_memtable_ooo_budget_exceeded(const tl_memtable_t* mt);
  * again at publish time) to translate contention into TL_EBUSY without
  * wasting work.
  *
+ * Ownership: caller owns *out_dropped and must free with tl__free(mt->alloc, ...).
+ * *out_dropped is NULL exactly when no records were dropped. Pass NULL outputs
+ * to skip collection.
+ *
  * Requires: writer_mu held externally, memtable_mu acquired internally
  *
  * @param mt   Memtable
  * @param mu   Pointer to memtable_mu in tl_timelog (for queue operations)
  * @param cond Pointer to condvar for signaling (may be NULL)
  * @return TL_OK, TL_EBUSY (queue full), TL_ENOMEM (active state PRESERVED)
- */
-tl_status_t tl_memtable_seal(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
-                              tl_seq_t applied_seq);
-
-/**
- * Extended seal API: optionally collect tombstone-dropped records that became
- * unreachable during mandatory head flush / active-run filtering.
- *
- * Ownership: caller owns *out_dropped and must free with tl__free(mt->alloc, ...).
- * Pass NULL outputs to skip collection.
  */
 tl_status_t tl_memtable_seal_ex(tl_memtable_t* mt, tl_mutex_t* mu, tl_cond_t* cond,
                                  tl_seq_t applied_seq,

@@ -22,22 +22,12 @@
 
 PyObject* PyPageSpanObjectsView_Create(PyObject* span)
 {
+    /* Single caller (PyPageSpan_objects) is a PageSpan method that just
+     * checked closed under the same CS discipline; every accessor on the
+     * view re-validates under CS anyway, so no type/closed re-check here.
+     * The state lookup stays — it resolves the heap type. */
     tl_py_module_state_t* mod_st = TlPy_StateFromObject(span);
     if (mod_st == NULL) {
-        return NULL;
-    }
-    if (!TlPyPageSpan_Check(span, mod_st)) {
-        PyErr_SetString(PyExc_TypeError, "expected PageSpan");
-        return NULL;
-    }
-
-    PyPageSpan* span_obj = (PyPageSpan*)span;
-    int closed;
-    TL_PY_OBJ_LOCK(span_obj);
-    closed = span_obj->closed;
-    TL_PY_OBJ_UNLOCK();
-    if (closed) {
-        PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
 
@@ -117,28 +107,23 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
      * span's CS prevents this span's close() from detaching the owner, so
      * its snapshot (and the pin that blocks retired-object drain) stay
      * live — the decoded object cannot be freed before we incref it. The
-     * incref is a lone INCREF of a distinct object (permitted, py_compat.h);
-     * Py_DECREF on error is moot since we only succeed here. */
-    int err = 0; /* 0=ok 1=closed 2=no-h 3=out-of-range 4=bad-handle */
+     * incref is a lone INCREF of a distinct object (permitted, py_compat.h).
+     * While open, span->h is never NULL (core always fills it; detach clears
+     * it only together with closed=1 under this CS) and decoding an encoded
+     * object pointer is never NULL. */
+    int err = 0; /* 0=ok 1=closed 2=out-of-range */
     PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK(span);
     if (span->closed) {
         err = 1;
-    } else if (span->h == NULL) {
-        err = 2;
     } else {
         Py_ssize_t len = (Py_ssize_t)span->len;
         Py_ssize_t adj = index < 0 ? index + len : index;
         if (adj < 0 || adj >= len) {
-            err = 3;
+            err = 2;
         } else {
-            PyObject* decoded = tl_py_handle_decode(span->h[adj]);
-            if (decoded == NULL) {
-                err = 4;
-            } else {
-                obj = Py_NewRef(decoded);
-            }
+            obj = Py_NewRef(tl_py_handle_decode(span->h[adj]));
         }
     }
     TL_PY_OBJ_UNLOCK();
@@ -148,15 +133,7 @@ static PyObject* PyPageSpanObjectsView_getitem(PyPageSpanObjectsView* self,
         return NULL;
     }
     if (err == 2) {
-        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
-        return NULL;
-    }
-    if (err == 3) {
         PyErr_SetString(PyExc_IndexError, "index out of range");
-        return NULL;
-    }
-    if (err == 4) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
         return NULL;
     }
     return obj;
@@ -214,28 +191,22 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
      * and the decoded object cannot be freed before we incref it. Only the
      * final result return happens after the CS.
      */
-    int err = 0;  /* 0=ok 1=eof 2=no-h 3=bad-handle 4=closed */
+    int err = 0;  /* 0=ok 1=eof 2=closed */
     PyObject* obj = NULL;
 
     TL_PY_OBJ_LOCK2(self, span);
     if (self->view == NULL) {
         err = 1;
     } else if (span->closed) {
-        err = 4;
-    } else if (span->h == NULL) {
         err = 2;
     } else {
         Py_ssize_t len = (Py_ssize_t)span->len;
         if (self->index >= len) {
             err = 1;
         } else {
-            PyObject* decoded = tl_py_handle_decode(span->h[self->index]);
-            if (decoded == NULL) {
-                err = 3;
-            } else {
-                obj = Py_NewRef(decoded);
-                self->index++;
-            }
+            /* h non-NULL and decode non-NULL while open — see getitem. */
+            obj = Py_NewRef(tl_py_handle_decode(span->h[self->index]));
+            self->index++;
         }
     }
     TL_PY_OBJ_UNLOCK2();
@@ -244,14 +215,6 @@ static PyObject* objectsviewiter_next(PyPageSpanObjectsViewIter* self)
         return NULL;  /* StopIteration */
     }
     if (err == 2) {
-        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
-        return NULL;
-    }
-    if (err == 3) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
-        return NULL;
-    }
-    if (err == 4) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
         return NULL;
     }
@@ -297,17 +260,15 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
     /* Pin the owner across the copy so the underlying h[] array cannot be
      * freed by a concurrent close. Read len + h + owner under the span's
      * CS, incref the owner, release CS, then iterate using the pinned
-     * pointers. */
-    int err = 0;  /* 0=ok 1=closed 2=no-h */
+     * pointers. h is never NULL while open — see getitem. */
+    int closed = 0;
     Py_ssize_t len = 0;
     const tl_handle_t* h_local = NULL;
     tl_pagespan_owner_t* owner = NULL;
 
     TL_PY_OBJ_LOCK(span);
     if (span->closed) {
-        err = 1;
-    } else if (span->h == NULL) {
-        err = 2;
+        closed = 1;
     } else {
         len = (Py_ssize_t)span->len;
         h_local = span->h;
@@ -318,12 +279,8 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
     }
     TL_PY_OBJ_UNLOCK();
 
-    if (err == 1) {
+    if (closed) {
         PyErr_SetString(PyExc_ValueError, "PageSpan is closed");
-        return NULL;
-    }
-    if (err == 2) {
-        PyErr_SetString(PyExc_RuntimeError, "handles not available in this span");
         return NULL;
     }
     if (owner == NULL) {
@@ -338,14 +295,8 @@ static PyObject* PyPageSpanObjectsView_copy(PyPageSpanObjectsView* self,
     }
 
     for (Py_ssize_t i = 0; i < len; i++) {
-        PyObject* obj = tl_py_handle_decode(h_local[i]);
-        if (!obj) {
-            Py_DECREF(list);
-            tl_pagespan_owner_decref(owner);
-            PyErr_SetString(PyExc_RuntimeError, "invalid handle in span");
-            return NULL;
-        }
-        PyList_SET_ITEM(list, i, Py_NewRef(obj));
+        /* Decode of an encoded object pointer is never NULL. */
+        PyList_SET_ITEM(list, i, Py_NewRef(tl_py_handle_decode(h_local[i])));
     }
 
     tl_pagespan_owner_decref(owner);

@@ -1,69 +1,7 @@
 #include "tl_flush.h"
 #include "../internal/tl_heap.h"
 #include "../internal/tl_intervals.h"
-
-/*===========================================================================
- * Merge Iterator Implementation
- *===========================================================================*/
-
-void tl_merge_iter_init(tl_merge_iter_t* it,
-                         const tl_record_t* a, size_t a_len,
-                         const tl_record_t* b, size_t b_len) {
-    TL_ASSERT(it != NULL);
-
-    it->a = a;
-    it->a_len = a_len;
-    it->a_pos = 0;
-
-    it->b = b;
-    it->b_len = b_len;
-    it->b_pos = 0;
-}
-
-const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it) {
-    TL_ASSERT(it != NULL);
-
-    if (it->a_pos >= it->a_len) {
-        if (it->b_pos >= it->b_len) {
-            return NULL;
-        }
-        return &it->b[it->b_pos];
-    }
-
-    if (it->b_pos >= it->b_len) {
-        return &it->a[it->a_pos];
-    }
-
-    /* Stable merge: ties resolved in favour of 'a' so callers see a deterministic
-     * ordering even when both sources contain the same timestamp. */
-    if (it->a[it->a_pos].ts <= it->b[it->b_pos].ts) {
-        return &it->a[it->a_pos];
-    }
-    return &it->b[it->b_pos];
-}
-
-const tl_record_t* tl_merge_iter_next(tl_merge_iter_t* it) {
-    TL_ASSERT(it != NULL);
-
-    if (it->a_pos >= it->a_len) {
-        if (it->b_pos >= it->b_len) {
-            return NULL;
-        }
-        return &it->b[it->b_pos++];
-    }
-
-    if (it->b_pos >= it->b_len) {
-        return &it->a[it->a_pos++];
-    }
-
-    /* Stable merge: 'a' (in-order run) wins ties against 'b' (OOO records) so
-     * that records with identical timestamps emerge in insertion order. */
-    if (it->a[it->a_pos].ts <= it->b[it->b_pos].ts) {
-        return &it->a[it->a_pos++];
-    } else {
-        return &it->b[it->b_pos++];
-    }
-}
+#include "../internal/tl_recvec.h"
 
 /*===========================================================================
  * Flush Build Implementation
@@ -127,9 +65,8 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
         return TL_ENOMEM;
     }
 
-    tl_record_t* dropped = NULL;
-    size_t dropped_len = 0;
-    size_t dropped_cap = 0;
+    tl_recvec_t dropped_vec;
+    tl_recvec_init(&dropped_vec, ctx->alloc);
 
     /* Stable k-way merge across the in-order run and every OOO run. Tie-break
      * key is the source's tie_id (active_run=0, OOO runs=1..N in generation
@@ -246,30 +183,14 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
             merged[i].handle = top->handle;
             i++;
         } else if (ctx->collect_drops) {
-            if (dropped_len >= dropped_cap) {
-                size_t new_cap = (dropped_cap == 0) ? 64 : dropped_cap * 2;
-                if (tl__alloc_would_overflow(new_cap, sizeof(tl_record_t))) {
-                    tl_heap_destroy(&heap);
-                    tl__free(ctx->alloc, srcs);
-                    tl__free(ctx->alloc, merged);
-                    tl__free(ctx->alloc, dropped);
-                    return TL_EOVERFLOW;
-                }
-                tl_record_t* new_arr = tl__realloc(ctx->alloc, dropped,
-                                                   new_cap * sizeof(tl_record_t));
-                if (new_arr == NULL) {
-                    tl_heap_destroy(&heap);
-                    tl__free(ctx->alloc, srcs);
-                    tl__free(ctx->alloc, merged);
-                    tl__free(ctx->alloc, dropped);
-                    return TL_ENOMEM;
-                }
-                dropped = new_arr;
-                dropped_cap = new_cap;
+            st = tl_recvec_push(&dropped_vec, top->ts, top->handle);
+            if (st != TL_OK) {
+                tl_heap_destroy(&heap);
+                tl__free(ctx->alloc, srcs);
+                tl__free(ctx->alloc, merged);
+                tl_recvec_destroy(&dropped_vec);
+                return st;
             }
-            dropped[dropped_len].ts = top->ts;
-            dropped[dropped_len].handle = top->handle;
-            dropped_len++;
         }
 
         flush_src_t* src = (flush_src_t*)top->iter;
@@ -321,10 +242,18 @@ tl_status_t tl_flush_build(const tl_flush_ctx_t* ctx,
     tl__free(ctx->alloc, merged);
 
     if (st != TL_OK) {
-        tl__free(ctx->alloc, dropped);
+        tl_recvec_destroy(&dropped_vec);
         return st;
     }
 
+    size_t dropped_len = 0;
+    tl_record_t* dropped = tl_recvec_take(&dropped_vec, &dropped_len);
+    if (dropped_len == 0 && dropped != NULL) {
+        /* Normalize a reserved-but-empty take so out_dropped is NULL exactly
+         * when nothing was dropped. */
+        tl__free(ctx->alloc, dropped);
+        dropped = NULL;
+    }
     *out_dropped = dropped;
     *out_dropped_len = dropped_len;
 

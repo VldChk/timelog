@@ -18,6 +18,19 @@ volatile int tl_test_memview_used_fallback = 0;
  * Internal Helpers
  *===========================================================================*/
 
+/* Widen the running [*min_ts, *max_ts] bounds to include [lo, hi]. */
+static void bounds_include(tl_ts_t* min_ts, tl_ts_t* max_ts, bool* has_data,
+                           tl_ts_t lo, tl_ts_t hi) {
+    if (!*has_data) {
+        *min_ts = lo;
+        *max_ts = hi;
+        *has_data = true;
+        return;
+    }
+    if (lo < *min_ts) *min_ts = lo;
+    if (hi > *max_ts) *max_ts = hi;
+}
+
 static void update_bounds_from_records(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                         bool* has_data,
                                         const tl_record_t* data, size_t len) {
@@ -25,17 +38,7 @@ static void update_bounds_from_records(tl_ts_t* min_ts, tl_ts_t* max_ts,
         return;
     }
 
-    tl_ts_t rec_min = data[0].ts;
-    tl_ts_t rec_max = data[len - 1].ts;
-
-    if (!*has_data) {
-        *min_ts = rec_min;
-        *max_ts = rec_max;
-        *has_data = true;
-    } else {
-        if (rec_min < *min_ts) *min_ts = rec_min;
-        if (rec_max > *max_ts) *max_ts = rec_max;
-    }
+    bounds_include(min_ts, max_ts, has_data, data[0].ts, data[len - 1].ts);
 }
 
 static void update_bounds_from_records_unsorted(tl_ts_t* min_ts, tl_ts_t* max_ts,
@@ -52,14 +55,7 @@ static void update_bounds_from_records_unsorted(tl_ts_t* min_ts, tl_ts_t* max_ts
         rec_max = TL_MAX(rec_max, data[i].ts);
     }
 
-    if (!*has_data) {
-        *min_ts = rec_min;
-        *max_ts = rec_max;
-        *has_data = true;
-    } else {
-        if (rec_min < *min_ts) *min_ts = rec_min;
-        if (rec_max > *max_ts) *max_ts = rec_max;
-    }
+    bounds_include(min_ts, max_ts, has_data, rec_min, rec_max);
 }
 
 static void update_bounds_from_runs(tl_ts_t* min_ts, tl_ts_t* max_ts,
@@ -77,14 +73,7 @@ static void update_bounds_from_runs(tl_ts_t* min_ts, tl_ts_t* max_ts,
         rec_max = TL_MAX(rec_max, run->max_ts);
     }
 
-    if (!*has_data) {
-        *min_ts = rec_min;
-        *max_ts = rec_max;
-        *has_data = true;
-    } else {
-        if (rec_min < *min_ts) *min_ts = rec_min;
-        if (rec_max > *max_ts) *max_ts = rec_max;
-    }
+    bounds_include(min_ts, max_ts, has_data, rec_min, rec_max);
 }
 
 static void update_bounds_from_tombs(tl_ts_t* min_ts, tl_ts_t* max_ts,
@@ -105,155 +94,134 @@ static void update_bounds_from_tombs(tl_ts_t* min_ts, tl_ts_t* max_ts,
         tomb_max = last->end - 1;
     }
 
-    if (!*has_data) {
-        *min_ts = tomb_min;
-        *max_ts = tomb_max;
-        *has_data = true;
-    } else {
-        if (tomb_min < *min_ts) *min_ts = tomb_min;
-        if (tomb_max > *max_ts) *max_ts = tomb_max;
-    }
+    bounds_include(min_ts, max_ts, has_data, tomb_min, tomb_max);
 }
 
 static void update_bounds_from_memrun(tl_ts_t* min_ts, tl_ts_t* max_ts,
                                        bool* has_data,
                                        const tl_memrun_t* mr) {
-    bool mr_has_records = tl_memrun_has_records(mr);
-    bool mr_has_tombs = tl_memrun_has_tombstones(mr);
-
-    if (!mr_has_records && !mr_has_tombs) {
+    if (!tl_memrun_has_records(mr) && !tl_memrun_has_tombstones(mr)) {
         return;
     }
 
-    tl_ts_t mr_min = tl_memrun_min_ts(mr);
-    tl_ts_t mr_max = tl_memrun_max_ts(mr);
-
-    if (!*has_data) {
-        *min_ts = mr_min;
-        *max_ts = mr_max;
-        *has_data = true;
-    } else {
-        if (mr_min < *min_ts) *min_ts = mr_min;
-        if (mr_max > *max_ts) *max_ts = mr_max;
-    }
+    bounds_include(min_ts, max_ts, has_data,
+                   tl_memrun_min_ts(mr), tl_memrun_max_ts(mr));
 }
 
-static tl_status_t copy_intervals(tl_alloc_ctx_t* alloc,
-                                   const tl_interval_t* src, size_t len,
-                                   tl_interval_t** out) {
-    *out = NULL;
+/* Allocator-aware duplicate of a flat array (same shape as tl_records_copy).
+ * Returns NULL with *st == TL_OK for empty input; NULL with an error status
+ * on failure. Returned as void* so typed assignment happens at the caller
+ * (no aliasing through a void** out-param). */
+static void* dup_array(tl_alloc_ctx_t* alloc,
+                       const void* src, size_t len, size_t elem_size,
+                       tl_status_t* st) {
+    *st = TL_OK;
 
     if (len == 0) {
-        return TL_OK;
+        return NULL;
     }
 
     if (src == NULL) {
-        return TL_EINVAL;
+        *st = TL_EINVAL;
+        return NULL;
     }
 
-    if (tl__alloc_would_overflow(len, sizeof(tl_interval_t))) {
-        return TL_EOVERFLOW;
+    if (tl__alloc_would_overflow(len, elem_size)) {
+        *st = TL_EOVERFLOW;
+        return NULL;
     }
 
-    size_t bytes = len * sizeof(tl_interval_t);
-    tl_interval_t* dst = tl__malloc(alloc, bytes);
+    size_t bytes = len * elem_size;
+    void* dst = tl__malloc(alloc, bytes);
     if (dst == NULL) {
-        return TL_ENOMEM;
+        *st = TL_ENOMEM;
+        return NULL;
     }
 
     memcpy(dst, src, bytes);
-    *out = dst;
-    return TL_OK;
-}
-
-static tl_status_t copy_seqs(tl_alloc_ctx_t* alloc,
-                              const tl_seq_t* src, size_t len,
-                              tl_seq_t** out) {
-    *out = NULL;
-
-    if (len == 0) {
-        return TL_OK;
-    }
-
-    if (src == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (tl__alloc_would_overflow(len, sizeof(tl_seq_t))) {
-        return TL_EOVERFLOW;
-    }
-
-    size_t bytes = len * sizeof(tl_seq_t);
-    tl_seq_t* dst = tl__malloc(alloc, bytes);
-    if (dst == NULL) {
-        return TL_ENOMEM;
-    }
-
-    memcpy(dst, src, bytes);
-    *out = dst;
-    return TL_OK;
+    return dst;
 }
 
 /*
  * Copy and pin the sealed memrun array using an epoch-validated two-phase
- * approach: snapshot the queue metadata under the lock, drop the lock to
- * allocate, then re-acquire and verify the queue is unchanged before pinning.
- * If the queue mutated under us we retry; after a handful of failed attempts
- * we fall back to doing both the allocation and the pin under the lock, which
- * is always correct but holds the lock longer.
+ * approach (H-09): snapshot the queue metadata under the lock, drop the lock
+ * to allocate, then re-acquire and verify the queue is unchanged before
+ * pinning. If the queue mutated under us we retry; after max_retries failed
+ * attempts the final pass does both the allocation and the pin under the
+ * lock, which is always correct and immune to livelock from a thrashing
+ * producer but holds the lock longer.
  */
 static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
                                         const tl_memtable_t* mt,
                                         tl_mutex_t* memtable_mu) {
     const int max_retries = 3;
 
-    for (int attempt = 0; attempt < max_retries; attempt++) {
-        size_t len = 0;
-        size_t head = 0;
-        uint64_t epoch = 0;
+    /* Attempts 0..max_retries-1 allocate off-lock; the pass at max_retries is
+     * the under-lock fallback, which always succeeds or fails definitively,
+     * so the loop can only exit via return. */
+    for (int attempt = 0; ; attempt++) {
+        bool alloc_under_lock = (attempt >= max_retries);
+
+#ifdef TL_TEST_HOOKS
+        if (alloc_under_lock) {
+            tl_test_memview_used_fallback = 1;
+        }
+#endif
 
         TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-        len = mt->sealed_len;
-        head = mt->sealed_head;
-        epoch = mt->sealed_epoch;
+        size_t len = mt->sealed_len;
+        size_t head = mt->sealed_head;
+        uint64_t epoch = mt->sealed_epoch;
         if (len == 0) {
             mv->sealed = NULL;
             mv->sealed_len = 0;
             TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
             return TL_OK;
         }
-        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+
+        if (!alloc_under_lock) {
+            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+        }
 
         if (tl__alloc_would_overflow(len, sizeof(tl_memrun_t*))) {
+            if (alloc_under_lock) {
+                TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            }
             return TL_EOVERFLOW;
         }
 
         tl_memrun_t** sealed = (tl_memrun_t**)tl__malloc(mv->alloc,
                                                           len * sizeof(tl_memrun_t*));
         if (sealed == NULL) {
+            if (alloc_under_lock) {
+                TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            }
             return TL_ENOMEM;
         }
 
-        /* Validate the snapshot is still current. Any change to length, head,
-         * or epoch means a seal/pop happened while the lock was released and
-         * the pointers we are about to read could now be stale. */
-        TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-        if (mt->sealed_len != len ||
-            mt->sealed_head != head ||
-            mt->sealed_epoch != epoch) {
-            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-            tl__free(mv->alloc, (void*)sealed);
-            continue;
-        }
+        if (!alloc_under_lock) {
+            /* Validate the snapshot is still current. Any change to length,
+             * head, or epoch means a seal/pop happened while the lock was
+             * released and the pointers we are about to read could now be
+             * stale. */
+            TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+            if (mt->sealed_len != len ||
+                mt->sealed_head != head ||
+                mt->sealed_epoch != epoch) {
+                TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+                tl__free(mv->alloc, sealed);
+                continue;
+            }
 
 #ifdef TL_TEST_HOOKS
-        if (tl_test_memview_force_retry_count > 0) {
-            tl_test_memview_force_retry_count--;
-            TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-            tl__free(mv->alloc, sealed);
-            continue;
-        }
+            if (tl_test_memview_force_retry_count > 0) {
+                tl_test_memview_force_retry_count--;
+                TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
+                tl__free(mv->alloc, sealed);
+                continue;
+            }
 #endif
+        }
 
         for (size_t i = 0; i < len; i++) {
             tl_memrun_t* mr = tl_memtable_sealed_at(mt, i);
@@ -265,43 +233,6 @@ static tl_status_t copy_sealed_memruns(tl_memview_t* mv,
         mv->sealed_len = len;
         return TL_OK;
     }
-
-    /* Fallback: do allocation + pinning entirely under the lock. Always
-     * correct, immune to livelock from a thrashing producer. */
-#ifdef TL_TEST_HOOKS
-    tl_test_memview_used_fallback = 1;
-#endif
-    TL_LOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-
-    size_t len = mt->sealed_len;
-    if (len == 0) {
-        mv->sealed = NULL;
-        mv->sealed_len = 0;
-        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-        return TL_OK;
-    }
-
-    if (tl__alloc_would_overflow(len, sizeof(tl_memrun_t*))) {
-        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-        return TL_EOVERFLOW;
-    }
-
-    tl_memrun_t** sealed = (tl_memrun_t**)tl__malloc(mv->alloc,
-                                                      len * sizeof(tl_memrun_t*));
-    if (sealed == NULL) {
-        TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-        return TL_ENOMEM;
-    }
-
-    for (size_t i = 0; i < len; i++) {
-        tl_memrun_t* mr = tl_memtable_sealed_at(mt, i);
-        sealed[i] = tl_memrun_acquire(mr);
-    }
-
-    mv->sealed = sealed;
-    mv->sealed_len = len;
-    TL_UNLOCK(memtable_mu, TL_LOCK_MEMTABLE_MU);
-    return TL_OK;
 }
 
 /*===========================================================================
@@ -331,7 +262,8 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
         goto fail;
     }
     mv->active_run_len = run_len;
-    status = copy_seqs(alloc, tl_memtable_run_seqs(mt), run_len, &mv->active_run_seqs);
+    mv->active_run_seqs = dup_array(alloc, tl_memtable_run_seqs(mt), run_len,
+                                    sizeof(tl_seq_t), &status);
     if (status != TL_OK) {
         goto fail;
     }
@@ -344,19 +276,21 @@ tl_status_t tl_memview_capture(tl_memview_t* mv,
     }
     mv->active_ooo_head_len = ooo_head_len;
     mv->active_ooo_head_sorted = mt->ooo_head_sorted;
-    status = copy_seqs(alloc, tl_memtable_ooo_head_seqs(mt), ooo_head_len,
-                       &mv->active_ooo_head_seqs);
+    mv->active_ooo_head_seqs = dup_array(alloc, tl_memtable_ooo_head_seqs(mt),
+                                         ooo_head_len, sizeof(tl_seq_t),
+                                         &status);
     if (status != TL_OK) {
         goto fail;
     }
 
     mv->active_ooo_runs = tl_ooorunset_acquire(
                             (tl_ooorunset_t*)tl_memtable_ooo_runs(mt));
-    mv->active_ooo_total_len = ooo_head_len +
-                               tl_ooorunset_total_len(mv->active_ooo_runs);
+    /* Saturating helper guards the head_len + runs_len addition. */
+    mv->active_ooo_total_len = tl_memtable_ooo_total_len(mt);
 
     tl_intervals_imm_t tombs_imm = tl_memtable_tombs_imm(mt);
-    status = copy_intervals(alloc, tombs_imm.data, tombs_imm.len, &mv->active_tombs);
+    mv->active_tombs = dup_array(alloc, tombs_imm.data, tombs_imm.len,
+                                 sizeof(tl_interval_t), &status);
     if (status != TL_OK) {
         goto fail;
     }
@@ -465,12 +399,12 @@ tl_status_t tl_memview_shared_capture(tl_memview_shared_t** out,
 
     *out = NULL;
 
+    /* TL_NEW is calloc-backed: the struct arrives zeroed. */
     tl_memview_shared_t* mv = TL_NEW(alloc, tl_memview_shared_t);
     if (mv == NULL) {
         return TL_ENOMEM;
     }
 
-    memset(mv, 0, sizeof(*mv));
     mv->epoch = epoch;
     tl_atomic_init_u32(&mv->refcnt, 1);
 

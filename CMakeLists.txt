@@ -17,8 +17,6 @@ option(TIMELOG_BUILD_PYTHON "Build CPython bindings from the top-level build" ON
 option(TIMELOG_BUILD_PY_TESTS "Build C-level tests for Python bindings" ON)
 option(TIMELOG_STAGE_PYTHON_MODULE
     "Copy built _timelog extension into python/timelog for in-repo imports" ON)
-option(TIMELOG_BUILD_PY_FACADE_TESTS
-    "Add target to run python/tests via pytest (requires pytest installed)" OFF)
 option(TIMELOG_STRICT_WARNINGS
     "Treat compiler warnings as errors for core targets" ON)
 option(TIMELOG_BUILD_CORE_TESTS
@@ -51,6 +49,9 @@ if(MSVC)
         /wd4127                 # Conditional expression is constant (assert macros, while(1))
         /wd4189                 # Local variable initialized but not referenced
         /wd4200                 # Zero-sized array (flexible array member)
+        /experimental:c11atomics # <stdatomic.h> backend for tl_atomic.h (D1);
+                                 # the Windows wheel has required this flag for
+                                 # the binding since v1.0.0 (VS2022 17.5+ floor)
         /D_CRT_SECURE_NO_WARNINGS
     )
 
@@ -164,8 +165,7 @@ set(TIMELOG_SOURCES
     core/src/delta/tl_memview.c
     core/src/query/tl_snapshot.c
     core/src/query/tl_segment_iter.c
-    core/src/query/tl_memrun_iter.c
-    core/src/query/tl_active_iter.c
+    core/src/query/tl_delta_iter.c
     core/src/query/tl_iter_build.c
     core/src/query/tl_submerge.c
     core/src/query/tl_plan.c
@@ -258,14 +258,6 @@ if(TIMELOG_BUILD_CORE_TESTS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/core/src/maint
     )
 
-    # Clang on Windows (non-MSVC driver) does not pull CRT libs by default.
-    if (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
-        target_link_libraries(test_timelog PRIVATE
-            $<$<CONFIG:Debug>:msvcrtd.lib vcruntimed.lib ucrtd.lib legacy_stdio_definitions.lib oldnames.lib>
-            $<$<NOT:$<CONFIG:Debug>>:msvcrt.lib vcruntime.lib ucrt.lib legacy_stdio_definitions.lib oldnames.lib>
-        )
-    endif()
-
     # Enable test hooks for deterministic failpoint testing (Phase 9)
     target_compile_definitions(test_timelog PRIVATE TL_TEST_HOOKS)
 
@@ -278,6 +270,34 @@ if(TIMELOG_BUILD_CORE_TESTS)
     endif()
 
     add_test(NAME timelog_tests COMMAND test_timelog)
+
+    # Per-group CTest entries (CI runs `ctest -L core_group -j <n>`).
+    # Group names MUST match the k_test_suites[] table in
+    # core/tests/test_main.c; test_timelog exits nonzero when
+    # TL_TEST_GROUPS names an unknown group, so drift fails loudly.
+    set(TIMELOG_TEST_GROUPS
+        internal_sync internal_data storage delta compaction pagespan
+        adaptive functional api_semantics snapshot_lifetime invariants
+        concurrency stress
+    )
+    foreach(_tl_group IN LISTS TIMELOG_TEST_GROUPS)
+        add_test(NAME core_group_${_tl_group} COMMAND test_timelog)
+        set_tests_properties(core_group_${_tl_group} PROPERTIES
+            ENVIRONMENT "TL_TEST_GROUPS=${_tl_group}"
+            LABELS core_group
+            TIMEOUT 600
+        )
+    endforeach()
+
+    # Bidirectional drift guard: fails if this list and test_main.c's
+    # k_test_suites table ever disagree in either direction.
+    string(REPLACE ";" "," _tl_groups_csv "${TIMELOG_TEST_GROUPS}")
+    add_test(NAME core_group_sync COMMAND test_timelog)
+    set_tests_properties(core_group_sync PROPERTIES
+        ENVIRONMENT "TL_TEST_EXPECT_GROUPS=${_tl_groups_csv}"
+        LABELS core_group
+        TIMEOUT 60
+    )
 
     add_executable(bench_search_lower_bound EXCLUDE_FROM_ALL
         core/tests/bench_search_lower_bound.c
@@ -306,7 +326,7 @@ endif()
 # =============================================================================
 
 if(TIMELOG_BUILD_PYTHON)
-    # Expose repository root for bindings/cpython standalone-aware CMake.
+    # Expose repository root to the bindings/cpython subdirectory.
     set(TIMELOG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
     if(NOT DEFINED TIMELOG_PYTHON_PACKAGE_DIR)
         set(TIMELOG_PYTHON_PACKAGE_DIR
@@ -346,47 +366,6 @@ if(TIMELOG_BUILD_PYTHON)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         COMMENT "Run all registered core and binding tests"
     )
-
-    if(TIMELOG_BUILD_PY_FACADE_TESTS)
-        add_custom_target(timelog_python_facade_tests
-            COMMAND ${CMAKE_COMMAND} -E env
-                    "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-                    "${Python3_EXECUTABLE}" -m pytest
-                    "${CMAKE_CURRENT_SOURCE_DIR}/python/tests" -q
-            DEPENDS _timelog
-            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-            COMMENT "Run Python facade tests with staged extension module"
-        )
-    endif()
-endif()
-
-# Ensure ASan runtime DLL is discoverable when using Clang on Windows.
-if (TIMELOG_BUILD_CORE_TESTS AND WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT MSVC)
-    execute_process(
-        COMMAND ${CMAKE_C_COMPILER} --print-resource-dir
-        OUTPUT_VARIABLE _clang_res_dir
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-
-    if (_clang_res_dir)
-        get_filename_component(_clang_ver "${_clang_res_dir}" NAME)
-        get_filename_component(_clang_lib_dir "${_clang_res_dir}" DIRECTORY)
-        get_filename_component(_clang_lib_root "${_clang_lib_dir}" DIRECTORY)
-        get_filename_component(_clang_root "${_clang_lib_root}" DIRECTORY)
-
-        set(_clang_rt_dir "${_clang_res_dir}/lib/windows")
-
-        if (CMAKE_SIZEOF_VOID_P EQUAL 8)
-            set(_clang_rt_dir_alt "${_clang_root}/x64/lib/clang/${_clang_ver}/lib/windows")
-            if (EXISTS "${_clang_rt_dir_alt}/clang_rt.asan_dynamic-x86_64.dll")
-                set(_clang_rt_dir "${_clang_rt_dir_alt}")
-            endif()
-        endif()
-
-        set_tests_properties(timelog_tests PROPERTIES
-            ENVIRONMENT "PATH=${_clang_rt_dir};$ENV{PATH}"
-        )
-    endif()
 endif()
 
 # =============================================================================

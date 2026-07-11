@@ -181,19 +181,8 @@ void tl_compact_ctx_destroy(tl_compact_ctx_t* ctx);
  * concurrent swap). This is an advisory check; the selection phase
  * re-validates from the live manifest.
  *
- * Background mode trigger coupling
- * --------------------------------
- * The background worker only calls this function on wakes that already
- * have flush work pending, and only when compact_pending is not already
- * set. The invariant "compaction triggers can only change when segments
- * change" makes idle re-checks pointless: only flush or compaction
- * itself can move the L0 count or alter the tombstone set.
- *
- * Side effect: delete-debt compaction will NOT fire on pure idle wakes
- * without write activity. Callers that need prompt delete-debt response
- * should either invoke tl_compact() explicitly or generate write
- * activity. Manual maintenance mode is unaffected (the manual stepper
- * always evaluates triggers unconditionally).
+ * Background-mode trigger coupling is described in the header block at the
+ * top of this file: the worker evaluates this on every wake-up.
  */
 bool tl_compact_needed(const tl_timelog_t* tl);
 

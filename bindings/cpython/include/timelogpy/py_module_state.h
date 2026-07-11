@@ -38,7 +38,6 @@ static inline tl_py_module_state_t* TlPy_ModuleState(PyObject* module)
 }
 
 extern const char TlPy_TimelogModuleName[];
-int TlPy_ModuleMatchesTimelogDef(PyObject* module);
 tl_py_module_state_t* TlPy_StateFromType(PyTypeObject* type);
 tl_py_module_state_t* TlPy_StateFromObject(PyObject* obj);
 

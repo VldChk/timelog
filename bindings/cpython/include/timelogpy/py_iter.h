@@ -89,18 +89,11 @@ typedef struct {
      * Exact count of remaining rows visible in this iterator snapshot.
      *
      * Initialized once at iterator creation for the iterator's normalized
-     * query bounds, then decremented after each successful next().
+     * query bounds (any user-visible iterator has a valid count — the
+     * count-failure construction path never returns the object), then
+     * decremented after each successful next().
      */
     uint64_t remaining_count;
-
-    /**
-     * Whether remaining_count is valid.
-     *
-     * Set to 1 on successful iterator construction after count precompute.
-     * Kept explicit so __len__ can fail deterministically if initialization
-     * logic changes in the future.
-     */
-    uint8_t remaining_valid;
 
     /**
      * State flag.

@@ -240,4 +240,40 @@ void __tsan_release(void* addr);
         return PyBool_FromLong(closed);                  \
     }
 
+/*
+ * Define a read-only int64 timestamp getter over a PageSpan-style field that
+ * is immutable after construction: sample `closed` and the field under the
+ * per-object critical section, raise the closed ValueError outside it.
+ * (Sibling of TL_PY_DEFINE_CLOSED_GETTER; the field type is tl_ts_t at every
+ * expansion site.)
+ */
+#define TL_PY_DEFINE_SPAN_TS_GETTER(Fn, Type, field)     \
+    static PyObject* Fn(Type* self, void* closure)       \
+    {                                                    \
+        (void)closure;                                   \
+        int closed;                                      \
+        long long v;                                     \
+        TL_PY_OBJ_LOCK(self);                            \
+        closed = self->closed;                           \
+        v = (long long)self->field;                      \
+        TL_PY_OBJ_UNLOCK();                              \
+        if (closed) {                                    \
+            PyErr_SetString(PyExc_ValueError,            \
+                            "PageSpan is closed");       \
+            return NULL;                                 \
+        }                                                \
+        return PyLong_FromLongLong(v);                   \
+    }
+
+/*
+ * Shared __enter__ for context-manager heap types whose entry is exactly
+ * "return self" (PageSpan, TimelogIter, PageSpanIter). PyTimelog's __enter__
+ * is deliberately NOT a user — it also restarts maintenance.
+ */
+static inline PyObject* tl_py_enter_self(PyObject* self, PyObject* noargs)
+{
+    (void)noargs;
+    return Py_NewRef(self);
+}
+
 #endif /* TIMELOGPY_PY_COMPAT_H */

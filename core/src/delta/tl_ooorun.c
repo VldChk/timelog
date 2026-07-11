@@ -73,59 +73,6 @@ void tl_ooorun_release(tl_ooorun_t* run) {
  * Runset Lifecycle
  *===========================================================================*/
 
-tl_status_t tl_ooorunset_create(tl_alloc_ctx_t* alloc,
-                                 tl_ooorun_t* const* runs,
-                                 size_t count,
-                                 tl_ooorunset_t** out) {
-    TL_ASSERT(alloc != NULL);
-    TL_ASSERT(out != NULL);
-
-    *out = NULL;
-
-    if (count == 0 || runs == NULL) {
-        return TL_EINVAL;
-    }
-
-    if (count > (SIZE_MAX - sizeof(tl_ooorunset_t)) / sizeof(tl_ooorun_t*)) {
-        return TL_EOVERFLOW;
-    }
-
-    size_t bytes = sizeof(tl_ooorunset_t) + count * sizeof(tl_ooorun_t*);
-    tl_ooorunset_t* set = tl__malloc(alloc, bytes);
-    if (set == NULL) {
-        return TL_ENOMEM;
-    }
-
-    tl_atomic_init_u32(&set->refcnt, 1);
-    set->alloc = alloc;
-    set->count = count;
-    set->total_len = 0;
-
-    for (size_t i = 0; i < count; i++) {
-        if (runs[i] == NULL) {
-            /* Release everything we already pinned before bailing so the
-             * partially built set leaves no dangling references. */
-            for (size_t j = 0; j < i; j++) {
-                tl_ooorun_release(set->runs[j]);
-            }
-            tl__free(alloc, set);
-            return TL_EINVAL;
-        }
-        set->runs[i] = tl_ooorun_acquire(runs[i]);
-        if (runs[i]->len > SIZE_MAX - set->total_len) {
-            for (size_t j = 0; j <= i; j++) {
-                tl_ooorun_release(set->runs[j]);
-            }
-            tl__free(alloc, set);
-            return TL_EOVERFLOW;
-        }
-        set->total_len += runs[i]->len;
-    }
-
-    *out = set;
-    return TL_OK;
-}
-
 tl_status_t tl_ooorunset_append(tl_alloc_ctx_t* alloc,
                                  tl_ooorunset_t* old_set,
                                  tl_ooorun_t* run,

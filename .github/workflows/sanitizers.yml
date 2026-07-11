@@ -36,7 +36,6 @@ jobs:
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-asan --target timelog_e2e_build --config Debug -j 2
@@ -65,12 +64,8 @@ jobs:
           LSAN_OPTIONS: suppressions=${{ github.workspace }}/.lsan-suppressions
         run: |
           set +e
-          python demo/ci/run_core_test_groups.py \
-            --build-dir build-asan \
-            --config Debug \
-            --ctest-regex '^timelog_tests$' \
-            --summary-json "${RUNNER_TEMP}/sanitizers-core-summary.json" \
-            --summary-md "${RUNNER_TEMP}/sanitizers-core-summary.md" \
+          ctest --test-dir build-asan -C Debug -L core_group -j 4 --output-on-failure --no-tests=error \
+            --output-junit "${RUNNER_TEMP}/sanitizers-core-junit.xml" \
             2>&1 | tee "${RUNNER_TEMP}/sanitizers-core.log"
           exit_code=${PIPESTATUS[0]}
           exit $exit_code
@@ -80,7 +75,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          ctest --test-dir build-asan -C Debug --output-on-failure -R '^py_.*_tests$' \
+          ctest --test-dir build-asan -C Debug --output-on-failure -R '^py_.*_tests$' --no-tests=error \
             2>&1 | tee "${RUNNER_TEMP}/sanitizers-bindings.log"
           exit_code=${PIPESTATUS[0]}
           exit $exit_code
@@ -113,8 +108,7 @@ jobs:
         with:
           name: sanitizers-failure-logs
           path: |
-            ${{ runner.temp }}/sanitizers-core-summary.json
-            ${{ runner.temp }}/sanitizers-core-summary.md
+            ${{ runner.temp }}/sanitizers-core-junit.xml
             ${{ runner.temp }}/sanitizers-core.log
             ${{ runner.temp }}/sanitizers-bindings.log
             ${{ runner.temp }}/sanitizers-pyfacade.log
@@ -146,7 +140,6 @@ jobs:
           -DTIMELOG_SANITIZER=thread
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-tsan --target timelog_e2e_build --config Debug -j 2
@@ -227,7 +220,6 @@ jobs:
           -DTIMELOG_SANITIZER=thread
           -DTIMELOG_BUILD_PYTHON=ON
           -DTIMELOG_BUILD_PY_TESTS=ON
-          -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF
 
       - name: Build e2e targets
         run: cmake --build build-tsan-ft --target timelog_e2e_build --config RelWithDebInfo -j 2

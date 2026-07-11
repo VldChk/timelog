@@ -12,8 +12,7 @@
  * - Tests for LIFO Treiber stack behavior (not FIFO)
  */
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "py_test_harness.h"
 
 #include "timelogpy/py_handle.h"
 #include "timelogpy/py_timelog.h"
@@ -21,57 +20,8 @@
 #include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdbool.h>
 
-/*===========================================================================
- * Test Framework (from test_py_handle.c pattern)
- *===========================================================================*/
-
-static int tests_run = 0;
-static int tests_failed = 0;
-
-/*===========================================================================
- * Python Initialization Helpers
- *===========================================================================*/
-
-static void tlpy_set_pythonhome(void)
-{
-#ifdef TIMELOG_PYTHON_EXECUTABLE
-    const char* existing = getenv("PYTHONHOME");
-    if (existing != NULL && existing[0] != '\0') {
-        return;
-    }
-
-    const char* exe = TIMELOG_PYTHON_EXECUTABLE;
-    size_t len = strlen(exe);
-    char* buf = (char*)malloc(len + 1);
-    if (buf == NULL) {
-        return;
-    }
-    memcpy(buf, exe, len + 1);
-
-    char* last_slash = strrchr(buf, '\\');
-    char* last_fwd = strrchr(buf, '/');
-    char* last = last_slash;
-    if (last_fwd != NULL && (last == NULL || last_fwd > last)) {
-        last = last_fwd;
-    }
-    if (last != NULL) {
-        *last = '\0';
-#ifdef _WIN32
-        _putenv_s("PYTHONHOME", buf);
-#else
-        setenv("PYTHONHOME", buf, 0);
-#endif
-    }
-    free(buf);
-#endif
-}
-
-/* Module storage for full init */
 static PyObject* test_module = NULL;
 static tl_py_module_state_t* test_module_state = NULL;
 static PyObject* test_timelog_type = NULL;
@@ -80,8 +30,7 @@ static PyObject* test_timelog_busy_error = NULL;
 /* Full init for PyTimelog tests */
 static int tlpy_init_python_full(void)
 {
-    tlpy_set_pythonhome();
-    Py_Initialize();
+    tlpy_init_python();
 
     /* Create the real timelog module object for this process. */
     test_module = TlPy_Test_CreateModule();
@@ -120,7 +69,7 @@ static int tlpy_init_python_full(void)
     return 0;
 }
 
-static int tlpy_finalize_python(void)
+static void tlpy_clear_test_module(void)
 {
     if (PyDict_DelItemString(PyImport_GetModuleDict(), "timelog._timelog") < 0) {
         PyErr_Clear();
@@ -130,88 +79,7 @@ static int tlpy_finalize_python(void)
     Py_XDECREF(test_module);
     test_module = NULL;
     test_module_state = NULL;
-    return Py_FinalizeEx();
 }
-
-/*===========================================================================
- * Test Macros
- *===========================================================================*/
-
-#define TEST(name) \
-    static void test_##name(void); \
-    static void run_##name(void) { \
-        printf("  %s... ", #name); \
-        fflush(stdout); \
-        tests_run++; \
-        test_##name(); \
-        if (PyErr_Occurred()) { \
-            printf("FAIL (exception set)\n"); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        printf("PASS\n"); \
-    } \
-    static void test_##name(void)
-
-#define ASSERT(cond) \
-    do { \
-        if (!(cond)) { \
-            printf("FAIL\n    Assertion failed: %s\n    at %s:%d\n", \
-                   #cond, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_EQ(a, b) \
-    do { \
-        if ((a) != (b)) { \
-            printf("FAIL\n    Expected %s == %s\n    Got %lld != %lld\n    at %s:%d\n", \
-                   #a, #b, (long long)(a), (long long)(b), __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_NOT_NULL(ptr) \
-    do { \
-        if ((ptr) == NULL) { \
-            printf("FAIL\n    Expected %s != NULL\n    at %s:%d\n", \
-                   #ptr, __FILE__, __LINE__); \
-            if (PyErr_Occurred()) PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_NULL(ptr) \
-    do { \
-        if ((ptr) != NULL) { \
-            printf("FAIL\n    Expected %s == NULL\n    at %s:%d\n", \
-                   #ptr, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while(0)
-
-#define ASSERT_EXCEPTION(exc_type) \
-    do { \
-        if (!PyErr_Occurred()) { \
-            printf("FAIL\n    Expected exception %s, none occurred\n    at %s:%d\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-        if (!PyErr_ExceptionMatches(exc_type)) { \
-            printf("FAIL\n    Expected exception %s, got different\n    at %s:%d\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        PyErr_Clear(); \
-    } while(0)
 
 /*===========================================================================
  * Helper: Create PyTimelog with custom config
@@ -933,10 +801,7 @@ int main(int argc, char* argv[])
     run_handle_only_tests();
     run_pytimelog_tests();
 
-    if (tlpy_finalize_python() < 0) {
-        fprintf(stderr, "Warning: Py_FinalizeEx failed after PyTimelog tests\n");
-    }
+    tlpy_clear_test_module();
 
-    printf("\n=== TOTAL: %d tests, %d failed ===\n", tests_run, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    return tlpy_test_report();
 }

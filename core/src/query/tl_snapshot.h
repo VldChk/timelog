@@ -71,12 +71,6 @@ TL_INLINE const tl_memview_t* tl_snapshot_memview(const tl_snapshot_t* snap) {
     return tl_memview_shared_view(snap->memview);
 }
 
-/** Get allocator from snapshot. */
-TL_INLINE tl_alloc_ctx_t* tl_snapshot_alloc(const tl_snapshot_t* snap) {
-    TL_ASSERT(snap != NULL);
-    return snap->alloc;
-}
-
 /** Get op_seq watermark captured with the snapshot. */
 TL_INLINE tl_seq_t tl_snapshot_seq(const tl_snapshot_t* snap) {
     TL_ASSERT(snap != NULL);

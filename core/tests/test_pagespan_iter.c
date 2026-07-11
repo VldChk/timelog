@@ -111,8 +111,7 @@ static void test_release_hook_close_timelog(void* user) {
 TEST_DECLARE(pagespan_flags_default_value) {
     uint32_t expected = TL_PAGESPAN_SEGMENTS_ONLY |
                         TL_PAGESPAN_INCLUDE_L0 |
-                        TL_PAGESPAN_INCLUDE_L1 |
-                        TL_PAGESPAN_REQUIRE_ZEROCOPY;
+                        TL_PAGESPAN_INCLUDE_L1;
     TEST_ASSERT_EQ(expected, TL_PAGESPAN_DEFAULT);
 }
 

@@ -15,29 +15,6 @@ int TlPy_StateHasCompleteErrors(const tl_py_module_state_t* st)
            st->exc_timelog_busy_error != NULL;
 }
 
-static int tlpy_validate_error_pair(PyObject* error, PyObject* busy)
-{
-    int is_subclass = 0;
-
-    if (!PyExceptionClass_Check(error) || !PyExceptionClass_Check(busy)) {
-        PyErr_SetString(PyExc_TypeError,
-                        "timelog module errors must be exception classes");
-        return -1;
-    }
-
-    is_subclass = PyObject_IsSubclass(busy, error);
-    if (is_subclass < 0) {
-        return -1;
-    }
-    if (is_subclass == 0) {
-        PyErr_SetString(PyExc_TypeError,
-                        "timelog module TimelogBusyError must subclass TimelogError");
-        return -1;
-    }
-
-    return 0;
-}
-
 int TlPy_InitErrors(PyObject* module, tl_py_module_state_t* st)
 {
     PyObject* error = NULL;
@@ -49,17 +26,15 @@ int TlPy_InitErrors(PyObject* module, tl_py_module_state_t* st)
         return -1;
     }
 
-    if ((st->exc_timelog_error == NULL) != (st->exc_timelog_busy_error == NULL)) {
-        PyErr_SetString(PyExc_RuntimeError,
-                        "timelog module state has incomplete exception pair");
-        TlPy_ClearErrors(st);
-        return -1;
-    }
-
+    /* State is only ever written pairwise below and cleared pairwise by
+     * TlPy_ClearErrors, so a half-populated or non-subclass pair is
+     * unreachable by construction: complete state is already valid. */
     if (TlPy_StateHasCompleteErrors(st)) {
-        return tlpy_validate_error_pair(st->exc_timelog_error,
-                                        st->exc_timelog_busy_error);
+        return 0;
     }
+    /* Fail loudly in debug builds if a future caller ever violates the
+     * pairwise write/clear discipline (would silently leak the survivor). */
+    assert(st->exc_timelog_error == NULL && st->exc_timelog_busy_error == NULL);
 
     error = PyErr_NewException("timelog._timelog.TimelogError", NULL, NULL);
     if (error == NULL) {
@@ -68,12 +43,6 @@ int TlPy_InitErrors(PyObject* module, tl_py_module_state_t* st)
 
     busy = PyErr_NewException("timelog._timelog.TimelogBusyError", error, NULL);
     if (busy == NULL) {
-        Py_DECREF(error);
-        return -1;
-    }
-
-    if (tlpy_validate_error_pair(error, busy) < 0) {
-        Py_DECREF(busy);
         Py_DECREF(error);
         return -1;
     }
@@ -134,32 +103,45 @@ PyObject* TlPy_RaiseFromState(const tl_py_module_state_t* st,
     return NULL;
 }
 
+/*
+ * Shared raiser core built on PyErr_FormatV (no 512-byte buffer, no
+ * truncation). Uses PyUnicode_FromFormat's specifier set — no %f/%g; the
+ * binding only uses %s, %llu, and literals.
+ *
+ * The formatted message stands alone. The engine status is already encoded
+ * in the exception TYPE; appending ": invalid state" / ": resource busy" to
+ * a complete sentence read like a formatting bug (v1.3 usability lab,
+ * multiple personas). A NULL/empty FORMAT falls back to the status text so
+ * the exception is never blank.
+ */
+static PyObject* tlpy_raise_fmt_va(const tl_py_module_state_t* st,
+                                   tl_status_t status,
+                                   const char* format, va_list args)
+{
+#ifndef NDEBUG
+    assert(status != TL_OK && status != TL_EOF &&
+           "tlpy_raise_fmt_va called with success status");
+#endif
+
+    PyObject* type = tlpy_status_to_exception_type(st, status);
+    if (format == NULL || format[0] == '\0') {
+        PyErr_SetString(type, tl_strerror(status));
+    } else {
+        PyErr_FormatV(type, format, args);
+    }
+    return NULL;
+}
+
+/* NOTE: test-only surface today — no production caller; the binding raises
+ * via TlPy_RaiseFromObjectFmt. Kept because test_py_errors.c calls it. */
 PyObject* TlPy_RaiseFromStateFmt(const tl_py_module_state_t* st,
                                  tl_status_t status,
                                  const char* format, ...)
 {
-    char buffer[512];
-    int n;
     va_list args;
-
-#ifndef NDEBUG
-    assert(status != TL_OK && status != TL_EOF &&
-           "TlPy_RaiseFromStateFmt called with success status");
-#endif
-
     va_start(args, format);
-    n = vsnprintf(buffer, sizeof(buffer), format, args);
+    (void)tlpy_raise_fmt_va(st, status, format, args);
     va_end(args);
-
-    /* The formatted message stands alone. The engine status is already
-     * encoded in the exception TYPE; appending ": invalid state" /
-     * ": resource busy" to a complete sentence read like a formatting bug
-     * (v1.3 usability lab, multiple personas). An empty message falls back
-     * to the status text so the exception is never blank. */
-    if (n <= 0 || buffer[0] == '\0') {
-        snprintf(buffer, sizeof(buffer), "%s", tl_strerror(status));
-    }
-    PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
     return NULL;
 }
 
@@ -177,28 +159,13 @@ PyObject* TlPy_RaiseFromObjectFmt(PyObject* obj,
                                   const char* format, ...)
 {
     tl_py_module_state_t* st = TlPy_StateFromObject(obj);
-    char buffer[512];
-    int n;
-    va_list args;
-
-#ifndef NDEBUG
-    assert(status != TL_OK && status != TL_EOF &&
-           "TlPy_RaiseFromObjectFmt called with success status");
-#endif
-
     if (st == NULL) {
         return NULL;
     }
 
+    va_list args;
     va_start(args, format);
-    n = vsnprintf(buffer, sizeof(buffer), format, args);
+    (void)tlpy_raise_fmt_va(st, status, format, args);
     va_end(args);
-
-    /* See TlPy_RaiseFromStateFmt: no status-name suffix on custom messages;
-     * empty messages fall back to the status text. */
-    if (n <= 0 || buffer[0] == '\0') {
-        snprintf(buffer, sizeof(buffer), "%s", tl_strerror(status));
-    }
-    PyErr_SetString(tlpy_status_to_exception_type(st, status), buffer);
     return NULL;
 }

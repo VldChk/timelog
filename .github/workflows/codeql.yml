@@ -45,7 +45,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DTIMELOG_BUILD_PYTHON=ON \
             -DTIMELOG_BUILD_PY_TESTS=OFF \
-            -DTIMELOG_BUILD_PY_FACADE_TESTS=OFF \
             -DTIMELOG_BUILD_CORE_TESTS=OFF \
             -DTIMELOG_BUILD_DEMOS=OFF
           cmake --build build-codeql -j2

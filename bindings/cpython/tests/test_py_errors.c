@@ -3,123 +3,11 @@
  * @brief Error subsystem tests for module-local exception ownership
  */
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#include "py_test_harness.h"
 
 #include "timelogpy/py_errors.h"
 #include "timelogpy/py_module_state.h"
 #include "timelog/timelog.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-static int tests_run = 0;
-static int tests_failed = 0;
-
-static void tlpy_set_pythonhome(void)
-{
-#ifdef TIMELOG_PYTHON_EXECUTABLE
-    const char* existing = getenv("PYTHONHOME");
-    if (existing != NULL && existing[0] != '\0') {
-        return;
-    }
-
-    const char* exe = TIMELOG_PYTHON_EXECUTABLE;
-    size_t len = strlen(exe);
-    char* buf = (char*)malloc(len + 1);
-    if (buf == NULL) {
-        return;
-    }
-    memcpy(buf, exe, len + 1);
-
-    char* last_slash = strrchr(buf, '\\');
-    char* last_fwd = strrchr(buf, '/');
-    char* last = last_slash;
-    if (last_fwd != NULL && (last == NULL || last_fwd > last)) {
-        last = last_fwd;
-    }
-    if (last != NULL) {
-        *last = '\0';
-#ifdef _WIN32
-        _putenv_s("PYTHONHOME", buf);
-#else
-        setenv("PYTHONHOME", buf, 0);
-#endif
-    }
-    free(buf);
-#endif
-}
-
-static void tlpy_init_python(void)
-{
-    tlpy_set_pythonhome();
-    Py_Initialize();
-}
-
-static int tlpy_finalize_python(void)
-{
-    return Py_FinalizeEx();
-}
-
-#define TEST(name) \
-    static void test_##name(void); \
-    static void run_##name(void) { \
-        printf("  %s... ", #name); \
-        fflush(stdout); \
-        tests_run++; \
-        PyErr_Clear(); \
-        test_##name(); \
-        if (PyErr_Occurred()) { \
-            printf("FAIL (unexpected exception)\\n"); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        printf("PASS\\n"); \
-    } \
-    static void test_##name(void)
-
-#define ASSERT(cond) \
-    do { \
-        if (!(cond)) { \
-            printf("FAIL\\n    Assertion failed: %s\\n    at %s:%d\\n", \
-                   #cond, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-    } while (0)
-
-#define ASSERT_NOT_NULL(ptr) \
-    do { \
-        if ((ptr) == NULL) { \
-            printf("FAIL\\n    Expected %s != NULL\\n    at %s:%d\\n", \
-                   #ptr, __FILE__, __LINE__); \
-            if (PyErr_Occurred()) { \
-                PyErr_Print(); \
-            } \
-            tests_failed++; \
-            return; \
-        } \
-    } while (0)
-
-#define ASSERT_EXCEPTION(exc_type) \
-    do { \
-        if (!PyErr_Occurred()) { \
-            printf("FAIL\\n    Expected exception %s\\n    at %s:%d\\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            tests_failed++; \
-            return; \
-        } \
-        if (!PyErr_ExceptionMatches((exc_type))) { \
-            printf("FAIL\\n    Expected exception %s\\n    at %s:%d\\n", \
-                   #exc_type, __FILE__, __LINE__); \
-            PyErr_Print(); \
-            tests_failed++; \
-            return; \
-        } \
-        PyErr_Clear(); \
-    } while (0)
 
 static struct PyModuleDef test_module_def = {
     .m_base = PyModuleDef_HEAD_INIT,
@@ -369,7 +257,7 @@ TEST(raise_formatted_empty_format_still_sets_status_text)
     Py_DECREF(module);
 }
 
-TEST(raise_formatted_long_message_truncates_safely)
+TEST(raise_formatted_long_message_is_preserved)
 {
     PyObject* module = NULL;
     tl_py_module_state_t* st = NULL;
@@ -392,8 +280,9 @@ TEST(raise_formatted_long_message_truncates_safely)
     ASSERT_NOT_NULL(exc_text);
     text = PyUnicode_AsUTF8(exc_text);
     ASSERT(text != NULL);
-    ASSERT(strncmp(text, long_msg, 64) == 0);
-    ASSERT(strlen(text) < 512);
+    /* PyErr_FormatV imposes no fixed buffer: the FULL message survives. */
+    ASSERT(strcmp(text, long_msg) == 0);
+    ASSERT(strlen(text) == sizeof(long_msg) - 1);
 
     Py_XDECREF(exc_text);
     Py_XDECREF(exc_type);
@@ -415,7 +304,7 @@ int main(void)
 {
     tlpy_init_python();
 
-    printf("Running py_errors tests...\\n\\n");
+    printf("Running py_errors tests...\n\n");
     run_init_creates_module_owned_exception_pair();
     run_busy_error_subclasses_timelog_error();
     run_clear_errors_clears_state_owned_refs();
@@ -426,15 +315,8 @@ int main(void)
     run_raise_unknown_uses_timelog_error();
     run_raise_formatted_appends_status_message();
     run_raise_formatted_empty_format_still_sets_status_text();
-    run_raise_formatted_long_message_truncates_safely();
+    run_raise_formatted_long_message_is_preserved();
     run_runtime_fallback_without_state_uses_runtimeerror();
 
-    printf("\\nSummary: %d run, %d failed\\n", tests_run, tests_failed);
-
-    if (tlpy_finalize_python() < 0) {
-        fprintf(stderr, "Py_FinalizeEx failed\\n");
-        return 1;
-    }
-
-    return tests_failed == 0 ? 0 : 1;
+    return tlpy_test_report();
 }

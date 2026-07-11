@@ -987,6 +987,64 @@ TEST_DECLARE(cint_one_exhausts_retries) {
 
     tl_close(tl);
 }
+
+/**
+ * Test: exhaustion keeps an explicit compaction request armed.
+ *
+ * tl_maint_step() consumes compact_pending on TL_OK/TL_EOF/TL_EOVERFLOW but
+ * keeps it armed on TL_EBUSY. Retry exhaustion always surfaces TL_EBUSY
+ * (header contract for tl_compact_one), so an explicit request that exhausts
+ * its publish retries must stay pending — leaving the flag armed for one
+ * extra step — and the NEXT tl_maint_step() must retry and consume it.
+ */
+TEST_DECLARE(cint_maint_step_keeps_pending_on_exhaustion) {
+    tl_config_t cfg;
+    tl_config_init_defaults(&cfg);
+    cfg.maintenance_mode = TL_MAINT_DISABLED;   /* Manual mode */
+    cfg.max_delta_segments = 100;  /* Heuristic never fires on its own */
+
+    tl_timelog_t* tl = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_open(&cfg, &tl));
+
+    compact_flush_n_times(tl, 2, 1000, 10);
+
+    /* Drain any residual flush work so the steps below hit compaction. */
+    while (tl_maint_step(tl) == TL_OK) {}
+
+    /* Explicit request arms compact_pending. */
+    TEST_ASSERT_STATUS(TL_OK, tl_compact(tl));
+
+    /* Exhaust all publish attempts (TL_COMPACT_MAX_RETRIES is 3) via the
+     * manifest-change failpoint. */
+    tl_test_force_ebusy_count = 3;
+    TEST_ASSERT_STATUS(TL_EBUSY, tl_maint_step(tl));
+
+    /* The explicit request must survive the EBUSY exhaustion. */
+    tl_mutex_lock(&tl->maint_mu);
+    bool pending_after_ebusy = tl->compact_pending;
+    tl_mutex_unlock(&tl->maint_mu);
+    TEST_ASSERT(pending_after_ebusy);
+
+    /* Failpoint spent: the next step retries the armed request, succeeds,
+     * and consumes the flag. (The heuristic cannot fire at threshold 100,
+     * so TL_OK here proves the flag drove the retry.) */
+    TEST_ASSERT_STATUS(TL_OK, tl_maint_step(tl));
+
+    tl_mutex_lock(&tl->maint_mu);
+    bool pending_after_ok = tl->compact_pending;
+    tl_mutex_unlock(&tl->maint_mu);
+    TEST_ASSERT(!pending_after_ok);
+
+    /* And the retry really compacted. */
+    tl_snapshot_t* snap = NULL;
+    TEST_ASSERT_STATUS(TL_OK, tl_snapshot_acquire(tl, &snap));
+    tl_stats_t stats;
+    tl_stats(snap, &stats);
+    tl_snapshot_release(snap);
+    TEST_ASSERT(stats.segments_l1 > 0);
+
+    tl_close(tl);
+}
 #endif /* TL_TEST_HOOKS */
 
 /*===========================================================================
@@ -1025,7 +1083,8 @@ void run_compaction_internal_tests(void) {
     RUN_TEST(cint_delete_debt_unbounded_returns_max);
     /* Delete debt extreme range (1 test) */
     RUN_TEST(cint_delete_debt_extreme_range);
-    /* Delete debt + retry limit tests (3 tests) */
+    /* Retry limit tests */
     RUN_TEST(cint_one_exhausts_retries);
+    RUN_TEST(cint_maint_step_keeps_pending_on_exhaustion);
 #endif
 }

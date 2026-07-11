@@ -11,26 +11,25 @@
  * Test Framework Configuration
  *===========================================================================*/
 
-#define TEST_MAX_NAME_LEN 256
+/* Cap on RECORDED failures (passes only increment a counter). Failures
+ * beyond the cap still count and fail the run; test_report() notes the
+ * truncation. */
 #define TEST_MAX_TESTS    1000
 
 /*===========================================================================
- * Test Result Tracking
+ * Test Result Tracking (failures only)
  *===========================================================================*/
 
 typedef struct test_result {
     const char* name;
-    const char* file;
-    int         line;
-    int         passed;
     char        message[512];
 } test_result_t;
 
 typedef struct test_context {
-    test_result_t results[TEST_MAX_TESTS];
-    int           count;
+    test_result_t results[TEST_MAX_TESTS]; /* recorded failures */
+    int           count;                   /* recorded failure count */
     int           passed;
-    int           failed;
+    int           failed;                  /* total failure count */
     const char*   current_test;
 } test_context_t;
 
@@ -43,13 +42,7 @@ extern test_context_t g_test_ctx;
 
 typedef void (*test_fn)(void);
 
-typedef struct test_entry {
-    const char* name;
-    test_fn     fn;
-} test_entry_t;
-
 #define TEST_DECLARE(name) void test_##name(void)
-#define TEST_ENTRY(name) { #name, test_##name }
 
 /*===========================================================================
  * Assertion Macros

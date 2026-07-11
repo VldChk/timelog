@@ -75,26 +75,6 @@ TL_INLINE void tl_lock_release_check(tl_lock_id_t id) {
     t->depth--;
 }
 
-/**
- * Check if a specific lock is held.
- */
-TL_INLINE bool tl_lock_is_held(tl_lock_id_t id) {
-    const tl_lock_tracker_t* t = &tl__lock_tracker;
-    for (int i = 0; i < t->depth; i++) {
-        if (t->held[i] == id) return true;
-    }
-    return false;
-}
-
-/**
- * Get the highest-priority lock currently held.
- */
-TL_INLINE tl_lock_id_t tl_lock_highest_held(void) {
-    tl_lock_tracker_t* t = &tl__lock_tracker;
-    if (t->depth == 0) return TL_LOCK_NONE;
-    return t->held[0]; /* First acquired = highest priority */
-}
-
 /* Macros for lock operations with tracking */
 #define TL_LOCK(mu, id) do { \
     tl_lock_acquire_check(id); \
@@ -106,25 +86,14 @@ TL_INLINE tl_lock_id_t tl_lock_highest_held(void) {
     tl_lock_release_check(id); \
 } while(0)
 
-#define TL_TRYLOCK(mu, id, result) do { \
-    tl_lock_acquire_check(id); \
-    (result) = tl_mutex_trylock(mu); \
-    if (!(result)) { \
-        tl_lock_release_check(id); \
-    } \
-} while(0)
-
 #else /* !TL_DEBUG */
 
 /* Release mode: no tracking overhead */
 #define TL_LOCK(mu, id)           tl_mutex_lock(mu)
 #define TL_UNLOCK(mu, id)         tl_mutex_unlock(mu)
-#define TL_TRYLOCK(mu, id, result) ((result) = tl_mutex_trylock(mu))
 
 #define tl_lock_acquire_check(id) ((void)0)
 #define tl_lock_release_check(id) ((void)0)
-#define tl_lock_is_held(id)       (false)
-#define tl_lock_highest_held()    (TL_LOCK_NONE)
 
 #endif /* TL_DEBUG */
 

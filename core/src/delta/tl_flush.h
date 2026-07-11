@@ -37,85 +37,6 @@ typedef struct tl_flush_ctx {
 } tl_flush_ctx_t;
 
 /*===========================================================================
- * Two-Way Merge Iterator
- *
- * Produces records in timestamp order from two sorted inputs.
- * Stable merge: if timestamps are equal, prefers first input.
- *
- * Usage:
- *   tl_merge_iter_t it;
- *   tl_merge_iter_init(&it, run, run_len, ooo, ooo_len);
- *   while (!tl_merge_iter_done(&it)) {
- *       const tl_record_t* rec = tl_merge_iter_next(&it);
- *       // Process rec
- *   }
- *
- * Thread Safety:
- * - Not thread-safe. Each thread should use its own iterator.
- *===========================================================================*/
-
-typedef struct tl_merge_iter {
-    const tl_record_t* a;       /* First input array (e.g., run) */
-    size_t             a_len;   /* Length of first array */
-    size_t             a_pos;   /* Current position in first array */
-
-    const tl_record_t* b;       /* Second input array (e.g., ooo) */
-    size_t             b_len;   /* Length of second array */
-    size_t             b_pos;   /* Current position in second array */
-} tl_merge_iter_t;
-
-/*===========================================================================
- * Merge Iterator API
- *===========================================================================*/
-
-/**
- * Initialize a merge iterator.
- *
- * @param it    Iterator to initialize
- * @param a     First sorted array (may be NULL if a_len == 0)
- * @param a_len Length of first array
- * @param b     Second sorted array (may be NULL if b_len == 0)
- * @param b_len Length of second array
- */
-void tl_merge_iter_init(tl_merge_iter_t* it,
-                         const tl_record_t* a, size_t a_len,
-                         const tl_record_t* b, size_t b_len);
-
-/**
- * Peek at the next record without advancing.
- *
- * Stable merge: If both inputs have equal timestamps, peeks from 'a' first.
- *
- * @param it  Iterator
- * @return Pointer to next record, or NULL if exhausted
- */
-const tl_record_t* tl_merge_iter_peek(const tl_merge_iter_t* it);
-
-/**
- * Get the next record from the merge.
- *
- * Stable merge: If both inputs have equal timestamps, returns from 'a' first.
- *
- * @param it  Iterator
- * @return Pointer to next record, or NULL if exhausted
- */
-const tl_record_t* tl_merge_iter_next(tl_merge_iter_t* it);
-
-/**
- * Check if iterator is exhausted.
- */
-TL_INLINE bool tl_merge_iter_done(const tl_merge_iter_t* it) {
-    return it->a_pos >= it->a_len && it->b_pos >= it->b_len;
-}
-
-/**
- * Get count of remaining records (test/diagnostic helper).
- */
-TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
-    return (it->a_len - it->a_pos) + (it->b_len - it->b_pos);
-}
-
-/*===========================================================================
  * Flush Build API
  *===========================================================================*/
 
@@ -135,6 +56,7 @@ TL_INLINE size_t tl_merge_iter_remaining(const tl_merge_iter_t* it) {
  *                         and no tombstones exist.
  * @param out_dropped      Output: dropped records (ts, handle) for on_drop
  *                         callback. Owned by caller; free with alloc.
+ *                         NULL when no records were dropped.
  * @param out_dropped_len  Output: length of out_dropped
  * @return TL_OK on success,
  *         TL_ENOMEM on allocation failure,

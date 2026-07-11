@@ -211,14 +211,19 @@ class TestBulkAppendValidation:
             log.bulk_append(_ts_array([1]), ["a"])
 
     def test_kwargs_contract(self):
-        # Hand-rolled FASTCALL parser: kw form, unknown kw, duplicate, missing.
+        # PyArg_ParseTupleAndKeywords parser: kw form, unknown kw, duplicate,
+        # missing. Message regexes accept both CPython wordings (3.12 says
+        # "invalid keyword argument"; 3.13+ says "unexpected keyword
+        # argument"; duplicates say "given by name ... and position").
         log = Timelog(maintenance="disabled")
         log.bulk_append(timestamps=_ts_array([1]), objects=["a"])
-        with pytest.raises(TypeError, match="unexpected keyword"):
+        with pytest.raises(TypeError, match="(unexpected|invalid) keyword"):
             log.bulk_append(_ts_array([2]), ["b"], wrong_kw=1)
-        with pytest.raises(TypeError, match="multiple values"):
+        with pytest.raises(TypeError, match="multiple values|given by name"):
             log.bulk_append(_ts_array([3]), ["c"], objects=["d"])
-        with pytest.raises(TypeError):
+        # The "(pos 2)" fragment is PyArg-specific: it pins that bulk_append
+        # really parses via PyArg_ParseTupleAndKeywords, not a stale parser.
+        with pytest.raises(TypeError, match=r"missing required argument 'objects' \(pos 2\)"):
             log.bulk_append(_ts_array([4]))  # missing objects
         with pytest.raises(TypeError):
             log.bulk_append(_ts_array([5]), ["e"], ["extra"], None)  # too many positional

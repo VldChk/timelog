@@ -87,7 +87,6 @@ static inline PyObject* tl_py_handle_decode(tl_handle_t h) {
 typedef struct tl_py_drop_node {
     struct tl_py_drop_node* next;   /**< Intrusive list link */
     PyObject*               obj;    /**< Object to DECREF */
-    tl_ts_t                 ts;     /**< Timestamp for debugging/metrics */
 } tl_py_drop_node_t;
 
 /*===========================================================================

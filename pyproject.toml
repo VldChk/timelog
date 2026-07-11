@@ -45,7 +45,6 @@ install.components = ["python"]
 [tool.scikit-build.cmake.define]
 TIMELOG_BUILD_PYTHON = true
 TIMELOG_BUILD_PY_TESTS = false
-TIMELOG_BUILD_PY_FACADE_TESTS = false
 TIMELOG_STAGE_PYTHON_MODULE = false
 TIMELOG_STRICT_WARNINGS = false
 TIMELOG_BUILD_CORE_TESTS = false

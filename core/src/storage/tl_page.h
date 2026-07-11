@@ -5,37 +5,6 @@
 #include "../internal/tl_alloc.h"
 
 /*===========================================================================
- * Page Delete Flags
- *
- * These flags indicate the delete status of a page for read-path pruning.
- * V1 only produces FULLY_LIVE pages; other values are reserved for V2.
- *===========================================================================*/
-
-typedef enum tl_page_del_flags {
-    TL_PAGE_FULLY_LIVE      = 0,        /* All rows are live */
-    TL_PAGE_FULLY_DELETED   = 1 << 0,   /* All rows are deleted (skip page) */
-    TL_PAGE_PARTIAL_DELETED = 1 << 1    /* Some rows deleted (consult bitset) */
-} tl_page_del_flags_t;
-
-/*===========================================================================
- * Row Delete Metadata (V2 reserved)
- *
- * V1 does not emit per-page delete masks. These types are defined for
- * forward compatibility but are never instantiated in V1.
- *===========================================================================*/
-
-typedef enum tl_rowdel_kind {
-    TL_ROWDEL_NONE   = 0,               /* No row-level deletes */
-    TL_ROWDEL_BITSET = 1                /* Bitset: bit i set => row i deleted */
-} tl_rowdel_kind_t;
-
-typedef struct tl_rowbitset {
-    uint32_t nbits;
-    uint32_t nwords;
-    uint64_t words[];  /* bit i set => row i deleted */
-} tl_rowbitset_t;
-
-/*===========================================================================
  * Page Structure
  *
  * Immutable after construction. Contains records in SoA (Structure of Arrays)
@@ -57,21 +26,17 @@ typedef struct tl_rowbitset {
  * Invariants:
  * - ts[] is non-decreasing (sorted by timestamp)
  * - count > 0 => min_ts == ts[0] && max_ts == ts[count-1]
- * - flags == FULLY_LIVE in V1
- * - row_del == NULL in V1
  *===========================================================================*/
 
+/* NOTE: The speculative V2 row-level delete surface (page delete flags,
+ * row_del bitsets, per-record liveness checks) was removed as never
+ * instantiated dead weight (audit 2026-07). A real V2 must re-derive it,
+ * including count/pagespan support which never honored row deletes. */
 typedef struct tl_page {
     /* Metadata (for pruning without scanning data) */
     tl_ts_t   min_ts;           /* ts[0] when count > 0 */
     tl_ts_t   max_ts;           /* ts[count-1] when count > 0 */
     uint32_t  count;            /* Number of records */
-    uint32_t  flags;            /* tl_page_del_flags_t */
-
-    /* Row-level delete metadata (V2 reserved, NULL in V1) */
-    void*     row_del;          /* Pointer to tl_rowbitset_t if PARTIAL_DELETED */
-    uint32_t  row_del_kind;     /* tl_rowdel_kind_t */
-    uint32_t  reserved;         /* Padding for alignment */
 
     /* Data arrays (SoA layout) */
     tl_ts_t*     ts;            /* Timestamp array, length == count */
@@ -82,24 +47,10 @@ typedef struct tl_page {
 } tl_page_t;
 
 /*===========================================================================
- * Page Builder
+ * Page Building
  *
  * Constructs immutable pages from a sorted record stream.
  *===========================================================================*/
-
-typedef struct tl_page_builder {
-    tl_alloc_ctx_t* alloc;
-    size_t          target_page_bytes;
-    size_t          records_per_page;   /* Computed from target_page_bytes */
-} tl_page_builder_t;
-
-/*---------------------------------------------------------------------------
- * Lifecycle
- *---------------------------------------------------------------------------*/
-
-/** Initialize page builder with target page size. */
-void tl_page_builder_init(tl_page_builder_t* pb, tl_alloc_ctx_t* alloc,
-                          size_t target_page_bytes);
 
 /*---------------------------------------------------------------------------
  * Capacity Computation
@@ -125,7 +76,7 @@ size_t tl_page_builder_compute_capacity(size_t target_page_bytes);
  *
  * Precondition: records are sorted by timestamp (non-decreasing).
  *
- * @param pb      Page builder
+ * @param alloc   Allocator context
  * @param records Sorted record array
  * @param count   Number of records (must be > 0, must be <= UINT32_MAX)
  * @param out     Output page pointer
@@ -137,9 +88,9 @@ size_t tl_page_builder_compute_capacity(size_t target_page_bytes);
  * Note: count is size_t for API consistency, but tl_page_t.count is uint32_t.
  * Values > UINT32_MAX are rejected to prevent silent truncation.
  */
-tl_status_t tl_page_builder_build(tl_page_builder_t* pb,
-                                   const tl_record_t* records, size_t count,
-                                   tl_page_t** out);
+tl_status_t tl_page_build(tl_alloc_ctx_t* alloc,
+                          const tl_record_t* records, size_t count,
+                          tl_page_t** out);
 
 /*---------------------------------------------------------------------------
  * Page Destruction
@@ -160,10 +111,6 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc);
  * For range queries [t1, t2), the read path uses:
  * - row_start = lower_bound(t1)  -> first ts >= t1
  * - row_end   = lower_bound(t2)  -> first ts >= t2 (exclusive boundary)
- *
- * For point queries (all records with ts == target):
- * - start = lower_bound(target)
- * - end   = upper_bound(target)
  *===========================================================================*/
 
 /**
@@ -173,14 +120,6 @@ void tl_page_destroy(tl_page_t* page, tl_alloc_ctx_t* alloc);
  * Complexity: O(log count)
  */
 size_t tl_page_lower_bound(const tl_page_t* page, tl_ts_t target);
-
-/**
- * Find first row index where ts[i] > target.
- * Returns page->count if all ts <= target.
- *
- * Complexity: O(log count)
- */
-size_t tl_page_upper_bound(const tl_page_t* page, tl_ts_t target);
 
 /*===========================================================================
  * Record Access
@@ -196,45 +135,6 @@ TL_INLINE void tl_page_get_record(const tl_page_t* page, size_t idx,
     out->handle = page->h[idx];
 }
 
-/**
- * Check if a row is deleted via row-level metadata.
- *
- * Defensive behavior: if metadata is missing or inconsistent for a
- * PARTIAL_DELETED page, treat the row as deleted to avoid leaks.
- */
-TL_INLINE bool tl_page_row_is_deleted(const tl_page_t* page, size_t idx) {
-    TL_ASSERT(page != NULL);
-
-    if ((page->flags & TL_PAGE_PARTIAL_DELETED) == 0) {
-        return false;
-    }
-
-    if (page->row_del_kind != TL_ROWDEL_BITSET || page->row_del == NULL) {
-        return true; /* Unknown or missing metadata - conservative skip */
-    }
-
-    const tl_rowbitset_t* bs = (const tl_rowbitset_t*)page->row_del;
-    if (bs->nwords == 0) {
-        return true;
-    }
-
-    if ((uint64_t)bs->nwords * 64u < (uint64_t)bs->nbits) {
-        return true;
-    }
-
-    if (idx >= (size_t)bs->nbits) {
-        return true;
-    }
-
-    size_t word_idx = idx / 64;
-    if (word_idx >= (size_t)bs->nwords) {
-        return true;
-    }
-
-    uint64_t mask = (uint64_t)1u << (idx % 64);
-    return (bs->words[word_idx] & mask) != 0;
-}
-
 /*===========================================================================
  * Validation (Debug Only)
  *===========================================================================*/
@@ -248,8 +148,6 @@ TL_INLINE bool tl_page_row_is_deleted(const tl_page_t* page, size_t idx) {
  * - ts[] is non-decreasing
  * - min_ts == ts[0] when count > 0
  * - max_ts == ts[count-1] when count > 0
- * - flags is valid
- * - row_del == NULL when flags != PARTIAL_DELETED
  */
 bool tl_page_validate(const tl_page_t* page);
 #endif
@@ -265,7 +163,6 @@ typedef struct tl_page_meta {
     tl_ts_t    min_ts;          /* Page min_ts (for pruning) */
     tl_ts_t    max_ts;          /* Page max_ts (for pruning) */
     uint32_t   count;           /* Page record count */
-    uint32_t   flags;           /* Page delete flags */
     tl_page_t* page;            /* Pointer to actual page */
 } tl_page_meta_t;
 
