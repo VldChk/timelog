@@ -733,17 +733,16 @@ class Timelog(_CTimelog):
                     values[pos:pos + k] = chunk["value"]
                     pos += k
             except Exception as exc:
-                # Any conversion failure gets the row note, whatever its type
-                # (a custom __float__ can raise anything). The guard skips
+                # Any failure while filling gets the row note, whatever its
+                # type (a custom __float__ can raise anything; value
+                # conversion is the usual cause but not the only one, so the
+                # note names the row without presuming why). The guard skips
                 # pre-consumption errors (row -1) and closed iterators —
                 # engine errors and exhaustion auto-close, so a row label
                 # cannot mislabel those failures.
                 row = n - len(it) - 1
                 if row >= 0 and not it.closed:
-                    exc.add_note(
-                        f"to_numpy(): raised while converting the value "
-                        f"at row {row} of {n}"
-                    )
+                    exc.add_note(f"to_numpy(): raised at row {row} of {n}")
                 raise
             return timestamps, values
         finally:
