@@ -4,6 +4,34 @@ Concise user-facing summary of the current release line. Deeper behavior
 contracts live in `docs/python-api.md`, `docs/configuration.md`, and
 `docs/performance.md`.
 
+## 1.4.0
+
+Focus: export APIs and a large internal simplification at zero regression.
+
+- `to_numpy(t1=None, t2=None, *, dtype=None)` exports a time range as a pair
+  of fresh contiguous 1-D numpy arrays (`int64` timestamps, `float64` values;
+  `dtype` overrides the value dtype with any scalar numeric dtype, e.g.
+  `np.int64` for exact big-int payloads). numpy stays an optional dependency,
+  imported lazily.
+- `to_dict(t1=None, t2=None)` exports a time range as `{timestamp: object}`.
+  Duplicate timestamps collapse to one value; which record wins is
+  deterministic for a given storage state but otherwise unspecified (see
+  `docs/python-api.md`). `to_dict` never imports numpy.
+- Export bounds behave exactly like `log[t1:t2]` slicing; exports are
+  snapshot-isolated, consume in bounded chunks so large exports cannot
+  monopolize the GIL, and release their reader pin on every path. Conversion
+  failures in `to_numpy` keep their original exception type with the failing
+  row index attached as a note (PEP 678). Measured ~71-79 ns/record
+  (`to_numpy`) and ~60 ns/record (`to_dict`) at 1M records.
+- Internal simplification campaign: net -4,829 lines removed (dead functions,
+  speculative surfaces, duplicated plumbing) with the full validation matrix
+  green; same-harness A/B shows no regression and small wins (mixed read
+  +5.5%, query-after-delete +7.2%, append +2.4%).
+- `extend()` no longer raises a latent `SystemError` (NULL return without an
+  exception) on non-EBUSY mid-stream engine failure.
+- MSVC builds now use the C11 `<stdatomic.h>` backend (gated), aligning
+  Windows atomics with the GCC/Clang path.
+
 ## 1.3.0
 
 Focus: Python-facing usability and hot-path performance.

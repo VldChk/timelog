@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(timelog VERSION 1.3.0 LANGUAGES C)
+project(timelog VERSION 1.4.0 LANGUAGES C)
 
 # =============================================================================
 # Build Configuration
